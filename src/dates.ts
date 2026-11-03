@@ -290,7 +290,7 @@ export function dateSortKey(value?: string): string {
 }
 
 const QUALIFIER_TEXT: Record<'cs' | 'en' | 'de' | 'pl', Record<Exclude<DateQualifier, ''>, string>> = {
-    cs: { '~': 'kolem', '<': 'před', '>': 'po' },
+    cs: { '~': 'okolo', '<': 'pred', '>': 'po' },
     en: { '~': 'about', '<': 'before', '>': 'after' },
     de: { '~': 'um', '<': 'vor', '>': 'nach' },
     pl: { '~': 'ok.', '<': 'przed', '>': 'po' },

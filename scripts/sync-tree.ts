@@ -48,3 +48,4 @@ console.log('\n📦 Rebuilding browsable index.html...');
 execSync('npm run embed', { stdio: 'inherit' });
 
 console.log('\n✨ Sync & build complete! Your tree is ready to view or push to GitHub Pages.');
+

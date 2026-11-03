@@ -178,7 +178,7 @@ export function recordedAgeGap(recorded: string | undefined, birth?: string, eve
 }
 
 function yearWords(lang: Language): [string, string, string] {
-    if (lang === 'cs') return ['rok', 'roky', 'let'];
+    if (lang === 'cs') return ['rok', 'roky', 'rokov'];
     if (lang === 'de') return ['Jahr', 'Jahre', 'Jahre'];
     if (lang === 'pl') return ['rok', 'lata', 'lat'];
     return ['year', 'years', 'years'];

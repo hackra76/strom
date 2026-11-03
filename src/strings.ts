@@ -3,8 +3,9 @@
  */
 
 import { stringsPL } from './strings-pl/index.js';
+import { buildSlovakStrings } from './strings-sk.js';
 
-export type Language = 'en' | 'cs' | 'de' | 'pl';
+export type Language = 'cs' | 'en' | 'de' | 'pl';
 
 /** The event a main excerpt of the person page shows (personPage.excerptCaption). */
 export type PersonPageCaptionEvent = 'birth' | 'birthBaptism' | 'marriage' | 'death' | 'deathBurial';
@@ -12,10 +13,8 @@ export type PersonPageCaptionEvent = 'birth' | 'birthBaptism' | 'marriage' | 'de
 export type PersonPageRegister = 'birth' | 'marriage' | 'death';
 
 export const SUPPORTED_LANGUAGES: { code: Language; name: string }[] = [
-    { code: 'en', name: 'English' },
-    { code: 'cs', name: 'Čeština' },
-    { code: 'de', name: 'Deutsch' },
-    { code: 'pl', name: 'Polski' }
+    { code: 'cs', name: 'Slovenčina' },
+    { code: 'en', name: 'English' }
 ];
 
 // Type definition for strings structure
@@ -20952,9 +20951,11 @@ const stringsDE: StringsType = {
 };
 
 // Language dictionary
+const stringsSK = buildSlovakStrings(stringsCZ);
+
 const languagePacks: Record<Language, StringsType> = {
+    cs: stringsSK,
     en: stringsEN,
-    cs: stringsCZ,
     de: stringsDE,
     pl: stringsPL
 };
@@ -20968,7 +20969,7 @@ export function getStringsForLang(lang: Language): StringsType {
 export let strings: StringsType = stringsEN;
 
 // Current language
-let currentLanguage: Language = 'en';
+let currentLanguage: Language = 'cs';
 
 /**
  * Get current language
@@ -20996,15 +20997,9 @@ export function setLanguage(lang: Language): void {
  * Detect browser language and return matching supported language
  */
 export function detectBrowserLanguage(): Language {
-    const browserLang = navigator.language.split('-')[0].toLowerCase();
-    if (browserLang === 'cs' || browserLang === 'sk') {
+    const browserLang = (typeof navigator !== 'undefined' && navigator.language ? navigator.language : '').split('-')[0].toLowerCase();
+    if (browserLang === 'sk' || browserLang === 'cs') {
         return 'cs';
-    }
-    if (browserLang === 'de') {
-        return 'de';
-    }
-    if (browserLang === 'pl') {
-        return 'pl';
     }
     return 'en';
 }
