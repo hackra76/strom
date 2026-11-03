@@ -1,40 +1,27 @@
 {
-  "name": "strom",
+  "name": "strom-rodokmen",
   "version": "3.21.1",
-  "description": "Family tree application",
-  "main": "dist/bundle.js",
+  "description": "Dvorský Family Tree - Web Viewer",
   "scripts": {
-    "build": "node scripts/bundle.js",
     "embed": "tsx scripts/embed-tree.ts",
+    "sync": "tsx scripts/sync-tree.ts",
+    "build": "tsx scripts/embed-tree.ts",
     "build:dev": "esbuild src/main.ts --bundle --sourcemap --outfile=dist/bundle.js",
     "watch": "esbuild src/main.ts --bundle --sourcemap --outfile=dist/bundle.js --watch",
-    "dev": "npm run build:dev && npx http-server -p 8080 -c-1",
-    "typecheck": "tsc --noEmit --incremental --tsBuildInfoFile .tsbuildinfo",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:real": "npx tsx scripts/test-real-data.ts",
-    "gen:etalon": "tsx scripts/generate-etalon.ts",
-    "gen:devel-demo": "tsx scripts/generate-devel-demo.ts",
-    "test:e2e": "sh scripts/e2e.sh",
-    "test:e2e:smoke": "sh scripts/e2e.sh --grep @smoke",
-    "test:quick": "sh scripts/e2e.sh --quick"
+    "dev": "npm run embed && npx http-server -p 8080 -c-1",
+    "typecheck": "tsc --noEmit --incremental --tsBuildInfoFile .tsbuildinfo"
   },
   "keywords": [
     "family-tree",
-    "genealogy"
-  ],
-  "author": "Milan Víšek",
-  "contributors": [
-    "Claude (Anthropic)"
+    "genealogy",
+    "dvorsky"
   ],
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "devDependencies": {
-    "@playwright/test": "^1.61.1",
     "@types/node": "^25.0.10",
     "esbuild": "^0.27.2",
     "tsx": "^4.23.0",
-    "typescript": "^5.9.3",
-    "vitest": "^4.0.17"
+    "typescript": "^5.9.3"
   }
 }
