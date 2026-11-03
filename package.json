@@ -5,6 +5,7 @@
   "main": "dist/bundle.js",
   "scripts": {
     "build": "node scripts/bundle.js",
+    "embed": "tsx scripts/embed-tree.ts",
     "build:dev": "esbuild src/main.ts --bundle --sourcemap --outfile=dist/bundle.js",
     "watch": "esbuild src/main.ts --bundle --sourcemap --outfile=dist/bundle.js --watch",
     "dev": "npm run build:dev && npx http-server -p 8080 -c-1",
