@@ -40,16 +40,18 @@ console.log('2. Preparing single-file HTML...');
 const template = readFileSync('src/template.html', 'utf-8');
 const js = readFileSync('dist/bundle.js', 'utf-8');
 const escapedJs = js.replace(/\$/g, '$$$$');
-let html = template
-    .replace('<script src="dist/bundle.js"></script>', `<script>${escapedJs}</script>`)
-    .replace(/(<span id="about-version">)[^<]*(<\/span>)/, `$1${pkgVersion}$2`);
 
 console.log('3. Parsing tree-strom.ged...');
 const gedContent = readFileSync('tree-strom.ged', 'utf-8');
 const gedcom = parseGedcom(gedContent);
 const { data, treeName } = convertToStrom(gedcom);
 
-const radovan = Object.values(data.persons || {}).find(p => p.refn === 'P0001');
+const finalTreeName = treeName || 'Dvorský';
+
+// Identify default focus person: P0001 or Radovan Dvorský
+const radovan = Object.values(data.persons || {}).find(p => p.refn === 'P0001')
+    || Object.values(data.persons || {}).find(p => p.firstName === 'Radovan' && p.lastName === 'Dvorský');
+
 if (radovan) {
     data.defaultPersonId = radovan.id;
     console.log(`Focus person set to: ${radovan.firstName} ${radovan.lastName} (${radovan.id})`);
@@ -59,14 +61,32 @@ const envelope = {
     exportId: `exp_${Date.now()}_strom_pub`,
     exportedAt: new Date().toISOString(),
     appVersion: pkgVersion,
-    treeName: treeName || 'Dvorský',
+    treeName: finalTreeName,
     data: data
 };
 
-const scriptTag = `<script>window.STROM_EMBEDDED_DATA = ${jsonForScript(envelope)};</script>`;
-html = html.replace('</head>', () => `${scriptTag}\n</head>`);
+// Custom head additions for family browsing & privacy
+const headAdditions = `
+    <meta name="robots" content="noindex, nofollow">
+    <meta name="description" content="Rodokmeň rodiny ${finalTreeName}">
+    <meta name="apple-mobile-web-app-title" content="Rodokmeň ${finalTreeName}">
+    <style>
+        /* Suppress confusing promotional / import-to-storage banner for family visitors */
+        #view-mode-banner, #embedded-mode-banner {
+            display: none !important;
+        }
+    </style>
+    <script>window.STROM_EMBEDDED_DATA = ${jsonForScript(envelope)};</script>
+`;
+
+let html = template
+    .replace('<title>Strom</title>', `<title>Rodokmeň rodiny ${finalTreeName}</title>`)
+    .replace('<script src="dist/bundle.js"></script>', `<script>${escapedJs}</script>`)
+    .replace(/(<span id="about-version">)[^<]*(<\/span>)/, `$1${pkgVersion}$2`)
+    .replace('</head>', () => `${headAdditions}\n</head>`);
 
 writeFileSync('index.html', html, 'utf-8');
 console.log('4. Done! Output written to index.html (' + Math.round(html.length / 1024) + ' KB)');
+console.log('Tree title:', `Rodokmeň rodiny ${finalTreeName}`);
 console.log('Total persons:', Object.keys(data.persons || {}).length);
 console.log('Total partnerships:', Object.keys(data.partnerships || {}).length);
