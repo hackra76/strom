@@ -24194,31 +24194,5 @@
 
     <!-- Load bundled TypeScript -->
     <script src="dist/bundle.js"></script>
-    <script>
-  window.addEventListener('DOMContentLoaded', async () => {
-    // Check if a tree is already loaded in local storage / IndexedDB
-    // If not, fetch your hosted tree automatically:
-    if (!localStorage.getItem('strom_has_tree')) {
-      try {
-        const response = await fetch('tree-strom.ged');
-        if (response.ok) {
-          const blob = await response.blob();
-          const file = new File([blob], 'tree-strom.ged', { type: 'text/plain' });
-          // Dispatch to Strom's file input or drop handler
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          const input = document.querySelector('input[type="file"]');
-          if (input) {
-            input.files = dt.files;
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-            localStorage.setItem('strom_has_tree', 'true');
-          }
-        }
-      } catch (err) {
-        console.warn('Auto-import failed:', err);
-      }
-    }
-  });
-</script>
 </body>
 </html>

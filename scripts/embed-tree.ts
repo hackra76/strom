@@ -1,43 +1,72 @@
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { buildSync } from 'esbuild';
 import { parseGedcom, convertToStrom } from '../src/ged-parser.js';
 import { jsonForScript } from '../src/export.js';
 
-console.log('Reading tree-strom.ged...');
+console.log('1. Building TypeScript bundle...');
+const pkgVersion = JSON.parse(readFileSync('package.json', 'utf-8')).version;
+
+// Changelog sections
+const notesHelper = buildSync({
+    entryPoints: ['src/release-notes.ts'],
+    bundle: true,
+    format: 'esm',
+    platform: 'neutral',
+    write: false,
+});
+const { changelogSection, changelogFileName, CHANGELOG_LANGUAGES } = await import(
+    'data:text/javascript;base64,' + Buffer.from(notesHelper.outputFiles[0].text).toString('base64')
+);
+const sections: Record<string, string | null> = {};
+for (const lang of CHANGELOG_LANGUAGES) {
+    const file = changelogFileName(lang);
+    sections[lang] = existsSync(file) ? changelogSection(readFileSync(file, 'utf-8'), pkgVersion) : null;
+}
+const releaseNotes = { version: pkgVersion, sections };
+
+buildSync({
+    entryPoints: ['src/main.ts'],
+    bundle: true,
+    minify: true,
+    outfile: 'dist/bundle.js',
+    define: {
+        __APP_VERSION__: JSON.stringify(pkgVersion),
+        __RELEASE_NOTES__: JSON.stringify(releaseNotes),
+    },
+    logLevel: 'warning',
+});
+
+console.log('2. Preparing single-file HTML...');
+const template = readFileSync('src/template.html', 'utf-8');
+const js = readFileSync('dist/bundle.js', 'utf-8');
+const escapedJs = js.replace(/\$/g, '$$$$');
+let html = template
+    .replace('<script src="dist/bundle.js"></script>', `<script>${escapedJs}</script>`)
+    .replace(/(<span id="about-version">)[^<]*(<\/span>)/, `$1${pkgVersion}$2`);
+
+console.log('3. Parsing tree-strom.ged...');
 const gedContent = readFileSync('tree-strom.ged', 'utf-8');
 const gedcom = parseGedcom(gedContent);
 const { data, treeName } = convertToStrom(gedcom);
 
-// Find focus person (P0001 / Radovan Dvorský if available)
 const radovan = Object.values(data.persons || {}).find(p => p.refn === 'P0001');
 if (radovan) {
     data.defaultPersonId = radovan.id;
-    console.log(`Set default focus person to: ${radovan.firstName} ${radovan.lastName} (${radovan.id})`);
+    console.log(`Focus person set to: ${radovan.firstName} ${radovan.lastName} (${radovan.id})`);
 }
 
 const envelope = {
     exportId: `exp_${Date.now()}_strom_pub`,
     exportedAt: new Date().toISOString(),
-    appVersion: '3.21.1',
+    appVersion: pkgVersion,
     treeName: treeName || 'Dvorský',
     data: data
 };
 
 const scriptTag = `<script>window.STROM_EMBEDDED_DATA = ${jsonForScript(envelope)};</script>`;
-
-console.log('Reading index.html...');
-let html = readFileSync('index.html', 'utf-8');
-
-// Strip previous STROM_EMBEDDED_DATA if exists
-html = html.replace(/<script>\s*window\.STROM_EMBEDDED_DATA\s*=[\s\S]*?<\/script>\s*/g, '');
-
-// Strip the previous broken auto-import DOMContentLoaded script if present
-html = html.replace(/<script>\s*window\.addEventListener\('DOMContentLoaded',\s*async\s*\(\)\s*=>\s*\{[\s\S]*?<\/script>\s*/g, '');
-
-// Insert new STROM_EMBEDDED_DATA before </head>
 html = html.replace('</head>', () => `${scriptTag}\n</head>`);
 
 writeFileSync('index.html', html, 'utf-8');
-console.log('Successfully updated index.html with embedded family tree!');
-console.log('Total file size:', Math.round(html.length / 1024), 'KB');
+console.log('4. Done! Output written to index.html (' + Math.round(html.length / 1024) + ' KB)');
 console.log('Total persons:', Object.keys(data.persons || {}).length);
 console.log('Total partnerships:', Object.keys(data.partnerships || {}).length);
