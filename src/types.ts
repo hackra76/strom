@@ -1527,7 +1527,7 @@ export function mergedPrimaryName(
     return theirs ?? own;
 }
 export const SURNAME_DISPLAYS: readonly SurnameDisplay[] = ['birth', 'both', 'married'];
-export type LanguageSetting = 'en' | 'cs' | 'de' | 'pl' | 'system';
+export type LanguageSetting = 'sk' | 'en' | 'cs' | 'de' | 'pl' | 'system';
 
 export interface AppSettings {
     theme: ThemeMode;  // default: 'system'

@@ -48,7 +48,7 @@ export const DESC_W: readonly number[] = [70, 62, 56, 52, 50];
 
 export const FAN_MIN_GENERATIONS = 3;
 export const FAN_MAX_GENERATIONS = 10;
-export const FAN_DEFAULT_GENERATIONS = 5;
+export const FAN_DEFAULT_GENERATIONS = 9;
 export const FAN_MIN_DESC_GENERATIONS = 1;
 export const FAN_MAX_DESC_GENERATIONS = 5;
 export const FAN_DEFAULT_DESC_GENERATIONS = 3;

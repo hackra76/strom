@@ -3,8 +3,9 @@
  */
 
 import { stringsPL } from './strings-pl/index.js';
+import { buildSlovakStrings } from './strings-sk.js';
 
-export type Language = 'en' | 'cs' | 'de' | 'pl';
+export type Language = 'cs' | 'en' | 'de' | 'pl';
 
 /** The event a main excerpt of the person page shows (personPage.excerptCaption). */
 export type PersonPageCaptionEvent = 'birth' | 'birthBaptism' | 'marriage' | 'death' | 'deathBurial';
@@ -12,10 +13,8 @@ export type PersonPageCaptionEvent = 'birth' | 'birthBaptism' | 'marriage' | 'de
 export type PersonPageRegister = 'birth' | 'marriage' | 'death';
 
 export const SUPPORTED_LANGUAGES: { code: Language; name: string }[] = [
-    { code: 'en', name: 'English' },
-    { code: 'cs', name: 'Čeština' },
-    { code: 'de', name: 'Deutsch' },
-    { code: 'pl', name: 'Polski' }
+    { code: 'cs', name: 'Slovenčina' },
+    { code: 'en', name: 'English' }
 ];
 
 // Type definition for strings structure
@@ -4230,10 +4229,17 @@ const stringsEN = {
         betaValue: (version: string) => `BETA · ${version}`,
         betaTitle: 'Test version before release. It keeps its own data, separate from the regular app. Trees move between them by export and import; a backup before moving is a good habit.',
         description: 'Family tree in browser or single HTML. Data stays on the device.',
-        createdBy: 'Created by',
+        createdBy: 'Original app by',
         author: 'Author',
         authorName: 'Milan Víšek',
+        modifiedBy: 'Research & fork edits (2026):',
+        forkAuthorName: 'Radovan Dvorský',
         sourceCode: 'Source code',
+        upstreamSource: 'Original source (ACiDekCZ)',
+        forkSource: 'Fork source (hackra76)',
+        rodokmenLabel: 'Chronicle:',
+        rodokmenUpstream: 'rodokmen-skill (J. Šaršon, MIT)',
+        rodokmenFork: 'SK port (hackra76)',
         // Shown only in the Czech UI (a Czech community; see about-links.ts).
         usersGroup: 'Users\' group on Facebook ↗',
         // The changelog on GitHub in the UI language (see about-links.ts).
@@ -11165,10 +11171,17 @@ const stringsCZ: StringsType = {
         betaValue: (version: string) => `BETA · ${version}`,
         betaTitle: 'Testovací verze před vydáním. Má vlastní data, oddělená od běžné aplikace. Rodokmeny se mezi nimi přenášejí exportem a importem; záloha před přenosem je dobrý zvyk.',
         description: 'Rodokmen v prohlížeči nebo v jednom HTML. Data neopouštějí zařízení.',
-        createdBy: 'Vytvořil',
+        createdBy: 'Původní aplikace:',
         author: 'Autor',
         authorName: 'Milan Víšek',
+        modifiedBy: 'Výzkum a úpravy forku (2026):',
+        forkAuthorName: 'Radovan Dvorský',
         sourceCode: 'Zdrojový kód',
+        upstreamSource: 'Původní kód (ACiDekCZ)',
+        forkSource: 'Zdrojový kód forku (hackra76)',
+        rodokmenLabel: 'Kronika:',
+        rodokmenUpstream: 'rodokmen-skill (J. Šaršon, MIT)',
+        rodokmenFork: 'SK port (hackra76)',
         usersGroup: 'Skupina uživatelů na Facebooku ↗',
         whatsNew: 'Co je nového ↗',
         close: 'Zavřít',
@@ -18051,10 +18064,17 @@ const stringsDE: StringsType = {
         betaValue: (version: string) => `BETA · ${version}`,
         betaTitle: 'Testversion vor der Veröffentlichung. Die Beta hat eigene Daten, getrennt von der regulären App. Stammbäume wechseln per Export und Import; eine Sicherung vor dem Wechsel ist eine gute Gewohnheit.',
         description: 'Stammbaum im Browser oder als einzelne HTML-Datei. Die Daten bleiben auf dem eigenen Gerät.',
-        createdBy: 'Erstellt von',
+        createdBy: 'Ursprüngliche App von',
         author: 'Autor',
         authorName: 'Milan Víšek',
+        modifiedBy: 'Forschung & Fork-Anpassungen (2026):',
+        forkAuthorName: 'Radovan Dvorský',
         sourceCode: 'Quellcode',
+        upstreamSource: 'Originalcode (ACiDekCZ)',
+        forkSource: 'Fork-Quellcode (hackra76)',
+        rodokmenLabel: 'Chronik:',
+        rodokmenUpstream: 'rodokmen-skill (J. Šaršon, MIT)',
+        rodokmenFork: 'SK-Port (hackra76)',
         usersGroup: 'Nutzergruppe auf Facebook ↗',
         whatsNew: 'Was ist neu ↗',
         close: 'Schließen',
@@ -20952,9 +20972,11 @@ const stringsDE: StringsType = {
 };
 
 // Language dictionary
+const stringsSK = buildSlovakStrings(stringsCZ);
+
 const languagePacks: Record<Language, StringsType> = {
+    cs: stringsSK,
     en: stringsEN,
-    cs: stringsCZ,
     de: stringsDE,
     pl: stringsPL
 };
@@ -20968,7 +20990,7 @@ export function getStringsForLang(lang: Language): StringsType {
 export let strings: StringsType = stringsEN;
 
 // Current language
-let currentLanguage: Language = 'en';
+let currentLanguage: Language = 'cs';
 
 /**
  * Get current language
@@ -20996,15 +21018,9 @@ export function setLanguage(lang: Language): void {
  * Detect browser language and return matching supported language
  */
 export function detectBrowserLanguage(): Language {
-    const browserLang = navigator.language.split('-')[0].toLowerCase();
-    if (browserLang === 'cs' || browserLang === 'sk') {
+    const browserLang = (typeof navigator !== 'undefined' && navigator.language ? navigator.language : '').split('-')[0].toLowerCase();
+    if (browserLang === 'sk' || browserLang === 'cs') {
         return 'cs';
-    }
-    if (browserLang === 'de') {
-        return 'de';
-    }
-    if (browserLang === 'pl') {
-        return 'pl';
     }
     return 'en';
 }
