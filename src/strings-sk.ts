@@ -1345,6 +1345,16 @@ export function buildSlovakStrings(cz: StringsType): StringsType {
 
     sk.treeOverview = {
         ...sk.treeOverview,
+        ancestorGeneration: (n: number) => n <= 1 ? 'rodičia' : n === 2 ? 'starí rodičia'
+            : n === 3 ? 'prastarí rodičia' : `${n}. generácia predkov`,
+        descendantGeneration: (n: number) => n <= 1 ? 'deti' : n === 2 ? 'vnúčatá'
+            : n === 3 ? 'pravnúčatá' : `${n}. generácia potomkov`,
+        sameGeneration: 'generácia osoby',
+        ancestorGenerationOf: (n: number) => n <= 1 ? 'generácia rodičov' : n === 2 ? 'generácia starých rodičov'
+            : n === 3 ? 'generácia prastarých rodičov' : `${n}. generácia predkov`,
+        descendantGenerationOf: (n: number) => n <= 1 ? 'generácia detí' : n === 2 ? 'generácia vnukov'
+            : n === 3 ? 'generácia pravnukov' : `${n}. generácia potomkov`,
+        sameGenerationOf: 'generácia osoby',
         menu: 'Prehľad rodokmeňa',
         title: (name: string) => `Prehľad rodokmeňa: ${name}`,
         empty: 'Tento rodokmeň zatiaľ nemá žiadne osoby.',
@@ -2481,6 +2491,33 @@ export function buildSlovakStrings(cz: StringsType): StringsType {
     sk.uiTips = {
         ...sk.uiTips,
         centerOnFocus: 'Vycentrovať na zameranú osobu',
+    };
+
+    sk.genLabels = {
+        ...sk.genLabels,
+        settingLabel: 'Popisky generácií',
+        settingHint: 'Pripnúť názvy generácií k ľavému okraju plátna',
+    };
+
+    sk.generationLabels = {
+        ...sk.generationLabels,
+        grandparents: 'STARÍ RODIČIA',
+        parents: 'RODIČIA',
+        focus: 'ZAMERANÁ GENERÁCIA',
+        children: 'DETI',
+        grandchildren: 'VNÚČATÁ',
+        generationN: (offset: number) => `GENERÁCIA ${offset > 0 ? '+' : '−'}${Math.abs(offset)}`,
+    };
+
+    sk.kinship = {
+        ...sk.kinship,
+        title: 'Príbuzenský vzťah',
+        fromLabel: 'Východisková osoba',
+        pickLabel: 'Vybrať druhú osobu:',
+        isOf: 'je voči osobe',
+        noRelation: 'Žiadny vzťah sa nenašiel (v rámci evidovaného stromu).',
+        highlight: 'Zvýrazniť v strome',
+        close: 'Zavrieť',
     };
 
     return sk;

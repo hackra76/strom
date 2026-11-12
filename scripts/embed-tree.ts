@@ -50,10 +50,22 @@ async function buildHelpData() {
         platform: 'neutral',
         write: false,
     });
+    const skHelper = buildSync({
+        entryPoints: ['src/help/help-sk.ts'],
+        bundle: true,
+        format: 'esm',
+        platform: 'neutral',
+        write: false,
+    });
     const { convertHelp, embedHelp } = await import(
         'data:text/javascript;base64,' + Buffer.from(helper.outputFiles[0].text).toString('base64')
     );
-    return embedHelp(convertHelp(files, pin), (data: Buffer) => deflateRawSync(data, { level: 9 }));
+    const { translateHelpToSlovak } = await import(
+        'data:text/javascript;base64,' + Buffer.from(skHelper.outputFiles[0].text).toString('base64')
+    );
+    const bundle = convertHelp(files, pin);
+    bundle.langs.cs = translateHelpToSlovak(bundle.langs.cs);
+    return embedHelp(bundle, (data: Buffer) => deflateRawSync(data, { level: 9 }));
 }
 const helpData = await buildHelpData();
 
