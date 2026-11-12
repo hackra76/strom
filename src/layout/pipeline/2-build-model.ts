@@ -11,7 +11,7 @@
  */
 
 import { PersonId, PartnershipId, StromData, coupleSides } from '../../types.js';
-import { compareMarriages } from '../../marriage-order.js';
+import { compareMarriages, marriageDates } from '../../marriage-order.js';
 import {
     BuildModelInput,
     LayoutModel,
@@ -280,7 +280,9 @@ export function buildLayoutModel(input: BuildModelInput): LayoutModel {
             personToUnion,
             childToParentUnion,
             partnerChains,
-            displayPolicy.chainPartnershipsOf
+            displayPolicy.chainPartnershipsOf,
+            (displayPolicy.partnerOrder ?? 'chronological') === 'chronological',
+            displayPolicy.compactChainPersonIds
         );
     }
 
@@ -493,7 +495,9 @@ function expandPartnerChains(
     personToUnion: Map<PersonId, UnionId>,
     childToParentUnion: Map<PersonId, UnionId>,
     partnerChains: Map<PersonId, PartnerChain>,
-    chainPartnershipsOf?: ReadonlyMap<PersonId, ReadonlySet<PartnershipId>>
+    chainPartnershipsOf?: ReadonlyMap<PersonId, ReadonlySet<PartnershipId>>,
+    chronological = false,
+    compactChainPersonIds?: ReadonlySet<PersonId>
 ): void {
     // Build reverse lookup: partnershipId → existing unionId
     const partnershipToUnion = new Map<PartnershipId, UnionId>();
@@ -515,10 +519,11 @@ function expandPartnerChains(
         if (!primaryUnion) continue;
 
         // Collect all partnerships for this person that are in selection, in
-        // chronological order (wedding date, then data order — T13): the
-        // extra partners on one side of the shared person then stand in the
-        // order of the marriages, the earliest next to the person
-        // (buildChainBlockPersonOrder walks them in this order).
+        // chronological order (wedding date, else its latest possible date —
+        // the union's end, its first child's birth — then data order; T13,
+        // T50): the extra partners on one side of the shared person then
+        // stand in the order of the marriages, the earliest next to the
+        // person (buildChainBlockPersonOrder walks them in this order).
         // A chain limited to some unions (DisplayPolicy.chainPartnershipsOf)
         const allowed = chainPartnershipsOf?.get(sharedPersonId);
         const personPartnerships = person.partnerships
@@ -527,8 +532,8 @@ function expandPartnerChains(
             .filter(p => !allowed || allowed.has(p.id) || p.id === primaryUnion.partnershipId)
             .filter(p => p.partnership && selection.persons.has(p.partnership.person1Id) && selection.persons.has(p.partnership.person2Id))
             .sort((a, b) => compareMarriages(
-                { startDate: a.partnership.startDate, index: a.index },
-                { startDate: b.partnership.startDate, index: b.index }));
+                marriageDates(data, a.partnership, a.index),
+                marriageDates(data, b.partnership, b.index)));
 
         if (personPartnerships.length <= 1) {
             continue;
@@ -536,9 +541,14 @@ function expandPartnerChains(
 
         const primaryPartnershipId = primaryUnion.partnershipId;
         const chainUnionIds: UnionId[] = [primaryUnionId];
+        // All the chain's unions in the order of the marriages (T13)
+        const chronologicalUnionIds: UnionId[] = [];
 
         for (const { id: partnershipId, partnership } of personPartnerships) {
-            if (partnershipId === primaryPartnershipId) continue;
+            if (partnershipId === primaryPartnershipId) {
+                chronologicalUnionIds.push(primaryUnionId);
+                continue;
+            }
 
             const partnerId = partnership.person1Id === sharedPersonId
                 ? partnership.person2Id
@@ -550,6 +560,7 @@ function expandPartnerChains(
             if (existingUnionId) {
                 // Union already exists (partner was not folded) — reuse it
                 chainUnionIds.push(existingUnionId);
+                chronologicalUnionIds.push(existingUnionId);
             } else {
                 // Partnership was folded (both partners already assigned) —
                 // create a new chain union and move children from primary union
@@ -569,6 +580,7 @@ function expandPartnerChains(
 
                 unions.set(chainUnionId, chainUnion);
                 chainUnionIds.push(chainUnionId);
+                chronologicalUnionIds.push(chainUnionId);
                 // A partnership folded for BOTH partners (each primary
                 // elsewhere, both expanded) gets one chain union: the other
                 // partner's chain reuses it, so mergeOverlappingChains joins
@@ -612,7 +624,10 @@ function expandPartnerChains(
             sharedPersonId,
             unionIds: chainUnionIds,
             width: 0, // Computed later in measure step
-            sharedPersonCenterX: 0 // Computed later in place step
+            sharedPersonCenterX: 0, // Computed later in place step
+            ...(chronological && !compactChainPersonIds?.has(sharedPersonId)
+                && chronologicalUnionIds.length === chainUnionIds.length
+                ? { chronologicalUnionIds } : {})
         });
     }
 
@@ -672,6 +687,9 @@ function mergeOverlappingChains(
         const allUnionIds = new Set<UnionId>(keepChain.unionIds);
         for (const uid of absorbChain.unionIds) allUnionIds.add(uid);
         keepChain.unionIds = [...allUnionIds];
+        // The partners of a merged chain hang off more than one person:
+        // they keep the compact order
+        delete keepChain.chronologicalUnionIds;
         partnerChains.delete(personId);
     }
 }

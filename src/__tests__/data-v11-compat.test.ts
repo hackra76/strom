@@ -97,8 +97,13 @@ describe('data format 10 -> 11', () => {
         // 3.8.1 knows data version 10 and IndexedDB schema 5. Raising either
         // decides what an older app does with this one's data (see header).
         // 3.10 raised the data version to 12 (Gender 'unknown', U01), 13 for
-        // spec 021's lists, 14 for the lineage corrections (package 1031).
-        expect(STROM_DATA_VERSION).toBe(14);
+        // spec 021's lists, 14 for the lineage corrections (package 1031),
+        // 15 for the origin of facts from a GEDCOM import (spec 066), 16 for
+        // the confirmation and re-verification of facts (spec 065), 17 for
+        // the saved views of the Table view (spec 073), 18 for the sources'
+        // call number, folio and image (spec 075), 19 for the QUAY of a
+        // citation (spec 077).
+        expect(STROM_DATA_VERSION).toBe(19);
         // A raise would stop an older build at its start (VersionError) — the
         // whole app, also an older exported HTML file: never raised again.
         const storage = readFileSync(new URL('../storage.ts', import.meta.url), 'utf8');

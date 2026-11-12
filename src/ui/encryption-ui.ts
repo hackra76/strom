@@ -39,7 +39,8 @@ import { PersonPicker } from '../person-picker.js';
 import { AppExporter } from '../export.js';
 import { SettingsManager } from '../settings.js';
 import { ThemeMode, LanguageSetting, AppMode, AuditLog, PERSON_CITATION_FIELDS } from '../types.js';
-import { CryptoSession, isEncrypted, encrypt, decrypt, EncryptedData } from '../crypto.js';
+import { CryptoSession, isEncrypted, encrypt, decrypt, EncryptedData, isCryptoAvailable } from '../crypto.js';
+import { cryptoErrorText, cryptoFailureText, resetPasswordError, requireCrypto } from '../crypto-errors.js';
 import { validateTreeData, ValidationResult as TreeValidationResult, ValidationIssue } from '../validation.js';
 import * as CrossTree from '../cross-tree.js';
 import { AuditLogManager } from '../audit-log.js';
@@ -53,6 +54,8 @@ export type ExportFormat = 'json' | 'html' | 'gedcom' | 'csv' | 'all';
 
 /** The dialog is the narrowed full backup (button says "Save to file"). */
 let exportQuick = false;
+/** Which export the dialog is for: GEDCOM keeps the deceased's sources under a privacy mode (spec 066 §4). */
+let exportFormat: ExportFormat = 'json';
 /** The export takes every tree (only the current one is measured; the others may hold sources). */
 let exportAllTrees = false;
 /**
@@ -103,12 +106,9 @@ export const encryptionUiMethods = uiModule({
             return;
         }
 
-        // Clear fields
+        // Clear fields (outside a secure context the notice shows at once)
         input.value = '';
-        if (error) {
-            error.style.display = 'none';
-            error.textContent = '';
-        }
+        resetPasswordError(error);
 
         // Set callback for password verification - callback manages dialog
         this.passwordPromptCallback = async (password: string) => {
@@ -125,9 +125,9 @@ export const encryptionUiMethods = uiModule({
      */
     async tryDisableEncryption(password: string): Promise<void> {
         const error = document.getElementById('password-prompt-error');
-        const showWrongPassword = () => {
+        const showFailure = (text: string) => {
             if (error) {
-                error.textContent = strings.encryption.wrongPassword;
+                error.textContent = text;
                 error.style.display = 'block';
             }
             // Clear input for retry
@@ -150,13 +150,14 @@ export const encryptionUiMethods = uiModule({
         if (probe) {
             try {
                 await decrypt(probe, password);
-            } catch {
-                showWrongPassword();
+                // Password verified - unlock session to decrypt data
+                const salt = new Uint8Array(atob(probe.salt).split('').map(c => c.charCodeAt(0)));
+                await CryptoSession.unlock(password, salt);
+            } catch (err) {
+                // Only an AES-GCM refusal is a wrong password (GitHub #13).
+                showFailure(cryptoErrorText(err));
                 return;
             }
-            // Password verified - unlock session to decrypt data
-            const salt = new Uint8Array(atob(probe.salt).split('').map(c => c.charCodeAt(0)));
-            await CryptoSession.unlock(password, salt);
         }
 
         // Close dialog first: from here on failures are not a password issue.
@@ -224,13 +225,10 @@ export const encryptionUiMethods = uiModule({
 
         if (!modal || !input || !confirm) return;
 
-        // Clear fields
+        // Clear fields (outside a secure context the notice shows at once)
         input.value = '';
         confirm.value = '';
-        if (error) {
-            error.style.display = 'none';
-            error.textContent = '';
-        }
+        resetPasswordError(error);
 
         modal.classList.add('active');
         input.focus();
@@ -271,6 +269,9 @@ export const encryptionUiMethods = uiModule({
 
         const password = input.value;
         const confirmPassword = confirm.value;
+
+        // No Web Crypto at this address: no password can help (GitHub #13).
+        if (!requireCrypto(error)) return;
 
         // Validate password
         if (password.length < 6) {
@@ -318,7 +319,7 @@ export const encryptionUiMethods = uiModule({
             if (failed > 0) this.showToast(strings.storageSafety.reencodeFailed(failed), 6000);
         } catch (err) {
             if (error) {
-                error.textContent = strings.encryption.decryptionFailed;
+                error.textContent = cryptoErrorText(err, 'encrypt');
                 error.style.display = 'block';
             }
         }
@@ -338,12 +339,9 @@ export const encryptionUiMethods = uiModule({
 
         if (!modal || !input) return;
 
-        // Clear fields
+        // Clear fields (outside a secure context the notice shows at once)
         input.value = '';
-        if (error) {
-            error.style.display = 'none';
-            error.textContent = '';
-        }
+        resetPasswordError(error);
 
         modal.classList.add('active');
         input.focus();
@@ -367,6 +365,10 @@ export const encryptionUiMethods = uiModule({
         if (!input || !this.passwordPromptCallback) return;
 
         const password = input.value;
+
+        // Every prompt here ends in Web Crypto: without it (an insecure
+        // address) say so instead of judging the password (GitHub #13).
+        if (!requireCrypto(error)) return;
 
         if (!password) {
             if (error) {
@@ -395,10 +397,10 @@ export const encryptionUiMethods = uiModule({
                 this.pendingEncryptedData = null;
                 this.passwordPromptOnCancel = null;
                 callback(password);
-            } catch {
-                // Wrong password
+            } catch (err) {
+                // Wrong password, or another failure said as what it is
                 if (error) {
-                    error.textContent = strings.encryption.wrongPassword;
+                    error.textContent = cryptoErrorText(err);
                     error.style.display = 'block';
                 }
                 input.select();
@@ -502,16 +504,13 @@ export const encryptionUiMethods = uiModule({
         if (!modal || !input) return;
 
         input.value = '';
-        if (error) {
-            error.style.display = 'none';
-            error.textContent = '';
-        }
+        resetPasswordError(error);
         this.pendingEncryptedData = null;
         this.passwordPromptCallback = async (password: string) => {
-            const ok = await DataManager.decryptEmbeddedData(password);
-            if (!ok) {
+            const result = await DataManager.decryptEmbeddedData(password);
+            if (result !== 'ok') {
                 if (error) {
-                    error.textContent = strings.encryption.wrongPassword;
+                    error.textContent = cryptoFailureText(result);
                     error.style.display = 'block';
                 }
                 input.select();
@@ -658,16 +657,13 @@ export const encryptionUiMethods = uiModule({
         };
 
         input.value = '';
-        if (error) {
-            error.style.display = 'none';
-            error.textContent = '';
-        }
+        resetPasswordError(error);
         this.pendingEncryptedData = null;
         this.passwordPromptCallback = async (password: string) => {
             const result = await TreeManager.recoverTreeWithPassword(treeId, password);
-            if (result === 'wrong-password') {
+            if (result === 'wrong-password' || result === 'unavailable' || result === 'error') {
                 if (error) {
-                    error.textContent = strings.encryption.wrongPassword;
+                    error.textContent = cryptoFailureText(result);
                     error.style.display = 'block';
                 }
                 input.select();
@@ -722,6 +718,9 @@ export const encryptionUiMethods = uiModule({
      */
     /** Current value of the export dialog's privacy-mode selector. */
     readExportPrivacyMode(): PrivacyMode {
+        // GEDCOM "Back to {prog}": everyone's full data.
+        const override = this.exportGedcomPrivacyOverride();
+        if (override) return override;
         const sel = document.getElementById('export-privacy-mode') as HTMLSelectElement | null;
         const v = sel?.value;
         return (v === 'initials' || v === 'anonymous' || v === 'minimal') ? v : 'full';
@@ -729,6 +728,9 @@ export const encryptionUiMethods = uiModule({
 
     /** The four export-content checkboxes as a ContentOptions object. */
     readExportContentOptions(): ContentOptions {
+        // GEDCOM "Back to {prog}": its own content, the Content section hidden.
+        const override = this.exportGedcomContentOverride();
+        if (override) return override;
         const on = (id: string) => (document.getElementById(id) as HTMLInputElement | null)?.checked ?? true;
         return {
             photos: on('export-content-photos'),
@@ -768,6 +770,7 @@ export const encryptionUiMethods = uiModule({
         for (const partnership of Object.values(data.partnerships)) {
             if (partnership.note) notesSlice.push(partnership.note);
             if (partnership.sourceIds) sourcesSlice.push(partnership.sourceIds);
+            if (partnership.divorceSourceIds) sourcesSlice.push(partnership.divorceSourceIds);
             for (const ev of partnership.events ?? []) {
                 if (ev.note) notesSlice.push(ev.note);
                 if (ev.sourceIds) sourcesSlice.push(ev.sourceIds);
@@ -793,8 +796,8 @@ export const encryptionUiMethods = uiModule({
         if (!sizes || !el) return;
         const opts = this.readExportContentOptions();
         // Source images offered apart: attachments count without the file's excerpts, the choice adds its own.
-        // A privacy mode drops the sources, and their images with them.
-        const images = this.readExportPrivacyMode() === 'full' ? this.exportSourceImagesBytes() : null;
+        // A privacy mode drops the sources, and their images with them (GEDCOM: the living's only).
+        const images = this.readExportPrivacyMode() === 'full' || exportFormat === 'gedcom' ? this.exportSourceImagesBytes() : null;
         const total = sizes.base
             + (opts.photos ? sizes.photos : 0)
             + (opts.attachments ? sizes.attachments - (images ? sizes.excerpts : 0) : 0)
@@ -840,6 +843,12 @@ export const encryptionUiMethods = uiModule({
         }
         this.updateExportSizeEstimate();
         this.syncExportPresetHighlight();
+        this.syncExportSourcesWarning();
+    },
+
+    /** The tree the export dialog measures: the exported one (null while another tree is read). */
+    exportMeasuredData(): StromData | null {
+        return exportOtherTree ? exportOtherTree.data : DataManager.getData();
     },
 
     /**
@@ -848,19 +857,23 @@ export const encryptionUiMethods = uiModule({
      * deceased too (applyLivingPrivacy). When the tree has any, say so under
      * the choice and in Content, dim the two checkboxes (and source images)
      * they would otherwise light, and size the estimate on the filtered tree.
+     * GEDCOM keeps the deceased's sources (spec 066 §4): only the living lose
+     * them, said under the choice; the checkboxes stay.
      */
     syncExportPrivacyEffects(): void {
         const mode = this.readExportPrivacyMode();
         // The exported tree: another than the open one is measured once it is read.
-        const data = exportOtherTree ? exportOtherTree.data : DataManager.getData();
+        const data = this.exportMeasuredData();
         const section = document.getElementById('export-content-section');
         const showContent = !!section && section.style.display !== 'none';
-        const drops = mode !== 'full' && showContent && (exportAllTrees || (!!data && hasSourcesOrAttachments(data)));
+        const gedcom = exportFormat === 'gedcom';
+        const affected = mode !== 'full' && showContent && (exportAllTrees || (!!data && hasSourcesOrAttachments(data)));
+        const drops = affected && !gedcom;
         const p = strings.privacy;
         const privacyNote = document.getElementById('export-privacy-drops');
         if (privacyNote) {
-            privacyNote.textContent = drops ? p.dropsSources(p.modeFull) : '';
-            privacyNote.hidden = !drops;
+            privacyNote.textContent = drops ? p.dropsSources(p.modeFull) : affected ? p.dropsLivingOnly : '';
+            privacyNote.hidden = !affected;
         }
         const contentNote = document.getElementById('export-content-privacy-note');
         if (contentNote) {
@@ -880,7 +893,8 @@ export const encryptionUiMethods = uiModule({
         if (images) images.disabled = drops;
         if (showContent && data) {
             // Per-category sizes computed here (open, privacy change); toggling never re-stringifies.
-            this.readExportContentSizes(mode === 'full' ? data : applyLivingPrivacy(data, mode));
+            this.readExportContentSizes(mode === 'full' ? data
+                : applyLivingPrivacy(data, mode, undefined, { keepDeceasedSources: gedcom }));
             this.updateExportSizeEstimate();
         } else if (showContent) {
             // Another tree not read yet: no estimate rather than the open tree's.
@@ -888,6 +902,9 @@ export const encryptionUiMethods = uiModule({
             const el = document.getElementById('export-content-size');
             if (el) el.textContent = '';
         }
+        // GEDCOM: the "Back" summary of the tree read, and what the choices leave out of its sources.
+        this.syncExportGedcomBack();
+        this.syncExportSourcesWarning();
     },
 
     /**
@@ -910,6 +927,7 @@ export const encryptionUiMethods = uiModule({
     onExportContentChange(): void {
         this.updateExportSizeEstimate();
         this.syncExportPresetHighlight();
+        this.syncExportSourcesWarning();
     },
 
     showExportPasswordDialog(
@@ -933,6 +951,8 @@ export const encryptionUiMethods = uiModule({
             treeId?: TreeId;
             /** Every tree goes into the file (not only the current one). */
             allTrees?: boolean;
+            /** GEDCOM: what the file is for, preselected ("back" from the What next card). */
+            gedcomPurpose?: 'back' | 'share';
         } = {}
     ): void {
         this.exportPasswordCallback = callback;
@@ -940,6 +960,7 @@ export const encryptionUiMethods = uiModule({
         exportQuick = !!quick;
         exportAllTrees = !!options.allTrees;
         const format = options.format ?? 'json';
+        exportFormat = format;
         const e = strings.encryption;
 
         const title = document.getElementById('export-dialog-title');
@@ -986,8 +1007,10 @@ export const encryptionUiMethods = uiModule({
         this.setupExportSourceImages(showContent ? options.treeId ?? null : null);
         // What the chosen privacy leaves out, and the estimate on what remains: the exported tree's.
         void this.setExportMeasuredTree(exportAllTrees ? null : options.treeId ?? null);
+        // GEDCOM: what the file is for (spec 066 §4); "Back" hides privacy and content.
+        this.setupExportGedcomPurpose(format === 'gedcom' && !quick, options.gedcomPurpose ?? 'share');
         this.syncExportPrivacyEffects();
-        if (showContent) this.syncExportPresetHighlight();
+        if (showContent && this.exportGedcomPurpose() !== 'back') this.syncExportPresetHighlight();
 
         const modal = document.getElementById('export-password-modal');
         const input = block.querySelector<HTMLInputElement>('#export-password-input');
@@ -1007,6 +1030,8 @@ export const encryptionUiMethods = uiModule({
             error.style.display = 'none';
             error.textContent = '';
         }
+        // A quick save starts with encryption on: the insecure-address notice at once.
+        if (quick) resetPasswordError(error);
 
         // Show audit log checkbox only for full backup (Export All) when audit logging is enabled
         const auditLogSection = document.getElementById('export-audit-log-section');
@@ -1096,6 +1121,9 @@ export const encryptionUiMethods = uiModule({
             if (input) input.value = '';
             if (confirm) confirm.value = '';
             if (error) error.style.display = 'none';
+        } else if (!isCryptoAvailable()) {
+            // Said before a password is typed: it cannot encrypt here (GitHub #13).
+            resetPasswordError(error);
         }
         const btn = document.getElementById('export-submit-btn');
         if (btn) {
@@ -1142,6 +1170,9 @@ export const encryptionUiMethods = uiModule({
 
         const password = input.value;
         const confirmPassword = confirm.value;
+
+        // No Web Crypto at this address: an encrypted file cannot be made (GitHub #13).
+        if (!requireCrypto(error)) return;
 
         // Password is required for encrypted export
         if (password.length < 6) {

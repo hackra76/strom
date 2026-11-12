@@ -14,7 +14,12 @@ import { carryOverTreeDecisions, withRejectionDetails } from './quality-dismiss.
 import { keepPlaceOrigins, placesWithoutMeta, isPlaceRecordId, cleanCoords } from './place-records.js';
 import { PhoneSummary, sanitizePhoneSummary } from './phone.js';
 import { ReadAccepts, LiveRead, READ_FEATURE, sanitizeReadAccepts, sanitizeReads } from './research-read.js';
+import { readAgainSaid, waitingProposalsSaid, type ReadSourceProposal, type ReadSourceState } from './research-read-task.js';
+import { READ_CHOICES_NOW_FEATURE, READ_CHOOSE_FEATURE } from './read-choices.js';
+import { verifyStatusSaid, type LiveVerifyStatus } from './research-verify.js';
+import { researchPersonRef, researchFamilyRef, personResearchRef, familyResearchRef, confirmationEdits } from './verify.js';
 import { HISTORY_KINDS, isHistoryKind, parseHistoryKindList, type HistoryKind } from './history.js';
+import { sourcePlaceKey } from './source-location.js';
 
 /** `1 SOUR` value that marks a file written by Strom Research. */
 export const STROM_RESEARCH_SOURCE = 'STROM_RESEARCH';
@@ -45,7 +50,7 @@ export const RESEARCH_LINK_ACTIONS = [
     'send', 'excerpt', 'app', 'open', 'chat', 'task', 'review', 'research',
     'new', 'update', 'sessions', 'conflict', 'story', 'sync-undo', 'setup', 'live',
     'direction', 'finish', 'media', 'archive', 'seal', 'experiment', 'history', 'fixes', 'doctor', 'places',
-    'history-kinds', 'history-align',
+    'history-kinds', 'history-align', 'hypothesis', 'hypotheses',
 ] as const;
 export type ResearchLinkAction = typeof RESEARCH_LINK_ACTIONS[number];
 
@@ -73,6 +78,8 @@ export const RESEARCH_LINK_MARKS: Readonly<Record<ResearchLinkAction, ResearchAc
     'sync-undo': 'terminal', setup: 'terminal', direction: 'terminal', finish: 'terminal', archive: 'terminal',
     seal: 'terminal', experiment: 'terminal', fixes: 'terminal', doctor: 'terminal',
     'history-kinds': 'terminal', 'history-align': 'terminal',
+    // A hypothesis decided (or its decision changed) by a person there; who decides them, confirmed there.
+    hypothesis: 'terminal', hypotheses: 'terminal',
     // The agent's work: a conversation, or a session the terminal starts with its estimate.
     chat: 'agent', history: 'agent', places: 'agent',
 };
@@ -97,6 +104,27 @@ export function researchLinkMark(action: ResearchLinkAction, p: ResearchLinkMark
     if (action === 'fixes' && p.fixPaid && p.fixDo !== 'undo') return 'agent';
     return RESEARCH_LINK_MARKS[action];
 }
+
+/**
+ * Actions asked through the research's bridge, no link and no terminal (spec 065): verify a fact,
+ * a person or the tree (an AI agent works on them in the research's background), confirm a fact
+ * from the scan or take it back, stop the verification not yet begun, split the older sources'
+ * locations into fields and undo that split (spec 075 §5, no agent: the research's code).
+ */
+export const RESEARCH_BRIDGE_ACTIONS = ['verify', 'verify-bulk', 'fact-confirm', 'verify-stop', 'sources-split'] as const;
+export type ResearchBridgeAction = typeof RESEARCH_BRIDGE_ACTIONS[number];
+
+/**
+ * What an action asked through the bridge carries: `none` (nothing), or `bridgeAgent` — an AI
+ * agent works without a terminal: the AI badge alone (Milan, 2 Nov 2026).
+ */
+export type ResearchBridgeMark = 'none' | 'bridgeAgent';
+
+/** The mark of each action asked through the bridge (`researchBridgeActionLabel` draws it). */
+export const RESEARCH_BRIDGE_MARKS: Readonly<Record<ResearchBridgeAction, ResearchBridgeMark>> = {
+    verify: 'bridgeAgent', 'verify-bulk': 'bridgeAgent',
+    'fact-confirm': 'none', 'verify-stop': 'none', 'sources-split': 'none',
+};
 
 /**
  * The mark of a ready link (one the research's bridge handed over): its action and `do=` read
@@ -151,9 +179,68 @@ export function researchSourceRef(refn: unknown): string | null {
     return typeof refn === 'string' && /^S\d{1,9}$/.test(refn.trim()) ? refn.trim() : null;
 }
 
-/** A person's id in the research (its REFN, e.g. "P0012"), or null. */
-export function researchPersonRef(refn: unknown): string | null {
-    return typeof refn === 'string' && /^P\d{1,7}$/.test(refn.trim()) ? refn.trim() : null;
+// The ids of a person and a family in the research live with the
+// re-verification that names them (src/verify.ts).
+export { researchPersonRef, researchFamilyRef, personResearchRef, familyResearchRef };
+
+/**
+ * The partners of each family of the research's GEDCOM, by the family's id
+ * ("F0054" from `0 @F0054@ FAM`, and its REFN when it has one): the REFN of
+ * the husband first, then of the wife (those without a REFN left out). A
+ * quick read of the lines, no parse: what a row of `working[]` about a couple
+ * needs to name a person of the tree.
+ */
+export function researchFamilyPartners(gedcom: string): Map<string, string[]> {
+    const refnOf = new Map<string, string>();
+    const families: Array<{ keys: string[]; partners: string[] }> = [];
+    let indi: string | null = null;
+    let fam: { keys: string[]; partners: string[] } | null = null;
+    for (const raw of gedcom.split(/\r\n|\r|\n/)) {
+        const line = raw.trim();
+        const head = /^0\s+@([^@]+)@\s+(\S+)/.exec(line);
+        if (line.startsWith('0')) {
+            indi = null;
+            fam = null;
+            if (head?.[2] === 'INDI') indi = head[1];
+            else if (head?.[2] === 'FAM') {
+                fam = { keys: [head[1]], partners: [] };
+                families.push(fam);
+            }
+            continue;
+        }
+        const one = /^1\s+(\S+)\s*(.*)$/.exec(line);
+        if (!one) continue;
+        const [, tag, value] = one;
+        if (indi && tag === 'REFN' && !refnOf.has(indi)) refnOf.set(indi, value.trim());
+        if (fam && tag === 'REFN') fam.keys.push(value.trim());
+        if (fam && (tag === 'HUSB' || tag === 'WIFE')) {
+            const xref = /^@([^@]+)@$/.exec(value.trim())?.[1];
+            if (xref) {
+                if (tag === 'HUSB') fam.partners.unshift(xref);
+                else fam.partners.push(xref);
+            }
+        }
+    }
+    const out = new Map<string, string[]>();
+    for (const f of families) {
+        const partners = f.partners.map(x => refnOf.get(x)).filter((r): r is string => !!researchPersonRef(r));
+        if (!partners.length) continue;
+        for (const key of f.keys) if (researchFamilyRef(key) && !out.has(key)) out.set(key, partners);
+    }
+    return out;
+}
+
+/**
+ * Rows of `working[]` about a couple (`family`, no `person`) get the person
+ * to follow: the first partner the family names (the husband, else the
+ * wife). Rows naming a person stay as they are.
+ */
+export function workingWithFamilyPersons<T extends { person?: string; family?: string }>(working: readonly T[], partners: ReadonlyMap<string, readonly string[]> | null): T[] {
+    return working.map(w => {
+        if (w.person || !w.family) return w;
+        const first = partners?.get(w.family)?.[0];
+        return first ? { ...w, person: first } : w;
+    });
 }
 
 /** A task's id in the research ("T0003"), or null. */
@@ -171,6 +258,11 @@ export function researchArchiveHost(value: unknown): string | null {
 /** A research direction's id ("G0002"), or null. */
 export function researchDirectionRef(id: unknown): string | null {
     return typeof id === 'string' && /^G\d{1,7}$/.test(id.trim()) ? id.trim() : null;
+}
+
+/** A branch outside the directions ("B-P0031", named after its person), or null. */
+export function researchBranchRef(id: unknown): string | null {
+    return typeof id === 'string' && /^B-P\d{1,7}$/.test(id.trim()) ? id.trim() : null;
 }
 
 /** A conflict's id in the research ("X0007"), or null. */
@@ -250,6 +342,40 @@ export interface ResearchLinkParams {
     inherit?: boolean;
     /** `history-align`: the terminal's alignment offers deleting from the shared catalogues too (`prune=1`). */
     prune?: boolean;
+    /**
+     * `hypothesis` (spec 060, 074): the hypothesis ("H0022") and what to do with it: `decide` (its
+     * screen in the research; with `variant`: that version, confirmed in the terminal), `abandon`
+     * (no version holds), `keep-open` (leave it open), `reopen` (back to open).
+     */
+    hypothesis?: string;
+    hypothesisDo?: ResearchHypothesisDo;
+    /** `hypothesis` with `do=decide` (spec 074): the version chosen ("B"). */
+    variant?: string;
+    /** `hypotheses` (spec 060): who decides the research's hypotheses (the research confirms it in its terminal). */
+    decide?: ResearchHypothesesDecide;
+    /** `hypotheses` (spec 074 P2): accept the agent's proposals of these hypotheses (`do=accept&ids=`, at most 50). */
+    hypothesesDo?: 'accept';
+    ids?: readonly string[];
+    /**
+     * `live` (spec 064, with `live.start` in the research's features): only start the bridge at its last
+     * address (`do=start`), no new window and no terminal; without it the link also opens the app followed live.
+     */
+    liveDo?: 'start';
+}
+
+/** Who decides the research's hypotheses (spec 060): the person (the default), or the agent on its own. */
+export type ResearchHypothesesDecide = 'person' | 'agent';
+const HYPOTHESES_DECIDE: readonly string[] = ['person', 'agent'];
+
+/** What a `hypothesis` link asks (spec 060, 074; the research's fixed list, V4). */
+export const LINK_HYPOTHESIS_DOS = ['decide', 'abandon', 'keep-open', 'reopen'] as const;
+export type ResearchHypothesisDo = typeof LINK_HYPOTHESIS_DOS[number];
+/** The most hypotheses one "Accept proposals" link names (spec 074 P2). */
+export const MAX_HYPOTHESES_ACCEPT = 50;
+
+/** A hypothesis's id in the research ("H0022"), or null. */
+export function researchHypothesisRef(id: unknown): string | null {
+    return typeof id === 'string' && /^H\d{1,7}$/.test(id.trim()) ? id.trim() : null;
 }
 
 /** A value of `history.kinds` for the `history-kinds` link: `all`, `none`, kinds, or `all` without kinds — else null. */
@@ -330,10 +456,13 @@ export function researchSchemeUrl(action: ResearchLinkAction, p: ResearchLinkPar
         case 'update':
         case 'sessions':
         case 'setup':
-        case 'live':
         case 'seal':
         case 'doctor':
             return base;
+        case 'live':
+            // spec 064: the fixed `do=start` only (the bridge starts quietly); anything else is the link as it was.
+            if (p.liveDo === undefined) return base;
+            return p.liveDo === 'start' ? `${base}&do=start` : null;
         case 'excerpt': {
             const source = researchSourceRef(p.source);
             const clip = researchClip(p.clip);
@@ -376,6 +505,25 @@ export function researchSchemeUrl(action: ResearchLinkAction, p: ResearchLinkPar
             if (p.inherit) return p.kindsScope === 'tree' && p.kinds === undefined ? `${base}&scope=tree&inherit=1` : null;
             const kinds = typeof p.kinds === 'string' ? historyKindsLinkValue(p.kinds) : null;
             return kinds ? `${base}&scope=${p.kindsScope}&kinds=${kinds}` : null;
+        }
+        case 'hypothesis': {
+            // spec 060, 074: the hypothesis by its id and a `do` of the fixed list; a version only with `decide`.
+            const id = researchHypothesisRef(p.hypothesis);
+            if (!id || !p.hypothesisDo || !(LINK_HYPOTHESIS_DOS as readonly string[]).includes(p.hypothesisDo)) return null;
+            if (p.variant === undefined) return `${base}&id=${id}&do=${p.hypothesisDo}`;
+            return p.hypothesisDo === 'decide' && typeof p.variant === 'string' && /^[A-Z]{1,3}$/.test(p.variant)
+                ? `${base}&id=${id}&do=decide&variant=${p.variant}` : null;
+        }
+        case 'hypotheses': {
+            // spec 074 P2: accept the agent's proposals of 1–50 hypotheses by their ids, nothing else.
+            if (p.hypothesesDo !== undefined) {
+                if (p.hypothesesDo !== 'accept' || p.decide !== undefined || !Array.isArray(p.ids)) return null;
+                const ids = p.ids.map(x => typeof x === 'string' && /^H\d{1,7}$/.test(x) ? x : null);
+                if (ids.length < 1 || ids.length > MAX_HYPOTHESES_ACCEPT || ids.some(x => !x) || new Set(ids).size !== ids.length) return null;
+                return `${base}&do=accept&ids=${ids.join(',')}`;
+            }
+            // spec 060: a fixed value only; the research confirms it in its terminal.
+            return p.decide && HYPOTHESES_DECIDE.includes(p.decide) ? `${base}&decide=${p.decide}` : null;
         }
         case 'history-align':
             // spec 035: the research's terminal shows the preview and asks; `prune=1` leads to the shared catalogues (only there).
@@ -642,20 +790,38 @@ function fnv1a(text: string, seed: number): number {
 }
 
 /**
- * People without what the app keeps for itself and never sends (a hidden
- * married surname suggestion): hiding one leaves the tree in step with the
- * research. People without such a field are the same objects, so a tree
- * that has none keeps its fingerprint.
+ * People without what the app keeps for itself and never sends in the file
+ * (a hidden married surname suggestion; the research's verification of facts,
+ * spec 065, which comes with its version): hiding a suggestion leaves the
+ * tree in step with the research. A fact confirmed, or a confirmation of the
+ * research taken back, here does go (`_STROM_CONFIRMED`, which the research
+ * reads against `_STROM_HEAD`): only what differs from the research's own
+ * (confirmationEdits) counts, so a tree with no such edit keeps the
+ * fingerprint it had. People without such a field are the same objects.
  */
 function withoutAppLocal(persons: StromData['persons']): StromData['persons'] {
     let out: StromData['persons'] | null = null;
     for (const [id, p] of Object.entries(persons)) {
-        if (p?.dismissedMarriedSuggestion === undefined) continue;
+        if (p?.dismissedMarriedSuggestion === undefined && p?.confirmed === undefined && p?.researchVerify === undefined) continue;
         out ??= { ...persons };
-        const { dismissedMarriedSuggestion: _local, ...rest } = p;
-        out[id as PersonId] = rest as Person;
+        const { dismissedMarriedSuggestion: _local, confirmed: _confirmed, researchVerify: _verify, ...rest } = p;
+        const edits = confirmationEdits(p);
+        out[id as PersonId] = (Object.keys(edits).length ? { ...rest, confirmed: edits } : rest) as Person;
     }
     return out ?? persons;
+}
+
+/** Couples without the research's verification and their id there, with their confirmation edits (see withoutAppLocal). */
+function couplesWithoutAppLocal(partnerships: StromData['partnerships']): StromData['partnerships'] {
+    let out: StromData['partnerships'] | null = null;
+    for (const [id, ps] of Object.entries(partnerships)) {
+        if (ps?.confirmed === undefined && ps?.researchVerify === undefined && ps?.researchId === undefined) continue;
+        out ??= { ...partnerships };
+        const { confirmed: _confirmed, researchVerify: _verify, researchId: _id, ...rest } = ps;
+        const edits = confirmationEdits(ps);
+        out[id as PartnershipId] = (Object.keys(edits).length ? { ...rest, confirmed: edits } : rest) as Partnership;
+    }
+    return out ?? partnerships;
 }
 
 /** The parts of a tree the user can change (see contentFingerprint). */
@@ -665,7 +831,7 @@ function fingerprintParts(raw: StromData): unknown[] {
     const data = withoutConvertedStandIns(raw);
     return [
         withoutAppLocal(data.persons ?? {}),
-        data.partnerships ?? {},
+        couplesWithoutAppLocal(data.partnerships ?? {}),
         data.sources ?? null,
         // Without the app's own bookkeeping of a location (who, when, "Keep"):
         // the research never has it, a tree in step stays in step.
@@ -775,6 +941,20 @@ export function unknownSexFromTie(data: StromData, sexU: unknown): StromData | n
 
 /** The bridge feature of a research that keeps titles apart from the name (NPFX / NSFX; Strom Research 1.13). */
 export const TITLES_FEATURE = 'person.titles';
+
+/**
+ * `/status.features` (Strom Research 1.31, spec 075): the research reads a source's place field by field — the
+ * folio, the image and the call number (`_STROM_FOLIO`, `_STROM_IMAGE`, `_STROM_LOCATOR` beside the composed PAGE;
+ * JSON `folio`, `image`, `callNumber`). Without it a send carries the composed PAGE alone.
+ */
+export const SOURCES_FIELDS_FEATURE = 'sources.fields';
+/** `/status.features` (spec 075 §5): `GET/POST <token>/sources/split` and `/sources/split/undo` — the older locations split. */
+export const SOURCES_SPLIT_FEATURE = 'sources.split';
+
+/** Whether a send to this research carries the sources' place field by field (`sources.fields`); not known: no. */
+export function researchSendsSourceFields(status: { features: readonly string[] | null } | null | undefined): boolean {
+    return !!status?.features?.includes(SOURCES_FIELDS_FEATURE);
+}
 
 /** `/status.features`: the research takes a source sent as an entry of its reading (`_STROM_READING`) in `/sync`. */
 export const READ_SYNC_FEATURE = 'read.sync';
@@ -994,6 +1174,7 @@ function keepMarriedSurnameField(next: StromData, previous: StromData, features:
         // A research that keeps the kind and has no such spelling took it off.
         if (knows && kept.length === variants.length) continue;
         const changed: Person = { ...p, marriedSurname: was.marriedSurname };
+        if (was.marriedFirstName) changed.marriedFirstName = was.marriedFirstName;
         if (kept.length > 0) changed.nameVariants = kept;
         else delete changed.nameVariants;
         persons ??= { ...next.persons };
@@ -1135,6 +1316,40 @@ export function stabilizeIds(next: StromData, previous: StromData): StromData {
         if (nextIds.has(oldId)) continue;
         map.set(newId, oldId);
     }
+    // A person without a number (a placeholder for an unknown partner, a
+    // person the importer made up) is the same person when the numbered
+    // people around them are the same: their name and their numbered
+    // parents, children and partners (the unnumbered ones get new ids too).
+    const noRefnKeys = (data: StromData, remap: boolean): Map<string, string> => {
+        const numbered = (x: string) => !!data.persons?.[x as PersonId]?.refn?.trim();
+        const id = (x: string) => (remap ? (map.get(x) ?? x) : x);
+        const partners = new Map<string, string[]>();
+        for (const ps of Object.values(data.partnerships ?? {})) {
+            if (!ps?.person1Id || !ps?.person2Id) continue;
+            (partners.get(ps.person1Id) ?? partners.set(ps.person1Id, []).get(ps.person1Id)!).push(ps.person2Id);
+            (partners.get(ps.person2Id) ?? partners.set(ps.person2Id, []).get(ps.person2Id)!).push(ps.person1Id);
+        }
+        const seen = new Map<string, string | null>();
+        for (const [pid, p] of Object.entries(data.persons ?? {})) {
+            if (!p || p.refn?.trim()) continue;
+            const ids = (v: readonly string[] | undefined) => (v ?? []).filter(numbered).map(id).sort().join(',');
+            const near = [ids(p.parentIds), ids(p.childIds), ids(partners.get(pid))];
+            if (near.every(n => !n)) continue;
+            const key = [p.isPlaceholder ? 1 : 0, p.gender, p.firstName ?? '', p.lastName ?? '', ...near].join('\u0000');
+            seen.set(key, seen.has(key) ? null : pid);
+        }
+        const out = new Map<string, string>();
+        for (const [k, pid] of seen) if (pid) out.set(k, pid);
+        return out;
+    };
+    const prevNoRefn = noRefnKeys(previous, false);
+    const takenPersons = new Set(map.values());
+    for (const [key, newId] of noRefnKeys(next, true)) {
+        const oldId = prevNoRefn.get(key);
+        if (!oldId || oldId === newId || nextIds.has(oldId) || takenPersons.has(oldId)) continue;
+        map.set(newId, oldId);
+        takenPersons.add(oldId);
+    }
 
     const pairKey = (a: string | null | undefined, b: string | null | undefined, remap: boolean): string | null => {
         if (!a || !b) return null;
@@ -1172,9 +1387,11 @@ export function stabilizeIds(next: StromData, previous: StromData): StromData {
         map.set(newId, oldId);
     }
     // An entry the user made in the app comes back with the research's number:
-    // the same title, archive, page and wording is the same entry.
+    // the same title, archive, page and wording is the same entry. The page is
+    // the composed PAGE (spec 075): the same whether the research gave the
+    // folio and image back as fields or, an older one, as words of the location.
     const entryKey = (src: Source): string =>
-        [src.title, src.repository, src.reference, src.transcript].map(v => (v ?? '').trim().toLowerCase()).join('\u0000');
+        [src.title, src.repository, sourcePlaceKey(src), src.transcript].map(v => (v ?? '').trim().toLowerCase()).join('\u0000');
     const prevUnnumbered = new Map<string, string | null>();
     for (const [id, src] of Object.entries(previous.sources ?? {})) {
         if (!src || src.refn) continue;
@@ -1189,6 +1406,34 @@ export function stabilizeIds(next: StromData, previous: StromData): StromData {
         map.set(newId, oldId);
         taken.add(oldId);
     }
+    // A source without a number on both sides — the source of its own a
+    // citation of another page or date gets at every reading (the file
+    // has no id for it), or an entry made in the app the research has not
+    // numbered — is the same entry when all it says is the same. Only where
+    // that is unique on both sides: two such entries are never joined.
+    const unnumberedKey = (src: Source): string => {
+        const text = [src.title, src.repository, src.callNumber, sourcePlaceKey(src), src.url, src.note, src.recordDate, src.transcript]
+            .map(v => (v ?? '').trim());
+        return [...text, src.quality ?? '', JSON.stringify(src.gedcomExtra ?? [])].join('\u0000');
+    };
+    const uniqueUnnumbered = (data: StromData, keep: (id: string) => boolean): Map<string, string> => {
+        const seen = new Map<string, string | null>();
+        for (const [id, src] of Object.entries(data.sources ?? {})) {
+            if (!src || src.refn || !keep(id)) continue;
+            const key = unnumberedKey(src);
+            seen.set(key, seen.has(key) ? null : id);
+        }
+        const out = new Map<string, string>();
+        for (const [k, id] of seen) if (id) out.set(k, id);
+        return out;
+    };
+    const prevPlain = uniqueUnnumbered(previous, id => !taken.has(id) && !nextIds.has(id));
+    for (const [key, newId] of uniqueUnnumbered(next, id => !map.has(id) && !previous.sources?.[id])) {
+        const oldId = prevPlain.get(key);
+        if (!oldId || taken.has(oldId)) continue;
+        map.set(newId, oldId);
+        taken.add(oldId);
+    }
 
     const prevPairs = uniquePairs(previous, false);
     for (const [key, newId] of uniquePairs(next, true)) {
@@ -1196,6 +1441,59 @@ export function stabilizeIds(next: StromData, previous: StromData): StromData {
         if (!oldId || oldId === newId || nextIds.has(oldId)) continue;
         map.set(newId, oldId);
     }
+
+    // An event read from a GEDCOM gets a new id at every reading (the file
+    // has none of its own), and so do its participants and a couple's own
+    // (the wedding's witnesses): one that says exactly the same as one of
+    // the same person or couple before keeps that one's id (identical ones in
+    // their order). A changed one keeps its new id; its facts (`event:<id>`
+    // keys) follow the id (remapId).
+    type Item = { id?: string; participants?: readonly Item[] };
+    type Holder = { events?: readonly Item[]; participants?: readonly Item[] };
+    const holders = (data: StromData): [string, Holder | undefined][] =>
+        [...Object.entries(data.persons ?? {}), ...Object.entries(data.partnerships ?? {})];
+    /** Ids inside `next` an old id must not take over. */
+    const innerIds = new Set<string>();
+    const collect = (items: readonly Item[] | undefined): void => {
+        for (const x of items ?? []) {
+            if (x?.id) innerIds.add(x.id);
+            collect(x?.participants);
+        }
+    };
+    for (const [, h] of holders(next)) { collect(h?.events); collect(h?.participants); }
+    /** What an item says: all but its id and its participants' ids. */
+    const said = (x: Item, remap: boolean): string => {
+        const { id: _id, participants, ...rest } = x;
+        const out = { ...rest, ...(participants ? { participants: participants.map(({ id: _p, ...y }) => y) } : {}) };
+        return JSON.stringify(remap ? remapIds(out, map) : out);
+    };
+    const inner = new Map<string, string>();
+    const pair = (old: readonly Item[] | undefined, theirs: readonly Item[] | undefined): void => {
+        if (!old?.length || !theirs?.length) return;
+        const byKey = new Map<string, Item[]>();
+        for (const x of old) {
+            if (!x?.id || innerIds.has(x.id)) continue;
+            const k = said(x, false);
+            byKey.set(k, [...(byKey.get(k) ?? []), x]);
+        }
+        for (const x of theirs) {
+            const was = x?.id ? byKey.get(said(x, true))?.shift() : undefined;
+            if (!was?.id || !x.id) continue;
+            if (was.id !== x.id) inner.set(x.id, was.id);
+            // Its participants, in the same order (the same key says so).
+            (x.participants ?? []).forEach((y, i) => {
+                const w = was.participants?.[i]?.id;
+                if (y.id && w && w !== y.id && !innerIds.has(w)) inner.set(y.id, w);
+            });
+        }
+    };
+    const prevHolders = new Map(holders(previous));
+    for (const [id, h] of holders(next)) {
+        const was = prevHolders.get(map.get(id) ?? id);
+        pair(was?.events, h?.events);
+        pair(was?.participants, h?.participants);
+    }
+    for (const [k, v] of inner) map.set(k, v);
 
     return remapIds(next, map) as StromData;
 }
@@ -1281,6 +1579,7 @@ export function carryOverMedia(next: StromData, previous: StromData): MediaCarry
         if (old.photo && !cur.photo) {
             out.photo = old.photo;
             if (old.photoOriginalName) out.photoOriginalName = old.photoOriginalName;
+            if (old.photoDate) out.photoDate = old.photoDate;
             changed = true;
         }
         const have = cur.attachments ?? [];
@@ -1386,15 +1685,26 @@ export function carryOverUnknownPartners(next: StromData, previous: StromData): 
  * never text. Long strings (images, transcripts) are never ids.
  */
 function remapIds(value: unknown, map: Map<string, string>): unknown {
-    if (typeof value === 'string') return value.length <= 256 ? map.get(value) ?? value : value;
+    if (typeof value === 'string') return value.length <= 256 ? remapId(value, map) : value;
     if (value === null || typeof value !== 'object') return value;
     if (Array.isArray(value)) return value.map(v => (v === undefined ? null : remapIds(v, map)));
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
         if (v === undefined || typeof v === 'function') continue;
-        out[map.get(k) ?? k] = remapIds(v, map);
+        out[remapId(k, map)] = remapIds(v, map);
     }
     return out;
+}
+
+/** An id, or a fact of an event named by its id (`event:<id>`, `event:<id>.date`), mapped. */
+function remapId(s: string, map: Map<string, string>): string {
+    const direct = map.get(s);
+    if (direct !== undefined) return direct;
+    if (!s.startsWith('event:')) return s;
+    const dot = s.indexOf('.', 6);
+    const id = dot < 0 ? s.slice(6) : s.slice(6, dot);
+    const to = map.get(id);
+    return to === undefined ? s : `event:${to}${dot < 0 ? '' : s.slice(dot)}`;
 }
 
 // ==================== LIVE BRIDGE MESSAGES ====================
@@ -1406,13 +1716,29 @@ export interface LiveWorker {
     task: string;
     /** The person the work is about (REFN "P12"), when the research says. */
     person?: string;
+    /** The couple the work is about (the research's family "F0054"), when it names a family instead of a person. */
+    family?: string;
     /** The run waits between sessions (its gate said wait, e.g. the usage limit). */
     paused?: { until: string; reason: string };
     /** The research direction of the task ("G0002"; a newer research). */
     research?: string;
     /** The agent's session ("N0132"; a newer research): it can be finished. */
     session?: string;
+    /** The place record the work is about ("L0001"; with the feature `working.place`). */
+    place?: string;
+    /**
+     * The task is not of the line in `research` but helps it, and how (as `queue[].why.by`; with the feature
+     * `working.helps`). Absent with `research`: a task of the line.
+     */
+    helps?: QueueHelpsBy;
+    /** The branch of the task ("B-P0208"): outside the lines, or added to the line (with the feature `working.helps`). */
+    branch?: string;
 }
+
+/** The bridge names the place record of a row of `working` (`working[].place`, research 1.28). */
+export const WORKING_PLACE_FEATURE = 'working.place';
+/** The bridge says how a row of `working` helps its line, and its branch (`working[].helps`, `branch`; spec 036 K1.8). */
+export const WORKING_HELPS_FEATURE = 'working.helps';
 
 /** Something the research waits for from the user. */
 /**
@@ -1442,7 +1768,22 @@ export interface LiveWaiting {
      * 'permission': the research asks how it may download from an archive (`host`); `on` carries its terms.
      * The rest only from a research with `waiting.groups` in its features (see below).
      */
-    kind?: 'story' | 'permission' | 'place' | WaitingTaskKind;
+    kind?: 'story' | 'permission' | 'place' | 'branch' | 'hypothesis' | WaitingTaskKind;
+    /**
+     * 'hypothesis' (spec 074, V13; a research that decides hypotheses from the app): the item's id is the
+     * hypothesis ("H0022"), `person` the first person of its question; the agent's proposal (a version's
+     * letter, or 'none': no version holds) and whether it can be decided by a version from the app (`pick`).
+     * Its question, versions and proposal's sentence come from the research's tree (GEDCOM), by its id.
+     */
+    proposal?: string;
+    pick?: true;
+    /**
+     * 'branch' (`offLine.branches`): a branch outside the directions grew; the research asks once what to do with it.
+     * The branch, its tasks and people (the line it is near is `research`).
+     */
+    branch?: string;
+    tasks?: number;
+    persons?: number;
     /**
      * 'place' (spec 034 §9, `places.answer`): the research asks where a place
      * is. Its record id (the item's id is the same "L…"), the texts of the
@@ -1482,8 +1823,13 @@ export interface LiveWaiting {
     note?: string;
     /** Whom a letter goes to. */
     to?: string;
-    /** Images: the folder for them, how many are saved there and how many the task wants. */
-    inbox?: { dir: string; have: number; want: number };
+    /**
+     * Images of a book (kind 'images', or 'web' with one book): how many of
+     * those asked for are there and how many it wants (absent: not known), the
+     * missing numbers, the book (spec 048, research 1.27); an older research
+     * sends only the folder, have and want.
+     */
+    inbox?: WaitingInbox;
     /** The task link's actions the research offers at it (only those are ever offered). */
     actions?: WaitingAction[];
 }
@@ -1518,13 +1864,46 @@ export type WaitingSection = typeof WAITING_SECTIONS[number];
 /** Kinds of places a waiting item is done at. */
 export const WAITING_GROUP_KINDS = ['archive', 'office', 'family', 'web', 'other'] as const;
 export type WaitingGroupKind = typeof WAITING_GROUP_KINDS[number];
-export interface WaitingGroup { key: string; name: string; kind: WaitingGroupKind }
-/** The task link's actions a waiting item may offer (answer: the link without `do`). */
-export const WAITING_ACTIONS = ['answer', 'file', 'note', 'folder', 'sent', 'chat'] as const;
+/** A place items are done at; an archive's group names its website (`url`, research 1.27). */
+export interface WaitingGroup { key: string; name: string; kind: WaitingGroupKind; url?: string }
+/**
+ * The actions a waiting item may offer: the task link's (answer: the link
+ * without `do`), and `images` — images of its book sent from the app through
+ * the bridge (`accepts.media.taskImages`, spec 048).
+ */
+export const WAITING_ACTIONS = ['answer', 'file', 'note', 'folder', 'images', 'sent', 'chat'] as const;
 export type WaitingAction = typeof WAITING_ACTIONS[number];
+/** The actions that go by the task link (all but `images`, which goes through the bridge). */
+export type WaitingLinkAction = Exclude<WaitingAction, 'images'>;
+
+/** Most missing image numbers kept (the research sends at most 50). */
+export const MAX_INBOX_MISSING = 50;
+/** The highest image number taken (`X-Strom-Image`: 1–6 digits). */
+export const MAX_IMAGE_NUMBER = 999_999;
+
+/** A task's images of a book as the research counts them (`inbox` of a waiting item, of a task image's answer). */
+export interface WaitingInbox {
+    /** Of the images asked for, how many are there (registered or lying in the folder). */
+    have: number;
+    /** How many it asks for; absent: not known (a website looked at for one book). */
+    want?: number;
+    /** The numbers still missing, ascending (at most 50); absent: an older research. */
+    missing?: number[];
+    /** The book's title, for the eye (at most 120 characters). */
+    book?: string;
+    /** The images asked for as the research says them ("57–58"). */
+    images?: string;
+    /** The book's record set ("B0012"). */
+    recordset?: string;
+    /** Its folder in the shared inbox (the name alone), and the whole path ('' = not said). */
+    folder?: string;
+    dir: string;
+    /** Files lying in the folder, not taken yet. */
+    lying?: number;
+}
 /** Each kind's chip. */
 const KIND_SECTION: Record<string, WaitingSection> = {
-    story: 'decide', permission: 'decide', place: 'decide', takeover: 'decide', check: 'decide',
+    story: 'decide', permission: 'decide', place: 'decide', branch: 'decide', hypothesis: 'decide', takeover: 'decide', check: 'decide',
     images: 'images', letter: 'letter', family: 'family', web: 'web', other: 'other',
 };
 
@@ -1552,6 +1931,51 @@ export interface LiveDirection {
     generations?: number[];
     /** What its last session did. */
     last?: { at: string; text: string };
+    /** Its place in the order of work (1 = first; with `caps.directionsOrder`). */
+    order?: number;
+    /** How far it reaches: generations at most, only before a year (absent: no limit). */
+    limits?: DirectionLimits;
+    /** A question direction: the question. */
+    question?: string;
+    /** A review: how far it reaches. */
+    review?: { scope: ResearchReviewScope };
+    /** When it was created (ISO). */
+    created?: string;
+    /** The direction it came from ("G0001"). */
+    parent?: string;
+    /** What it found in its last days (`directions.found`; absent: nothing in them). */
+    found?: DirectionFound;
+}
+
+/** A direction's limits (each absent: no limit of that kind). */
+export interface DirectionLimits {
+    generations?: number;
+    before?: number;
+}
+
+/** What a direction found in its last `days` days: sessions, persons, sources, and (some of) those persons' REFNs. */
+export interface DirectionFound {
+    days: number;
+    sessions: number;
+    persons: number;
+    sources: number;
+    people: string[];
+}
+
+/** What the research's bridge can do with the directions (`/status.caps`, Strom Research 1.26). */
+export interface ResearchCaps {
+    /** Create, edit, set the state and the order through the bridge (`POST /directions…`). */
+    directionsWrite: boolean;
+    /** `researches[]` comes in the order of work, each with `order`; `POST /directions/order`. */
+    directionsOrder: boolean;
+    /** What the order means for the queue: more time on the top ones, or one after another (absent: not said). */
+    orderMode?: 'weight' | 'strict';
+    /** The kinds the bridge creates. */
+    directionKinds: LiveDirectionKind[];
+    /** A second direction of the same person and kind is created. */
+    duplicateDirections: boolean;
+    /** Branches outside the directions, their choices and the reason of a task's place. */
+    offLineBranches: boolean;
 }
 
 /** The bridge's /status (and the `hello` event), checked and cleaned. */
@@ -1605,6 +2029,8 @@ export interface LiveStatus {
     treeKind?: ResearchTreeKind;
     /** `tree.state` (with `tree.state` in `features`): a research, one waiting for its agent, or an archive. */
     treeState?: ResearchTreeState;
+    /** `verify` (with `verify` in `features`, not for an archive or a waiting tree): facts by their re-verification state (spec 065). */
+    verify?: LiveVerifyStatus;
     /** `seal` (with `seal.foreign` in `features`): the tree's key is on this computer, or it was sealed on another one. */
     seal?: 'here' | 'elsewhere';
     /** `notDownloaded` (with `tree.notDownloaded` in `features`): files of the tree a cloud folder has not brought down yet. */
@@ -1625,15 +2051,91 @@ export interface LiveStatus {
     historyRev?: string;
     /** `quality.rev` (with `quality.read` in `features`): a print of what `GET /quality` returns (spec 021 §D). */
     qualityRev?: string;
+    /** `directions.rev` (with `directions.places` in `features`): a print of who stands where in the lines; read `GET /directions/people` again when it changes. */
+    directionsRev?: string;
     /** `experiments.historyPace` (with `experiments.pace` in `features`): how often the research looks for history. */
     historyPace?: HistoryPace;
     /** `history.placeEstimate` (with `history.place` in `features`): one place's own history, minutes and (measured) USD. */
     historyPlaceEstimate?: { minutes: [number, number]; usd?: [number, number] };
     /** `stories.history` (with `stories.history` in `features`): the research may use the history of places in stories. */
     storiesHistory?: boolean;
+    /**
+     * `hypotheses.decide` (with `hypotheses.decide` in `features`, spec 060): who decides the research's
+     * hypotheses; a value the app does not know reads as `person`. Absent: not said (an archive, a research
+     * waiting for its agent, an older research).
+     */
+    hypothesesDecide?: ResearchHypothesesDecide;
+    /**
+     * `readAgain` (with `read.sourceTask` in `features`, spec 059): the state of each source whose newest reading
+     * differs from its transcript, by source id (S…). Absent: not said (an archive, a research waiting for its agent, an older research).
+     */
+    readAgain?: Record<string, ReadSourceState>;
+    /**
+     * The agent's proposals for confirmed transcripts (`waiting` items of kind `transcript`, with `read.sourceTask` in
+     * `features`), by source id (S…): also for a source with no differing newer reading. Absent: none.
+     */
+    sourceProposals?: Record<string, ReadSourceProposal>;
     /** `busy` (with `status.busy` in `features`): sessions and runs working now; absent: not said (an archive, an older research). */
     busy?: LiveBusy;
+    /** `caps`: what the bridge does with the directions; absent: an older research, an archive, a research waiting for its agent. */
+    caps?: ResearchCaps;
+    /** `offLine` (with `offLine.branches` in `features`): work outside the directions by branches; absent: not said. */
+    offLine?: LiveOffLine;
+    /** `queueCounts` (with `queue.page` in `features`): the queue's counts for the filters; absent: not said. */
+    queueCounts?: LiveQueueCounts;
+    /** The agent's name (`agent.name`, or a bare name); absent: none said (an archive has none). */
+    agentName?: string;
+    /** `browser` (with `browser.state` in `features`, not for an archive): the agent's browser and its archives; absent: not said. */
+    browser?: BrowserInfo;
+    /**
+     * `live` (with `live.idle` in `features`, spec 064): how long the bridge stays on without work
+     * (`idleMinutes`, 0 = until the computer shuts down or it is switched off) and the choices offered.
+     */
+    live?: LiveIdle;
 }
+
+/** `/status.features` (spec 064): `/status.live` and `POST /live {"idleMinutes"}`. */
+export const LIVE_IDLE_FEATURE = 'live.idle';
+/** `/status.features` (spec 064): `POST /live {"do": "stop"}` switches the bridge off as `strom live stop`. */
+export const LIVE_STOP_FEATURE = 'live.stop';
+/** `/status.features` (spec 064): the link `live?tree=…&do=start` starts the bridge quietly at its last address. */
+export const LIVE_START_FEATURE = 'live.start';
+/** The longest time without work the bridge takes (a week, in minutes). */
+export const LIVE_IDLE_MAX = 10080;
+
+/** `/status.live`: minutes without work before the bridge ends (0: never by itself) and the choices to offer. */
+export interface LiveIdle {
+    idleMinutes: number;
+    idleChoices: number[];
+}
+
+/** The two choices of Settings when the research names none: until the computer shuts down, after 2 hours idle. */
+export const LIVE_IDLE_DEFAULT_CHOICES: readonly number[] = [0, 120];
+
+function liveMinutes(v: unknown): number | null {
+    return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= LIVE_IDLE_MAX ? v : null;
+}
+
+/** `/status.live` checked: `idleMinutes` a whole number of minutes (0–10080), the choices likewise (at most 8, no repeats). */
+export function sanitizeLiveIdle(value: unknown): LiveIdle | null {
+    const r = asRecord(value);
+    const idleMinutes = liveMinutes(r?.idleMinutes);
+    if (!r || idleMinutes === null) return null;
+    const said = Array.isArray(r.idleChoices) ? r.idleChoices.map(liveMinutes).filter((n): n is number => n !== null) : [];
+    const idleChoices = [...new Set(said)].slice(0, 8);
+    return { idleMinutes, idleChoices: idleChoices.length ? idleChoices : [...LIVE_IDLE_DEFAULT_CHOICES] };
+}
+
+/** `/status.features`: the bridge says the state of the agent's browser (`browser`, spec 048 §11). */
+export const BROWSER_STATE_FEATURE = 'browser.state';
+/** The agent's browser: the extension connected, missing, or an agent whose browser the research does not watch. */
+export type BrowserState = 'ready' | 'no-extension' | 'agent-without-browser';
+/** An archive the agent reaches only through the browser, and whether the research may download from it there. */
+export interface BrowserArchive { host: string; title?: string; permitted: boolean }
+/** `/status.browser`, checked: `url` only for `no-extension` (the extension's store page). */
+export interface BrowserInfo { state: BrowserState; url?: string; archives: BrowserArchive[] }
+/** Most archives of `browser.archives` kept. */
+export const MAX_BROWSER_ARCHIVES = 20;
 
 /** How often the research looks for history (`/status.experiments.historyPace`). */
 export type HistoryPace = 'sometimes' | 'rare' | 'idle';
@@ -1696,6 +2198,18 @@ export const HISTORY_KINDS_FEATURE = 'history.kinds';
 export const HISTORY_ALIGN_FEATURE = 'history.align';
 /** `/status.features` (R7): `/status.stories.history` and `POST /stories {history}`. */
 export const STORIES_HISTORY_FEATURE = 'stories.history';
+/**
+ * `/status.features` (spec 060): `/status.hypotheses.decide`, `POST /hypotheses {decide}` and who decided a
+ * hypothesis in the research's file (`_BY`, `DECI`, `_AT`).
+ */
+export const HYPOTHESES_DECIDE_FEATURE = 'hypotheses.decide';
+/**
+ * spec 074 (P1): the research takes a hypothesis decided by a version from the app
+ * (`hypothesis?do=decide&variant=`, `abandon`, `keep-open`, `reopen`), confirmed in its terminal.
+ */
+export const HYPOTHESIS_DECIDE_LINK_FEATURE = 'hypothesis.decide.link';
+/** spec 074 (P2): the research takes the agent's proposals accepted together (`hypotheses?do=accept&ids=`). */
+export const HYPOTHESES_ACCEPT_LINK_FEATURE = 'hypotheses.accept.link';
 
 /** The tree's kind as the status said it, or null (an older research). */
 export function sanitizeTreeKind(value: unknown): ResearchTreeKind | null {
@@ -1879,6 +2393,11 @@ export interface ResearchAccepts {
     mediaRegion: boolean;
     /** It takes a file for a waiting task (`accepts.media.task`: `X-Strom-Task` with `PUT /media/<sha256>`); absent: no. */
     mediaTask?: true;
+    /**
+     * It takes images of a book a task waits for (`accepts.media.taskImages`:
+     * `X-Strom-Image`, `X-Strom-Replace` with `X-Strom-Task`, research 1.27); absent: no.
+     */
+    mediaTaskImages?: true;
     /** The kinds of file it takes (`accepts.media.types`); null when it does not say. */
     mediaTypes: { mime: string; ext: string[] }[] | null;
     /** It takes batches ("Add materials", `accepts.media.batch`): at most so many files and bytes, ZIP or not; null: no batches. */
@@ -1971,6 +2490,7 @@ export function sanitizeAccepts(value: unknown): ResearchAccepts | null {
         mediaMaxBytes: mediaMaxBytes(asRecord(r.media)?.max ?? asRecord(r.media)?.maxBytes),
         mediaRegion: asRecord(r.media)?.region === true,
         ...(asRecord(r.media)?.task === true ? { mediaTask: true as const } : {}),
+        ...(asRecord(r.media)?.taskImages === true ? { mediaTaskImages: true as const } : {}),
         mediaTypes: mediaTypes(asRecord(r.media)?.types),
         mediaBatch: mediaBatch(asRecord(r.media)?.batch),
         mediaEstimate: mediaEstimate(asRecord(r.media)?.estimate),
@@ -2014,20 +2534,135 @@ export interface LiveQueueItem {
     research?: string;
     /**
      * Off the research's lines and helping none (`tasks.offLine` in `features`): `last` = taken only after the
-     * lines' work; `never` = not taken (work outside the lines is set off in the research). Absent: it does not apply.
+     * lines' work; `never` = not taken (work outside the lines is set off in the research); `occasional` (with
+     * `offLine.branches`) = now and then among the lines' work. Absent: it does not apply.
      */
-    offLine?: 'last' | 'never';
+    offLine?: 'last' | 'never' | 'occasional';
     /**
      * Off the lines by its people but helping the line in `research` (`tasks.offLine` in `features`): it serves a
      * question of the line (`question`), connects people to the tree (`joins`), or the agent said how (`agent`).
      */
     helps?: 'question' | 'joins' | 'agent';
+    /** The branch outside the directions the task belongs to ("B-P0031"; `offLine.branches`). */
+    branch?: string;
+    /** Its own place set by hand (`queue.own`): next once, or after everything else. */
+    own?: 'next' | 'last';
+    /** Why it stands where it stands (`offLine.branches`); absent for tasks about nobody. */
+    why?: QueueWhy;
+    /** Its place in the whole queue, 1 = next (`queue.page`); absent: a task set aside, or an older research. */
+    pos?: number;
+    /** What the task makes (Strom Research 1.31): a person's story, or a piece of history; absent: neither said. */
+    kind?: LiveQueueKind;
+}
+
+/** The kinds of a queued task the research names. */
+export type LiveQueueKind = 'story' | 'history';
+
+/** How work outside the directions is taken (the tree's choice, and a branch's own). */
+export type OffLineMode = 'occasional' | 'last' | 'normal' | 'never';
+export const OFF_LINE_MODES: readonly OffLineMode[] = ['occasional', 'last', 'normal', 'never'];
+/** How a task helps a direction (`queue[].why.by`). */
+export type QueueHelpsBy = 'question' | 'joins' | 'agent' | 'partner' | 'branch';
+/** Why a task stands where it stands in the queue (`queue[].why`). */
+export type QueueWhy =
+    | { kind: 'own'; do: 'next' | 'last' }
+    | { kind: 'line'; research: string }
+    | { kind: 'helps'; research: string; by: QueueHelpsBy }
+    | { kind: 'off'; mode: Exclude<OffLineMode, 'never'>; branch?: string }
+    | { kind: 'paused'; research: string };
+
+/** How a branch hangs on a direction: through whom and how they are related. */
+export type BranchRel = 'sibling' | 'partner' | 'child' | 'parent' | 'other';
+/** A branch outside the directions (`/status.offLine.branches[]`). */
+export interface OffLineBranch {
+    id: string;
+    /** The branch's person (REFN), the nearest to a direction. */
+    person: string;
+    via?: { person: string; rel: BranchRel };
+    /** The nearest direction ("G0003"); absent: none near. */
+    nearest?: string;
+    tasks: number;
+    persons: number;
+    /** 2–3 of its tasks, in the queue's order. */
+    samples: { id: string; text: string }[];
+    /** How it is taken now; 'line' = added to the direction `line` (its tasks help it). */
+    mode: OffLineMode | 'line';
+    line?: string;
+    /** Its own choice (not the tree's default). */
+    own: boolean;
+    /** It grew past the research's threshold. */
+    grows?: boolean;
+}
+/** `/status.offLine`: the tree's choice for work outside the directions, and its branches. */
+export interface LiveOffLine {
+    mode: OffLineMode;
+    /** The tree's choice was set by a person (not the default). */
+    own: boolean;
+    /** With 'occasional': about 1 task outside per `share` tasks of the directions. */
+    share: number;
+    /** Ask in Awaiting action about growing branches. */
+    suggest: boolean;
+    tasks: number;
+    queued: number;
+    /** Tasks with their own place set by hand. */
+    ownTasks: number;
+    branches: OffLineBranch[];
 }
 
 /** `/status.features`: queue items say when work outside the lines comes (`offLine`) and how a task helps a line (`helps`). */
 export const TASKS_OFF_LINE_FEATURE = 'tasks.offLine';
 /** `/status.features`: the status says how many sessions and runs work now (`busy`). */
 export const STATUS_BUSY_FEATURE = 'status.busy';
+/** `/status.features`: directions are created and edited through the bridge (spec 038). */
+export const DIRECTIONS_EDIT_FEATURE = 'directions.edit';
+/** `/status.features`: the directions' order is written through the bridge. */
+export const DIRECTIONS_ORDER_FEATURE = 'directions.order';
+/** `/status.features`: a direction says what it found in its last days (`found`). */
+export const DIRECTIONS_FOUND_FEATURE = 'directions.found';
+/** `/status.features`: who is in which direction (`GET /directions/people`). */
+export const DIRECTIONS_PEOPLE_FEATURE = 'directions.people';
+/** `/status.features`: `GET /directions/people` also says where each person stands (`places`, `lines`, `branches`, `rev`; spec 073 §16.9). */
+export const DIRECTIONS_PLACES_FEATURE = 'directions.places';
+/** `/status.features`: branches outside the directions (`offLine.branches`, `GET|POST /offline…`). */
+export const OFF_LINE_BRANCHES_FEATURE = 'offLine.branches';
+/** `/status.features`: a task's own place in the queue (`POST /queue/<T…>`, `queue[].why`). */
+export const QUEUE_OWN_FEATURE = 'queue.own';
+/** `/status.features`: the whole queue by pages (`GET /queue`), each task's `pos` and `/status.queueCounts`. */
+export const QUEUE_PAGE_FEATURE = 'queue.page';
+
+/** `/status.queueCounts`: tasks up next by direction and branch (absent = 0), all of them, set aside, and the order's print. */
+export interface LiveQueueCounts {
+    research: Record<string, number>;
+    branch: Record<string, number>;
+    next: number;
+    parked: number;
+    /** A print of the queue's order (16 hex): pages read with the same one are still valid. */
+    rev: string;
+}
+
+/** Most directions and branches read from `queueCounts`. */
+const MAX_COUNTED = 2000;
+
+/** `/status.queueCounts`, checked; null when its `rev` or counts are not valid. */
+export function sanitizeQueueCounts(value: unknown): LiveQueueCounts | null {
+    const r = asRecord(value);
+    if (!r || typeof r.rev !== 'string' || !/^[0-9a-f]{8,64}$/.test(r.rev)) return null;
+    const next = asCount(r.next);
+    const parked = asCount(r.parked);
+    if (next === null || parked === null) return null;
+    const map = (raw: unknown, ref: (v: unknown) => string | null): Record<string, number> => {
+        const out: Record<string, number> = {};
+        const m = asRecord(raw);
+        if (!m) return out;
+        for (const [k, v] of Object.entries(m).slice(0, MAX_COUNTED)) {
+            const id = ref(k);
+            const n = asCount(v);
+            if (id && n !== null && n > 0) out[id] = n;
+        }
+        return out;
+    };
+    return { research: map(r.research, researchDirectionRef), branch: map(r.branch, researchBranchRef), next, parked, rev: r.rev };
+}
 
 /** What works in the research now (`/status.busy`). */
 export interface LiveBusy {
@@ -2069,7 +2704,7 @@ const asCount = (v: unknown): number | null =>
     typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : null;
 
 /** The `working` list (status field or `working` event). Untrusted input. */
-export function sanitizeWorking(value: unknown): LiveWorker[] {
+export function sanitizeWorking(value: unknown, helpsSaid = false): LiveWorker[] {
     if (!Array.isArray(value)) return [];
     const out: LiveWorker[] = [];
     for (const item of value.slice(0, MAX_ITEMS)) {
@@ -2078,14 +2713,21 @@ export function sanitizeWorking(value: unknown): LiveWorker[] {
         const who = cleanText(r.who, 80);
         if (!who) continue;
         const person = researchPersonRef(r.person);
+        // A couple's task: the bridge may name the family, in its own field or as the person.
+        const family = person ? null : (researchFamilyRef(r.family) ?? researchFamilyRef(r.person));
         const p = asRecord(r.paused);
         const until = p ? cleanText(p.until, 40) : '';
         const paused = p ? { until: Number.isFinite(Date.parse(until)) ? until : '', reason: cleanText(p.reason, 200) } : null;
         const research = researchDirectionRef(r.research);
         const session = researchSessionRef(r.session);
+        const place = isPlaceRecordId(r.place) ? r.place : null;
+        // How the task helps its line, and its branch: only from a research that says so; `helps` only with the line.
+        const helps = helpsSaid && research && typeof r.helps === 'string' && HELPS_BY.includes(r.helps) ? r.helps as QueueHelpsBy : null;
+        const branch = helpsSaid ? researchBranchRef(r.branch) : null;
         out.push({
-            who, since: cleanText(r.since, 40), task: cleanText(r.task), ...(person ? { person } : {}), ...(paused ? { paused } : {}),
-            ...(research ? { research } : {}), ...(session ? { session } : {}),
+            who, since: cleanText(r.since, 40), task: cleanText(r.task), ...(person ? { person } : {}), ...(family ? { family } : {}), ...(paused ? { paused } : {}),
+            ...(research ? { research } : {}), ...(session ? { session } : {}), ...(place ? { place } : {}),
+            ...(helps ? { helps } : {}), ...(branch ? { branch } : {}),
         });
     }
     return out;
@@ -2120,6 +2762,47 @@ export function waitingNote(value: unknown): string | null {
         ? v : null;
 }
 
+/** An image number of a book (1–999999), or null. */
+export function imageNumber(value: unknown): number | null {
+    return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= MAX_IMAGE_NUMBER ? value : null;
+}
+
+/** Image numbers: valid ones only, each once, ascending, at most `max`. */
+export function imageNumbers(value: unknown, max = MAX_INBOX_MISSING): number[] {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set<number>();
+    for (const v of value.slice(0, 1000)) {
+        const n = imageNumber(v);
+        if (n !== null) seen.add(n);
+    }
+    return [...seen].sort((a, b) => a - b).slice(0, max);
+}
+
+/**
+ * A task's `inbox` (a waiting item's, or a task image's answer). Untrusted:
+ * without a count of what is there it is none; `want` 0 or absent = not
+ * known; anything else wrong is dropped, the rest stays.
+ */
+export function sanitizeWaitingInbox(value: unknown): WaitingInbox | null {
+    const r = asRecord(value);
+    const have = r ? asCount(r.have) : null;
+    if (!r || have === null) return null;
+    const out: WaitingInbox = { have, dir: cleanText(r.dir, 200) };
+    const want = asCount(r.want);
+    if (want !== null && want > 0 && want <= MAX_IMAGE_NUMBER) out.want = want;
+    if (Array.isArray(r.missing)) out.missing = imageNumbers(r.missing);
+    const book = cleanText(r.book, 120);
+    if (book) out.book = book;
+    const images = cleanText(r.images, 120);
+    if (images) out.images = images;
+    if (typeof r.recordset === 'string' && /^B\d{4,9}$/.test(r.recordset)) out.recordset = r.recordset;
+    const folder = cleanText(r.folder, 200);
+    if (folder) out.folder = folder;
+    const lying = asCount(r.lying);
+    if (lying !== null) out.lying = lying;
+    return out;
+}
+
 /** The fields of a `waiting.groups` research. Untrusted input: anything wrong is dropped, the item stays. */
 function waitingGroupFields(r: Record<string, unknown>, kind: LiveWaiting['kind']): Partial<LiveWaiting> {
     const out: Partial<LiveWaiting> = {};
@@ -2131,7 +2814,8 @@ function waitingGroupFields(r: Record<string, unknown>, kind: LiveWaiting['kind'
     const name = g ? cleanText(g.name, MAX_NAME) : '';
     if (g && key && name) {
         const gk = typeof g.kind === 'string' && (WAITING_GROUP_KINDS as readonly string[]).includes(g.kind) ? g.kind as WaitingGroupKind : 'other';
-        out.group = { key, name, kind: gk };
+        const gUrl = webUrl(g.url);
+        out.group = { key, name, kind: gk, ...(gUrl ? { url: gUrl } : {}) };
     }
     if (r.phase === 'sent') {
         out.phase = 'sent';
@@ -2147,10 +2831,8 @@ function waitingGroupFields(r: Record<string, unknown>, kind: LiveWaiting['kind'
     if (note) out.note = note;
     const to = cleanText(r.to, 120);
     if (to) out.to = to;
-    const inbox = asRecord(r.inbox);
-    const have = inbox ? asCount(inbox.have) : null;
-    const want = inbox ? asCount(inbox.want) : null;
-    if (inbox && have !== null && want !== null) out.inbox = { dir: cleanText(inbox.dir, 200), have, want };
+    const inbox = sanitizeWaitingInbox(r.inbox);
+    if (inbox) out.inbox = inbox;
     // Only the known actions, in their own order; an empty list stays (it offers none).
     if (Array.isArray(r.actions)) {
         const said = r.actions as unknown[];
@@ -2231,7 +2913,7 @@ export function waitingPlaceFields(r: Record<string, unknown>): Partial<LiveWait
  * announces `waiting.groups` (kind, section, group, phase … are read only then).
  * A place question (kind 'place') is read with or without them.
  */
-export function sanitizeWaiting(value: unknown, groups = false): LiveWaiting[] {
+export function sanitizeWaiting(value: unknown, groups = false, branches = false): LiveWaiting[] {
     if (!Array.isArray(value)) return [];
     const out: LiveWaiting[] = [];
     for (const item of value.slice(0, MAX_WAITING)) {
@@ -2251,17 +2933,31 @@ export function sanitizeWaiting(value: unknown, groups = false): LiveWaiting[] {
         const task: WaitingTaskKind | null = !groups || story || host || r.kind === 'story' || r.kind === 'permission' ? null
             : TASK_KINDS.includes(r.kind as WaitingTaskKind) ? r.kind as WaitingTaskKind : 'other';
         const placeQ = !story && !host && r.kind === 'place' ? waitingPlaceFields(r) : null;
-        const kind: LiveWaiting['kind'] = story ? 'story' : host ? 'permission' : placeQ ? 'place' : task ?? undefined;
+        // A growing branch (`offLine.branches`): it names the branch; without a valid one it is just a line.
+        const branch = branches && r.kind === 'branch' ? researchBranchRef(r.branch) : null;
+        // A hypothesis to decide (spec 074, V13): it names the hypothesis by its id; without a valid one it is "other".
+        const hypo = groups && !story && !host && r.kind === 'hypothesis' ? researchHypothesisRef(r.id) : null;
+        const kind: LiveWaiting['kind'] = story ? 'story' : host ? 'permission' : placeQ ? 'place' : branch ? 'branch' : hypo ? 'hypothesis' : task ?? undefined;
         out.push({
             id: host ? `permission:${host}` : cleanText(r.id, 40), what, on: cleanText(r.on, host ? MAX_TERMS : 120), at: cleanText(r.at ?? r.since, 40),
             ...(person ? { person } : {}), ...(research ? { research } : {}),
             ...(story ? { kind: 'story' as const } : {}), ...(partner && partner !== person ? { partner } : {}),
             ...(host ? { kind: 'permission' as const, host } : {}),
-            ...(task && !placeQ ? { kind: task } : {}),
+            ...(task && !placeQ && !branch && !hypo ? { kind: task } : {}),
+            ...(hypo ? { kind: 'hypothesis' as const, ...waitingHypothesisFields(r) } : {}),
             ...(placeQ ?? {}),
+            ...(branch ? { kind: 'branch' as const, branch, tasks: asCount(r.tasks) ?? 0, persons: asCount(r.persons ?? r.newPersons) ?? 0 } : {}),
             ...(groups ? waitingGroupFields(r, kind) : {}),
         });
     }
+    return out;
+}
+
+/** A hypothesis item's own fields (V13): the agent's proposal (a version's letter or 'none') and `pick`. Anything else is dropped. */
+function waitingHypothesisFields(r: Record<string, unknown>): Partial<LiveWaiting> {
+    const out: Partial<LiveWaiting> = {};
+    if (typeof r.proposal === 'string' && (r.proposal === 'none' || /^[A-Z]{1,3}$/.test(r.proposal))) out.proposal = r.proposal;
+    if (r.pick === true) out.pick = true;
     return out;
 }
 
@@ -2269,11 +2965,11 @@ export function sanitizeWaiting(value: unknown, groups = false): LiveWaiting[] {
 const MAX_QUEUE = 20;
 
 /** The `queue` list of the status. Untrusted input: bad items are dropped. */
-export function sanitizeQueue(value: unknown, offLine = false): LiveQueueItem[] {
+export function sanitizeQueue(value: unknown, offLine = false, branches = false, max = MAX_QUEUE): LiveQueueItem[] {
     if (!Array.isArray(value)) return [];
     const out: LiveQueueItem[] = [];
     for (const item of value) {
-        if (out.length >= MAX_QUEUE) break;
+        if (out.length >= max) break;
         const r = asRecord(item);
         const id = researchTaskRef(r?.id);
         const text = cleanText(r?.text);
@@ -2282,14 +2978,103 @@ export function sanitizeQueue(value: unknown, offLine = false): LiveQueueItem[] 
         const person = researchPersonRef(r.person);
         const research = researchDirectionRef(r.research);
         // When work outside the lines comes, and how a task helps a line: only from a research that says so.
-        const off = offLine && (r.offLine === 'last' || r.offLine === 'never') ? r.offLine : null;
+        const off = offLine && (r.offLine === 'last' || r.offLine === 'never' || (branches && r.offLine === 'occasional')) ? r.offLine : null;
         const helps = offLine && (r.helps === 'question' || r.helps === 'joins' || r.helps === 'agent') ? r.helps : null;
+        // The branch, the own place and the reason: only from a research with branches outside the directions.
+        const branch = branches ? researchBranchRef(r.branch) : null;
+        const own = branches && (r.own === 'next' || r.own === 'last') ? r.own : null;
+        const why = branches ? sanitizeQueueWhy(r.why) : null;
+        // Its place in the whole queue: tasks up next only (one set aside has none).
+        const pos = state === 'next' && typeof r.pos === 'number' && Number.isInteger(r.pos) && r.pos >= 1 && r.pos <= 10_000_000 ? r.pos : null;
+        // What it makes (a story, history): only the kinds known here.
+        const kind = r.kind === 'story' || r.kind === 'history' ? r.kind : null;
         if (state) out.push({
             id, text, state, ...(person ? { person } : {}), ...(research ? { research } : {}),
             ...(off ? { offLine: off } : {}), ...(helps ? { helps } : {}),
+            ...(branch ? { branch } : {}), ...(own ? { own } : {}), ...(why ? { why } : {}), ...(pos ? { pos } : {}),
+            ...(kind ? { kind } : {}),
         });
     }
     return out;
+}
+
+const HELPS_BY: readonly string[] = ['question', 'joins', 'agent', 'partner', 'branch'];
+
+/** `queue[].why`: one of its five shapes, or null (unknown kind, a field missing or wrong). */
+export function sanitizeQueueWhy(value: unknown): QueueWhy | null {
+    const r = asRecord(value);
+    if (!r) return null;
+    const research = researchDirectionRef(r.research);
+    switch (r.kind) {
+        case 'own': return r.do === 'next' || r.do === 'last' ? { kind: 'own', do: r.do } : null;
+        case 'line': return research ? { kind: 'line', research } : null;
+        case 'paused': return research ? { kind: 'paused', research } : null;
+        case 'helps':
+            return research && typeof r.by === 'string' && HELPS_BY.includes(r.by) ? { kind: 'helps', research, by: r.by as QueueHelpsBy } : null;
+        case 'off': {
+            if (r.mode !== 'occasional' && r.mode !== 'last' && r.mode !== 'normal') return null;
+            const branch = researchBranchRef(r.branch);
+            return { kind: 'off', mode: r.mode, ...(branch ? { branch } : {}) };
+        }
+        default: return null;
+    }
+}
+
+const BRANCH_RELS: readonly string[] = ['sibling', 'partner', 'child', 'parent', 'other'];
+/** Most branches taken from the status. */
+const MAX_BRANCHES = 100;
+
+/** One branch of `/status.offLine.branches`, or null when its id, person or mode is wrong. */
+export function sanitizeOffLineBranch(value: unknown): OffLineBranch | null {
+    const r = asRecord(value);
+    const id = researchBranchRef(r?.id);
+    const person = researchPersonRef(r?.person);
+    const mode = typeof r?.mode === 'string' && ((OFF_LINE_MODES as readonly string[]).includes(r.mode) || r.mode === 'line')
+        ? r.mode as OffLineBranch['mode'] : null;
+    if (!r || !id || !person || !mode) return null;
+    const line = researchDirectionRef(r.line);
+    // A branch added to a direction names it; without one it is read as the tree's default.
+    if (mode === 'line' && !line) return null;
+    const via = asRecord(r.via);
+    const viaPerson = via ? researchPersonRef(via.person) : null;
+    const nearest = researchDirectionRef(r.nearest);
+    const samples: { id: string; text: string }[] = [];
+    for (const raw of Array.isArray(r.samples) ? r.samples.slice(0, 5) : []) {
+        const sr = asRecord(raw);
+        const sid = researchTaskRef(sr?.id);
+        const text = cleanText(sr?.text);
+        if (sid && text && samples.length < 3) samples.push({ id: sid, text });
+    }
+    return {
+        id, person,
+        ...(via && viaPerson ? { via: { person: viaPerson, rel: typeof via.rel === 'string' && BRANCH_RELS.includes(via.rel) ? via.rel as BranchRel : 'other' } } : {}),
+        ...(nearest ? { nearest } : {}),
+        tasks: asCount(r.tasks) ?? 0,
+        persons: asCount(r.persons ?? r.newPersons) ?? 0,
+        samples,
+        mode,
+        ...(mode === 'line' && line ? { line } : {}),
+        own: r.own === true,
+        ...(r.grows === true ? { grows: true } : {}),
+    };
+}
+
+/** `/status.offLine` (and the `offLine` of a `POST /offline` answer, without branches). Null when its mode is wrong. */
+export function sanitizeOffLine(value: unknown): LiveOffLine | null {
+    const r = asRecord(value);
+    const mode = typeof r?.mode === 'string' && (OFF_LINE_MODES as readonly string[]).includes(r.mode) ? r.mode as OffLineMode : null;
+    if (!r || !mode) return null;
+    const share = asCount(r.share);
+    const seen = new Set<string>();
+    const branches: OffLineBranch[] = [];
+    for (const raw of Array.isArray(r.branches) ? r.branches.slice(0, MAX_BRANCHES) : []) {
+        const b = sanitizeOffLineBranch(raw);
+        if (b && !seen.has(b.id)) { seen.add(b.id); branches.push(b); }
+    }
+    return {
+        mode, own: r.own === true, share: share && share >= 2 ? share : 10, suggest: r.suggest !== false,
+        tasks: asCount(r.tasks) ?? 0, queued: asCount(r.queued) ?? 0, ownTasks: asCount(r.ownTasks) ?? 0, branches,
+    };
 }
 
 /** `busy: { sessions, runs }` (counts; a missing one is 0), or null when neither is a count. */
@@ -2340,9 +3125,76 @@ export function sanitizeDirections(value: unknown): LiveDirection[] {
         const lastAt = last ? cleanText(last.at, 40) : '';
         const lastText = last ? cleanText(last.text, MAX_DIRECTION_NOTE) : '';
         if (lastText && Number.isFinite(Date.parse(lastAt))) d.last = { at: lastAt, text: lastText };
+        const order = asCount(r.order);
+        if (order !== null && order >= 1) d.order = order;
+        const limits = sanitizeDirectionLimits(r.limits);
+        if (limits) d.limits = limits;
+        const question = cleanText(r.question, MAX_TEXT);
+        if (question) d.question = question;
+        const review = asRecord(r.review);
+        if (review && typeof review.scope === 'string' && REVIEW_SCOPES.includes(review.scope)) d.review = { scope: review.scope as ResearchReviewScope };
+        const created = cleanText(r.created, 40);
+        if (Number.isFinite(Date.parse(created))) d.created = created;
+        const parent = researchDirectionRef(r.parent);
+        if (parent && parent !== id) d.parent = parent;
+        const found = sanitizeDirectionFound(r.found);
+        if (found) d.found = found;
         out.push(d);
     }
     return out;
+}
+
+/** A direction's `limits`: generations 1–99, a year 1000–2100; null when neither is valid. */
+export function sanitizeDirectionLimits(value: unknown): DirectionLimits | null {
+    const r = asRecord(value);
+    if (!r) return null;
+    const gens = asCount(r.generations);
+    const before = asCount(r.before);
+    const out: DirectionLimits = {
+        ...(gens !== null && gens >= 1 && gens <= 99 ? { generations: gens } : {}),
+        ...(before !== null && before >= 1000 && before <= 2100 ? { before } : {}),
+    };
+    return out.generations !== undefined || out.before !== undefined ? out : null;
+}
+
+/** Most persons of `found.people` taken (the bridge sends at most 50). */
+const MAX_FOUND_PEOPLE = 50;
+
+/** A direction's `found`: counts (all valid) and the persons' REFNs; null when anything is wrong or nothing was found. */
+export function sanitizeDirectionFound(value: unknown): DirectionFound | null {
+    const r = asRecord(value);
+    if (!r) return null;
+    const days = asCount(r.days);
+    const sessions = asCount(r.sessions);
+    const persons = asCount(r.persons);
+    const sources = asCount(r.sources);
+    if (days === null || days < 1 || sessions === null || persons === null || sources === null) return null;
+    if (sessions + persons + sources === 0) return null;
+    const people = Array.isArray(r.people)
+        ? [...new Set(r.people.slice(0, MAX_FOUND_PEOPLE).map(researchPersonRef).filter((x): x is string => !!x))] : [];
+    return { days, sessions, persons, sources, people };
+}
+
+const CAP_KINDS: readonly string[] = ['ancestors', 'descendants', 'question', 'person'];
+
+/**
+ * `/status.caps`: what the bridge does with the directions. Untrusted: each
+ * field read only when of its type. Null when it says nothing (an older
+ * research, an archive, one waiting for its agent).
+ */
+export function sanitizeResearchCaps(value: unknown): ResearchCaps | null {
+    const r = asRecord(value);
+    if (!r) return null;
+    const kinds = Array.isArray(r.directionKinds)
+        ? [...new Set(r.directionKinds.filter((k): k is LiveDirectionKind => typeof k === 'string' && CAP_KINDS.includes(k)))] : [];
+    return {
+        directionsWrite: r.directionsWrite === true,
+        directionsOrder: r.directionsOrder === true,
+        ...(r.orderMode === 'weight' || r.orderMode === 'strict' ? { orderMode: r.orderMode } : {}),
+        directionKinds: kinds,
+        duplicateDirections: r.duplicateDirections === true,
+        offLineBranches: r.offLineBranches === true,
+    };
 }
 
 /** `update: { version }`: a newer research, or null. */
@@ -2489,16 +3341,16 @@ export function sanitizeLiveStatus(value: unknown): LiveStatus | null {
         headAt: Number.isFinite(Date.parse(cleanText(r.headAt, 40))) ? cleanText(r.headAt, 40) : '',
         persons: asCount(r.persons),
         families: asCount(r.families),
-        working: sanitizeWorking(r.working),
-        waiting: sanitizeWaiting(r.waiting, !!features?.includes(WAITING_GROUPS_FEATURE)),
+        working: sanitizeWorking(r.working, !!features?.includes(WORKING_HELPS_FEATURE)),
+        waiting: sanitizeWaiting(r.waiting, !!features?.includes(WAITING_GROUPS_FEATURE), !!features?.includes(OFF_LINE_BRANCHES_FEATURE)),
         links: sanitizeResearchLinks(r.links),
-        queue: sanitizeQueue(r.queue, !!features?.includes(TASKS_OFF_LINE_FEATURE)),
+        queue: sanitizeQueue(r.queue, !!features?.includes(TASKS_OFF_LINE_FEATURE), !!features?.includes(OFF_LINE_BRANCHES_FEATURE)),
         queueMore: asCount(r.queueMore) ?? 0,
         update: sanitizeUpdate(r.update),
         spend: sanitizeSpend(r.spend, !!features?.includes(SPEND_READERS_FEATURE)),
         lastIntake: sanitizeIntake(r.lastIntake),
         researches: sanitizeDirections(r.researches),
-        accepts: readAcceptsGated(sanitizeAccepts(r.accepts), !!features?.includes(READ_FEATURE)),
+        accepts: readAcceptsGated(sanitizeAccepts(r.accepts), !!features?.includes(READ_FEATURE), !!features?.includes(READ_CHOOSE_FEATURE), !!features?.includes(READ_CHOICES_NOW_FEATURE)),
         inbox: sanitizeInbox(r.inbox),
         sends: sanitizeSends(r.sends),
         version: researchVersion(r.strom),
@@ -2514,9 +3366,72 @@ export function sanitizeLiveStatus(value: unknown): LiveStatus | null {
         ...(features?.includes(SEAL_FOREIGN_FEATURE) && (r.seal === 'here' || r.seal === 'elsewhere') ? { seal: r.seal } : {}),
         ...(features?.includes(NOT_DOWNLOADED_FEATURE) && asCount(r.notDownloaded) !== null ? { notDownloaded: asCount(r.notDownloaded)! } : {}),
         ...experimentsSaid(r, features),
+        ...hypothesesSaid(r, features),
+        ...(readAgainSaid(r.readAgain, features) ? { readAgain: readAgainSaid(r.readAgain, features)! } : {}),
+        ...(waitingProposalsSaid(r.waiting, features) ? { sourceProposals: waitingProposalsSaid(r.waiting, features)! } : {}),
         ...qualitySaid(r, features),
+        ...directionsRevSaid(r, features),
+        ...verifyStatusSaid(r, features),
         ...(features?.includes(STATUS_BUSY_FEATURE) && sanitizeBusy(r.busy) ? { busy: sanitizeBusy(r.busy)! } : {}),
+        ...(sanitizeResearchCaps(r.caps) ? { caps: sanitizeResearchCaps(r.caps)! } : {}),
+        ...(features?.includes(OFF_LINE_BRANCHES_FEATURE) && sanitizeOffLine(r.offLine) ? { offLine: sanitizeOffLine(r.offLine)! } : {}),
+        ...(features?.includes(QUEUE_PAGE_FEATURE) && sanitizeQueueCounts(r.queueCounts) ? { queueCounts: sanitizeQueueCounts(r.queueCounts)! } : {}),
+        ...agentSaid(r.agent),
+        ...(sanitizeBrowser(r) ? { browser: sanitizeBrowser(r)! } : {}),
+        ...(features?.includes(LIVE_IDLE_FEATURE) && sanitizeLiveIdle(r.live) ? { live: sanitizeLiveIdle(r.live)! } : {}),
     };
+}
+
+/** `agent: { name }` (or a bare name, an older shape): the agent's name, when said. */
+function agentSaid(agent: unknown): Pick<LiveStatus, 'agentName'> {
+    const named = typeof agent === 'string' ? agent : asRecord(agent)?.name;
+    const name = cleanText(named, 120);
+    return name ? { agentName: name } : {};
+}
+
+/**
+ * `/status.browser` (spec 048 §11): only from a bridge that announces
+ * `browser.state`, never for an archive; an unknown state is null. `url` stays
+ * only as an https page of chromewebstore.google.com; at most 20 archives,
+ * each with a valid host (else left out) and a title of at most 120 characters.
+ */
+export function sanitizeBrowser(status: unknown): BrowserInfo | null {
+    const r = asRecord(status);
+    if (!r) return null;
+    const features = Array.isArray(r.features) ? r.features : [];
+    if (!features.includes(BROWSER_STATE_FEATURE)) return null;
+    const tree = asRecord(r.tree);
+    if (features.includes(TREE_STATE_FEATURE) && tree?.state === 'archive') return null;
+    const b = asRecord(r.browser);
+    if (!b) return null;
+    const state = b.state;
+    if (state !== 'ready' && state !== 'no-extension' && state !== 'agent-without-browser') return null;
+    const archives: BrowserArchive[] = [];
+    for (const a of Array.isArray(b.archives) ? b.archives : []) {
+        if (archives.length >= MAX_BROWSER_ARCHIVES) break;
+        const o = asRecord(a);
+        const host = o ? researchArchiveHost(o.host) : null;
+        if (!o || !host) continue;
+        const title = cleanText(o.title, 120);
+        archives.push({ host, ...(title ? { title } : {}), permitted: o.permitted === true });
+    }
+    return { state, ...(browserStoreUrl(b.url) ? { url: browserStoreUrl(b.url)! } : {}), archives };
+}
+
+/** The extension's store page: https on chromewebstore.google.com only, else null. */
+function browserStoreUrl(value: unknown): string | null {
+    if (typeof value !== 'string' || value.length > 500) return null;
+    try {
+        const u = new URL(value);
+        return u.protocol === 'https:' && u.hostname === 'chromewebstore.google.com' && !u.username && !u.password && !u.port ? u.href : null;
+    } catch { return null; }
+}
+
+/** `hypotheses.decide`, read only when `features` names it: `agent`, else (any other word) `person`. */
+function hypothesesSaid(r: Record<string, unknown>, features: readonly string[] | null): Pick<LiveStatus, 'hypothesesDecide'> {
+    const h = features?.includes(HYPOTHESES_DECIDE_FEATURE) ? asRecord(r.hypotheses) : null;
+    if (!h || typeof h.decide !== 'string') return {};
+    return { hypothesesDecide: h.decide === 'agent' ? 'agent' : 'person' };
 }
 
 /** `quality.rev`, read only when `features` names `quality.read`. */
@@ -2524,6 +3439,13 @@ function qualitySaid(r: Record<string, unknown>, features: string[] | null): Pic
     const q = features?.includes('quality.read') ? asRecord(r.quality) : null;
     const rev = q ? cleanText(q.rev, 128) : '';
     return rev ? { qualityRev: rev } : {};
+}
+
+/** `directions.rev`, read only when `features` names `directions.places`. */
+function directionsRevSaid(r: Record<string, unknown>, features: string[] | null): Pick<LiveStatus, 'directionsRev'> {
+    const d = features?.includes(DIRECTIONS_PLACES_FEATURE) ? asRecord(r.directions) : null;
+    const rev = d ? cleanText(d.rev, 128) : '';
+    return rev ? { directionsRev: rev } : {};
 }
 
 /** `experiments` and `history.rev`, each read only when `features` names it. */
@@ -2583,10 +3505,23 @@ function treeSaid(tree: Record<string, unknown> | null, features: string[] | nul
 }
 
 /** `accepts.read` stays only from a bridge that says it reads now (`read.now` in `features`). */
-function readAcceptsGated(accepts: ResearchAccepts | null, reads: boolean): ResearchAccepts | null {
-    if (!accepts?.read || reads) return accepts;
-    const { read: _read, ...rest } = accepts;
-    return rest;
+function readAcceptsGated(accepts: ResearchAccepts | null, reads: boolean, choose: boolean, now = false): ResearchAccepts | null {
+    if (!accepts?.read) return accepts;
+    if (!reads) {
+        const { read: _read, ...rest } = accepts;
+        return rest;
+    }
+    // The readers to choose from only from a bridge that takes the choice (read.choose).
+    const choices = accepts.read.choices;
+    if (!choices) return accepts;
+    if (!choose) {
+        const { choices: _choices, ...read } = accepts.read;
+        return { ...accepts, read };
+    }
+    // What an alias runs on now only from a bridge that says it (read.choices.now): else the models read as before.
+    if (now || !choices.agents.some(a => a.models.some(m => m.nowName))) return accepts;
+    const agents = choices.agents.map(a => ({ ...a, models: a.models.map(({ nowName: _now, ...m }) => m) }));
+    return { ...accepts, read: { ...accepts.read, choices: { ...choices, agents } } };
 }
 
 /** A version as the research names itself ("1.11.0", "1.12.0-beta.2"), or ''. Untrusted. */
@@ -2684,11 +3619,13 @@ export function sanitizeLiveChange(value: unknown): LiveChange | null {
 }
 
 /** The bridge's `end` event (`live.end`): whether a bridge comes back on the same address (null: not said). Untrusted input. */
-export function sanitizeLiveEnd(value: unknown): { back: boolean | null; reason: string } {
+export function sanitizeLiveEnd(value: unknown): { back: boolean | null; reason: string; by?: 'app' } {
     const r = asRecord(value);
     return {
         back: typeof r?.back === 'boolean' ? r.back : null,
         reason: r ? cleanText(r.reason, 40) : '',
+        // spec 064: switched off from the app (`POST /live {"do": "stop"}`); without it from the terminal.
+        ...(r?.by === 'app' ? { by: 'app' as const } : {}),
     };
 }
 
@@ -3316,7 +4253,7 @@ export function researchIdsByContent(current: StromData, handedOver: StromData, 
         p => name(p),
     ];
     const sourceKey = (src: Source): string =>
-        [src.title, src.repository, src.reference, src.transcript].map(norm).join('\u0000');
+        [src.title, src.repository, sourcePlaceKey(src), src.transcript].map(norm).join('\u0000');
     const unique = <T>(records: [string, T][], key: (r: T) => string): Map<string, string> => {
         const seen = new Map<string, string | null>();
         for (const [id, r] of records) {

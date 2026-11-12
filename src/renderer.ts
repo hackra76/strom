@@ -5,6 +5,7 @@
 
 import { DataManager } from './data.js';
 import { UI } from './ui.js';
+import { cardStatusAria, cardStatusWords, statusMarkHtml } from './ui/fact-status.js';
 import { ZoomPan } from './zoom.js';
 import { strings } from './strings.js';
 import {
@@ -14,6 +15,8 @@ import {
     Position,
     DEFAULT_LAYOUT_CONFIG,
     LayoutConfig,
+    layoutConfigFor,
+    TreeSpacing,
     TreeId,
     StromData,
     personCardHeight
@@ -25,10 +28,13 @@ import { ViewMode, STANDALONE_VIEWS, ResearchEdgeMode, ResearchEdgeHypo } from '
 import { cardLines, CardLine, cardLineHtml, cardYears, CardLineStyle, cardDateReferences, cardAge, formatAge, isFieldCardDensity } from './card-fields.js';
 import {
     CustomCardMetrics, CardLineRows, CardHead, customCardMetrics, customCardRows, customCardViewHeight, customCardSpouseLineY,
-    measureCardTexts, cardFontsPending, CARD_HEAD_HEIGHT, CARD_EDGE_PILL_ROOM, CARD_EDGE_PILL_RIGHT, CARD_EDGE_PILL_LEFT,
+    measureCardTexts, cardFontsPending, CARD_HEAD_HEIGHT, CARD_EDGE_PILL_ROOM, CARD_EDGE_PILL_LEFT, CARD_STATUS_MARK_ROOM, bottomRightPillsRoom,
+    cardNameMaxRows, normalCardHeights, normalCardNameRows, rowSeparators, NormalCardName, CARD_LOCK_NAME_ROOM,
 } from './card-width.js';
 import { checkRecordedAge, ageBirthDate } from './recorded-age.js';
-import { ACTION_GLYPH, AGENT_DONE_MS, AGENT_DONE_FADE_MS, AGENT_SPIN_MS, CardSignalContext, CardSignalInfo, cardSignalInfo, researchCardInfoNow, sharedPhaseDelay, stateStripesHtml, storySignalText } from './card-signals.js';
+import { treeKnowsOrigin, CardStatusClass } from './reliability.js';
+import { cardActionMarksHtml, actionSignalText, clipText, markTipHtml } from './card-signal-marks.js';
+import { AGENT_DONE_MS, AGENT_DONE_FADE_MS, AGENT_SPIN_MS, CardSignalContext, CardSignalInfo, cardSignalInfo, researchCardInfoNow, sharedPhaseDelay, storyFoldHtml, storySignalText, StoryMark } from './card-signals.js';
 import { EvidenceLevel, treeHasAnySource, unionsByPerson } from './evidence-level.js';
 import { EdgeHypoFamilyLink, EdgeView, edgeHypoFamilies, edgeMoves, edgeNamedOptions, edgeView } from './research-edge.js';
 import {
@@ -50,7 +56,7 @@ import {
 } from './layout/index.js';
 import { renderDebugOverlay, clearDebugOverlay } from './debug-overlay.js';
 import { debugPanel } from './debug-panel.js';
-import { yearOf, displayYear, formatFlexDate } from './dates.js';
+import { yearOf, displayYear, formatFlexDate, shortYearRanges } from './dates.js';
 import { computeTimelineModel } from './timeline.js';
 import { buildTimelineSvg } from './timeline-chart.js';
 import { HISTORY_CHANGED_EVENT } from './ui/history-ui.js';
@@ -76,14 +82,20 @@ import { parentRelKind, parentRelDash, connectionDash } from './parent-rel-style
 import { isDiagramStandIn } from './layout/pipeline/placeholders.js';
 import {
     unionOrderBadges, UnionOrderBadge, hiddenRelativesTabs, hiddenChildIds, newlyShownChildIds, BranchTab, lineLinksOf, lineLinkTabs, LineLinks, placeUnionOrderPill, PillPlacement, REL_LINK_ICON_WIDTH,
-    viewLineSegments, segmentsNearCard, EDGE_INSET, PillLabel, pillLabelForms, pillLabelWidths, unionSummaries,
+    viewLineSegments, segmentsNearCard, EDGE_INSET, PillLabel, PillLabelForm, PillSegment, pillLabelForms, pillLabelWidths, unionSummaries,
     childrenDrawnElsewhere, siblingOrderMark, SiblingOrderMark,
     siblingsTabState, SiblingsTabState, newlyShownSiblingIds, siblingGroups, ShownChildrenContext, HiddenRelativesTab, unionChildIdSet, branchTabsInOrder,
     offeredPartners, OfferedPartner, childrenByUnion, childrenComeWithPartners, otherFamilyChildrenElsewhere, marriagesInOrder,
 } from './marriage-order.js';
 import { partnerIdsShownInPlace } from './layout/pipeline/1-select-subgraph.js';
-import { measureUnionOrderPills, measureTabRows, rowKey, unionOrderPillKey, unionOrderPillPartsHtml, pillFontsPending, branchTabRestHtml, tabsForm, tabsFormClass, bubblePlacement, bubbleBox, touchBubbleBox, touchBubbleBounds, touchBubbleSide, bubbleOpensBelow, BUBBLE_WINDOW_MARGIN, BUBBLE_LOW_WINDOW_NAMES, BUBBLE_LOW_WINDOW_HEIGHT, bubbleNameCounts, bubbleNamesToFit } from './union-order-measure.js';
-import { prepareBubble, showBubble, hideBubble, closeOpenBubble, openBubble } from './bubble-layer.js';
+import { measureUnionOrderPills, applyUnionOrderGlyphLift, measureTabRows, rowKey, unionOrderPillKey, unionOrderPillPartsHtml, pillFontsPending, branchTabRestHtml, tabsForm, tabsFormClass, bubblePlacement, bubbleBox, touchBubbleBox, touchBubbleBounds, touchBubbleSide, bubbleOpensBelow, BUBBLE_WINDOW_MARGIN, BUBBLE_LOW_WINDOW_NAMES, BUBBLE_LOW_WINDOW_HEIGHT, bubbleNameCounts, bubbleNamesToFit } from './union-order-measure.js';
+import { prepareBubble, showBubble, hideBubble, closeOpenBubble, openBubble, openBubbleOwner } from './bubble-layer.js';
+import { LiveDiff, diffLive, liveChangeCount } from './live-diff.js';
+import { playLiveScene } from './live-scene.js';
+import { LIVE, edgeNotchSpot, EdgeSide, liveMotionOn, cardTrailOpacity } from './live-transition.js';
+import { getLiveMotion } from './live-follow-prefs.js';
+import { announceLive } from './ui/live-announce.js';
+import { MOBILE_MAX, MQ_PHONE_LANDSCAPE } from './breakpoints.js';
 import { pillUnderFinger } from './card-tap.js';
 import { showFocusToast, hideFocusToast } from './focus-toast.js';
 import { openCardMenuFromKeyboard } from './ui/keyboard-access.js';
@@ -141,6 +153,8 @@ interface CustomCardsMeasure {
     edgeRightIds: Set<PersonId>;
     /** The cards of one height whose last line was wrapped clear of the ∞ pill (CARD_EDGE_PILL_LEFT). */
     edgeLeftIds: Set<PersonId>;
+    /** The cards whose last line was wrapped clear of the status mark (CARD_STATUS_MARK_ROOM) and of no pill. */
+    statusRoomIds: Set<PersonId>;
 }
 /**
  * What the outputs draw (the poster, the book's tree, the people of the
@@ -149,6 +163,19 @@ interface CustomCardsMeasure {
  * longest text of those people, not of a shown family's), without the room
  * the screen keeps for the pills on a card's bottom edge.
  */
+/**
+ * A layout configuration with another spacing's gaps (layoutConfigFor), its
+ * card sizes, partner line and card heights kept.
+ */
+function withSpacing(config: LayoutConfig, spacing: TreeSpacing): LayoutConfig {
+    const { dense: _dense, ...rest } = config;
+    const gaps = layoutConfigFor(spacing);
+    return {
+        ...rest, horizontalGap: gaps.horizontalGap, verticalGap: gaps.verticalGap, partnerGap: gaps.partnerGap,
+        ...(gaps.dense ? { dense: true } : {}),
+    };
+}
+
 interface OutputLayout {
     positions: Map<PersonId, Position>;
     connections: Connection[];
@@ -173,6 +200,13 @@ interface LineStyle {
 const VIEW_LABEL_BELOW = 18;
 /** The line a child's label leaves showing at both ends of the horizontal stretch it sits on (px, together). */
 const VIEW_LABEL_LINE_ENDS = 24;
+/**
+ * The gap kept under the top couple of a family outside the tree for its
+ * button "Show linked to the tree" and the line under it (px). MUST match
+ * index.html .view-link-island: 26 (the caption above it) + 32 (the button)
+ * + 4 + 15 (the line) = 77, and 11 clear above the next row's cards.
+ */
+const VIEW_LINK_ISLAND_ROOM = 88;
 /** How long the cards of children just shown (or one glided to) glow (ms). */
 const CHILDREN_GLOW_MS = 1600;
 /** The "▾ children" bubble stays this long after the pointer left it (ms), so the pointer can reach its rows. */
@@ -189,8 +223,98 @@ interface ChildrenScene {
     /** A copy of the lines, for the ghost. */
     lines: SVGSVGElement;
 }
-/** Room the sibling-order pill ("3 of 5") takes on a card's bottom-right edge, with its inset (px). */
-const SIBLING_ORDER_PILL_RIGHT = 60;
+
+/**
+ * A live load in progress (TreeRenderer.renderLive): the tree as it stood
+ * and the cards as they get matched to the new drawing by person id.
+ */
+interface LiveRender {
+    /** The data shown before the load. */
+    previous: StromData;
+    /** No scene, no rings (a second pass of the same data). */
+    quiet: boolean;
+    positions: Map<PersonId, Position>;
+    connections: Connection[];
+    spouseLines: SpouseLine[];
+    /** A copy of the lines, for the ghost, and their markup to tell a change. */
+    lines: SVGSVGElement;
+    linesHtml: string;
+    /** The cards before; the ones matched are taken out as the new drawing goes. */
+    cards: Map<PersonId, HTMLElement>;
+    /** Every card before (the scene takes the ones that leave from here). */
+    allCards: Map<PersonId, HTMLElement>;
+    /** Cards kept as they were (their element stays). */
+    kept: Set<PersonId>;
+    /** Cards drawn anew (their content changed). */
+    redrawn: Set<PersonId>;
+    /** New elements: their names are fitted at once. */
+    fresh: HTMLElement[];
+    /** The card placed last, to put a new one after it. */
+    last: HTMLElement | null;
+}
+
+/** What a live load tells the rest of the app (src/ui/live-follow-ui.ts sets it). */
+export interface LiveRenderHooks {
+    /** The colour (a CSS value) of the session a person's change belongs to. */
+    colorOf?: (id: PersonId) => string;
+    /** The people following is about to jump to: no edge notch for them. */
+    jumpTargets?: () => ReadonlySet<PersonId>;
+    /** A live load was drawn: who came, went and changed. */
+    onLoaded?: (diff: LiveDiff) => void;
+    /** The trail on the cards: the newest first, each with its colour. */
+    cardTrail?: () => ReadonlyArray<{ personId: PersonId; kind: 'added' | 'changed'; color: string }>;
+}
+
+/** Measures the meta row's "…" (fitCardMetaYears); made on first use. */
+let metaMeasure: CanvasRenderingContext2D | null | undefined;
+
+/** A card's content for telling whether a live load changed it (its place and running animations' phase left out). */
+function cardSignature(card: HTMLElement): string {
+    const left = card.style.left, top = card.style.top;
+    card.style.left = '';
+    card.style.top = '';
+    const shell = (card.cloneNode(false) as HTMLElement).outerHTML;
+    card.style.left = left;
+    card.style.top = top;
+    return (shell + card.innerHTML).replace(/animation-delay:[^;"]*/g, '');
+}
+
+/** The texts of a card's rows, for marking the ones a live load changed (.live-field). */
+function cardRows(card: HTMLElement): Array<[HTMLElement, string]> {
+    const rows: Array<[HTMLElement, string]> = [];
+    const name = card.querySelector<HTMLElement>('.name-text');
+    if (name) rows.push([name.closest<HTMLElement>('.name') ?? name, `${name.dataset.given ?? ''} ${name.dataset.surname ?? ''}`]);
+    const birth = card.querySelector<HTMLElement>('.card-birth');
+    if (birth) rows.push([birth, birth.dataset.birth ?? birth.textContent ?? '']);
+    const meta = card.querySelector<HTMLElement>('.birth-date');
+    if (meta) rows.push([meta, meta.dataset.full ?? meta.querySelector('.meta-text')?.textContent ?? meta.textContent ?? '']);
+    const years = card.querySelector<HTMLElement>('.card-years');
+    if (years) rows.push([years, years.textContent ?? '']);
+    card.querySelectorAll<HTMLElement>('.card-lines > *').forEach((row, i) => rows.push([row, `${i}:${row.textContent ?? ''}`]));
+    return rows;
+}
+
+/** Mark the rows of `fresh` whose text differs from the same row of `old` (by kind and order). */
+function markChangedRows(old: HTMLElement, fresh: HTMLElement): void {
+    const kindOf = (el: HTMLElement) => el.className.split(' ')[0];
+    const before = new Map<string, string>();
+    const seen = new Map<string, number>();
+    for (const [el, text] of cardRows(old)) {
+        const k = kindOf(el);
+        const n = seen.get(k) ?? 0;
+        seen.set(k, n + 1);
+        before.set(`${k}#${n}`, text);
+    }
+    seen.clear();
+    for (const [el, text] of cardRows(fresh)) {
+        const k = kindOf(el);
+        const n = seen.get(k) ?? 0;
+        seen.set(k, n + 1);
+        const was = before.get(`${k}#${n}`);
+        if (was !== undefined && was !== text) el.classList.add('live-field');
+        if (was === undefined && text.trim()) el.classList.add('live-field');
+    }
+}
 
 /** A bubble's own height, not the one its max-height cuts it to. */
 function bubbleOwnHeight(bubble: HTMLElement): number {
@@ -241,6 +365,12 @@ class TreeRendererClass {
      * person's own card height too (the layout's personHeights).
      */
     private customMetrics: CustomCardViewMetrics | null = null;
+    /**
+     * The Normal cards of the drawn view whose name takes more than two rows
+     * and their height (src/card-width.ts normalCardHeights, T40; null: none,
+     * every card 64px). The next render starts from them (usually the same).
+     */
+    private normalHeights: Map<PersonId, number> | null = null;
     /** The custom card's lines per drawn person, computed once per render. */
     private customLines = new Map<PersonId, CardLine[]>();
     /** The custom card lines' rows (src/card-width.ts customCardRows): what wraps, what is cut. */
@@ -261,6 +391,8 @@ class TreeRendererClass {
     private edgeRightIds = new Set<PersonId>();
     /** The cards of one height whose last line was wrapped clear of the ∞ pill (CARD_EDGE_PILL_LEFT). */
     private edgeLeftIds = new Set<PersonId>();
+    /** The cards whose last line was wrapped clear of the status mark alone (CARD_STATUS_MARK_ROOM). */
+    private statusRoomIds = new Set<PersonId>();
     /** The other trees the last cards were matched against (the ⇄ pill); the next measure reads them. */
     private lastCrossTrees: Map<TreeId, { name: string; data: StromData }> | null = null;
     /** The last render was the one more render asked for by pills measured otherwise (never twice in a row). */
@@ -273,6 +405,8 @@ class TreeRendererClass {
     private generationBands: GenerationBand[] = [];
     /** The layout's generation bands (LayoutResult.bands): each as tall as its tallest card. */
     private layoutBands: LayoutBand[] = [];
+    /** The gaps the dense spacing grew for their bus lanes (LayoutResult.gapExtra). */
+    private layoutGapExtra: ReadonlyMap<number, number> | null = null;
 
     // Connections for line rendering from layout engine
     private connections: Connection[] = [];
@@ -286,8 +420,12 @@ class TreeRendererClass {
     private viewLayer: LayoutViewLayer | null = null;
     /** The live bridge the tree follows, for whether the view links are available (null: from the data alone). */
     private viewLinksBridge: (() => { features: readonly string[] | null } | null) | null = null;
-    /** The current render's layout without the view links (outputs, the people of the view), made when first asked. */
-    private outputLayoutCache: { seq: number; output: OutputLayout } | null = null;
+    /**
+     * The current render's layout without the view links (outputs, the people
+     * of the view), per spacing (the image export may take the other one),
+     * made when first asked.
+     */
+    private outputLayoutCache = new Map<TreeSpacing, { seq: number; output: OutputLayout }>();
     /** The browser prints the tree: laid out without the view links until it is done (setPrinting). */
     private printing = false;
     /** The focus depth before the print, given back after it. */
@@ -320,8 +458,12 @@ class TreeRendererClass {
     private viewStandIn: ViewStandIn | null = null;
     /** Search highlight: hits get 'search-hit', everyone else 'search-dim'. */
     private highlightIds: Set<PersonId> | null = null;
-    /** People the last live-research change touched: 'live-changed' glow. */
-    private changedIds: Set<PersonId> | null = null;
+    /** What a live load tells the rest of the app (setLiveHooks). */
+    private liveHooks: LiveRenderHooks = {};
+    /** Each card's content as drawn (cardSignature): a live load keeps a card whose content is the same. */
+    private cardSigs = new WeakMap<HTMLElement, string>();
+    /** The edge notches of the last live load (a new person out of view), their timer. */
+    private liveEdgeTimer: ReturnType<typeof setTimeout> | null = null;
     /** "Show in tree" from the tree overview: these people stand out, the rest dims. Not kept over a reload. */
     private evidenceIds: Set<PersonId> | null = null;
     /** Shown faintly beside the highlighted people (a lineage's married-in spouses): neither framed nor dimmed. */
@@ -510,26 +652,96 @@ class TreeRendererClass {
         return this.renderInternal();
     }
 
-    private async renderInternal(): Promise<void> {
+    /**
+     * A live load of the research's tree (spec 055): the tree just loaded
+     * replaces the one shown without an empty frame — the cards are matched
+     * by person id (one whose content did not change keeps its element, its
+     * photo and fitted name), and the change plays as a short scene
+     * (src/live-scene.ts): cards move, new people grow out of their line with
+     * the light along it, changed cards get a ring. Other views (timeline,
+     * fan, map) draw as usual. `previous`: the data shown before the load.
+     */
+    renderLive(previous: StromData | null): Promise<void> {
+        if (!previous || STANDALONE_VIEWS.includes(this.viewMode)) return this.renderInternal();
+        return this.renderInternal({ previous, quiet: false });
+    }
+
+    /** Hooks of a live load (colours of the sessions, the trail, the following's jump targets). */
+    setLiveHooks(hooks: LiveRenderHooks): void {
+        this.liveHooks = hooks;
+    }
+
+    /** The Table view in its own container; the other views' containers and the canvas hidden. */
+    private showTableView(canvas: HTMLElement): void {
+        this.fanView?.deactivate();
+        document.body.dataset.viewMode = 'table';
+        for (const id of ['timeline-container', 'fan-container', 'map-container']) {
+            const other = document.getElementById(id);
+            if (other) other.style.display = 'none';
+        }
+        canvas.querySelectorAll('.person-card').forEach(c => c.remove());
+        canvas.style.display = 'none';
+        const el = document.getElementById('table-container');
+        if (el) {
+            el.style.display = 'flex';
+            UI.renderTableView?.(el);
+        }
+        this.updateFocusUI();
+        UI.updateViewModeUI?.();
+        // A followed research's card stands below the table's bar (fitted again whenever the bar's height changes).
+        UI.placeLivePanel?.();
+        UI.updateMinimap?.();
+        UI.updateGenLabels?.();
+        UI.updateViewLinksIndicator?.();
+    }
+
+    private async renderInternal(liveLoad: { previous: StromData; quiet: boolean } | null = null): Promise<void> {
         // Sequence token: a newer render started while this one awaited must
         // win, or both append their cards to the same canvas (duplicates).
         const seq = ++this.renderSeq;
-        // A transition of children shown in place ends with any new drawing
-        this.finishChildrenTransition();
-        // The cards go: an open bubble (in the top layer) with them
-        closeOpenBubble();
         const canvas = document.getElementById('tree-canvas');
         const svg = document.getElementById('tree-lines') as SVGSVGElement | null;
         const empty = document.getElementById('empty-state');
 
         if (!canvas || !svg) return;
 
-        // A re-render invalidates the anchor of the cross-tree chooser (its
-        // badge card is about to be removed) — close it first.
-        UI.hideCrossTreeChooser?.();
+        if (!liveLoad) {
+            // A transition of children shown in place ends with any new drawing
+            this.finishChildrenTransition();
+            // The cards go: an open bubble (in the top layer) with them
+            closeOpenBubble();
+            // A re-render invalidates the anchor of the cross-tree chooser (its
+            // badge card is about to be removed) — close it first.
+            UI.hideCrossTreeChooser?.();
+        }
 
-        // Clear previous render
-        canvas.querySelectorAll('.person-card').forEach(c => c.remove());
+        // The other trees the cards are matched against (IndexedDB) are read
+        // BEFORE anything is taken off: from here on the drawing runs in one
+        // go, so no frame ever shows the canvas empty (spec 055).
+        const allTrees = STANDALONE_VIEWS.includes(this.viewMode) ? null : await this.getAllTreesForCrossTreeMatching();
+        if (seq !== this.renderSeq) return;
+
+        // A live load: the tree as it stands now, for matching the cards and the scene.
+        let live: LiveRender | null = null;
+        if (liveLoad) {
+            this.finishChildrenTransition();
+            const cards = new Map<PersonId, HTMLElement>();
+            canvas.querySelectorAll<HTMLElement>(':scope > .person-card[data-id]').forEach(c => cards.set(c.dataset.id as PersonId, c));
+            if (cards.size > 0 && !STANDALONE_VIEWS.includes(this.viewMode)) {
+                live = {
+                    previous: liveLoad.previous, quiet: liveLoad.quiet,
+                    positions: new Map(this.positions), connections: this.connections, spouseLines: this.spouseLines,
+                    lines: svg.cloneNode(true) as SVGSVGElement, linesHtml: svg.innerHTML,
+                    cards, allCards: new Map(cards), kept: new Set(), redrawn: new Set(), fresh: [], last: null,
+                };
+            } else {
+                closeOpenBubble();
+                UI.hideCrossTreeChooser?.();
+            }
+        }
+
+        // Clear previous render (a live load keeps the cards: matched below)
+        if (!live) canvas.querySelectorAll('.person-card').forEach(c => c.remove());
         svg.innerHTML = '';
         this.positions.clear();
         this.connections = [];
@@ -537,15 +749,25 @@ class TreeRendererClass {
         this.lineLinks = new Map();
         this.generationBands = [];
         this.layoutBands = [];
+        this.layoutGapExtra = null;
         this.viewLayer = null;
-        this.outputLayoutCache = null;
+        this.outputLayoutCache.clear();
 
         const persons = DataManager.getAllPersons();
         // The first render knows whether the tree is empty: the welcome may show now.
         document.documentElement.classList.remove('app-booting');
         if (persons.length === 0) {
-            if (empty) empty.style.display = 'block';
+            if (live) canvas.querySelectorAll('.person-card').forEach(c => c.remove());
             this.focusPersonId = null;
+            // The Table view keeps its bar and says in place of the grid that it is empty (spec 073 §13a).
+            if (this.viewMode === 'table') {
+                if (empty) empty.style.display = 'none';
+                this.showTableView(canvas);
+                return;
+            }
+            if (empty) empty.style.display = 'block';
+            const table = document.getElementById('table-container');
+            if (table) table.style.display = 'none';
             this.updateFocusUI();
             UI.updateViewLinksIndicator?.();
             return;
@@ -556,6 +778,13 @@ class TreeRendererClass {
         if (!this.focusPersonId || !DataManager.getPerson(this.focusPersonId)) {
             this.focusPersonId = this.findDefaultFocusPerson();
             if (!this.focusPersonId) return;
+        }
+
+        // The table lists the whole tree (spec 073 §1.6): it runs no layout and
+        // leaves the diagram's selection of people as it is.
+        if (this.viewMode === 'table') {
+            this.showTableView(canvas);
+            return;
         }
 
         // Compute layout using the new layout engine
@@ -578,10 +807,15 @@ class TreeRendererClass {
         const { lines: valueLines, years, height: heightMode } = fieldCards ?? SettingsManager.getCardFields();
         const ownHeights = custom && heightMode === 'content';
         const spouseLineY = custom ? customCardSpouseLineY(valueLines, years, heightMode) : undefined;
+        // Spacing (Settings → Spacing): the gaps of the tree views; the views
+        // drawn their own way (fan, timeline, map) keep the normal layout.
+        const dense = SettingsManager.getTreeSpacing() === 'dense' && !STANDALONE_VIEWS.includes(this.viewMode);
+        canvas.classList.toggle('tree-dense', dense);
         this.config = {
-            ...this.config, ...size, spouseLineY, personHeights: undefined,
+            ...layoutConfigFor(dense ? 'dense' : 'normal'), ...size, spouseLineY, personHeights: undefined,
             ...(custom && this.customMetrics ? { cardWidth: this.customMetrics.cardWidth, cardHeight: this.customMetrics.cardHeight } : {}),
             ...(ownHeights && this.customMetrics?.personHeights ? { personHeights: this.customMetrics.personHeights } : {}),
+            ...(density === 'normal' && this.normalHeights ? { personHeights: this.normalHeights } : {}),
         };
         document.body.dataset.cardDensity = density;
         // The cards of details share one look (index.html body[data-card-fields]).
@@ -597,6 +831,9 @@ class TreeRendererClass {
         this.updatePlacesDatalist();
         // Links "linked in the view only": the Family and Descendants views lay them out as if real.
         const viewLinks = this.currentViewLinks();
+        // The button of a family outside the tree gets its room under the family's top couple.
+        const islandRoom = this.viewLinkIslandRoom(viewLinks);
+        if (islandRoom) this.config = { ...this.config, roomBelow: islandRoom };
         let result = this.computeTreeLayout(descendantsOnly, viewLinks);
         if (custom) {
             const metrics = this.measureCustomCards(result.positions);
@@ -622,9 +859,28 @@ class TreeRendererClass {
             });
         } else {
             this.customMetrics = null;
+            // A Normal card whose name takes more than two rows is taller (T40):
+            // measured for the people laid out, laid out again when that changes
+            // a card's height.
+            if (density === 'normal') {
+                const heights = this.normalNameHeights(result.positions);
+                const measured: LayoutConfig = { ...this.config, personHeights: heights ?? undefined };
+                if (!sameCardSizes(this.config, measured, result.positions.keys())) {
+                    this.config = measured;
+                    result = this.computeTreeLayout(descendantsOnly, viewLinks);
+                } else this.config = measured;
+                this.normalHeights = heights;
+                // Measured before the card fonts were in: measure again once they are.
+                cardFontsPending()?.then(() => {
+                    if (seq !== this.renderSeq || SettingsManager.getCardDensity() !== 'normal') return;
+                    const again: LayoutConfig = { ...this.config, personHeights: this.normalNameHeights(this.positions) ?? undefined };
+                    if (!sameCardSizes(this.config, again, this.positions.keys())) this.render();
+                });
+            } else this.normalHeights = null;
             this.edgeRoomIds.clear();
             this.edgeRightIds.clear();
             this.edgeLeftIds.clear();
+            this.statusRoomIds.clear();
             this.customLines.clear();
             this.customRows.clear();
             this.customHeads.clear();
@@ -638,6 +894,7 @@ class TreeRendererClass {
         this.lineLinks = lineLinksOf(this.omittedEdges);
         this.spouseLines = result.spouseLines;
         this.layoutBands = result.bands ?? [];
+        this.layoutGapExtra = result.gapExtra ?? null;
         this.viewLayer = result.viewLayer ?? null;
         this.depthEdge = new Set(result.ancestorDepthEdge ?? []);
         if (!descendantsOnly) this.pruneParentsShown(result.extraDepthDrawn ?? []);
@@ -655,15 +912,19 @@ class TreeRendererClass {
         // §5.2: leaving the Fan view forgets its way back.
         if (this.viewMode !== 'fan') this.fanView?.deactivate();
         // Chrome that belongs to some views only (the evidence pill) reads it here.
-        const leftFan = document.body.dataset.viewMode === 'fan' && this.viewMode !== 'fan';
+        // A followed research's card stood below the Fan or the Table view's bar: back at the top it is placed again.
+        const leftFan = (document.body.dataset.viewMode === 'fan' && this.viewMode !== 'fan') || document.body.dataset.viewMode === 'table';
         document.body.dataset.viewMode = this.viewMode;
         for (const [mode, view] of Object.entries(standalone)) {
             const el = document.getElementById(view.id);
             if (el) el.style.display = mode === this.viewMode ? view.display : 'none';
         }
+        const table = document.getElementById('table-container');
+        if (table) table.style.display = 'none';
         if (active) {
             const el = document.getElementById(active.id);
             if (el) {
+                if (live) canvas.querySelectorAll('.person-card').forEach(c => c.remove());
                 canvas.style.display = 'none';
                 active.draw(el);
                 this.updateFocusUI();
@@ -678,16 +939,20 @@ class TreeRendererClass {
 
         canvas.style.display = '';
 
-        const current = await this.renderCards(canvas, seq);
-        if (!current) return;
+        this.renderCards(canvas, allTrees, live);
         this.renderLines(svg);
         this.renderEdgeLinks(svg, canvas);
         this.renderViewLinkLabels(canvas);
         this.renderViewLinkIslands(canvas);
         this.updateSVGSize(svg);
+        this.applyCardTrail(canvas);
         // Fit long names once, after the cards are in the DOM and measurable.
-        // Printing: now, the page is printed before the next frame.
-        if (this.printing) this.fitCardNames(canvas);
+        // Printing: now, the page is printed before the next frame. A live
+        // load: the new cards now (the kept ones are fitted), before a frame
+        // shows them unfitted.
+        if (live) {
+            if (live.fresh.length > 0) this.fitCardNames(canvas, 0, live.fresh);
+        } else if (this.printing) this.fitCardNames(canvas);
         else requestAnimationFrame(() => this.fitCardNames(canvas));
 
         // Update focus UI (shows panel with focused person name, generation controls)
@@ -704,8 +969,204 @@ class TreeRendererClass {
         UI.updateGenLabels?.();
         // "Linked in the view only · n" over the view, the open list in step.
         UI.updateViewLinksIndicator?.();
-        // Pills on a bottom edge came out otherwise than measured: once more at their size.
-        if (this.edgeRoomRerenderSeq === seq && seq === this.renderSeq) this.render();
+        // Pills on a bottom edge came out otherwise than measured: once more at their size
+        // (after a live load's scene, quietly: the same data, the cards kept).
+        const again = this.edgeRoomRerenderSeq === seq && seq === this.renderSeq;
+        if (live) this.playLive(canvas, svg, live, again ? () => {
+            if (seq === this.renderSeq) void this.renderInternal({ previous: DataManager.getData(), quiet: true });
+        } : null);
+        else if (again) this.render();
+    }
+
+    /**
+     * After a live load's drawing (renderInternal): the cards that left go,
+     * the view keeps the anchor in place, the scene plays, new people out of
+     * the view get a notch at the edge, the screen reader hears what changed.
+     * `then`: runs once the scene ends.
+     */
+    private playLive(canvas: HTMLElement, svg: SVGSVGElement, live: LiveRender, then: (() => void) | null): void {
+        // An open bubble stays only on a card kept on its place.
+        const owner = openBubbleOwner()?.closest<HTMLElement>('.person-card');
+        const ownerId = owner?.dataset.id as PersonId | undefined;
+        if (owner && (!owner.isConnected || !ownerId || !live.kept.has(ownerId)
+            || live.positions.get(ownerId)?.x !== this.positions.get(ownerId)?.x || live.positions.get(ownerId)?.y !== this.positions.get(ownerId)?.y)) {
+            closeOpenBubble();
+        }
+        if (live.redrawn.size > 0 || live.cards.size > 0) UI.hideCrossTreeChooser?.();
+
+        const data = DataManager.getData();
+        const diff = live.quiet ? { added: [], removed: [], changed: new Map(), merged: new Map(), moved: [] } as LiveDiff : diffLive(live.previous, data);
+        // A person drawn anew but not in the data's change (a relation came or went): no ring.
+        // The anchor: the focus, or the kept card nearest the middle of the view.
+        const container = document.getElementById('tree-container');
+        let anchorId: PersonId | null = this.focusPersonId && live.positions.has(this.focusPersonId) && this.positions.has(this.focusPersonId) ? this.focusPersonId : null;
+        if (!anchorId && container) {
+            const { scale, tx, ty } = ZoomPan.getTransform();
+            const cx = (container.clientWidth / 2 - tx) / scale, cy = (container.clientHeight / 2 - ty) / scale;
+            let best = Infinity;
+            for (const [id, p] of live.positions) {
+                if (!this.positions.has(id)) continue;
+                const d = Math.hypot(p.x - cx, p.y - cy);
+                if (d < best) { best = d; anchorId = id; }
+            }
+        }
+        const shift = anchorId ? this.keepCardInPlace(anchorId, live.positions, false) : { x: 0, y: 0 };
+        const anchorBox = anchorId ? this.cardBox(anchorId) : null;
+        const anchor = anchorBox ? { x: (anchorBox.left + anchorBox.right) / 2, y: (anchorBox.top + anchorBox.bottom) / 2 } : { x: 0, y: 0 };
+
+        const coarse = window.matchMedia?.('(pointer: coarse)').matches === true;
+        const compact = isCompactMotion(window.innerWidth, coarse);
+        const phone = window.innerWidth <= MOBILE_MAX || window.matchMedia?.(MQ_PHONE_LANDSCAPE).matches === true;
+        const cap = childrenTransitionTiming('open', compact).cap;
+        let moves = 0;
+        for (const [id, p] of this.positions) {
+            const was = live.positions.get(id);
+            if (was && (Math.abs(was.x + shift.x - p.x) > 0.5 || Math.abs(was.y + shift.y - p.y) > 0.5)) moves++;
+        }
+        const canAnimate = typeof Element.prototype.animate === 'function';
+        const motion = canAnimate && liveMotionOn(getLiveMotion(), this.reducedMotion()) && (this.viewMode === 'family' || this.viewMode === 'descendants');
+        const overLimit = liveChangeCount(diff) > LIVE.maxChangedForScene || moves > cap * 3;
+        const colorOf = (id: PersonId) => this.liveHooks.colorOf?.(id) ?? 'var(--follow-c1)';
+        const leave = new Map(live.cards);
+
+        const done = (): void => {
+            if (this.childrenTransition === handle) this.childrenTransition = null;
+            container?.removeEventListener('pointerdown', cut, true);
+            container?.removeEventListener('wheel', cut, true);
+            if (!live.quiet) this.liveHooks.onLoaded?.(diff);
+            then?.();
+        };
+        const cut = (e: Event): void => {
+            // A touch drag does not cut the scene short (the finger is often still on the glass).
+            if (e.type === 'pointerdown' && (e as PointerEvent).pointerType === 'touch') return;
+            handle?.finish();
+        };
+        let handle: { finish: () => void } | null = null;
+        if (live.quiet || !container) {
+            for (const el of leave.values()) el.remove();
+            done();
+        } else {
+            handle = playLiveScene({
+                diff,
+                before: { positions: live.positions, connections: live.connections, spouseLines: live.spouseLines, data: live.previous, cards: live.allCards, lines: live.lines },
+                after: { positions: this.positions, connections: this.connections, spouseLines: this.spouseLines, data },
+                redrawn: live.redrawn, shift, anchor, linesChanged: svg.innerHTML !== live.linesHtml,
+                motion: motion && !this.printing, overLimit, compact, phone, cap,
+                transform: ZoomPan.getTransform(), container, canvas, svg,
+                cardEl: id => this.cardElement(id),
+                cardSize: id => {
+                    const el = this.cardElement(id) ?? live.allCards.get(id);
+                    return { w: el?.offsetWidth || this.config.cardWidth, h: el?.offsetHeight || this.cardHeightOf(id) };
+                },
+                colorOf,
+                onDone: () => done(),
+            });
+            // The cards that left and the scene did not take: gone now.
+            for (const el of leave.values()) if (el.parentElement === canvas) el.remove();
+            if (handle) {
+                this.childrenTransition = handle;
+                container.addEventListener('pointerdown', cut, true);
+                container.addEventListener('wheel', cut, { capture: true, passive: true });
+            }
+        }
+        if (live.quiet) return;
+        this.showLiveEdges(diff.added, colorOf);
+        announceLive(diff, live.previous, data);
+    }
+
+    /**
+     * §3.4: a new person out of the view gets a notch at the edge of the
+     * tree's area on their side (one per side; several people: their count),
+     * in the session's colour; a click glides to them. It goes after a while
+     * by itself (CSS), the next load replaces it.
+     */
+    private showLiveEdges(added: readonly PersonId[], colorOf: (id: PersonId) => string): void {
+        const container = document.getElementById('tree-container');
+        if (!container) return;
+        container.querySelectorAll('.live-edge').forEach(el => el.remove());
+        if (this.liveEdgeTimer) clearTimeout(this.liveEdgeTimer);
+        this.liveEdgeTimer = null;
+        if (added.length === 0 || (this.viewMode !== 'family' && this.viewMode !== 'descendants')) return;
+        const skip = this.liveHooks.jumpTargets?.() ?? new Set<PersonId>();
+        const { scale, tx, ty } = ZoomPan.getTransform();
+        const w = container.clientWidth, h = container.clientHeight;
+        const bySide = new Map<EdgeSide, Array<{ id: PersonId; at: number; dist: number }>>();
+        for (const id of added) {
+            if (skip.has(id)) continue;
+            const box = this.cardBox(id);
+            if (!box) continue;
+            const rect = { left: box.left * scale + tx, top: box.top * scale + ty, right: box.right * scale + tx, bottom: box.bottom * scale + ty };
+            const spot = edgeNotchSpot(rect, w, h);
+            if (!spot) continue;
+            const cx = (rect.left + rect.right) / 2 - w / 2, cy = (rect.top + rect.bottom) / 2 - h / 2;
+            const list = bySide.get(spot.side) ?? [];
+            list.push({ id, at: spot.at, dist: Math.hypot(cx, cy) });
+            bySide.set(spot.side, list);
+        }
+        const L = strings.live;
+        for (const [side, list] of bySide) {
+            list.sort((a, b) => a.dist - b.dist);
+            const first = list[0];
+            const person = DataManager.getPerson(first.id);
+            const name = person ? shownNameFull(person, '?') : '?';
+            const at = list.reduce((sum, it) => sum + it.at, 0) / list.length;
+            const span = side === 'left' || side === 'right' ? h : w;
+            const pos = Math.max(LIVE.edge.corner + LIVE.edge.length / 2, Math.min(span - LIVE.edge.corner - LIVE.edge.length / 2, at));
+            const label = list.length === 1 ? L.edgeAdded(name) : L.edgeAddedMany(list.length);
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = `live-edge live-edge--${side}`;
+            btn.style.setProperty('--live-c', colorOf(first.id));
+            btn.style.setProperty('--live-edge-at', `${pos}px`);
+            btn.setAttribute('aria-label', L.edgeShowAria(name));
+            btn.innerHTML = `<span class="live-edge__mark" aria-hidden="true"></span><span class="live-edge__tip" aria-hidden="true">${this.escapeHtml(label)}</span>`;
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                btn.remove();
+                ZoomPan.glideToPerson(first.id);
+            });
+            btn.addEventListener('animationend', (e) => { if (e.animationName === 'live-edge-life') btn.remove(); });
+            container.appendChild(btn);
+        }
+        // Without the animation's end (a hidden page, reduced motion): gone after its time anyway.
+        const life = LIVE.edge.in[1] + LIVE.edge.holdMs + LIVE.edge.outMs + 200;
+        this.liveEdgeTimer = setTimeout(() => {
+            container.querySelectorAll<HTMLElement>('.live-edge').forEach(el => {
+                if (!el.matches(':hover, :focus-visible')) {
+                    el.remove();
+                    return;
+                }
+                // Kept while pointed at or focused; afterwards gone with its animation, or at once without one.
+                const later = () => { if (el.getAnimations().length === 0) el.remove(); };
+                el.addEventListener('mouseleave', later, { once: true });
+                el.addEventListener('blur', later, { once: true });
+            });
+            this.liveEdgeTimer = null;
+        }, life);
+    }
+
+    /** The trail of a followed research on the cards (§3.3): a dot per person worked on lately, older ones fainter. */
+    private applyCardTrail(canvas: HTMLElement): void {
+        canvas.querySelectorAll('.live-trail-dot').forEach(el => el.remove());
+        if (this.viewMode !== 'family' && this.viewMode !== 'descendants') return;
+        const trail = this.liveHooks.cardTrail?.() ?? [];
+        const L = strings.live;
+        trail.forEach((entry, i) => {
+            const card = this.cardElement(entry.personId);
+            if (!card) return;
+            const dot = document.createElement('span');
+            dot.className = 'live-trail-dot';
+            dot.style.setProperty('--live-c', entry.color);
+            dot.style.opacity = String(cardTrailOpacity(i));
+            dot.title = entry.kind === 'added' ? L.trailAdded : L.trailChanged;
+            card.appendChild(dot);
+        });
+    }
+
+    /** The trail on the cards changed (a load, the setting): draw it again, nothing else. */
+    refreshCardTrail(): void {
+        const canvas = document.getElementById('tree-canvas');
+        if (canvas) this.applyCardTrail(canvas);
     }
 
     /**
@@ -874,21 +1335,31 @@ class TreeRendererClass {
      * out (the screen's is as wide as a shown family's longest text too), as
      * the screen would measure it without the links.
      */
-    private outputLayout(): OutputLayout {
-        if (!this.viewLayer || !this.focusPersonId) {
+    private outputLayout(spacing: TreeSpacing = this.getLayoutSpacing()): OutputLayout {
+        const own = spacing === this.getLayoutSpacing();
+        if (!this.focusPersonId || this.positions.size === 0 || (own && !this.viewLayer && !this.config.roomBelow)) {
             return {
                 positions: this.positions, connections: this.withoutEdgeRoom(this.connections, this.edgeRoomIds),
                 spouseLines: this.spouseLines, omittedEdges: this.omittedEdges,
                 box: this.posterBox(this.config, this.edgeRoomIds), custom: this.customMetrics,
             };
         }
-        if (this.outputLayoutCache?.seq === this.renderSeq) return this.outputLayoutCache.output;
+        const cached = this.outputLayoutCache.get(spacing);
+        if (cached?.seq === this.renderSeq) return cached.output;
         const descendantsOnly = this.viewMode === 'descendants';
-        let config = this.config;
+        // Another spacing (the image export's own, spec 069 §4): the same
+        // people at the same card sizes, laid out with that spacing's gaps.
+        // The outputs draw no button of a family outside the tree: no room kept for it.
+        const { roomBelow: _room, ...screen } = this.config;
+        let config: LayoutConfig = own ? screen : withSpacing(screen, spacing);
         let result = this.computeTreeLayout(descendantsOnly, [], false, config);
         let custom: CustomCardMetrics | null = null;
         let edgeRoomIds = new Set<PersonId>();
-        if (this.customMetrics) {
+        if (!this.viewLayer) {
+            // No view link: the screen's people, their cards as the screen measured them.
+            custom = this.customMetrics;
+            edgeRoomIds = new Set(this.edgeRoomIds);
+        } else if (this.customMetrics) {
             const measured = this.customCardsOf(result.positions);
             const next: LayoutConfig = {
                 ...config, cardWidth: measured.metrics.cardWidth, cardHeight: measured.metrics.cardHeight,
@@ -904,7 +1375,7 @@ class TreeRendererClass {
             positions: result.positions, connections: this.withoutEdgeRoom(result.connections, edgeRoomIds),
             spouseLines: result.spouseLines, omittedEdges: result.omittedEdges ?? [], box: this.posterBox(config, edgeRoomIds), custom,
         };
-        this.outputLayoutCache = { seq: this.renderSeq, output };
+        this.outputLayoutCache.set(spacing, { seq: this.renderSeq, output });
         return output;
     }
 
@@ -981,6 +1452,7 @@ class TreeRendererClass {
         this.edgeRoomIds = measured.edgeRoomIds;
         this.edgeRightIds = measured.edgeRightIds;
         this.edgeLeftIds = measured.edgeLeftIds;
+        this.statusRoomIds = measured.statusRoomIds;
         return measured.metrics;
     }
 
@@ -988,6 +1460,8 @@ class TreeRendererClass {
     private customCardsOf(positions: Map<PersonId, Position>): CustomCardsMeasure {
         const data = DataManager.getData();
         const fields = SettingsManager.getEffectiveCardFields() ?? SettingsManager.getCardFields();
+        // The Detailed card shows the whole name on as many rows as it needs (T40), Register and Custom two at most.
+        const nameRows = cardNameMaxRows(SettingsManager.getCardDensity());
         // The years under the name say "1841 †" for one presumed dead, as the detailed card.
         const presumed = fields.years ? this.computePresumedDeceased() : null;
         const lines = new Map<PersonId, CardLine[]>();
@@ -998,8 +1472,13 @@ class TreeRendererClass {
         // wrapped that much narrower.
         const edgeRightIds = new Set<PersonId>();
         const edgeLeftIds = new Set<PersonId>();
+        // The status mark in the bottom-right corner (spec 066 P4 §2): a last line
+        // that may reach its height keeps 22px clear of it (pills keep more).
+        const statusRoomIds = new Set<PersonId>();
+        const signalCtx = this.signalContext();
         const visible = (pid: PersonId) => positions.has(pid);
         let anyBirth = false;
+        this.prepareCrossTreePills(positions.keys(), this.lastCrossTrees);
         for (const id of positions.keys()) {
             const person = DataManager.getPerson(id);
             if (!person) continue;
@@ -1012,25 +1491,33 @@ class TreeRendererClass {
             const reserve = fields.height !== 'content' && personLines.length > 0 && (crossPill || siblingPill || partnersPill);
             if (reserve && (crossPill || siblingPill)) edgeRightIds.add(id);
             if (reserve && partnersPill) edgeLeftIds.add(id);
+            // The status mark: unless the pills' room already covers it (a card of one height
+            // keeps theirs on the last line; a card as tall as its content grows below its text).
+            const pillsGrow = fields.height === 'content' && (crossPill || siblingPill || partnersPill);
+            const statusRoom = personLines.length > 0 && !(reserve && (crossPill || siblingPill)) && !pillsGrow
+                && cardSignalInfo(person, signalCtx).showStatus;
+            if (statusRoom) statusRoomIds.add(id);
             // The birth surname under the name (src/person-name.ts): its row never widens the card.
             const birth = birthNoteText(shownNameParts(person, '?').birthNote);
             if (birth) anyBirth = true;
             entries.push({
                 name: shownName(person, '?'), avatar: !person.isPlaceholder, lines: personLines,
                 ...(birth ? { birth } : {}),
+                // A whole name on rows ends before the lock of a locked card (index.html, 5px).
+                ...(nameRows === 0 && DataManager.isPersonLocked(id) ? { nameReserve: CARD_LOCK_NAME_ROOM } : {}),
                 ...(presumed ? { years: cardYears(person, presumed.has(id)) } : {}),
-                ...(reserve ? { lastLineReserve: (crossPill ? CARD_EDGE_PILL_RIGHT : 0) + (siblingPill ? SIBLING_ORDER_PILL_RIGHT : 0)
-                    + (partnersPill ? CARD_EDGE_PILL_LEFT : 0) } : {}),
+                ...(reserve || statusRoom ? { lastLineReserve: (reserve ? bottomRightPillsRoom(crossPill, siblingPill)
+                    + (partnersPill ? CARD_EDGE_PILL_LEFT : 0) : 0) + (statusRoom ? CARD_STATUS_MARK_ROOM : 0) } : {}),
             });
         }
         // The chosen width's cap (narrow / medium / wide); the poster takes this width too.
         // The date column at most as wide as the language's ordinary dates; a longer date goes its own way.
         const metrics = customCardMetrics(entries, measureCardTexts, fields.widthCap, fields.lines, fields.style,
             cardDateReferences(fields.fullDate));
-        const { rows, heights, heads } = customCardRows(entries, metrics, measureCardTexts, fields.lines, fields.style);
+        const { rows, heights, heads } = customCardRows(entries, metrics, measureCardTexts, fields.lines, fields.style, nameRows);
         const measured = {
             lines, rows, wrapped: fields.lines !== 1, style: fields.style,
-            heads: new Map(ids.map((id, i) => [id, heads[i]])), edgeRoomIds: new Set<PersonId>(), edgeRightIds, edgeLeftIds,
+            heads: new Map(ids.map((id, i) => [id, heads[i]])), edgeRoomIds: new Set<PersonId>(), edgeRightIds, edgeLeftIds, statusRoomIds,
         };
         if (fields.height === 'content') {
             // Each card as tall as its own content; the view's height is its tallest
@@ -1048,6 +1535,21 @@ class TreeRendererClass {
             return { ...measured, metrics: { ...metrics, cardHeight: tallest, personHeights: new Map(ids.map((id, i) => [id, heights[i]])) } };
         }
         return { ...measured, metrics: { ...metrics, cardHeight: customCardViewHeight(fields.on.length, fields.lines, heights, fields.years, anyBirth) } };
+    }
+
+    /**
+     * The Normal cards among `positions` whose name takes more than two rows,
+     * with their height (src/card-width.ts normalCardHeights); null: none.
+     */
+    private normalNameHeights(positions: ReadonlyMap<PersonId, Position>): Map<PersonId, number> | null {
+        const names = new Map<PersonId, NormalCardName>();
+        for (const id of positions.keys()) {
+            const person = DataManager.getPerson(id);
+            if (!person) continue;
+            const { given, surname } = shownNameParts(person, '?');
+            names.set(id, { given, surname, avatar: !person.isPlaceholder });
+        }
+        return normalCardHeights(names, measureCardTexts);
     }
 
     /** The custom card's width and date column of the drawn view (null in other densities). */
@@ -1070,13 +1572,18 @@ class TreeRendererClass {
      * (outputLayout: the screen's when no link is shown), without the room a
      * card measured with pills on its bottom edge keeps (no pills there).
      */
-    getPosterCardBox(): CardBox {
-        return this.outputLayout().box;
+    getPosterCardBox(spacing?: TreeSpacing): CardBox {
+        return this.outputLayout(spacing).box;
     }
 
     /** The custom card's width and columns the image export and the book draw (null in other densities). */
-    getPosterCardMetrics(): CustomCardMetrics | null {
-        return this.outputLayout().custom;
+    getPosterCardMetrics(spacing?: TreeSpacing): CustomCardMetrics | null {
+        return this.outputLayout(spacing).custom;
+    }
+
+    /** The spacing the current view is laid out with (Settings → Spacing; the fan, timeline and map: normal). */
+    getLayoutSpacing(): TreeSpacing {
+        return this.config.dense ? 'dense' : 'normal';
     }
 
     /** A drawn person's card height: its own ("by content"), else the view's. */
@@ -1159,6 +1666,22 @@ class TreeRendererClass {
         if (!person) return { left: false, right: false };
         const left = this.partnersPillOf(id, visible) !== null;
         return { left, right: this.hasCrossTreePill(person, crossTrees) || this.siblingOrderCandidate(id) };
+    }
+
+    /**
+     * Match the people of these cards to the other trees at once (one
+     * matching pass for all of them, cached): asked card by card, each would
+     * work out every tree's surname rules again.
+     */
+    private prepareCrossTreePills(ids: Iterable<PersonId>, crossTrees: Map<TreeId, { name: string; data: StromData }> | null): void {
+        const treeId = DataManager.getCurrentTreeId();
+        if (!crossTrees || !treeId) return;
+        const persons: Person[] = [];
+        for (const id of ids) {
+            const person = DataManager.getPerson(id);
+            if (person) persons.push(person);
+        }
+        CrossTree.prepareCrossTreeMatches(treeId, persons, crossTrees);
     }
 
     /** The card carries the ⇄ pill (the person is in other trees too) on its bottom-right edge. */
@@ -2012,12 +2535,19 @@ class TreeRendererClass {
      * every card's drift on the screen for that. Returns the shift (world
      * units: what stood at a world point now stands at the point plus it).
      */
-    private keepCardInPlace(anchorId: PersonId, beforeAll: ReadonlyMap<PersonId, Position>, restore: boolean): { x: number; y: number } {
+    private keepCardInPlace(anchorId: PersonId, beforeAll: ReadonlyMap<PersonId, Position>, restore: boolean,
+        beforeSize?: { w: number; h: number }): { x: number; y: number } {
         const before = beforeAll.get(anchorId), after = this.positions.get(anchorId);
         let sx = 0, sy = 0;
         if (before && after) {
             sx = after.x - before.x;
             sy = after.y - before.y;
+            // Anchored on the card's centre: the card itself may have changed its size (card type).
+            const box = beforeSize ? this.cardBox(anchorId) : null;
+            if (beforeSize && box) {
+                sx += (box.right - box.left - beforeSize.w) / 2;
+                sy += (box.bottom - box.top - beforeSize.h) / 2;
+            }
             const drift = this.childrenShownDrift.get(anchorId);
             if (restore && drift) { sx += drift.x; sy += drift.y; }
         }
@@ -2034,6 +2564,60 @@ class TreeRendererClass {
         }
         if (sx || sy) ZoomPan.shiftWorld(sx, sy);
         return { x: sx, y: sy };
+    }
+
+    /**
+     * The card that holds the view when the whole tree is laid out anew
+     * (spacing, card type): the focus when its card is wholly in the view,
+     * otherwise the card whose centre is nearest the view's centre. Null in
+     * the views of their own (fan, timeline, map, table) or with no card drawn.
+     */
+    private viewAnchorCard(): PersonId | null {
+        if (STANDALONE_VIEWS.includes(this.viewMode)) return null;
+        const container = document.getElementById('tree-container');
+        if (!container || this.positions.size === 0) return null;
+        const { scale, tx, ty } = ZoomPan.getTransform();
+        const vw = container.clientWidth, vh = container.clientHeight;
+        if (vw <= 0 || vh <= 0) return null;
+        const screenBox = (box: ChildrenRect) => ({
+            left: box.left * scale + tx, top: box.top * scale + ty,
+            right: box.right * scale + tx, bottom: box.bottom * scale + ty,
+        });
+        const focus = this.focusPersonId;
+        const focusBox = focus ? this.cardBox(focus) : null;
+        if (focus && focusBox) {
+            const b = screenBox(focusBox);
+            if (b.left >= 0 && b.top >= 0 && b.right <= vw && b.bottom <= vh) return focus;
+        }
+        const sizes = new Map<string, { w: number; h: number }>();
+        document.querySelectorAll<HTMLElement>('#tree-canvas .person-card[data-id]').forEach(el => {
+            if (el.dataset.id) sizes.set(el.dataset.id, { w: el.offsetWidth, h: el.offsetHeight });
+        });
+        let best: PersonId | null = null, bestD = Infinity;
+        for (const [id, p] of this.positions) {
+            const size = sizes.get(id);
+            if (!size) continue;
+            const dx = (p.x + size.w / 2) * scale + tx - vw / 2;
+            const dy = (p.y + size.h / 2) * scale + ty - vh / 2;
+            const d = dx * dx + dy * dy;
+            if (d < bestD) { bestD = d; best = id; }
+        }
+        return best;
+    }
+
+    /**
+     * Draw the view again after a change that lays the whole tree out anew
+     * (tree spacing, card type), at once and without a transition, keeping
+     * the anchor card's centre on the same place of the screen (spec 069 D3).
+     * The zoom does not change.
+     */
+    async renderKeepingView(): Promise<void> {
+        const anchorId = this.viewAnchorCard();
+        const box = anchorId ? this.cardBox(anchorId) : null;
+        const beforeAll = new Map(this.positions);
+        await this.renderInternal();
+        if (!anchorId || !box || !this.positions.has(anchorId)) return;
+        this.keepCardInPlace(anchorId, beforeAll, false, { w: box.right - box.left, h: box.bottom - box.top });
     }
 
     // ---------- §1 the transition, §5 the zoom ----------
@@ -3110,9 +3694,25 @@ class TreeRendererClass {
     /** Switch the display view mode and re-render. Persisted per tree. */
     setViewMode(mode: ViewMode): void {
         if (this.viewMode === mode) return;
+        // The Table view and the others share the person in focus (spec 073 U9):
+        // the table's active row's person goes along, and the table opens at the focus.
+        const fromTable = this.viewMode === 'table' ? UI.tableFocusPerson?.(this.focusPersonId) ?? null : null;
+        if (mode === 'table') UI.tableTakeFocus?.(this.focusPersonId);
         this.viewMode = mode;
         this.resetChildrenShown();
         this.persistViewMode();
+        // Following the research agent opens the fan around its own centre
+        // (the person focused before following, a pinned or a chosen one).
+        const centre = mode === 'fan' ? UI.liveFollowFanCenter?.() ?? null : null;
+        if (centre && centre !== this.focusPersonId && DataManager.getPerson(centre)) {
+            this.fanView?.deactivate();
+            void this.setFocus(centre, false);
+            return;
+        }
+        if (fromTable && fromTable !== this.focusPersonId && DataManager.getPerson(fromTable)) {
+            void this.setFocus(fromTable, true, () => this.centerForViewMode());
+            return;
+        }
         // The modes lay the tree out in different coordinate frames — the
         // pan/zoom state from the previous mode can leave every card outside
         // the viewport (reported on a live tree: switching to descendants
@@ -3497,7 +4097,7 @@ class TreeRendererClass {
      * a place offers what this family already uses (see src/places.ts — nothing
      * is downloaded). Most-used first: the browser keeps datalist order.
      */
-    private updatePlacesDatalist(): void {
+    updatePlacesDatalist(): void {
         const list = document.getElementById('places-datalist');
         if (!list) return;
         const places = placeList(DataManager.getData());
@@ -3569,19 +4169,6 @@ class TreeRendererClass {
             if (!this.highlightIds) return;
             const id = bar.getAttribute('data-person-id') as PersonId | null;
             if (id) bar.classList.add(this.highlightIds.has(id) ? 'search-hit' : 'search-dim');
-        });
-    }
-
-    /**
-     * Mark the people a live research change just touched ('live-changed').
-     * Pass null to clear. Class toggling only; re-applied on every render.
-     */
-    setChangedIds(ids: Set<PersonId> | null): void {
-        this.changedIds = ids && ids.size > 0 ? ids : null;
-        document.querySelectorAll('.person-card').forEach(el => {
-            const card = el as HTMLElement;
-            const id = card.dataset.id as PersonId | undefined;
-            card.classList.toggle('live-changed', !!(id && this.changedIds?.has(id)));
         });
     }
 
@@ -3764,13 +4351,14 @@ class TreeRendererClass {
      * poster export, the book and the minimap. Empty when nothing is rendered.
      * The outputs lay out WITHOUT the links "linked in the view only" (their
      * own layout of the view; `includeView: true` — the minimap — takes the
-     * screen's, ghosts and all).
+     * screen's, ghosts and all). `spacing`: laid out with that spacing (the
+     * image export's own, spec 069 §4); the view's when absent.
      */
-    getPosterLayout(opts: { includeView?: boolean } = {}): {
+    getPosterLayout(opts: { includeView?: boolean; spacing?: TreeSpacing } = {}): {
         positions: Map<PersonId, Position>; connections: Connection[]; spouseLines: SpouseLine[]; omittedEdges: OmittedEdge[];
     } {
         if (!opts.includeView) {
-            const { positions, connections, spouseLines, omittedEdges } = this.outputLayout();
+            const { positions, connections, spouseLines, omittedEdges } = this.outputLayout(opts.spacing);
             return { positions, connections, spouseLines, omittedEdges };
         }
         return {
@@ -3832,21 +4420,19 @@ class TreeRendererClass {
         // Don't do cross-tree matching in view mode, or when the user turned
         // the connection badges off (also skips the per-tree decrypt cost).
         if (DataManager.isViewMode()) return null;
-        if (!SettingsManager.isCrossTreeBadgesEnabled()) return null;
+        if (!SettingsManager.getCardSignals().crossTree) return null;
 
         // Cached per tree (stamped by lastModifiedAt): loading + decrypting
         // every tree's data on every render was a real cost on big setups.
         return CrossTree.getTreesDataForMatching(TreeManager);
     }
 
-    /** Returns false when a newer render superseded this one during the await. */
-    private async renderCards(canvas: HTMLElement, seq: number): Promise<boolean> {
-        // Get all trees for cross-tree matching (only if not in view mode)
-        const allTrees = await this.getAllTreesForCrossTreeMatching();
-        if (seq !== this.renderSeq) return false;
-        // Clear again after the await: nothing may have been added in between,
-        // but a card left by an interrupted render must never survive.
-        canvas.querySelectorAll('.person-card').forEach(c => c.remove());
+    /**
+     * Draw the cards (synchronous: the other trees were read before,
+     * renderInternal). A live load (`live`) matches them to the cards drawn
+     * by person id instead of drawing all anew (placeCard).
+     */
+    private renderCards(canvas: HTMLElement, allTrees: Map<TreeId, { name: string; data: StromData }> | null, live: LiveRender | null): void {
         const currentTreeId = DataManager.getCurrentTreeId();
 
         // Optional branch colouring: classify once per render (never in timeline).
@@ -3883,6 +4469,8 @@ class TreeRendererClass {
         const presumedDeceased = this.computePresumedDeceased();
         // At-a-glance signals (evidence, story, action badge): shared context.
         const signalCtx = this.signalContext();
+        // Citations in a tree that knows its facts' origin were made in Strom (the bubble says so).
+        const originKnown = treeKnowsOrigin(signalCtx.data, signalCtx.reliability);
         this.edgeViews = this.computeEdgeViews(signalCtx);
         const edgeAll = this.researchEdgeMode() === 'all';
         const edgeMotion = this.researchEdgeMotion();
@@ -3907,7 +4495,10 @@ class TreeRendererClass {
             { positions: this.positions, spouseLines: this.spouseLines }, DataManager.getData(), this.focusPersonId);
         const orderSlots = this.unionOrderSlots(orderBadges, partnershipChildIds, signalCtx);
         const shownHere = this.shownHereIds();
+        // The ⇄ pills of all the cards in one matching pass (findCrossTreeMatches below reads the cache).
+        this.prepareCrossTreePills(this.positions.keys(), allTrees);
 
+        const normalCard = SettingsManager.getCardDensity() === 'normal';
         for (const [id, pos] of this.positions) {
             const person = DataManager.getPerson(id);
             if (!person) continue;
@@ -3937,7 +4528,6 @@ class TreeRendererClass {
             if (this.highlightIds && !person.isPlaceholder) {
                 classes += this.highlightIds.has(id) ? ' search-hit' : ' search-dim';
             }
-            if (this.changedIds?.has(id)) classes += ' live-changed';
             // A person of a family shown "linked in the view only" (the hook of its look: package C).
             const ghostOf = this.viewLayer?.ghostIds.has(id) ? this.viewLayer.ghostOf.get(id) : undefined;
             if (ghostOf) classes += ' view-ghost';
@@ -3954,17 +4544,26 @@ class TreeRendererClass {
             if (indirectIds?.has(id)) {
                 classes += ' indirect';
             }
-            // An open question about this person (collaboration hint).
-            if (person.question?.trim() && !person.isPlaceholder) {
-                classes += ' has-question';
-            }
             const signals = cardSignalInfo(person, signalCtx);
+            // The other trees the person is also in (the ⇄ pill, its bubble row, the aria-label).
+            const crossTreeMatches: CrossTree.CrossTreeMatch[] = allTrees && currentTreeId && !person.isPlaceholder
+                ? CrossTree.findCrossTreeMatches(currentTreeId, person, allTrees) : [];
+            const crossTreeGroups = CrossTree.groupCrossTreeMatches(crossTreeMatches);
             if (signals.action || signals.showAgent || signals.doneSince !== null) classes += ' has-signal';
+            if (signals.actions.length >= 2) classes += ' has-signal-stack';
+            // The one mark of sources and reliability (spec 066 P4 §1), bottom right inside the card.
+            const statusHtml = signals.showStatus ? statusMarkHtml(signals.status, { mark: true }) : '';
+            if (statusHtml) classes += ' has-status';
+            // A narrow card (compact): the bottom-right edge's pills take their short forms (spec 066 P4 §2).
+            if (this.config.cardWidth < 160) classes += ' edge-narrow';
             card.className = classes;
             card.style.left = pos.x + 'px';
             card.style.top = pos.y + 'px';
             // The height "by content": the card's own height (top-aligned in its band).
-            if (this.config.personHeights) card.style.setProperty('--card-custom-h', `${this.cardHeightOf(id)}px`);
+            // A Normal card whose name takes more than two rows: its own height (T40).
+            if (this.config.personHeights && normalCard) {
+                if (this.config.personHeights.has(id)) card.style.height = `${this.cardHeightOf(id)}px`;
+            } else if (this.config.personHeights) card.style.setProperty('--card-custom-h', `${this.cardHeightOf(id)}px`);
             card.dataset.id = id;
             if (ghostOf) {
                 card.dataset.viewGhost = '';
@@ -3979,12 +4578,30 @@ class TreeRendererClass {
                 if (target.classList.contains('add-btn') || target.classList.contains('branch-tab')) return;
                 // Don't open context menu when clicking on badge buttons or their children
                 if (target.closest('.hidden-partners-btn')) return;
-                // The badge opens what it signals (touch: the person menu, which leads with it).
-                const badge = target.closest<HTMLElement>('.card-signal');
-                if (badge && !window.matchMedia?.('(pointer: coarse)').matches) {
+                // A mark of the card (spec 066 P4 §5 round 2): by touch its bubble with its action;
+                // with a mouse what it signals — the badge, the agent, the story — and the lock and
+                // the sibling order as the card. The status mark is the status tip's (status-tip.ts).
+                const mark = target.closest<HTMLElement>('[data-mark]');
+                const kind = mark?.dataset.mark;
+                // The stack of badges (two or three signals): by mouse, finger or keyboard (a click
+                // without a pointer) the menu of what to open, or straight what the research knows.
+                if (mark && kind === 'badge-stack') {
                     e.stopPropagation();
-                    UI.openCardSignal(id, badge.dataset.signal ?? '');
+                    UI.openCardSignalsMenu(id, mark, e.detail === 0);
                     return;
+                }
+                if (mark && kind !== 'status') {
+                    if (window.matchMedia?.('(pointer: coarse)').matches) {
+                        e.stopPropagation();
+                        UI.openCardMarkTip(id, mark);
+                        return;
+                    }
+                    if (kind === 'badge' || kind === 'agent' || kind === 'story') {
+                        e.stopPropagation();
+                        if (kind === 'story') UI.openPersonStory(id);
+                        else UI.openCardSignal(id, kind === 'agent' ? 'agent' : mark.dataset.signal ?? '');
+                        return;
+                    }
                 }
                 UI.showContextMenu(id, e);
             };
@@ -3994,8 +4611,19 @@ class TreeRendererClass {
             // plain text (never parsed as HTML).
             card.tabIndex = 0;
             card.setAttribute('role', 'button');
-            card.setAttribute('aria-label', this.cardAriaLabel(person, signals));
+            card.setAttribute('aria-label', this.cardAriaLabel(person, signals, {
+                years: cardFields ? '' : cardYears(person),
+                crossTrees: crossTreeGroups.length,
+                locked: DataManager.isPersonLocked(id),
+            }));
             card.addEventListener('keydown', (e) => {
+                // ↓ on the stack of badges opens its menu, as Enter and Space do (their click).
+                const stack = e.key === 'ArrowDown' ? (e.target as HTMLElement).closest?.<HTMLElement>('.card-signal-stack') : null;
+                if (stack) {
+                    e.preventDefault();
+                    UI.openCardSignalsMenu(id, stack, true);
+                    return;
+                }
                 if (e.target !== card || (e.key !== 'Enter' && e.key !== ' ')) return;
                 e.preventDefault();
                 openCardMenuFromKeyboard(card);
@@ -4156,24 +4784,34 @@ class TreeRendererClass {
             const metaPlace = person.birthPlace?.trim() ?? '';
             // Normal cards pack "years · place" onto one ellipsized meta row.
             const metaText = [metaYears, metaPlace].filter(Boolean).join(' · ');
+            // The years with their ranges short, for a row too narrow for them whole (fitCardMetaYears).
+            const metaYearsShort = shortYearRanges(metaYears);
 
-            // Person status: quiet stripes in the card's bottom-right corner, in
+            // Person status: the story's fold in the card's bottom-right corner, in
             // every density (decoration; the tooltip and aria-label say it).
-            const stateHtml = stateStripesHtml(
-                signals.showEvidence && signals.evidence ? signals.evidence.level : null,
-                signals.showStory ? signals.story : null);
+            const stateHtml = storyFoldHtml(signals.showStory ? signals.story : null, false, true);
+            const c = strings.card;
+            // Each mark's own bubble (spec 066 P4 §5 round 2): a mouse over the mark shows it, the card's bubble steps aside.
+            const markTip = (kind: string, head: string, lines: string[], click: string, below = false): string =>
+                markTipHtml(id, kind, head, lines, click, below);
+            const storyTip = stateHtml && signals.story
+                ? markTip('story', c.story.own(''), [storySignalText(signals.story, c.story), c.tipStoryKind], c.tipClickStory, true) : '';
+            // The fold takes the very corner; without it the status mark moves into it (index.html).
+            if (stateHtml) card.classList.add('has-story');
             // The action badge on the avatar's corner (a dot on the card's
             // corner where there is no avatar, or when zoomed far out). Without
             // a badge: the agent's arc circling the avatar (a small ring at the
             // card's corner), or the check once it is done with the person.
-            const signalLabel = signals.action ? this.signalText(signals, signals.action) : '';
+            // Two or three signals: a stack of badges, its bubble a row per signal (src/card-signal-marks.ts).
             let badgeHtml = '';
             let dotHtml = '';
-            if (signals.action) {
-                badgeHtml = `<button type="button" class="card-signal signal-${signals.action}" data-signal="${signals.action}" aria-label="${this.escapeHtml(signalLabel)}">${ACTION_GLYPH[signals.action]}</button>`;
-                dotHtml = `<span class="card-signal-dot signal-${signals.action}" aria-hidden="true"></span>`;
+            const actionMarks = cardActionMarksHtml(id, signals,
+                signals.actions.length >= 2 && signals.waiting ? UI.waitingCountOf(id) : 1);
+            if (actionMarks) {
+                ({ badgeHtml, dotHtml } = actionMarks);
             } else if (signals.showAgent) {
-                badgeHtml = `<span class="card-agent" style="animation-delay:${spinDelay}" aria-hidden="true"></span>`;
+                badgeHtml = `<span class="card-agent-mark" data-mark="agent"><span class="card-agent" style="animation-delay:${spinDelay}" aria-hidden="true"></span></span>`
+                    + markTip('agent', c.tipAgentHead, [clipText(signals.agent ?? '')], c.tipClickAgent);
                 dotHtml = `<span class="card-agent-dot" style="animation-delay:${spinDelay}" aria-hidden="true"></span>`;
             } else if (signals.doneSince !== null) {
                 const since = Math.min(renderedAt - signals.doneSince, AGENT_DONE_MS + AGENT_DONE_FADE_MS);
@@ -4213,11 +4851,13 @@ class TreeRendererClass {
                 ${avatarHtml}
                 <div class="card-body">
                     ${nameHtml}${birthHtml}
-                    ${density !== 'compact' && metaText ? `<div class="birth-date" data-years="${this.escapeHtml(metaYears)}"><span class="meta-text">${this.escapeHtml(metaText)}</span></div>` : ''}
+                    ${density !== 'compact' && metaText ? `<div class="birth-date" data-years="${this.escapeHtml(metaYears)}"${metaYearsShort !== metaYears ? ` data-years-short="${this.escapeHtml(metaYearsShort)}"` : ''}><span class="meta-text">${this.escapeHtml(metaText)}</span></div>` : ''}
                 </div>
             `;
-            // The lock, the status stripes and the corner dot: on every card type, the custom one too (N34).
-            html += `${isLocked ? `<span class="lock-icon" title="${strings.lock.lockedTooltip}">${iconSvg('lock', { size: 10 })}</span>` : ''}${stateHtml}${dotHtml}`;
+            // The lock, the status mark, the fold and the corner dot: on every card type, the custom one too (N34).
+            const lockHtml = isLocked
+                ? `<span class="lock-icon" data-mark="lock">${iconSvg('lock', { size: 10 })}</span>${markTip('lock', c.tipLockHead, [c.tipLock], '')}` : '';
+            html += `${lockHtml}${statusHtml}${stateHtml}${storyTip}${dotHtml}`;
 
             // Chain-link "relations" tab — lives in the top-right edge slot,
             // to the LEFT of the branch tabs so those (always visible, pinned to
@@ -4242,27 +4882,16 @@ class TreeRendererClass {
                 ? addTab('bottom', 'child', strings.contextMenu.addChild, strings.card.addTabChild) : '';
 
             // Cross-tree badge (bottom-right edge slot) if the person exists elsewhere.
-            let crossTreeMatches: CrossTree.CrossTreeMatch[] = [];
             let crossTreeHtml = '';
-            if (allTrees && currentTreeId && !person.isPlaceholder) {
-                crossTreeMatches = CrossTree.findCrossTreeMatches(currentTreeId, person, allTrees);
+            {
                 if (crossTreeMatches.length > 0) {
-                    const tooltipItems = crossTreeMatches.slice(0, 5).map(m =>
-                        `<div class="cross-tree-tooltip-item">
-                            <div class="cross-tree-tooltip-tree">${this.escapeHtml(m.treeName)}</div>
-                            <div class="cross-tree-tooltip-person">${this.escapeHtml(m.personName)}</div>
-                            <div class="cross-tree-tooltip-reason">${this.escapeHtml(CrossTree.matchReasonsText(m))}</div>
-                        </div>`
-                    ).join('');
-                    const moreCount = crossTreeMatches.length > 5 ? crossTreeMatches.length - 5 : 0;
-
-                    // A jump (§2): "⇄ N ↗" in the jump's look, its bubble names the trees and what a click does
-                    crossTreeHtml = `<div class="cross-tree-badge kind-jump" data-person-id="${this.escapeHtml(id)}" aria-label="${this.escapeHtml(strings.crossTree.badgeTitle(crossTreeMatches.length))}">
-                        <span class="pill-glyph">⇄</span><span class="pill-count">${crossTreeMatches.length}</span><span class="pill-glyph pill-jump" aria-hidden="true">↗</span>
+                    // Trees, not people: another tree may hold the same person twice (the bubble says so).
+                    const trees = CrossTree.crossTreeCount(crossTreeMatches);
+                    // "⇄ N": another tree in the app (no ↗, spec 066 P4 §6), its bubble names the trees and what a click does
+                    crossTreeHtml = `<div class="cross-tree-badge" data-mark="cross" data-person-id="${this.escapeHtml(id)}" aria-label="${this.escapeHtml(strings.crossTree.badgeTitle(trees))}">
+                        <span class="pill-glyph">⇄</span><span class="pill-count">${trees}</span>
                         <div class="cross-tree-tooltip">
-                            <div class="cross-tree-tooltip-header">${this.escapeHtml(strings.crossTree.badgeTitle(crossTreeMatches.length))}</div>
-                            ${tooltipItems}
-                            ${moreCount > 0 ? `<div class="cross-tree-tooltip-item">${strings.crossTree.moreMatches(moreCount)}</div>` : ''}
+                            ${CrossTree.crossTreeBubbleHtml(crossTreeMatches, t => this.escapeHtml(t))}
                             <div class="cross-tree-tooltip-hint badge-tooltip-action">${strings.focus.crossTreeHint}</div>
                         </div>
                     </div>`;
@@ -4299,25 +4928,29 @@ class TreeRendererClass {
             // The sibling-order pill (§3): the direct-line card out of its birth place among the shown siblings
             const siblingOrder = this.siblingOrderOf(id);
             const siblingOrderHtml = siblingOrder
-                ? `<span class="sibling-order-pill" aria-hidden="true"><span class="so-text">${this.escapeHtml(strings.focus.siblingOrderPill(siblingOrder.n, siblingOrder.total))}</span>`
-                    + `<span class="badge-tooltip so-tip">${this.escapeHtml(strings.focus.siblingOrderTooltip(siblingOrder.n, siblingOrder.total))}</span></span>`
+                ? `<span class="sibling-order-pill" data-mark="order" aria-hidden="true"><span class="so-text">${this.escapeHtml(strings.focus.siblingOrderPill(siblingOrder.n, siblingOrder.total))}</span>`
+                    + `<span class="so-short">${this.escapeHtml(strings.focus.siblingOrderPillShort(siblingOrder.n, siblingOrder.total))}</span>`
+                    + `<span class="badge-tooltip so-tip below"><span class="badge-tooltip-header">${this.escapeHtml(strings.card.tipSibHead)}</span>`
+                    + `<span class="badge-tooltip-body">${this.escapeHtml(strings.card.tipSib(siblingOrder.n, siblingOrder.total))}</span></span></span>`
                 : '';
             if (siblingOrder) card.setAttribute('aria-label', `${card.getAttribute('aria-label') ?? ''}. ${strings.focus.siblingOrderTooltip(siblingOrder.n, siblingOrder.total)}`);
             // A candidate keeps the pill's room whether or not the pill is drawn (measured before the layout)
             const siblingRoom = this.siblingOrderCandidate(id);
             if (crossTreeHtml || siblingOrderHtml) {
                 html += `<div class="card-edge edge-bottom-right">${siblingOrderHtml}${crossTreeHtml}</div>`;
-                // The pill reaches 9 px into the card: the status stripes rise above it.
+                // The pills reach 9 px into the card, 40 px before its corner (the status mark stays there).
                 card.classList.add('has-edge-br');
             }
             // The room on the card: where the pill stands, or where a card of one height was wrapped for it
             if (siblingOrderHtml || (siblingRoom && this.edgeRightIds.has(id))) {
                 card.classList.add('has-edge-br');
-                card.style.setProperty('--edge-br-room', `${SIBLING_ORDER_PILL_RIGHT + (crossTreeHtml ? CARD_EDGE_PILL_RIGHT : 0)}px`);
+                card.style.setProperty('--edge-br-room', `${bottomRightPillsRoom(!!crossTreeHtml, true)}px`);
             }
             const rightPills = !!crossTreeHtml || siblingRoom;
             // A card of details measured with the pills' room keeps its text above them (index.html .has-edge-room).
             if (this.edgeRoomIds.has(id)) card.classList.add('has-edge-room');
+            // Its last line wrapped clear of the status mark alone (index.html .has-status-room).
+            if (this.statusRoomIds.has(id)) card.classList.add('has-status-room');
             if (measuresEdgeRoom && this.edgeRoomIds.has(id) !== !!(hiddenIndicatorsHtml || rightPills)) edgeRoomStale = true;
             // A card of one height: its last line wrapped clear of the ⇄ pill exactly when the pill is there.
             if (customLines?.length && !measuresEdgeRoom && this.edgeRightIds.has(id) !== rightPills) edgeRoomStale = true;
@@ -4405,7 +5038,7 @@ class TreeRendererClass {
                     : strings.tooltip.childrenCount(ttUnions.otherChildren));
             }
 
-            const ttSignals = this.tooltipSignalRows(signals);
+            const ttSignals = this.tooltipSignalRows(signals, originKnown, crossTreeGroups);
             // A ghost's last row: linked in the view only, by which hypothesis and version.
             const ttViewLink = ghostOf
                 ? `<div class="tt-line tt-view-link"><span class="view-link-icon" aria-hidden="true"></span>${this.escapeHtml(strings.viewLinks.tooltip(ghostOf.hypo, ghostOf.variant))}</div>`
@@ -4418,8 +5051,10 @@ class TreeRendererClass {
                     ttRecorded ? `<div class="tt-line tt-warn">${this.escapeHtml(ttRecorded)}</div>` : '',
                     ...ttRelLines.map(line => `<div class="tt-line tt-rel">${line}</div>`),
                     ttSignals ? `<div class="tt-signals">${ttSignals}</div>` : '',
+                    // The sibling order, shown here only when its pill had to give way (index.html .so-retreat).
+                    siblingOrder ? `<div class="tt-line tt-so">${this.escapeHtml(strings.focus.siblingOrderTooltip(siblingOrder.n, siblingOrder.total))}</div>` : '',
                     ttViewLink,
-                    `<div class="tt-foot">${strings.tooltip.gestureHint}</div>`,
+                    `<div class="tt-foot">${this.escapeHtml(strings.card.ttFooter)}</div>`,
                 ].filter(Boolean).join('');
                 // A photo (round 9): reuse the SAME thumbnail the card avatar shows
                 // (person.photo) — no extra load, so the hover card never waits on
@@ -4453,6 +5088,19 @@ class TreeRendererClass {
                 const tip = host.querySelector<HTMLElement>(':scope > .badge-tooltip');
                 if (tip) this.bindTabBubble(host, tip);
             });
+            // The dense spacing's short marriage-order pill ("∞ 2", D1): its bubble
+            // says it all, by a mouse, the keyboard, a long press and a tap
+            const shortOrder = card.querySelector<HTMLElement>('.union-order-pill[data-label="short"]');
+            const shortOrderTip = shortOrder?.querySelector<HTMLElement>(':scope > .uo-tip');
+            if (shortOrder && shortOrderTip) {
+                this.bindTabBubble(shortOrder, shortOrderTip);
+                shortOrder.addEventListener('click', (e) => {
+                    if ((e as PointerEvent).pointerType !== 'touch' || e.target instanceof Element && e.target.closest('.uo-tip')) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.bubbleOpeners.get(shortOrder)?.();
+                });
+            }
 
             // The children tab shows (hides) the children in place
             const childrenTab = card.querySelector<HTMLElement>('.branch-tab.children-tab');
@@ -4547,6 +5195,11 @@ class TreeRendererClass {
             if (crossTreeBadge && currentTreeId && crossTreeMatches.length > 0) {
                 crossTreeBadge.addEventListener('click', (e) => {
                     e.stopPropagation();
+                    // By touch its bubble first, with "Go to the tree" as its button.
+                    if (window.matchMedia?.('(pointer: coarse)').matches) {
+                        UI.openCardMarkTip(id, crossTreeBadge as HTMLElement);
+                        return;
+                    }
                     if (crossTreeMatches.length === 1) {
                         UI.switchToTreeAndFocus(crossTreeMatches[0].treeId, crossTreeMatches[0].personId);
                     } else {
@@ -4555,14 +5208,73 @@ class TreeRendererClass {
                 });
             }
 
-            canvas.appendChild(card);
+            this.placeCard(canvas, card, id, live);
         }
+        this.yieldSiblingOrderPills(canvas);
         // Measure again with the pills as drawn (once: the second render knows them).
         if (edgeRoomStale && !this.edgeRoomRetried) {
             this.edgeRoomRetried = true;
-            this.edgeRoomRerenderSeq = seq;
+            this.edgeRoomRerenderSeq = this.renderSeq;
         } else this.edgeRoomRetried = false;
-        return true;
+    }
+
+    /**
+     * The bottom edge of a card (spec 066 P4 §2): when the bottom-right pills
+     * (⇄ N, the sibling order) reach the ∞ pills on the left, the sibling
+     * order gives way to the card's bubble. Only cards with pills on both
+     * sides are read.
+     */
+    private yieldSiblingOrderPills(canvas: HTMLElement): void {
+        for (const card of canvas.querySelectorAll<HTMLElement>(':scope > .person-card.has-edge-bl')) {
+            const pill = card.querySelector<HTMLElement>(':scope > .edge-bottom-right .sibling-order-pill');
+            const left = card.querySelector<HTMLElement>(':scope > .edge-bottom-left');
+            card.classList.remove('so-retreat');
+            if (!pill || !left) continue;
+            if (left.getBoundingClientRect().right + 4 > pill.getBoundingClientRect().left) card.classList.add('so-retreat');
+        }
+    }
+
+    /**
+     * Put a card just built into the canvas. A live load matches it to the
+     * card drawn for the same person: the same content keeps the old element
+     * (its photo decoded, its name fitted, its animations running) on its new
+     * place; other content replaces it (the photo element moves across) with
+     * the changed rows marked; a new person's card goes in after the one
+     * placed before it.
+     */
+    private placeCard(canvas: HTMLElement, card: HTMLElement, id: PersonId, live: LiveRender | null): void {
+        const sig = cardSignature(card);
+        this.cardSigs.set(card, sig);
+        if (!live) {
+            canvas.appendChild(card);
+            return;
+        }
+        const old = live.cards.get(id);
+        if (!old) {
+            const next = live.last ? live.last.nextElementSibling : canvas.querySelector(':scope > .person-card');
+            if (next) canvas.insertBefore(card, next);
+            else canvas.appendChild(card);
+            live.fresh.push(card);
+            live.last = card;
+            return;
+        }
+        live.cards.delete(id);
+        if (this.cardSigs.get(old) === sig) {
+            old.className = card.className;
+            old.style.left = card.style.left;
+            old.style.top = card.style.top;
+            live.kept.add(id);
+            live.last = old;
+            return;
+        }
+        const oldImg = old.querySelector<HTMLImageElement>('.card-avatar img');
+        const newImg = card.querySelector<HTMLImageElement>('.card-avatar img');
+        if (oldImg && newImg && oldImg.getAttribute('src') === newImg.getAttribute('src')) newImg.replaceWith(oldImg);
+        markChangedRows(old, card);
+        old.replaceWith(card);
+        live.redrawn.add(id);
+        live.fresh.push(card);
+        live.last = card;
     }
 
     /**
@@ -4574,17 +5286,23 @@ class TreeRendererClass {
      *
      * Steps (see the .name-fit-* CSS): 0 = 15px; 1 = 14px then 13px (floor);
      * 2 = two lines (given name / surname, 12.5px) plus the meta shortened to
-     * years only; 3 = ellipsis on whichever line still overflows. The full name
-     * always stays in the name-text title attribute.
+     * years only; 3 = a line still too wide goes on rows of its own, never
+     * shortened (T40: src/card-width.ts normalCardNameRows, the rows the card's
+     * height was laid out for, normalCardHeights). The Compact card ends in
+     * "…" instead. The full name always stays in the name-text title attribute.
      */
-    private fitCardNames(canvas: HTMLElement, attempt = 0): void {
+    private fitCardNames(canvas: HTMLElement, attempt = 0, only?: readonly HTMLElement[]): void {
         if (canvas.clientWidth === 0 && attempt < 5) {
-            requestAnimationFrame(() => this.fitCardNames(canvas, attempt + 1));
+            requestAnimationFrame(() => this.fitCardNames(canvas, attempt + 1, only));
             return;
         }
         // Fitted in the fallback font before the card fonts were in: fit again
         // once they are (the serif name is wider, it would end up clipped).
         cardFontsPending()?.then(() => { if (canvas.isConnected) this.fitCardNames(canvas); });
+        // `only`: these cards (a live load's new ones), the rest stay as fitted.
+        const names = only
+            ? only.filter(c => c.isConnected).flatMap(c => [...c.querySelectorAll<HTMLElement>('.name')])
+            : [...canvas.querySelectorAll<HTMLElement>('.person-card .name')];
         // In passes over all cards (each card fits on its own: fixed width,
         // absolutely placed): every write of a step, then one round of reads.
         // A write and a read per card forced a layout of the page per card
@@ -4592,7 +5310,7 @@ class TreeRendererClass {
         type Item = { nameEl: HTMLElement; textEl: HTMLElement; given: string; surname: string;
             meta: HTMLElement | null; metaText: HTMLElement | null };
         const items: Item[] = [];
-        canvas.querySelectorAll<HTMLElement>('.person-card .name').forEach(nameEl => {
+        names.forEach(nameEl => {
             const textEl = nameEl.querySelector<HTMLElement>('.name-text');
             // A custom card's name in computed rows is drawn as it is (src/card-width.ts).
             if (!textEl || nameEl.classList.contains('name--rows')) return;
@@ -4601,7 +5319,7 @@ class TreeRendererClass {
             const full = `${given} ${surname}`.trim();
 
             // Start from a clean single-line state (idempotent across retries).
-            nameEl.classList.remove('name-fit-1', 'name-fit-13', 'name-fit-2lines');
+            nameEl.classList.remove('name-fit-1', 'name-fit-13', 'name-fit-2lines', 'name-fit-wrap');
             if (textEl.dataset.split === '1') {
                 textEl.textContent = full;
                 delete textEl.dataset.split;
@@ -4652,33 +5370,112 @@ class TreeRendererClass {
         // The custom card has one name row above its lines: no two-line step either.
         const density = SettingsManager.getCardDensity();
         if (density === 'compact' || isFieldCardDensity(density)) {
-            this.fitCardBirths(canvas);
+            this.fitCardMetaYears(items);
+            this.fitCardBirths(canvas, only);
             return;
         }
 
         // Step 2: two lines (break between given name and surname) + years-only meta.
-        for (const { nameEl, textEl, given, surname, meta, metaText } of left) {
+        // Step 3: a line wider than the column on rows of its own (the rows the
+        // card's height was laid out for; between them the space the name had).
+        const rowsOf = normalCardNameRows(left.map(it => ({ given: it.given, surname: it.surname,
+            avatar: !!it.nameEl.closest('.person-card')?.querySelector('.card-avatar') })), measureCardTexts);
+        const lineOf = (cls: string, text: string, rows: readonly string[]): HTMLElement => {
+            const line = document.createElement('span');
+            line.className = `name-line ${cls}`;
+            if (rows.length <= 1) {
+                line.textContent = text;
+                return line;
+            }
+            const gaps = rowSeparators(text, rows);
+            rows.forEach((r, i) => {
+                if (i > 0 && gaps[i - 1]) line.appendChild(document.createTextNode(gaps[i - 1]));
+                const row = document.createElement('span');
+                row.className = 'name-row';
+                row.textContent = r;
+                line.appendChild(row);
+            });
+            return line;
+        };
+        left.forEach(({ nameEl, textEl, given, surname, meta, metaText }, i) => {
             nameEl.classList.remove('name-fit-13');
             nameEl.classList.add('name-fit-2lines');
-            const givenSpan = document.createElement('span');
-            givenSpan.className = 'name-line name-given';
-            givenSpan.textContent = given;
-            const surnameSpan = document.createElement('span');
-            surnameSpan.className = 'name-line name-surname';
-            surnameSpan.textContent = surname;
+            const rows = rowsOf[i];
+            if (rows.given.length > 1 || rows.surname.length > 1) nameEl.classList.add('name-fit-wrap');
             textEl.textContent = '';
-            textEl.appendChild(givenSpan);
-            textEl.appendChild(surnameSpan);
+            textEl.appendChild(lineOf('name-given', given, rows.given));
+            textEl.appendChild(lineOf('name-surname', surname, rows.surname));
             textEl.dataset.split = '1';
             if (meta && metaText && meta.dataset.years !== undefined) {
                 meta.dataset.full = metaText.textContent ?? '';
                 metaText.textContent = meta.dataset.years;
                 meta.classList.add('meta-short');
             }
+        });
+        this.fitCardMetaYears(items);
+        this.fitCardBirths(canvas, only);
+    }
+
+    /**
+     * The years of a meta row that do not show whole (a range at birth and
+     * at death, beside the status mark: "1650–1655 – 1720–1725 · Hořice")
+     * take their short form ("1650–55 – 1720–25 · Hořice") instead of losing
+     * the death year to the ellipsis; when even those and the "…" after them
+     * do not fit, the place leaves the row (as on a card whose name takes two
+     * rows; the tooltip keeps it). Whole means the row fits, or the years and
+     * the "…" do. Reads, then the writes, once per step. The full text stays
+     * in data-full (restored by the next fitting, read by the live-load row
+     * marks).
+     */
+    private fitCardMetaYears(items: ReadonlyArray<{ meta: HTMLElement | null; metaText: HTMLElement | null }>): void {
+        type Row = { meta: HTMLElement; metaText: HTMLElement; text: Text; years: string; short: string };
+        const ellipsis = new Map<string, number>();
+        /** Whether the first `chars` of the row show whole (the row fits, or they and the "…" do). */
+        const showsWhole = ({ meta, text }: Row, chars: number): boolean => {
+            const box = meta.getBoundingClientRect().width;
+            // In the canvas' (possibly zoomed) space, as the rects of the text.
+            const width = (end: number): number => {
+                const range = document.createRange();
+                range.setStart(text, 0);
+                range.setEnd(text, end);
+                // One line: the widest rect (an ellipsized row may report its text twice).
+                let w = 0;
+                for (const r of range.getClientRects()) w = Math.max(w, r.width);
+                return w;
+            };
+            if (width(text.data.length) <= box + 0.01) return true;
+            const cs = getComputedStyle(meta);
+            const font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+            let ell = ellipsis.get(font);
+            if (ell === undefined) {
+                metaMeasure ??= document.createElement('canvas').getContext('2d');
+                if (metaMeasure) metaMeasure.font = font;
+                ell = metaMeasure?.measureText('…').width ?? 0;
+                ellipsis.set(font, ell);
+            }
+            return width(chars) + ell * (box / meta.offsetWidth) <= box + 0.01;
+        };
+        const rows: Row[] = [];
+        for (const { meta, metaText } of items) {
+            const years = meta?.dataset.years;
+            const short = meta?.dataset.yearsShort;
+            const text = metaText?.firstChild;
+            if (!meta || !metaText || !years || !short || !(text instanceof Text) || !text.data.startsWith(years)
+                || meta.offsetWidth === 0) continue;
+            rows.push({ meta, metaText, text, years, short });
         }
-        // Step 3 (ellipsis on an overflowing line) is handled by the
-        // .name-line { text-overflow: ellipsis } CSS.
-        this.fitCardBirths(canvas);
+        const shorten = rows.filter(row => !showsWhole(row, row.years.length));
+        for (const { meta, metaText, years, short } of shorten) {
+            const now = metaText.textContent ?? '';
+            if (meta.dataset.full === undefined) meta.dataset.full = now;
+            metaText.textContent = short + now.slice(years.length);
+        }
+        const yearsOnly = shorten.filter(row => {
+            const text = row.metaText.firstChild;
+            if (!(text instanceof Text) || text.data === row.short) return false;
+            return !showsWhole({ ...row, text }, row.short.length);
+        });
+        for (const { metaText, short } of yearsOnly) metaText.textContent = short;
     }
 
     /**
@@ -4687,8 +5484,10 @@ class TreeRendererClass {
      * show, the row is left out (the full name stays in the tooltip). Reads
      * only after the name has been fitted, one layout for all cards.
      */
-    private fitCardBirths(canvas: HTMLElement): void {
-        const rows = [...canvas.querySelectorAll<HTMLElement>('.person-card .card-birth')];
+    private fitCardBirths(canvas: HTMLElement, only?: readonly HTMLElement[]): void {
+        const rows = only
+            ? only.filter(c => c.isConnected).flatMap(c => [...c.querySelectorAll<HTMLElement>('.card-birth')])
+            : [...canvas.querySelectorAll<HTMLElement>('.person-card .card-birth')];
         if (!rows.length) return;
         rows.forEach(el => el.classList.remove('is-dropped'));
         const drop: HTMLElement[] = [];
@@ -4766,7 +5565,11 @@ class TreeRendererClass {
         const dots = v.named ? '<span class="research-edge-dots"></span>' : '';
         const label = v.label && (all || v.kind !== 'proof') ? `<span class="research-edge-label">${this.escapeHtml(v.label)}</span>` : '';
         const popup = v.named ? ' aria-haspopup="dialog"' : '';
-        return `<button type="button" class="${cls.join(' ')}" data-edge-person="${this.escapeHtml(id)}" aria-label="${this.escapeHtml(v.aria)}"${popup}>`
+        // Dense: a line of another family closer than 24px over the stub (a bus in a lane
+        // toward the cards) shortens it, so it still ends 4px below that line (spec 069 §3)
+        const cap = this.denseEdgeCap(id, v);
+        const style = cap !== null ? ` style="--edge-cap:${cap.toFixed(1)}px"` : '';
+        return `<button type="button" class="${cls.join(' ')}" data-edge-person="${this.escapeHtml(id)}" aria-label="${this.escapeHtml(v.aria)}"${popup}${style}>`
             + `<i class="research-edge-line" aria-hidden="true">${dots}</i>${label}</button>`;
     }
 
@@ -4775,10 +5578,42 @@ class TreeRendererClass {
         const v = this.edgeViews.get(id);
         const pos = this.positions.get(id);
         if (!v || !pos || v.kind === 'proof') return null;
+        const h = v.kind === 'muted' ? 14 : v.shape === 'closed' ? 18 : this.config.dense ? 20 : v.named ? 37 : 26;
+        const cap = this.denseEdgeCap(id, v);
+        return { x: this.edgeStubX(pos.x, v), y: pos.y - (cap !== null ? Math.min(h, cap) : h) };
+    }
+
+    /** The x of a person's stub (canvas coordinates): over the missing parent's side, else the middle. */
+    private edgeStubX(cardX: number, v: EdgeView): number {
         const w = this.config.cardWidth;
-        const x = pos.x + (v.side === 'father' ? w * 40 / 188 : v.side === 'mother' ? w * 148 / 188 : w / 2);
-        const h = v.kind === 'muted' ? 14 : v.shape === 'closed' ? 18 : v.named ? 37 : 26;
-        return { x, y: pos.y - h };
+        return cardX + (v.side === 'father' ? w * 40 / 188 : v.side === 'mother' ? w * 148 / 188 : w / 2);
+    }
+
+    /** The lines across the view (buses, connectors, partner lines), for denseEdgeCap; per set of connections. */
+    private denseEdgeLines: { of: Connection[]; lines: PillSegment[] } | null = null;
+
+    /**
+     * In the dense spacing the stub is 20px and the bus of its gap 24px over
+     * the card; a bus in a lane toward the cards (16px over them) or another
+     * line over the stub lower than 24px leaves it the room down to 4px below
+     * that line (px; null: the whole stub fits, or the normal spacing).
+     */
+    private denseEdgeCap(id: PersonId, v: EdgeView): number | null {
+        const pos = this.positions.get(id);
+        if (!this.config.dense || !pos || v.kind === 'proof') return null;
+        if (this.denseEdgeLines?.of !== this.connections) {
+            const lines = viewLineSegments({ connections: this.connections, spouseLines: this.spouseLines })
+                .filter(l => Math.abs(l.y1 - l.y2) < 0.5);
+            this.denseEdgeLines = { of: this.connections, lines };
+        }
+        const x = this.edgeStubX(pos.x, v);
+        let room = Infinity;
+        for (const l of this.denseEdgeLines.lines) {
+            if (x < Math.min(l.x1, l.x2) - 1.5 || x > Math.max(l.x1, l.x2) + 1.5) continue;
+            const d = pos.y - l.y1;
+            if (d > 0 && d < 24) room = Math.min(room, d - 4);
+        }
+        return room === Infinity ? null : Math.max(4, room);
     }
 
     /**
@@ -4888,30 +5723,13 @@ class TreeRendererClass {
      */
     private renderViewLinkIslands(canvas: HTMLElement): void {
         canvas.querySelectorAll('.view-link-island').forEach(el => el.remove());
-        if (this.researchEdgeMode() !== 'all') return;
         const data = DataManager.getData();
-        const islandIds = [...this.positions.keys()].filter(id => {
-            const p = data.persons[id];
-            return !!p?.research?.island && !p.isPlaceholder && !this.viewLayer?.ghostIds.has(id);
-        });
-        if (islandIds.length === 0 || !this.viewLinksOffered()) return;
-        const ctx = viewLinkContext(data);
-        const candidates = viewLinkCandidates(data, ctx).filter(c => c.state === 'draw');
-        if (candidates.length === 0) return;
-        const shownGroups = new Set((this.viewLayer?.links ?? []).flatMap(l => l.islandIds.map(id => ctx.group.get(id))));
-        const byGroup = new Map<number, PersonId[]>();
-        for (const id of islandIds) {
-            const g = ctx.group.get(id);
-            if (g === undefined || shownGroups.has(g)) continue;
-            const list = byGroup.get(g) ?? [];
-            list.push(id);
-            byGroup.set(g, list);
-        }
+        const families = this.viewLinkIslandFamilies(this.viewLayer?.links ?? [], [...this.positions.keys()]);
         const w = this.config.cardWidth;
         const v = strings.viewLinks;
-        for (const [g, ids] of byGroup) {
-            const offers = candidates.filter(c => c.islandIds.some(id => ctx.group.get(id) === g));
-            if (offers.length === 0) continue;
+        for (const [g, { ids: all, offers }] of families) {
+            const ids = all.filter(id => this.positions.has(id) && !this.viewLayer?.ghostIds.has(id));
+            if (ids.length === 0) continue;
             // The top row of the family, its leftmost card and that card's partner beside it.
             const top = Math.min(...ids.map(id => this.positions.get(id)!.y));
             const row = ids.filter(id => this.positions.get(id)!.y === top).sort((a, b) => this.positions.get(a)!.x - this.positions.get(b)!.x);
@@ -4946,6 +5764,53 @@ class TreeRendererClass {
         }
     }
 
+    /**
+     * The families outside the tree that get their own button
+     * (renderViewLinkIslands), by family group: the people of the family
+     * among `inView` (not a "?" stand-in) and the versions that would link it
+     * to the tree. None outside the research edge "all", without the view
+     * links, or for a family shown linked (`shown`: the links laid out).
+     */
+    private viewLinkIslandFamilies(shown: readonly ViewLink[], inView: Iterable<PersonId>): Map<number, { ids: PersonId[]; offers: ViewLinkCandidate[] }> {
+        const families = new Map<number, { ids: PersonId[]; offers: ViewLinkCandidate[] }>();
+        if (this.researchEdgeMode() !== 'all') return families;
+        const data = DataManager.getData();
+        const islandIds = [...inView].filter(id => {
+            const p = data.persons[id];
+            return !!p?.research?.island && !p.isPlaceholder;
+        });
+        if (islandIds.length === 0 || !this.viewLinksOffered()) return families;
+        const ctx = viewLinkContext(data);
+        const candidates = viewLinkCandidates(data, ctx).filter(c => c.state === 'draw');
+        if (candidates.length === 0) return families;
+        const shownGroups = new Set(shown.flatMap(l => l.islandIds.map(id => ctx.group.get(id))));
+        for (const id of islandIds) {
+            const g = ctx.group.get(id);
+            if (g === undefined || shownGroups.has(g)) continue;
+            const family = families.get(g) ?? { ids: [], offers: candidates.filter(c => c.islandIds.some(x => ctx.group.get(x) === g)) };
+            family.ids.push(id);
+            families.set(g, family);
+        }
+        for (const [g, family] of families) if (family.offers.length === 0) families.delete(g);
+        return families;
+    }
+
+    /**
+     * The room kept under the top couple of a family outside the tree for its
+     * button (LayoutConfig.roomBelow): only with the focus in such a family
+     * (a family outside the tree is never laid out together with the tree
+     * unless shown linked, and then it has no button).
+     */
+    private viewLinkIslandRoom(viewLinks: readonly ViewLink[]): LayoutConfig['roomBelow'] {
+        const data = DataManager.getData();
+        const focus = this.focusPersonId ? data.persons[this.focusPersonId] : undefined;
+        if (!focus?.research?.island) return undefined;
+        const shown = viewLinks.length > 0 ? buildViewLayer(data, viewLinks)?.links ?? [] : [];
+        const families = this.viewLinkIslandFamilies(shown, Object.keys(data.persons) as PersonId[]);
+        if (families.size === 0) return undefined;
+        return [...families.values()].map(f => ({ personIds: new Set(f.ids), px: VIEW_LINK_ISLAND_ROOM }));
+    }
+
     /** "H0022 B · to Václav Horák (1818)": what the family's button would link it to. */
     private viewLinkIslandTo(c: ViewLinkCandidate): string {
         const anchor = DataManager.getPerson(c.anchorId);
@@ -4959,6 +5824,7 @@ class TreeRendererClass {
             data,
             unions: unionsByPerson(data),
             treeHasSources: treeHasAnySource(data),
+            reliability: UI.reliabilityOptionsNow(),
             settings: SettingsManager.getCardSignals(),
             research: researchCardInfoNow(),
         };
@@ -4981,6 +5847,40 @@ class TreeRendererClass {
         this.treeObserver.observe(container);
     }
 
+    /** The other trees a person is also in, as the card's ⇄ pill counts them (none: the pill is off or not shown). */
+    crossTreeMatchesFor(personId: PersonId): CrossTree.CrossTreeMatch[] {
+        const person = DataManager.getPerson(personId);
+        const treeId = DataManager.getCurrentTreeId();
+        if (!person || person.isPlaceholder || !treeId || !this.lastCrossTrees) return [];
+        return CrossTree.findCrossTreeMatches(treeId, person, this.lastCrossTrees);
+    }
+
+    /** Citations in this tree were made in Strom: the tree knows where its facts came from. */
+    treeKnowsOriginNow(): boolean {
+        const ctx = this.signalContext();
+        return treeKnowsOrigin(ctx.data, ctx.reliability);
+    }
+
+    /**
+     * The marks the image export and the poster draw in the cards' corner
+     * (spec 066 P4 §7): the status mark and the story's fold, each only where
+     * the card shows it (Settings → Show on card). The badges, the agent, ⇄
+     * and the lock are this device's state and stay on screen.
+     */
+    posterCardMarks(ids: Iterable<PersonId>): Map<string, { status?: CardStatusClass; story?: StoryMark }> {
+        const ctx = this.signalContext();
+        const out = new Map<string, { status?: CardStatusClass; story?: StoryMark }>();
+        for (const id of ids) {
+            const person = DataManager.getPerson(id);
+            if (!person) continue;
+            const info = cardSignalInfo(person, ctx);
+            const status = info.showStatus && info.status ? info.status.cls : undefined;
+            const story = info.showStory && info.story ? { kind: info.story.kind, final: info.story.final } : undefined;
+            if (status || story) out.set(id, { ...(status ? { status } : {}), ...(story ? { story } : {}) });
+        }
+        return out;
+    }
+
     /** One person's signals, as their card shows them (the person menu leads with them). */
     cardSignalsFor(personId: PersonId): CardSignalInfo | null {
         const person = DataManager.getPerson(personId);
@@ -4989,25 +5889,23 @@ class TreeRendererClass {
 
     /** One action signal in words (badge label, tooltip row). */
     private signalText(s: CardSignalInfo, which: 'waiting' | 'conflict' | 'question' | 'agent' | 'queued'): string {
-        const c = strings.card;
-        const clip = (t: string): string => (t.length > 60 ? `${t.slice(0, 59).trimEnd()}…` : t);
-        if (which === 'waiting') return c.ttWaiting(clip(s.waiting ?? ''));
-        if (which === 'conflict') return c.ttConflicts(s.conflicts);
-        if (which === 'question') return c.ttQuestion(clip(s.question ?? ''));
-        if (which === 'queued') return c.ttQueued(clip(s.queued ?? ''));
-        return c.ttAgent(clip(s.agent ?? ''));
+        return actionSignalText(s, which);
     }
 
-    /** The tooltip's signal rows (HTML): evidence, story and attachments, then what waits. */
-    private tooltipSignalRows(s: CardSignalInfo): string {
+    /**
+     * The tooltip's signal rows (HTML) in the card map's order (spec 066 P4 §5):
+     * the mark in words (and a quieter line of where its citations came from),
+     * the story and attachments, what waits, the other trees.
+     */
+    private tooltipSignalRows(s: CardSignalInfo, originKnown: boolean, crossTrees: readonly CrossTree.CrossTreeGroup[]): string {
         const c = strings.card;
         const rows: string[] = [];
-        if (s.evidence) {
-            const ev = s.evidence;
-            const bits = [ev.sources > 0 ? c.ttSources(ev.sources) : c.ariaEv.none];
-            if (ev.sources > 0 && ev.hasBirth) bits.push(ev.birthCited ? c.ttBirthCited : c.ttBirthMissing);
-            if (ev.sources > 0 && ev.hasDeath && !ev.deathCited) bits.push(c.ttDeathMissing);
-            rows.push(`<div class="tt-line tt-ev">${stateStripesHtml(ev.level, null, true)}${this.escapeHtml(bits.join(' · '))}</div>`);
+        // The bubble keeps the mark's words when the card does not show it (Settings → Show on card).
+        if (s.status) {
+            const w = cardStatusWords(s.status, originKnown);
+            rows.push(`<div class="tt-line tt-status">${statusMarkHtml(s.status, { className: 'card-status-mark--inline' })}`
+                + `<span class="tt-status-text"><span>${this.escapeHtml(w.main)}</span>`
+                + `${w.sub ? `<span class="tt-status-sub">${this.escapeHtml(w.sub)}</span>` : ''}</span></div>`);
         }
         // A linked tree that shows materials: "Materials N" in place of the attachments.
         const files = s.materials ?? s.attachments;
@@ -5015,7 +5913,7 @@ class TreeRendererClass {
             const bits: string[] = [];
             if (s.story) bits.push(storySignalText(s.story, c.story));
             if (files > 0) bits.push(s.materials !== null ? c.ttMaterials(files) : c.ttAttachments(files));
-            rows.push(`<div class="tt-line tt-story">${stateStripesHtml(null, s.story, true)}${this.escapeHtml(bits.join(' · '))}</div>`);
+            rows.push(`<div class="tt-line tt-story">${storyFoldHtml(s.story, true)}${this.escapeHtml(bits.join(' · '))}</div>`);
         }
         const action = (text: string): string => `<div class="tt-line tt-action">${this.escapeHtml(text)}</div>`;
         if (s.waiting) rows.push(action(this.signalText(s, 'waiting')));
@@ -5031,20 +5929,34 @@ class TreeRendererClass {
             `<div class="tt-line tt-agent"><span class="agent-mark" aria-hidden="true"></span>${this.escapeHtml(text)}</div>`;
         if (s.agent) rows.push(agent(this.signalText(s, 'agent')));
         else if (s.queued) rows.push(agent(this.signalText(s, 'queued')));
+        // The other trees (shown with the ⇄ pill only): one by its name, more by their number.
+        if (crossTrees.length > 0) {
+            const text = crossTrees.length === 1 ? c.ttCross(crossTrees[0].treeName) : c.ttCrossN(crossTrees.length);
+            rows.push(`<div class="tt-line tt-cross"><span class="tt-cross-glyph" aria-hidden="true">⇄</span>${this.escapeHtml(text)}</div>`);
+        }
         return rows.join('');
     }
 
-    /** The card's accessible name: the name, then its status and what waits. */
-    private cardAriaLabel(person: Person, s: CardSignalInfo): string {
+    /**
+     * The card's accessible name in the card map's order (spec 066 P4 §5):
+     * the name, the years, the mark in words; then the story, what waits, the
+     * other trees and the lock, each after a semicolon (the mark's facts
+     * are a list of their own).
+     */
+    private cardAriaLabel(person: Person, s: CardSignalInfo, extra: { years?: string; crossTrees?: number; locked?: boolean } = {}): string {
         const c = strings.card;
-        const parts = [shownNameFull(person)];
-        if (s.showEvidence && s.evidence) parts.push(c.ariaEv[s.evidence.level]);
-        if (s.showStory && s.story) parts.push(storySignalText(s.story, c.story));
-        if (s.action === 'waiting') parts.push(c.ariaWaiting);
-        else if (s.action === 'conflict') parts.push(c.ariaConflict);
-        else if (s.action === 'question') parts.push(c.ariaQuestion);
-        else if (s.showAgent) parts.push(c.ariaAgent);
-        return parts.join(', ');
+        const head = [shownNameFull(person)];
+        if (extra.years) head.push(extra.years);
+        if (s.showStatus && s.status) head.push(cardStatusAria(s.status));
+        const tail: string[] = [];
+        if (s.showStory && s.story) tail.push(storySignalText(s.story, c.story));
+        if (s.action === 'waiting') tail.push(c.ariaWaiting);
+        else if (s.action === 'conflict') tail.push(c.ariaConflict);
+        else if (s.action === 'question') tail.push(c.ariaQuestion);
+        else if (s.showAgent) tail.push(c.ariaAgent);
+        if (extra.crossTrees) tail.push(c.ariaCross(extra.crossTrees));
+        if (extra.locked) tail.push(strings.lock.lockedTooltip.toLocaleLowerCase());
+        return [head.join(', '), ...tail].join('; ');
     }
 
     /** True when the person is currently rendered on the canvas. */
@@ -5117,17 +6029,23 @@ class TreeRendererClass {
         const lineLeft = minX - pad;
         const lineRight = maxX + pad;
         const halfGap = this.config.verticalGap / 2;
+        // Half the gap between a band and the next one; a gap of the dense
+        // spacing grown for its bus lanes (LayoutResult.gapExtra) is taller.
+        const halfGapBelow = (generation: number): number => {
+            const extra = this.layoutGapExtra?.get(generation) ?? 0;
+            return extra > 0 ? (this.config.verticalGap + extra) / 2 : halfGap;
+        };
 
         for (const band of bands) {
             // Boundary rule just above the band.
-            const boundaryY = band.top - halfGap;
+            const boundaryY = band.top - halfGapBelow(band.generation - 1);
             const guideLine = this.drawLine(svg, lineLeft, boundaryY, lineRight, boundaryY, { className: 'gen-guide-line' });
             // Record the band for the sticky HTML label overlay.
             this.generationBands.push({
                 label: this.generationLabel(band.generation),
                 rowCenterY: band.top + band.height / 2,
-                bandTopY: band.top - halfGap,
-                bandBottomY: band.top + band.height + halfGap,
+                bandTopY: boundaryY,
+                bandBottomY: band.top + band.height + halfGapBelow(band.generation),
                 guideLine,
                 guideLeftX: lineLeft,
                 guideRightX: lineRight,
@@ -5629,7 +6547,14 @@ class TreeRendererClass {
                 esc: (t) => this.escapeHtml(t),
                 relTypeLabel: (t) => strings.parentRelType[t],
                 addParentLabel: () => strings.contextMenu.addParent,
-                afterDraw: () => { if (this.evidenceIds || this.evidenceLevelMap) this.applyEvidenceHighlight(); },
+                afterDraw: () => {
+                    if (this.evidenceIds || this.evidenceLevelMap) this.applyEvidenceHighlight();
+                    UI.applyFanFollowMarks?.();
+                },
+                pinnedCenter: () => UI.liveFollowPinned?.() ?? null,
+                menuExtra: (id, isCentre) => UI.fanFollowMenuItems?.(id, isCentre) ?? [],
+                unpinCenter: () => UI.unpinFanCenter?.(),
+                menuClosed: () => UI.fanFollowMenuClosed?.(),
                 selectedRod: () => UI.selectedRod(),
                 personDetail: id => UI.runPersonMenuAction(id, 'edit'),
                 personPage: id => UI.runPersonMenuAction(id, 'page'),
@@ -5736,11 +6661,25 @@ class TreeRendererClass {
     private unionOrderPillHtml(b: UnionOrderBadge, label: PillLabel): string {
         const toward = DataManager.getPerson(b.towardId);
         const tip = strings.focus.unionOrderTip(b.number, b.year, b.place, b.married, toward ? shownName(toward, '?') : '?');
-        const form = pillLabelForms(strings.focus.unionOrdinal(b.number), b.year).find(f => f.label === label)!;
-        return `<span class="union-order-pill" role="img" aria-label="${this.escapeHtml(tip)}"`
+        const form = this.unionOrderPillForms(b).find(f => f.label === label)!;
+        // The dense spacing's short pill ("∞ 2", D1) says the rest in its bubble: the keyboard reaches it too
+        const focusable = form.short ? ' tabindex="0"' : '';
+        return `<span class="union-order-pill" role="img" aria-label="${this.escapeHtml(tip)}"${focusable}`
             + ` data-union-order="${b.number}" data-toward="${this.escapeHtml(b.towardId)}" data-side="${b.side}" data-label="${label}">`
-            + unionOrderPillPartsHtml(form.ordinal, form.year, form.glyph)
+            + unionOrderPillPartsHtml(form.ordinal, form.year, form.glyph, form.short)
             + `<span class="badge-tooltip uo-tip">${this.escapeHtml(tip)}</span></span>`;
+    }
+
+    /**
+     * The labels a marriage-order pill may show (pillLabelForms), longest
+     * first; in the dense spacing (D1) only the short one, "∞ 2" (the
+     * marriage's number, strings.marriageOrder.short), on the top edge.
+     */
+    private unionOrderPillForms(b: UnionOrderBadge): PillLabelForm[] {
+        if (this.config.dense) {
+            return [{ label: 'short', ordinal: strings.marriageOrder.short(b.number), year: '', glyph: true, short: true }];
+        }
+        return pillLabelForms(strings.focus.unionOrdinal(b.number), b.year);
     }
 
     /**
@@ -5757,8 +6696,9 @@ class TreeRendererClass {
         if (badges.size === 0) return out;
         const data = DataManager.getData();
         const showTabs = this.viewMode !== 'descendants';
-        const formsOf = (b: UnionOrderBadge) => pillLabelForms(strings.focus.unionOrdinal(b.number), b.year);
+        const formsOf = (b: UnionOrderBadge) => this.unionOrderPillForms(b);
         const pills = measureUnionOrderPills([...badges.values()].flatMap(formsOf));
+        applyUnionOrderGlyphLift();
         const tabsOf = new Map<PersonId, BranchTab[]>();
         for (const id of badges.keys()) {
             // The line links show in every view (the descendants chart too)
@@ -5789,13 +6729,15 @@ class TreeRendererClass {
             const slot = placeUnionOrderPill({
                 cardWidth: W,
                 side: b.side,
-                ...pillLabelWidths(forms, forms.map(f => pills.get(unionOrderPillKey(f.ordinal, f.year, f.glyph))!.width)),
+                ...pillLabelWidths(forms, forms.map(f => pills.get(unionOrderPillKey(f.ordinal, f.year, f.glyph, f.short))!.width)),
                 leftTabs: 0,
                 rightTabs: rowsByForm.get(formOf.get(id) ?? 'full')?.get(rowKey(tabsOf.get(id)!, formOf.get(id) ?? 'full')) ?? 0,
                 leftInset: border + EDGE_INSET,
                 rightInset: border + EDGE_INSET + (signal ? 8 : 0),
                 rightHover: DataManager.isPersonLocked(id) ? 0 : hoverIcon,
                 segments: segmentsNearCard(segments, pos.x, pos.y, W),
+                // Dense (D1): never in the row above the tabs, which would reach the bus
+                edgeOnly: !!this.config.dense,
             });
             if (slot) out.set(id, { ...slot, border });
         }
@@ -5847,7 +6789,7 @@ class TreeRendererClass {
      */
     private childrenByUnionHtml(personId: PersonId, ids: readonly PersonId[]): string {
         const groups = childrenByUnion(DataManager.getData(), personId, ids);
-        if (groups.length < 2) return this.nameGroupsHtml([{ pre: '', items: this.bubbleItems(ids) }]);
+        if (groups.length < 2) return this.nameGroupsHtml([{ pre: '', items: this.bubbleItems(groups[0]?.ids ?? []) }]);
         return this.nameGroupsHtml(groups.map(g => {
             const partner = g.partnerId ? DataManager.getPerson(g.partnerId) : null;
             const label = g.number > 0 ? strings.focus.childrenGroupUnion(g.number, partner ? shownName(partner, '?') : '?') : '';

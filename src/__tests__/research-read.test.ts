@@ -4,18 +4,40 @@
  * takes. Invented data only (Novák, Lhota).
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
     sanitizeReadAccepts, sanitizeReads, sanitizeLiveRead, sanitizeReadResult, readFailure, retryAfter,
     readFileRefusals, readFileMime, readFileKind, readPageImageUrl, readDocYear, readUsualMinutes, readRunning, readSlow, cleanBlock,
-    readEndsToAnnounce, readSuperseded, LiveRead, ReadMemo, ReadState,
+    readPaceSecs, readViewNames, readSameSheet,
+    readEndsToAnnounce, readSuperseded, LiveRead, ReadMemo, ReadState, startSourceRead, startRead, readAgain,
+    unmarkedText,
 } from '../research-read.js';
 import { sanitizeLiveStatus, sanitizeAccepts } from '../research-link.js';
+import { strings, setLanguage, type Language } from '../strings.js';
 
 const ID = 'D20261019153012-a1b2';
 const SHA = 'a'.repeat(64);
 
 describe('accepts.read', () => {
+    it('has its own words for every reason the research gives, in every language (agent.cli-missing too)', () => {
+        expect(sanitizeReadAccepts({ ready: false, why: 'agent.cli-missing' })?.why).toBe('agent.cli-missing');
+        const whys = ['agent.none', 'agent.untested', 'agent.sandbox', 'agent.cli-missing', 'shared.none', 'limit', 'auth'];
+        try {
+            for (const lang of ['en', 'cs', 'de', 'pl'] as Language[]) {
+                setLanguage(lang);
+                for (const why of whys) {
+                    const text = strings.read.why[why];
+                    expect(text, `${lang} ${why}`).toBeTruthy();
+                    expect(text, `${lang} ${why}`).not.toBe(strings.read.why.other);
+                }
+                // Impersonal: never addressing the reader.
+                expect(strings.read.why['agent.cli-missing']).not.toMatch(/\b(you|your|vy|váš|Sie|Ihr|Pan|Pani)\b/iu);
+            }
+        } finally {
+            setLanguage('en');
+        }
+    });
+
     it('takes a ready reader with its limits', () => {
         expect(sanitizeReadAccepts({
             ready: true, why: null, readers: 2, types: ['image/jpeg', 'image/png', 'application/pdf'], max: 52428800, pages: 10, langs: ['cs', 'de', 'en'],
@@ -197,18 +219,33 @@ describe('GET read/<id>', () => {
         version: 2,
     };
 
+    it('a person\'s value never keeps the transcription\'s uncertain mark: taken off, the field uncertain; the written form keeps it', () => {
+        const marked = sanitizeReadResult({ ...full, entries: [{ ...full.entries[0], persons: [
+            { ref: 'p1', role: 'godparent', given: 'Franciscus', surname: 'Krejčí[?]', written: 'Franciscus Krejčí[?]', occupation: 'agricola [?]', residence: 'Lhota', uncertain: ['surname'] },
+        ] }] })!;
+        const p = marked.entries[0].persons[0];
+        expect(p).toMatchObject({ given: 'Franciscus', surname: 'Krejčí', occupation: 'agricola', residence: 'Lhota', written: 'Franciscus Krejčí[?]' });
+        expect(p.uncertain).toEqual(['surname', 'occupation']);
+        expect(unmarkedText('Franciscus Krejčí[?]')).toBe('Franciscus Krejčí');
+        expect(unmarkedText('[?] Novák [?]  Lhota')).toBe('Novák Lhota');
+        expect(unmarkedText('Novák')).toBe('Novák');
+    });
+
     it('takes the whole result', () => {
         const r = sanitizeReadResult(full)!;
         expect(r.id).toBe(ID);
         expect(r.doc).toEqual({ kind: 'register.baptism', language: ['la'], script: 'kurrent', date: '3. 4. 1846', legible: 'yes', why: null });
         expect(r.readers).toEqual({ asked: 2, ran: 2, agree: 'differ' });
-        expect(r.pages[0]).toEqual({ n: 1, file: 'I0042', sha: SHA, name: 'lhota.jpg', page: 1, w: 3024, h: 4032, image: `read/${ID}/page/1.jpg` });
+        expect(r.pages[0]).toEqual({ n: 1, file: 'I0042', sha: SHA, name: 'lhota.jpg', page: 1, w: 3024, h: 4032, region: null, image: `read/${ID}/page/1.jpg` });
         const e = r.entries[0];
         expect(e.transcript).toBe('Joannes[?] filius legitimus\nAntonii Nowak [...] Lhota');
         expect(e.variants).toEqual([{ at: 'Joannes[?]', other: 'Josephus' }]);
         // What differs (research 2026-10) is kept; a field that is no text is left out.
         const withField = sanitizeReadResult({ ...full, entries: [{ ...full.entries[0], variants: [{ field: 'p2.role', at: 'father', other: 'witness' }, { field: 7, at: 'a', other: 'b' }] }] })!;
         expect(withField.entries[0].variants).toEqual([{ at: 'father', other: 'witness', field: 'p2.role' }, { at: 'a', other: 'b' }]);
+        // A place only reader 2 read (`at` empty) stays; one with neither side does not.
+        const oneSide = sanitizeReadResult({ ...full, entries: [{ ...full.entries[0], variants: [{ at: '', other: 'sponsus' }, { at: '', other: '' }] }] })!;
+        expect(oneSide.entries[0].variants).toEqual([{ at: '', other: 'sponsus' }]);
         expect(e.glossary.map(g => g.kind)).toEqual(['term', 'abbr']);
         expect(e.persons[0]).toMatchObject({ ref: 'p1', role: 'child', roleText: 'pokřtěný', sex: 'M', age: '', uncertain: ['given'], match: [{ person: 'P0012', score: 0.82 }] });
         expect(e.persons[1].region).toBeNull();
@@ -238,6 +275,79 @@ describe('GET read/<id>', () => {
         expect(r.entries[0].persons[0]).toMatchObject({ role: 'other', match: [] });
         expect(r.cost).toBeNull();
         expect(sanitizeReadResult({ id: 'nope', state: 'done' })).toBeNull();
+    });
+
+    it('a source read again: its entries (only those of the result) and a failed comparison beside `source` (read.sourceEntry)', () => {
+        const two = { ...full, entries: [full.entries[0], { ...full.entries[0], id: 'e2' }] };
+        const r = sanitizeReadResult({ ...two, source: { id: 'S0001', agree: 'same', variants: [], entries: ['e2', 'e9', 'e2', 7, '../x'] } })!;
+        expect(r.source).toEqual({ id: 'S0001', agree: 'same', variants: [], task: '' });
+        expect(r.sourceRead).toEqual({ id: 'S0001', entries: ['e2'], failed: null });
+        // Not compared: `source` stays absent as before (an app without the feature shows a usual reading); the failure is said beside it.
+        const none = sanitizeReadResult({ ...two, source: { id: 'S0001', failed: { code: 'no-entry', why: 'nothing read' } } })!;
+        expect(none.source).toBeUndefined();
+        expect(none.sourceRead).toEqual({ id: 'S0001', entries: [], failed: 'no-entry' });
+        // Compared, not written: the comparison stays, the failure beside it; an unknown code is "other".
+        const write = sanitizeReadResult({ ...two, source: { id: 'S0001', agree: 'differ', variants: [{ at: 'a', other: 'b' }], entries: ['e1'], failed: { code: 'write' } } })!;
+        expect(write.source).toMatchObject({ agree: 'differ', task: '' });
+        expect(write.sourceRead).toEqual({ id: 'S0001', entries: ['e1'], failed: 'write' });
+        expect(sanitizeReadResult({ ...two, source: { id: 'S0001', failed: { code: 'rm -rf' } } })!.sourceRead?.failed).toBe('other');
+        // Neither said (an older research), or no source id: nothing.
+        expect(sanitizeReadResult({ ...two, source: { id: 'S0001', agree: 'same', variants: [] } })!.sourceRead).toBeUndefined();
+        expect(sanitizeReadResult({ ...two, source: { id: 'x', failed: { code: 'write' }, entries: ['e1'] } })!.sourceRead).toBeUndefined();
+    });
+
+    it('a difference\'s kind and region (read.variantKind, read.variantRegion): a known kind, a region of fractions; else left out', () => {
+        const r = sanitizeReadResult({
+            ...full,
+            entries: [{ ...full.entries[0], variants: [
+                { at: 'Tichopad', other: 'Tichopád', kind: 'spelling', region: [0.4, 0.2, 0.06, 0.02] },
+                { at: 'Jan', other: 'Jakub', field: 'p2.given', kind: 'guess', region: [0.4, 0.2, 2, 0.02] },
+                { at: 'a', other: 'b', region: [0.4, 0.2, 0, 0.02] },
+            ] }],
+            source: { id: 'S0042', agree: 'differ', task: 'T0107', variants: [
+                { at: 'Nro. 14', other: 'N. 4', kind: 'number', region: [0.412, 0.233, 0.061, 0.018] },
+                { at: 'Wlk', other: 'Vlk', kind: 7, region: 'here' },
+            ] },
+        })!;
+        expect(r.entries[0].variants).toEqual([
+            { at: 'Tichopad', other: 'Tichopád', kind: 'spelling', region: [0.4, 0.2, 0.06, 0.02] },
+            { at: 'Jan', other: 'Jakub', field: 'p2.given' },
+            { at: 'a', other: 'b' },
+        ]);
+        expect(r.source!.variants).toEqual([
+            { at: 'Nro. 14', other: 'N. 4', kind: 'number', region: [0.412, 0.233, 0.061, 0.018] },
+            { at: 'Wlk', other: 'Vlk' },
+        ]);
+    });
+
+    it('the blind reader\'s text: entries with a transcript, `of` only an entry of the result, a region of fractions (read.blindText)', () => {
+        const r = sanitizeReadResult({ ...full, blind: {
+            doc: { kind: 'register.marriage', language: ['la'] },
+            entries: [
+                { id: 'b1', page: 1, region: [0.1, 0.2, 0.5, 0.1], transcript: 'Josephus filius\nAntonii', of: 'e1' },
+                { id: 'b2', page: 2, region: [0, 0, 2, 1], transcript: 'Maria', of: 'e7' },
+                { id: 'b3', transcript: '' },
+                { id: 'b1', transcript: 'again', of: 'e1' },
+                'nope',
+            ],
+        } })!;
+        expect(r.blind?.doc).toEqual({ kind: 'register.marriage' });
+        expect(r.blind?.entries).toEqual([
+            { id: 'b1', page: 1, region: [0.1, 0.2, 0.5, 0.1], transcript: 'Josephus filius\nAntonii', of: 'e1' },
+            { id: 'b2', page: 2, region: null, transcript: 'Maria', of: '' },
+            { id: 'b4', page: 1, region: null, transcript: 'again', of: 'e1' },
+        ]);
+        expect(sanitizeReadResult({ ...full, blind: { entries: [] } })!.blind).toBeUndefined();
+        expect(sanitizeReadResult({ ...full, blind: { doc: { kind: 'spaceship' }, entries: [{ transcript: 'x' }] } })!.blind?.doc.kind).toBeNull();
+    });
+
+    it('the readers\' kinds only when two known kinds differ (read.kinds)', () => {
+        const kinds = (k: unknown, asked = 2) => sanitizeReadResult({ ...full, readers: { asked, ran: asked, agree: 'differ', kinds: k } })!.readers.kinds;
+        expect(kinds({ first: 'register.marriage', blind: 'register.baptism' })).toEqual({ first: 'register.marriage', blind: 'register.baptism' });
+        expect(kinds({ first: 'register.marriage', blind: 'register.marriage' })).toBeUndefined();
+        expect(kinds({ first: 'register.marriage', blind: 'spaceship' })).toBeUndefined();
+        expect(kinds({ first: 'register.marriage' })).toBeUndefined();
+        expect(kinds({ first: 'register.marriage', blind: 'register.baptism' }, 1)).toBeUndefined();
     });
 
     it('an unreadable document: no entries, the reason', () => {
@@ -334,6 +444,58 @@ describe('the files a reading takes', () => {
         expect(readUsualMinutes(2)).toBe(4);
     });
 
+    it('the time said is the slowest reader\'s: a reader of another agent counts, never one too short', () => {
+        const claude = { agent: 'claude', model: 'opus', effort: 'high' };
+        const codex = { agent: 'codex', model: 'gpt-6-astra', effort: 'xhigh' };
+        const who = (list: typeof claude[]) => list.map(w => ({ ...w, name: w.agent, modelName: '', ran: true }));
+        const ended = (id: string, secs: number, readers: typeof claude[]) => ({
+            id, state: 'done' as const, at: '2026-11-06T17:34:22.000Z', since: new Date(Date.parse('2026-11-06T17:34:22.000Z') + secs * 1000).toISOString(), who: who(readers),
+        });
+        // The research measures its own agent (Claude: about a minute); Codex never read here: no time rather than 4 minutes.
+        expect(readPaceSecs([claude, codex], { expectSecs: 63, measured: 'claude', history: [] })).toBeNull();
+        // Both readers the research's own: its measure, as before.
+        expect(readPaceSecs([claude, claude], { expectSecs: 63, measured: 'claude', history: [] })).toBe(63);
+        expect(readUsualMinutes(2, readPaceSecs([claude, claude], { expectSecs: 63, measured: 'claude' }))).toBe(4);
+        // A reading of both ended here (5 min 31 s, S1408): Codex's pace from it, the slowest reader wins.
+        const both = ended('D20261106173422-86d4', 331, [claude, codex]);
+        expect(readPaceSecs([claude, codex], { expectSecs: 63, measured: 'claude', history: [both] })).toBe(331);
+        expect(readUsualMinutes(2, 331)).toBe(6);
+        // A reading of Codex alone is its own measure, before one read with another.
+        expect(readPaceSecs([claude, codex], { expectSecs: 63, measured: 'claude', history: [both, ended('D20261105100000-0001', 200, [codex])] })).toBe(200);
+        // Another effort is another pace; the reading itself, one not done, or one of no readers said is not learned from.
+        expect(readPaceSecs([claude, { ...codex, effort: 'low' }], { expectSecs: 63, measured: 'claude', history: [both] })).toBeNull();
+        expect(readPaceSecs([claude, codex], { expectSecs: 63, measured: 'claude', history: [both], except: both.id })).toBeNull();
+        expect(readPaceSecs([claude, codex], { expectSecs: 63, measured: 'claude', history: [{ ...both, state: 'failed' }] })).toBeNull();
+        // No readers said (a research before 059): the research's word alone.
+        expect(readPaceSecs(undefined, { expectSecs: 240 })).toBe(240);
+        expect(readPaceSecs(null, {})).toBe(0);
+        // The research's agent, its pace not said: the usual time.
+        expect(readPaceSecs([claude], { measured: 'claude' })).toBe(0);
+    });
+
+    it('views of one page read in parts are excerpts, other pages pages', () => {
+        const v = (n: number, sha: string, page: number, region: [number, number, number, number] | null) => ({ n, file: 'M1', sha, page, region });
+        const A = 'a'.repeat(64), B = 'b'.repeat(64);
+        // S1408: two parts of M29553's one page.
+        expect(readViewNames([v(1, A, 1, [0.03, 0.73, 0.45, 0.15]), v(2, A, 1, [0.05, 0.77, 0.32, 0.17])]))
+            .toEqual([{ sheet: 1, part: 1, sheets: 1 }, { sheet: 1, part: 2, sheets: 1 }]);
+        // Two parts of page 1 and page 2.
+        expect(readViewNames([v(1, A, 1, [0, 0, 1, 0.5]), v(2, A, 1, [0, 0.5, 1, 0.5]), v(3, B, 1, null)]))
+            .toEqual([{ sheet: 1, part: 1, sheets: 2 }, { sheet: 1, part: 2, sheets: 2 }, { sheet: 2, part: 0, sheets: 2 }]);
+        // A PDF's pages, a single part: pages.
+        expect(readViewNames([v(1, A, 1, null), v(2, A, 2, null), v(3, A, 3, [0, 0, 1, 1])]).map(x => x.part)).toEqual([0, 0, 0]);
+        expect(readSameSheet(v(1, A, 1, null), v(2, A, 1, null))).toBe(true);
+        expect(readSameSheet(v(1, A, 1, null), v(2, A, 2, null))).toBe(false);
+    });
+
+    it('a page read in part keeps its region', () => {
+        const r = sanitizeReadResult({ id: ID, state: 'done', pages: [
+            { n: 1, sha: SHA, file: 'M29553', page: 1, w: 5545, h: 4453, region: [0.027, 0.727, 0.445, 0.145] },
+            { n: 2, sha: SHA, file: 'M29553', page: 1, region: [2, 0, 1, 1] },
+        ] });
+        expect(r?.pages.map(p => p.region)).toEqual([[0.027, 0.727, 0.445, 0.145], null]);
+    });
+
     it('a slow reader: its own time, and the several-minutes line from 120 s', () => {
         expect(readUsualMinutes(1, 60)).toBe(3);
         expect(readUsualMinutes(1, 240)).toBe(4);
@@ -343,5 +505,37 @@ describe('the files a reading takes', () => {
         expect(readSlow(119)).toBe(false);
         expect(readSlow(120)).toBe(true);
         expect(readSlow(240)).toBe(true);
+    });
+});
+
+describe('a start the bridge does not answer in time (a busy bridge takes it late)', () => {
+    const g = globalThis as { __STROM_READ_TIMEOUT_MS?: number };
+    afterEach(() => { vi.unstubAllGlobals(); delete g.__STROM_READ_TIMEOUT_MS; });
+
+    /** A fetch that answers only when aborted (the app gave up), or refuses the connection at once. */
+    function stubFetch(how: 'hang' | 'refused'): void {
+        vi.stubGlobal('fetch', vi.fn((_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
+            if (how === 'refused') { reject(new TypeError('Failed to fetch')); return; }
+            init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        })));
+    }
+
+    it('given up waiting: down, marked late (the reading may have been taken)', async () => {
+        g.__STROM_READ_TIMEOUT_MS = 20;
+        stubFetch('hang');
+        const source = await startSourceRead('http://127.0.0.1:1/t', { source: 'S0001', readers: 1 });
+        const doc = await startRead('http://127.0.0.1:1/t', { files: ['a'.repeat(64)], readers: 1, lang: 'en' });
+        const again = await readAgain('http://127.0.0.1:1/t', 'D20261019153012-a1b2', 1);
+        for (const r of [source, doc, again]) expect(r).toEqual({ ok: false, failure: expect.objectContaining({ kind: 'down', status: 0, late: true }) });
+    });
+
+    it('a bridge not running (connection refused): down, not late', async () => {
+        stubFetch('refused');
+        const r = await startSourceRead('http://127.0.0.1:1/t', { source: 'S0001', readers: 1 });
+        expect(r.ok).toBe(false);
+        if (!r.ok) {
+            expect(r.failure.kind).toBe('down');
+            expect(r.failure.late).toBeUndefined();
+        }
     });
 });

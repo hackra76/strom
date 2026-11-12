@@ -30,6 +30,7 @@ import { placeAliasMap, placeVariantGroups } from '../place-groups.js';
 import { researchLinkMark, type ResearchActionMark } from '../research-link.js';
 import { researchActionLabel, researchLinkFlags } from './research-open-mark.js';
 import { uiModule } from './module.js';
+import { helpMark } from './help-mark.js';
 
 /** How long the toasts of the research's steps stand. */
 const TOAST_MS = 6000;
@@ -67,6 +68,8 @@ export const placesView = {
     bulk: null as 'look' | 'check' | null,
     /** Rows with "Why here" open. */
     why: new Set<string>(),
+    /** Rows in Check with their location shown on the small map. */
+    checkMap: new Set<string>(),
 };
 
 /** A fresh open: no selection, menu, preview or open "Why here". */
@@ -76,6 +79,7 @@ export function resetPlacesView(): void {
     placesView.menu = false;
     placesView.bulk = null;
     placesView.why = new Set();
+    placesView.checkMap = new Set();
 }
 
 /** The texts of a place as the facts write them (what the bridge's `forms` take). */
@@ -121,10 +125,12 @@ export const placesIdentifyMethods = uiModule({
      * Read the research's places when its bridge here announces them (also
      * with the dialog closed: the map and the person card show the states).
      * One read at a time, none when the last one is younger than `maxAgeMs`;
-     * true when what the research says changed.
+     * true when what the research says changed. `fresh`: a read that starts
+     * now (after a write), not one already on its way, which may have been
+     * answered before the write.
      */
-    loadPlacesLive(maxAgeMs = 0): Promise<boolean> {
-        if (liveLoading) return liveLoading;
+    loadPlacesLive(maxAgeMs = 0, fresh = false): Promise<boolean> {
+        if (liveLoading) return fresh ? liveLoading.then(() => this.loadPlacesLive(0, true)) : liveLoading;
         const ctx = this.placesResearchContext();
         const { researchId, base } = ctx;
         if (!researchId || !base || !ctx.features.includes(PLACES_IDENTIFY_FEATURE)) return Promise.resolve(false);
@@ -133,12 +139,14 @@ export const placesIdentifyMethods = uiModule({
         }
         liveLoading = (async () => {
             const prev = placesView.live?.researchId === researchId ? placesView.live.payload : null;
+            // Only what was queued before this read asked is in its answer: a place queued meanwhile stays queued here.
+            const queuedBefore = [...placesView.queuedLocal];
             const res = await fetchBridgePlaces(base, { rev: prev?.rev });
             if (!res.ok) return false;
             liveReadAt = { researchId, at: Date.now() };
-            const hadLocal = placesView.queuedLocal.size > 0;
+            const hadLocal = queuedBefore.some(k => placesView.queuedLocal.has(k));
             placesView.live = { researchId, payload: res.payload };
-            placesView.queuedLocal = new Set();
+            for (const k of queuedBefore) placesView.queuedLocal.delete(k);
             return hadLocal || JSON.stringify(prev) !== JSON.stringify(res.payload);
         })().finally(() => { liveLoading = null; });
         return liveLoading;
@@ -150,10 +158,10 @@ export const placesIdentifyMethods = uiModule({
      * stays otherwise), the open map and person card. Without a bridge
      * everything keeps what the tree knows.
      */
-    async refreshPlacesLive(maxAgeMs = 0): Promise<void> {
+    async refreshPlacesLive(maxAgeMs = 0, fresh = false): Promise<void> {
         const before = JSON.stringify([...placesView.ids]);
         const prevCounts = JSON.stringify(this.placesLivePayload()?.counts);
-        const changed = await this.loadPlacesLive(maxAgeMs);
+        const changed = await this.loadPlacesLive(maxAgeMs, fresh);
         if (!changed) return;
         if (document.getElementById('places-modal')) {
             const after = JSON.stringify([...this.computePlaceIdentities(placesView.usages.keys())]);
@@ -359,7 +367,7 @@ export const placesIdentifyMethods = uiModule({
         }
         return `
             <div class="places-bulk" role="group" data-bulk="${kind}" aria-label="${this.escapeHtml(head)}">
-                <p class="places-bulk-head">${this.escapeHtml(head)}</p>
+                <div class="places-bulk-headrow"><p class="places-bulk-head">${this.escapeHtml(head)}</p></div>
                 <div class="places-bulk-lines">
                     ${lines.map(l => `<p class="places-bulk-line"><span class="places-bulk-icon" data-tone="${l.tone}" aria-hidden="true">${l.icon}</span><span>${this.escapeHtml(l.text)}</span></p>`).join('')}
                 </div>
@@ -384,6 +392,8 @@ export const placesIdentifyMethods = uiModule({
         if (ctxHost) ctxHost.innerHTML = this.placesContextHtml(summary);
         const bulkHost = top.querySelector<HTMLElement>('.places-bulk-host');
         if (bulkHost) bulkHost.innerHTML = this.placesBulkHtml();
+        // Looking up places off the map in the research: its rule (A6.5.2), "?" last in the preview's heading row.
+        bulkHost?.querySelector('.places-bulk[data-bulk="look"] .places-bulk-headrow')?.append(helpMark('mapLookup'));
         this.bindPlacesTopDynamic(top);
     },
 
@@ -538,7 +548,8 @@ export const placesIdentifyMethods = uiModule({
         } else if (sub) {
             this.showToast(sub, TOAST_MS);
         }
-        void this.refreshPlacesLive();
+        // A read after the step (one on its way may have been answered before it).
+        void this.refreshPlacesLive(0, true);
         return true;
     },
 
@@ -566,7 +577,7 @@ export const placesIdentifyMethods = uiModule({
             case 'archive': text = res.reason || r.errArchive; break;
             case 'network': text = r.errNetwork; break;
             case 'later': text = r.errUndoLater; break;
-            case 'changed': text = r.errChanged; void this.refreshPlacesLive(); break;
+            case 'changed': text = r.errChanged; void this.refreshPlacesLive(0, true); break;
             default: text = res.reason || r.errFailed;
         }
         const link = res.code === 'link' ? res.link : undefined;
@@ -584,7 +595,7 @@ export const placesIdentifyMethods = uiModule({
         }
         for (const k of keys) placesView.queuedLocal.delete(k);
         this.showToast(strings.places.research.unqueued, TOAST_MS);
-        await this.refreshPlacesLive();
+        await this.refreshPlacesLive(0, true);
         this.redrawPlacesKeepingSearch();
         this.placesLiveChanged();
     },
@@ -612,7 +623,7 @@ export const placesIdentifyMethods = uiModule({
                 const date = row.at ? ` <span class="place-why-date">${this.escapeHtml(formatPlaceDate(row.at, lang))}</span>` : '';
                 value = `${placeOriginBadge(row.origin, lang, row.origin === 'research' ? row.at : undefined)}${row.origin === 'research' ? '' : date}`;
             } else if (row.url) {
-                value = `${this.escapeHtml(row.text)} <a class="place-why-link" href="${this.escapeHtml(row.url)}" target="_blank" rel="noopener noreferrer"><span aria-hidden="true">↗</span></a>`;
+                value = `${this.escapeHtml(row.text)} <a class="place-why-link" href="${this.escapeHtml(row.url)}" target="_blank" rel="noopener noreferrer" aria-label="${this.escapeHtml(strings.places.dialog.dSourceOpen)}"><span aria-hidden="true">↗</span></a>`;
             } else {
                 value = this.escapeHtml(row.text);
             }

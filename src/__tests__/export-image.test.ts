@@ -3,8 +3,10 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { buildTreeSvg, computeBounds, PosterLayout } from '../export-image.js';
+import { buildTreeSvg, computeBounds, PosterLayout, fitCompactName, COMPACT_NAME_MIN_SQUEEZE } from '../export-image.js';
 import { StromData, Person, PersonId, PartnershipId, Position, DEFAULT_LAYOUT_CONFIG } from '../types.js';
+import { MeasureTexts, normalCardHeights, cardNameMaxRows } from '../card-width.js';
+import type { CardValueLines } from '../card-fields.js';
 
 function person(id: string, over: Partial<Person> = {}): Person {
     return {
@@ -161,10 +163,20 @@ describe('buildTreeSvg', () => {
     });
 
     it('long names shrink and clamp instead of overflowing the card', () => {
-        const data = makeData(person('a', { firstName: 'Maximilian Alexander Wolfgang Amadeus' } as never));
+        // Each part fits a row of its own, the whole is too long for one line: shrunk and clamped (two rows at most).
+        const data = makeData(person('a', { firstName: 'Maximilian', lastName: 'Wolfensteiner' } as never));
         const svg = buildTreeSvg(data, layout({ a: { x: 0, y: 0 } }));
         expect(svg).toContain('lengthAdjust="spacingAndGlyphs"');
-        expect(svg).not.toContain('font-size="15" font-weight="600" fill="#2b2822">Maximilian Alexander');
+        expect(svg).not.toContain('font-size="15" font-weight="600" fill="#2b2822">Maximilian Wolfensteiner');
+    });
+
+    it('a name too long for two rows goes on more rows, never squeezed past reading (T40)', () => {
+        const data = makeData(person('a', { firstName: 'Maximilian Alexander Wolfgang Amadeus' } as never));
+        const svg = buildTreeSvg(data, layout({ a: { x: 0, y: 0 } }));
+        const rows = [...svg.matchAll(/<text class="card-name-row"[^>]*>([^<]*)</g)].map(m => m[1]);
+        expect(rows.length).toBeGreaterThan(2);
+        expect(rows.join(' ')).toBe('Maximilian Alexander Wolfgang Amadeus Novák');
+        expect(svg).not.toContain('textLength');
     });
 });
 
@@ -293,5 +305,179 @@ describe('card densities (N16): each drawn at the layout\'s card size, in its ow
         const svg = buildTreeSvg(makeData(person('a')), layout({ a: { x: 0, y: 0 } }), { cardDensity: 'normal' });
         expect(svg).toContain('width="188" height="64" rx="8"');
         expect(svg).toMatch(/<circle [^>]*r="17"/);
+    });
+});
+
+describe('the card corner in the image (spec 066 P4 §7)', () => {
+    const data = makeData(person('a', { birthDate: '1900', deathDate: '1970', birthPlace: 'Lipany' }), person('b', { gender: 'female' }));
+    const l = layout({ a: { x: 0, y: 0 }, b: { x: 200, y: 300 } });
+    const markBox = (svg: string) => {
+        const m = /<g class="card-status-mark" data-status="([a-z0-9-]+)"><rect x="([\d.]+)" y="([\d.]+)" width="([\d.]+)" height="([\d.]+)"/.exec(svg);
+        return m ? { cls: m[1], x: +m[2], y: +m[3], w: +m[4], h: +m[5] } : null;
+    };
+
+    it('no marks without cardMarks (the family book\'s tree page, a switch off)', () => {
+        const svg = buildTreeSvg(data, l);
+        expect(svg).not.toContain('card-status-mark');
+        expect(svg).not.toContain('card-story');
+    });
+
+    it('the status mark sits in the bottom-right corner, 15px in beside the fold, 5px without', () => {
+        const withFold = buildTreeSvg(data, l, { cardMarks: new Map([['a', { status: 'cs-p2', story: { kind: 'own', final: true } }]]) });
+        const m = markBox(withFold)!;
+        expect(m.cls).toBe('cs-p2');
+        // Card a: 188x64 at (0,0); the 20px pill ends 1 + 15px inside the right edge, 1 + 4px above the bottom.
+        expect(m.x + m.w + 0.5).toBeCloseTo(188.5 - 1 - 15, 1);
+        expect(m.y + m.h + 0.5).toBeCloseTo(64.5 - 1 - 4, 1);
+        expect(withFold).toContain('<g class="card-story">');
+        // Two full dots.
+        expect(withFold.match(/<circle [^>]*r="2" fill="#5c5546"/g)).toHaveLength(2);
+        const alone = markBox(buildTreeSvg(data, l, { cardMarks: new Map([['a', { status: 'cs-p2' }]]) }))!;
+        expect(alone.x + alone.w + 0.5).toBeCloseTo(188.5 - 1 - 5, 1);
+    });
+
+    it('each step draws its own shape: ✓, ●○, ○, ○○ dashed, an empty dotted frame', () => {
+        const svgOf = (cls: 'cs-human' | 'cs-p1' | 'cs-res' | 'cs-import' | 'cs-none') =>
+            buildTreeSvg(data, l, { cardMarks: new Map([['a', { status: cls }]]) });
+        expect(svgOf('cs-human')).toContain('>✓</text>');
+        expect(svgOf('cs-p1').match(/r="2" fill="none"/g)).toHaveLength(1);
+        expect(svgOf('cs-res').match(/r="2" fill="none"/g)).toHaveLength(1);
+        expect(svgOf('cs-import')).toContain('stroke-dasharray="3,2"');
+        expect(svgOf('cs-import').match(/r="2" fill="none"/g)).toHaveLength(2);
+        const none = svgOf('cs-none');
+        expect(none).toContain('stroke-dasharray="1,1.5"');
+        expect(none).not.toMatch(/r="2"/);
+    });
+
+    it('a couple\'s story or a draft: a hollow fold; a placeholder draws no mark', () => {
+        const svg = buildTreeSvg(makeData(person('a'), person('b', { isPlaceholder: true })), l, {
+            cardMarks: new Map([['a', { story: { kind: 'couple', final: true } }], ['b', { status: 'cs-none' }]]),
+        });
+        expect(svg).toContain('<g class="card-story hollow">');
+        expect(svg).not.toContain('card-status-mark');
+    });
+
+    it('the last row ends before the mark (the screen\'s 28px), the name of a compact card before its 36px', () => {
+        const meta = (svg: string) => /<text x="([\d.]+)" y="45.0"[^>]*textLength="(\d+)"|<text x="([\d.]+)" y="45.0"/.exec(svg);
+        const plain = meta(buildTreeSvg(data, l))!;
+        const marked = meta(buildTreeSvg(data, l, { cardMarks: new Map([['a', { status: 'cs-p2' }]]) }))!;
+        // The row's centre moves 14px left (its room 28px narrower).
+        expect(+(plain[1] ?? plain[3]) - +(marked[1] ?? marked[3])).toBeCloseTo(14, 1);
+        const compact = { ...DEFAULT_LAYOUT_CONFIG, cardWidth: 150, cardHeight: 44 };
+        const nameX = (svg: string) => +/<text x="([\d.]+)" y="26.5"/.exec(svg)![1];
+        const a = nameX(buildTreeSvg(data, l, { config: compact, cardDensity: 'compact' }));
+        const b = nameX(buildTreeSvg(data, l, { config: compact, cardDensity: 'compact', cardMarks: new Map([['a', { status: 'cs-p2' }]]) }));
+        expect(a - b).toBeCloseTo(13, 1);
+    });
+});
+
+describe('a long name on the card is never shortened in the image (T40)', () => {
+    /** Every text a fixed 7px a character (the 126px column holds 18). */
+    const measure: MeasureTexts = (_kind, texts) => new Map([...texts].map(t => [t, t.length * 7]));
+    const long = person('a', { firstName: 'Bartoloměj Kryštof Maximilián', lastName: 'Wolfensteiner-Hohenbrandt', birthDate: '1888', deathDate: '1950' });
+    const word = person('a', { firstName: 'Ondřej', lastName: 'Wolfensteinerhohenbrandtovský' });
+    const rows = (svg: string) => [...svg.matchAll(/<text class="card-name-row"[^>]*>([^<]*)</g)].map(m => m[1]);
+    const rectH = (svg: string) => Number(/<rect x="[\d.-]+" y="[\d.-]+" width="\d+" height="(\d+)" rx="8"/.exec(svg)![1]);
+    const heightOf = (p: Person) => normalCardHeights(new Map([['a', { given: p.firstName, surname: p.lastName, avatar: true }]]), measure)?.get('a');
+
+    it('normal: the name on as many rows as it needs, whole, the card as tall as the screen laid it out', () => {
+        const h = heightOf(long)!;
+        expect(h).toBeGreaterThan(64);
+        const config = { ...DEFAULT_LAYOUT_CONFIG, personHeights: new Map([['a' as PersonId, h]]) };
+        const svg = buildTreeSvg(makeData(long), layout({ a: { x: 0, y: 0 } }), { config, cardDensity: 'normal', measureCardTexts: measure });
+        const r = rows(svg);
+        expect(r.length).toBeGreaterThan(2);
+        expect(r.join(' ').replace('- ', '-')).toBe('Bartoloměj Kryštof Maximilián Wolfensteiner-Hohenbrandt');
+        expect(svg).not.toContain('…');
+        expect(rectH(svg)).toBe(h);
+        // Every row inside the column (drawn at its measured width) and inside the card's height.
+        for (const m of svg.matchAll(/<text class="card-name-row"[^>]*y="([\d.]+)"[^>]*textLength="([\d.]+)"/g)) {
+            expect(Number(m[2])).toBeLessThanOrEqual(125);
+            expect(Number(m[1])).toBeLessThan(h);
+        }
+        // The years only, under the rows, inside the card.
+        const years = /<text x="[\d.]+" y="([\d.]+)"[^>]*>1888 – 1950</.exec(svg)!;
+        expect(Number(years[1])).toBeLessThan(h);
+    });
+
+    it('normal: one long word without spaces breaks between characters, nothing cut', () => {
+        const h = heightOf(word)!;
+        const config = { ...DEFAULT_LAYOUT_CONFIG, personHeights: new Map([['a' as PersonId, h]]) };
+        const svg = buildTreeSvg(makeData(word), layout({ a: { x: 0, y: 0 } }), { config, cardDensity: 'normal', measureCardTexts: measure });
+        const r = rows(svg);
+        expect(r.length).toBe(3);
+        expect(r.slice(1).join('')).toBe('Wolfensteinerhohenbrandtovský');
+        expect(svg).not.toContain('…');
+    });
+
+    it('normal: a short name stays the one-line 64px card', () => {
+        const svg = buildTreeSvg(makeData(person('a')), layout({ a: { x: 0, y: 0 } }), { cardDensity: 'normal', measureCardTexts: measure });
+        expect(rows(svg)).toEqual([]);
+        expect(rectH(svg)).toBe(64);
+        expect(svg).toMatch(/<text x="[\d.]+" y="28.0"[^>]*>Jan Novák</);
+    });
+
+    it('normal with the birth surname: the rows, then "roz.", never "…"', () => {
+        const married = person('a', { gender: 'female', firstName: 'Bartolomějka Kryštofa', lastName: 'Lindenthalová', marriedSurname: 'Wolfensteinerová-Hohenbrandtová' });
+        const svg = buildTreeSvg(makeData(married), layout({ a: { x: 0, y: 0 } }), { cardDensity: 'normal', measureCardTexts: measure,
+            config: { ...DEFAULT_LAYOUT_CONFIG, personHeights: new Map([['a' as PersonId, 79]]) } });
+        expect(rows(svg).join(' ')).toContain('Wolfensteinerová-');
+        expect(svg).toContain('class="card-birth"');
+        expect(svg.split('class="card-birth"')[0]).not.toContain('…');
+    });
+
+    it('compact stays one shortened row', () => {
+        const svg = buildTreeSvg(makeData(long), layout({ a: { x: 0, y: 0 } }), {
+            config: { ...DEFAULT_LAYOUT_CONFIG, cardWidth: 150, cardHeight: 44 }, cardDensity: 'compact', measureCardTexts: measure,
+        });
+        expect(rows(svg)).toEqual([]);
+        expect(svg.match(/<text /g)).toHaveLength(1);
+        // Shortened with "…" inside the 128px room as on the screen, not squeezed (1110).
+        expect(svg).toMatch(/font-size="12.5"[^>]*>Bartoloměj Kryšto…<\/text>/);
+        expect(svg).not.toContain('textLength');
+    });
+
+    it('compact: a long name without spaces (PNG and SVG draw this) is shortened, never squeezed below a readable ratio (1110)', () => {
+        const word30 = person('a', { firstName: 'Ivo', lastName: 'Wolkenhammerstrandvoldeckenbergsheim' });
+        const draw = (m?: MeasureTexts) => buildTreeSvg(makeData(word30), layout({ a: { x: 0, y: 0 } }), {
+            config: { ...DEFAULT_LAYOUT_CONFIG, cardWidth: 150, cardHeight: 44 }, cardDensity: 'compact',
+            ...(m ? { measureCardTexts: m } : {}),
+        });
+        for (const svg of [draw(measure), draw()]) {
+            const text = /<text [^>]*>([^<]*)<\/text>/.exec(svg)!;
+            expect(text[1].endsWith('…')).toBe(true);
+            expect(text[1].startsWith('Ivo Wolkenham')).toBe(true);
+            const squeeze = /textLength="([\d.]+)"/.exec(text[0]);
+            if (squeeze) {
+                const natural = (m => m.get(text[1]) ?? 0)(measure('nameSmall', [text[1]]));
+                expect(Number(squeeze[1]) / natural).toBeGreaterThanOrEqual(COMPACT_NAME_MIN_SQUEEZE);
+            }
+        }
+    });
+
+    it('compact: 13px, then 12.5px, then a name a little too wide narrowed whole, then "…"', () => {
+        const w = (texts: string[]) => new Map(texts.map(t => [t, t.length * 10]));
+        expect(fitCompactName('Jan Novák', 128, w)).toEqual({ text: 'Jan Novák', size: 13, width: 93.6, squeezed: false });
+        expect(fitCompactName('Jan Nováková', 121, w)).toEqual({ text: 'Jan Nováková', size: 12.5, width: 120, squeezed: false });
+        // 130px in a 120px room: 92% of its width, drawn whole.
+        expect(fitCompactName('Jan Novákovsk', 120, w)).toEqual({ text: 'Jan Novákovsk', size: 12.5, width: 120, squeezed: true });
+        // 180px in 120px: "…".
+        expect(fitCompactName('Jan Novákovský Brn', 120, w)).toEqual({ text: 'Jan Novákov…', size: 12.5, width: 120, squeezed: false });
+        // A cut after a space: the space dropped before the "…".
+        expect(fitCompactName('Jan Nováko Brn', 120, w).text).toBe('Jan Nováko…');
+    });
+
+    it('detailed: the whole name on rows; register and custom keep two rows, the last ending in "…"', () => {
+        const draw = (nameRows: CardValueLines) => buildTreeSvg(makeData(long), layout({ a: { x: 0, y: 0 } }), {
+            config: { ...DEFAULT_LAYOUT_CONFIG, cardWidth: 200, cardHeight: 120 },
+            cardLines: new Map([['a', []]]), cardDateColumn: 0, cardValueLines: 0, measureCardTexts: measure,
+            ...(nameRows === 2 ? {} : { cardNameMaxRows: nameRows }),
+        });
+        const detailed = rows(draw(cardNameMaxRows('detailed')));
+        expect(detailed.length).toBeGreaterThan(2);
+        expect(detailed.join(' ').replace('- ', '-')).toBe('Bartoloměj Kryštof Maximilián Wolfensteiner-Hohenbrandt');
+        const register = rows(draw(cardNameMaxRows('register')));
+        expect(register).toHaveLength(2);
+        expect(register[1].endsWith('…')).toBe(true);
     });
 });

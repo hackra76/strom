@@ -5,8 +5,9 @@
 
 import { parseFlexDate, yearOf } from '../dates.js';
 import { PersonId, Person, Partnership, StromData, gendersCompatible } from '../types.js';
-import { sameSurname } from '../surnames.js';
+import { sameSurname, withSurnameRules } from '../surnames.js';
 import { detectPartnershipConflicts, AUTO_CONFIRM_SCORE } from './executor.js';
+import { idEvidence, sameFileRecord, strongIdIndex, StrongIdIndex } from './id-match.js';
 import {
     PersonMatch,
     MatchConfidence,
@@ -15,6 +16,101 @@ import {
     MergeState,
     MergeStats
 } from './types.js';
+
+// ==================== ONE MATCHING PASS ====================
+
+/**
+ * What one matching pass (findMatches, findSimilarPersons) works out once.
+ * A pass compares every incoming person with every person of the tree, so
+ * the same names, surname pairs and dates come up again and again; each
+ * answer here is a pure function of its strings (and of a tree that does not
+ * change during the pass), so remembering it changes no result.
+ */
+interface MatchPass {
+    normalized: Map<string, string>;
+    similarity: Map<string, Map<string, number>>;
+    firstNames: Map<string, Map<string, FirstNamesResult>>;
+    lastNames: Map<string, Map<string, LastNameResult>>;
+    sameSurname: Map<StromData, Map<string, Map<string, boolean>>>;
+    /** bestLastNameMatch by tree, file and the two persons' surname signatures. */
+    bestLastNames: Map<StromData, Map<StromData, Map<string, Map<string, LastNameResult>>>>;
+    signatures: WeakMap<object, string>;
+    /** firstNameMayQuickMatch by the two normalized first names. */
+    firstNameBound: Map<string, Map<string, boolean>>;
+    /** A tree's persons (in order) and their strong ids, by tree. */
+    strongIds: Map<StromData, TreeStrongIds>;
+}
+
+/** A tree's persons in their order and the index of their strong ids. */
+interface TreeStrongIds {
+    persons: Person[];
+    index: StrongIdIndex;
+}
+
+let matchPass: MatchPass | null = null;
+
+/** The answer for (a, b) in a two-level memo, computed once. */
+function memo2<V>(table: Map<string, Map<string, V>>, a: string, b: string, compute: () => V): V {
+    let row = table.get(a);
+    if (!row) table.set(a, row = new Map());
+    let value = row.get(b);
+    if (value === undefined && !row.has(b)) {
+        value = compute();
+        row.set(b, value);
+    }
+    return value as V;
+}
+
+/**
+ * Run `fn` as one matching pass over these trees (see MatchPass); passes do
+ * not nest (inside a pass `fn` simply runs in it). The trees must not change
+ * while it runs. Cross-tree matching ("Also in" on the cards) runs its card
+ * loop in one pass over the current tree and every other tree.
+ */
+export function inMatchPass<T>(trees: StromData[], fn: () => T): T {
+    if (matchPass) return fn();
+    matchPass = { normalized: new Map(), similarity: new Map(), firstNames: new Map(), lastNames: new Map(), sameSurname: new Map(), bestLastNames: new Map(), signatures: new WeakMap(), firstNameBound: new Map(), strongIds: new Map() };
+    try {
+        const run = trees.reduceRight<() => T>((inner, data) => () => withSurnameRules(data, inner), fn);
+        return run();
+    } finally {
+        matchPass = null;
+    }
+}
+
+/** A tree's persons and their strong-id index, remembered for the pass. */
+function strongIdsOf(data: StromData): TreeStrongIds {
+    const have = matchPass?.strongIds.get(data);
+    if (have) return have;
+    const persons = Object.values(data.persons);
+    const made: TreeStrongIds = { persons, index: strongIdIndex(persons, data) };
+    matchPass?.strongIds.set(data, made);
+    return made;
+}
+
+/**
+ * The tree has more than one person (of a name, or more than one "?") with
+ * a strong id the incoming person has: the id does not say which one it is,
+ * so it pairs none of them by itself — a match is only offered (spec 066
+ * K3.2, as the research's rule (a)).
+ */
+function idNamesSeveral(incoming: Person, existingData: StromData, incomingData: StromData): boolean {
+    if (existingData === incomingData || !incoming.originalIds?.length) return false;
+    const tree = strongIdsOf(existingData);
+    let found = 0;
+    for (const at of tree.index.sharing(incoming, incomingData)) {
+        if (!!tree.persons[at].isPlaceholder === !!incoming.isPlaceholder && ++found > 1) return true;
+    }
+    return false;
+}
+
+/** sameSurname, remembered for the pass. */
+function sameSurnameIn(a: string, b: string, data: StromData): boolean {
+    if (!matchPass) return sameSurname(a, b, data);
+    let table = matchPass.sameSurname.get(data);
+    if (!table) matchPass.sameSurname.set(data, table = new Map());
+    return memo2(table, a, b, () => sameSurname(a, b, data));
+}
 
 // ==================== NAME NORMALIZATION ====================
 
@@ -36,6 +132,14 @@ const LETTER_FOLDS: Record<string, string> = {
  * "no name": callers must treat '' as unknown, never as equal to another ''.
  */
 export function normalizeName(text: string): string {
+    const cache = matchPass?.normalized;
+    if (!cache) return normalizeNameNow(text);
+    let out = cache.get(text);
+    if (out === undefined) cache.set(text, out = normalizeNameNow(text));
+    return out;
+}
+
+function normalizeNameNow(text: string): string {
     return text
         .toLowerCase()
         .normalize('NFD')
@@ -51,9 +155,16 @@ export function normalizeName(text: string): string {
  * Returns value between 0 (no match) and 1 (exact match)
  */
 export function stringSimilarity(a: string, b: string): number {
-    const normalizedA = normalizeName(a);
-    const normalizedB = normalizeName(b);
+    if (matchPass) return memo2(matchPass.similarity, a, b, () => stringSimilarityNow(a, b));
+    return stringSimilarityNow(a, b);
+}
 
+function stringSimilarityNow(a: string, b: string): number {
+    return normalizedSimilarity(normalizeName(a), normalizeName(b));
+}
+
+/** stringSimilarity of two names already normalized (normalizeName). */
+function normalizedSimilarity(normalizedA: string, normalizedB: string): number {
     // No name is not a name: two blanks (or two names in a script the
     // normalizer cannot read) must never count as the same name.
     if (normalizedA.length === 0 || normalizedB.length === 0) return 0;
@@ -69,30 +180,27 @@ export function stringSimilarity(a: string, b: string): number {
  * Levenshtein distance between two strings
  */
 function levenshteinDistance(a: string, b: string): number {
-    const matrix: number[][] = [];
-
-    for (let i = 0; i <= b.length; i++) {
-        matrix[i] = [i];
-    }
-    for (let j = 0; j <= a.length; j++) {
-        matrix[0][j] = j;
-    }
+    // Two rows of the matrix (row i of b against every prefix of a) are enough.
+    let previous: number[] = [];
+    for (let j = 0; j <= a.length; j++) previous[j] = j;
 
     for (let i = 1; i <= b.length; i++) {
+        const current: number[] = [i];
         for (let j = 1; j <= a.length; j++) {
             if (b.charAt(i - 1) === a.charAt(j - 1)) {
-                matrix[i][j] = matrix[i - 1][j - 1];
+                current[j] = previous[j - 1];
             } else {
-                matrix[i][j] = Math.min(
-                    matrix[i - 1][j - 1] + 1, // substitution
-                    matrix[i][j - 1] + 1,     // insertion
-                    matrix[i - 1][j] + 1      // deletion
+                current[j] = Math.min(
+                    previous[j - 1] + 1,   // substitution
+                    current[j - 1] + 1,    // insertion
+                    previous[j] + 1        // deletion
                 );
             }
         }
+        previous = current;
     }
 
-    return matrix[b.length][a.length];
+    return previous[a.length];
 }
 
 // ==================== DATE HELPERS ====================
@@ -146,7 +254,14 @@ function yearsClose(date1: string | undefined, date2: string | undefined, tolera
  * Check if first names match considering middle names
  * Handles first word match and any word match for multi-part names
  */
-function firstNamesMatch(name1: string, name2: string): { exact: boolean; firstWord: boolean; anyWord: boolean; prefix: boolean; matchedWord?: string } {
+type FirstNamesResult = { exact: boolean; firstWord: boolean; anyWord: boolean; prefix: boolean; matchedWord?: string };
+
+function firstNamesMatch(name1: string, name2: string): FirstNamesResult {
+    if (matchPass) return memo2(matchPass.firstNames, name1, name2, () => firstNamesMatchNow(name1, name2));
+    return firstNamesMatchNow(name1, name2);
+}
+
+function firstNamesMatchNow(name1: string, name2: string): FirstNamesResult {
     const n1 = normalizeName(name1);
     const n2 = normalizeName(name2);
 
@@ -199,20 +314,46 @@ function writtenSurnames(person: SurnameFields): string[] {
     return [person.lastName, person.marriedSurname ?? '', ...(person.nameVariants ?? [])].filter(Boolean);
 }
 
+/** The surname fields bestLastNameMatch reads, as one key. */
+function surnameSignature(person: SurnameFields): string {
+    const cache = matchPass?.signatures;
+    let key = cache?.get(person);
+    if (key === undefined) {
+        key = JSON.stringify([person.lastName, person.marriedSurname ?? null, person.nameVariants ?? null]);
+        cache?.set(person, key);
+    }
+    return key;
+}
+
 /** The best match across every written form of both names. */
 function bestLastNameMatch(
     existing: SurnameFields,
     incoming: SurnameFields,
     existingData?: StromData,
     incomingData?: StromData,
-): { exact: boolean; similar: boolean; similarity: number } {
+): LastNameResult {
+    if (!matchPass || !existingData || !incomingData) return bestLastNameMatchNow(existing, incoming, existingData, incomingData);
+    let byIncomingData = matchPass.bestLastNames.get(existingData);
+    if (!byIncomingData) matchPass.bestLastNames.set(existingData, byIncomingData = new Map());
+    let table = byIncomingData.get(incomingData);
+    if (!table) byIncomingData.set(incomingData, table = new Map());
+    return memo2(table, surnameSignature(existing), surnameSignature(incoming),
+        () => bestLastNameMatchNow(existing, incoming, existingData, incomingData));
+}
+
+function bestLastNameMatchNow(
+    existing: SurnameFields,
+    incoming: SurnameFields,
+    existingData?: StromData,
+    incomingData?: StromData,
+): LastNameResult {
     // A rule (Fíšek/Fíšková) or a group the user entered is not a similarity
     // question — it is an answer, so it does not go near the fuzzy comparison.
     // Both the birth surname and the one after marriage are asked.
     const surnames = (p: SurnameFields): string[] => [p.lastName, p.marriedSurname ?? ''].filter(Boolean);
     const rulesSay = (data?: StromData): boolean =>
-        !!data && (sameSurname(existing.lastName, incoming.lastName, data)
-            || surnames(existing).some(a => surnames(incoming).some(b => sameSurname(a, b, data))));
+        !!data && (sameSurnameIn(existing.lastName, incoming.lastName, data)
+            || surnames(existing).some(a => surnames(incoming).some(b => sameSurnameIn(a, b, data))));
     if (rulesSay(existingData) || rulesSay(incomingData)) {
         return { exact: true, similar: true, similarity: 1.0 };
     }
@@ -234,7 +375,14 @@ function bestLastNameMatch(
 /**
  * Check if last names are similar (handles typos and spelling variations)
  */
-function lastNamesSimilar(name1: string, name2: string): { exact: boolean; similar: boolean; similarity: number } {
+type LastNameResult = { exact: boolean; similar: boolean; similarity: number };
+
+function lastNamesSimilar(name1: string, name2: string): LastNameResult {
+    if (matchPass) return memo2(matchPass.lastNames, name1, name2, () => lastNamesSimilarNow(name1, name2));
+    return lastNamesSimilarNow(name1, name2);
+}
+
+function lastNamesSimilarNow(name1: string, name2: string): LastNameResult {
     const n1 = normalizeName(name1);
     const n2 = normalizeName(name2);
 
@@ -300,6 +448,44 @@ function getParents(person: Person, data: StromData): Person[] {
     return parents;
 }
 
+/**
+ * The siblings of a person through a parent of no name (a "?"): nothing
+ * pairs that parent by its name, so the siblings are what relate the person
+ * to the matched ones. Siblings through a named parent are reached through
+ * that parent.
+ */
+function getSiblingsThroughStandIns(person: Person, data: StromData): Person[] {
+    const siblings = new Set<Person>();
+    for (const parentId of person.parentIds) {
+        const parent = data.persons[parentId];
+        if (!parent?.isPlaceholder) continue;
+        for (const childId of parent.childIds) {
+            const child = data.persons[childId];
+            if (child && child.id !== person.id) siblings.add(child);
+        }
+    }
+    return [...siblings];
+}
+
+/**
+ * The in-laws of a person through a spouse of no name (a "?"): the partners
+ * of the person's "?" children and the parents of the person's "?" partners.
+ * Nothing pairs that "?" by its name, so they are what relate the person to
+ * the matched ones.
+ */
+function getInLawsThroughStandIns(person: Person, data: StromData): Person[] {
+    const inLaws = new Set<Person>();
+    for (const child of getChildren(person, data)) {
+        if (!child.isPlaceholder) continue;
+        for (const partner of getPartners(child, data)) if (partner.id !== person.id) inLaws.add(partner);
+    }
+    for (const partner of getPartners(person, data)) {
+        if (!partner.isPlaceholder) continue;
+        for (const parent of getParents(partner, data)) if (parent.id !== person.id) inLaws.add(parent);
+    }
+    return [...inLaws];
+}
+
 // ==================== MATCHING ALGORITHM ====================
 
 /**
@@ -311,11 +497,61 @@ interface MatchCandidate {
     reasons: MatchReason[];
 }
 
+/** A pair's score; `cap` bounds it with any bonus added later (only offered, never auto-confirmed). */
+interface ScoreResult {
+    score: number;
+    reasons: MatchReason[];
+    cap?: number;
+    /** A shared strong id the names, sex and birth years agree with: the same person. */
+    idConfirmed?: boolean;
+}
+
+/** A strong id both files give the person (`_UID`, `_FSFTID`…) that the rest agrees with: the same person. */
+const ID_MATCH_SCORE = 100;
+/** A shared strong id the rest does not agree with: at least a candidate to look at, nothing more. */
+const ID_CANDIDATE_SCORE = 60;
+/** The most two birth (else baptism) years may differ for a shared strong id to confirm a match. */
+const ID_MAX_YEAR_GAP = 3;
+/** The same xref or RIN in files of one program: a contribution to a name match. */
+const WEAK_ID_BONUS = 25;
+
+/** The highest score of a match that is only offered (below the auto-confirm bar). */
+function offerOnlyCap(): number {
+    return AUTO_CONFIRM_SCORE - 1;
+}
+
+/** The year a person was born, else baptized; null when neither is known. */
+function birthOrBaptismYear(person: Person): number | null {
+    const born = yearOf(person.birthDate);
+    if (born !== null) return born;
+    const baptism = person.events?.find(e => e.type === 'baptism' && e.date);
+    return baptism ? yearOf(baptism.date) : null;
+}
+
+/** A shared strong id that is only a hint: offered with its reason, below the auto-confirm bar. */
+function idCandidate(score: number, reasons: MatchReason[]): ScoreResult {
+    const cap = offerOnlyCap();
+    const out: MatchReason[] = reasons.includes('id') ? [...reasons] : ['id', ...reasons];
+    return { score: Math.min(Math.max(score, ID_CANDIDATE_SCORE), cap), reasons: out, cap };
+}
+
+/** A base score plus a relationship bonus, within 100 and the base's cap. */
+function withBonus(base: ScoreResult, bonus: number): number {
+    return Math.min(base.score + bonus, base.cap ?? 100);
+}
+
 /**
  * Find matches between incoming persons and existing persons
  * Uses multiple strategies for smart matching
  */
 export function findMatches(
+    existingData: StromData,
+    incomingData: StromData
+): PersonMatch[] {
+    return inMatchPass([existingData, incomingData], () => findMatchesInPass(existingData, incomingData));
+}
+
+function findMatchesInPass(
     existingData: StromData,
     incomingData: StromData
 ): PersonMatch[] {
@@ -343,6 +579,20 @@ export function findMatches(
         seeds = propagatedMatches;
     }
 
+    // Phase 2a: a person the name scores leave out (no surname, no dates — a
+    // tree loaded before files' ids were kept has nothing else to pair by)
+    // is the one of the same name related the same way to a matched person.
+    const sameNameBlocked = new Set<PersonId>();
+    let sameNameSeeds = matches;
+    for (let round = 0; round < maxRounds; round++) {
+        const found = matchSameNamedRelatives(
+            existingData, incomingData, sameNameSeeds, usedExisting, usedIncoming, sameNameBlocked, matches
+        );
+        if (found.length === 0) break;
+        matches.push(...found);
+        sameNameSeeds = found;
+    }
+
     // Phase 2b: persons whose given name is unknown ('?' or empty) have no
     // name to match by. One is proposed through a matched relative instead —
     // always for review, and it seeds only further persons of unknown name.
@@ -350,12 +600,16 @@ export function findMatches(
     let unknownSeeds = matches;
     for (let round = 0; round < maxRounds; round++) {
         const found = matchUnknownNamedRelatives(
-            existingData, incomingData, unknownSeeds, usedExisting, usedIncoming, unknownBlocked
+            existingData, incomingData, unknownSeeds, usedExisting, usedIncoming, unknownBlocked, matches
         );
         if (found.length === 0) break;
         matches.push(...found);
         unknownSeeds = found;
     }
+
+    // Phase 2c: the "?" a file's family of one named parent got for the other
+    // parent pairs with the "?" of that very family record in the tree.
+    matches.push(...matchFamilyRecordStandIns(existingData, incomingData, matches, usedExisting, usedIncoming));
 
     // Phase 3: Find remaining matches with lower threshold
     const remainingMatches = findRemainingMatches(
@@ -375,6 +629,53 @@ export function findMatches(
 }
 
 /**
+ * A family record of a file names one parent; the import stands a "?" in for
+ * the other (no ids: the file has no record of it). Merging the same file
+ * again, that "?" is the "?" the tree has in the same family record (same
+ * program, same xref) of the person the named parent merged into.
+ */
+function matchFamilyRecordStandIns(
+    existingData: StromData,
+    incomingData: StromData,
+    matches: readonly PersonMatch[],
+    usedExisting: Set<PersonId>,
+    usedIncoming: Set<PersonId>
+): PersonMatch[] {
+    const target = new Map<PersonId, PersonId>();
+    for (const m of matches) if (m.score >= AUTO_CONFIRM_SCORE) target.set(m.incomingId, m.existingId);
+    const standIn = (p: Person | undefined): p is Person => !!p?.isPlaceholder && !p.originalIds?.length;
+    const found: PersonMatch[] = [];
+    for (const incomingUnion of Object.values(incomingData.partnerships)) {
+        if (!incomingUnion.originalIds?.length) continue;
+        for (const [named, other] of [[incomingUnion.person1Id, incomingUnion.person2Id], [incomingUnion.person2Id, incomingUnion.person1Id]]) {
+            const incoming = incomingData.persons[other];
+            const existingNamed = target.get(named);
+            if (!existingNamed || !standIn(incoming) || usedIncoming.has(incoming.id)) continue;
+            const existingUnion = (existingData.persons[existingNamed]?.partnerships ?? [])
+                .map(id => existingData.partnerships[id])
+                .find(u => !!u && sameFileRecord(u, incomingUnion, existingData, incomingData));
+            if (!existingUnion) continue;
+            const existingOther = existingUnion.person1Id === existingNamed ? existingUnion.person2Id : existingUnion.person1Id;
+            const existing = existingData.persons[existingOther];
+            if (!standIn(existing) || usedExisting.has(existing.id) || !gendersCompatible(existing.gender, incoming.gender)) continue;
+            found.push({
+                existingId: existing.id,
+                incomingId: incoming.id,
+                confidence: scoreToConfidence(ID_MATCH_SCORE),
+                reasons: ['id'],
+                score: ID_MATCH_SCORE,
+                existingPerson: existing,
+                incomingPerson: incoming,
+                conflicts: detectConflicts(existing, incoming)
+            });
+            usedExisting.add(existing.id);
+            usedIncoming.add(incoming.id);
+        }
+    }
+    return found;
+}
+
+/**
  * Phase 1: Find direct matches using multiple strategies
  */
 function findDirectMatches(
@@ -385,15 +686,54 @@ function findDirectMatches(
 ): PersonMatch[] {
     const matches: PersonMatch[] = [];
 
+    // A strong id both files give a person decides first: a name match of
+    // another incoming person must not take the existing person it names.
+    // A nameless record of the file (a MyHeritage spouse known by its ids alone,
+    // read as a "?") pairs only with such a record of the same id: the same
+    // file merged again, its couples then are the same couples (P-c, spec 066).
+    // Only the tree's persons sharing a strong id with the record can pass the
+    // id check below: the index finds them, in the tree's order.
+    // An id more persons of the tree have pairs none of them here (only offered below).
+    // Persons of the file sharing an id: the first in the file's order the
+    // id confirms takes the person, the others cannot take it again.
+    const { persons: existingPersons, index: idIndex } = strongIdsOf(existingData);
+    const incomingPersons = Object.values(incomingData.persons);
+    for (const incoming of incomingPersons) {
+        if (!incoming.originalIds?.length) continue;
+        if (usedIncoming.has(incoming.id)) continue;
+        if (idNamesSeveral(incoming, existingData, incomingData)) continue;
+        for (const at of idIndex.sharing(incoming, incomingData)) {
+            const existing = existingPersons[at];
+            if (!!existing.isPlaceholder !== !!incoming.isPlaceholder || usedExisting.has(existing.id)) continue;
+            if (!gendersCompatible(existing.gender, incoming.gender)) continue;
+            if (!idEvidence(existing, incoming, existingData, incomingData).same) continue;
+            // (No name to compare for a nameless one: its strong id is all the file says of it.)
+            if (!incoming.isPlaceholder && !calculateMatchScore(existing, incoming, existingData, incomingData).idConfirmed) continue;
+            matches.push({
+                existingId: existing.id,
+                incomingId: incoming.id,
+                confidence: scoreToConfidence(ID_MATCH_SCORE),
+                reasons: ['id'],
+                score: ID_MATCH_SCORE,
+                existingPerson: existing,
+                incomingPerson: incoming,
+                conflicts: detectConflicts(existing, incoming)
+            });
+            usedExisting.add(existing.id);
+            usedIncoming.add(incoming.id);
+            break;
+        }
+    }
+
     // Process each incoming person
-    for (const incoming of Object.values(incomingData.persons)) {
+    for (const incoming of incomingPersons) {
         if (incoming.isPlaceholder) continue;
         if (usedIncoming.has(incoming.id)) continue;
 
         const candidates: MatchCandidate[] = [];
 
         // Find potential candidates
-        for (const existing of Object.values(existingData.persons)) {
+        for (const existing of existingPersons) {
             if (existing.isPlaceholder) continue;
             if (usedExisting.has(existing.id)) continue;
 
@@ -478,7 +818,7 @@ function propagateFromMatches(
 
                 // Add bonus for being partner of matched person
                 const partnerBonus = 20;
-                const totalScore = Math.min(baseResult.score + partnerBonus, 100);
+                const totalScore = withBonus(baseResult, partnerBonus);
 
                 // Accept with lower threshold due to relationship context
                 if (totalScore >= 30 || baseResult.score >= 25) {
@@ -525,7 +865,7 @@ function propagateFromMatches(
 
                 // Add bonus for being child of matched person
                 const childBonus = 15;
-                const totalScore = Math.min(baseResult.score + childBonus, 100);
+                const totalScore = withBonus(baseResult, childBonus);
 
                 if (totalScore >= 30 || baseResult.score >= 25) {
                     const confidence = scoreToConfidence(totalScore);
@@ -574,7 +914,7 @@ function propagateFromMatches(
 
                 // Add bonus for being parent of matched person
                 const parentBonus = 15;
-                const totalScore = Math.min(baseResult.score + parentBonus, 100);
+                const totalScore = withBonus(baseResult, parentBonus);
 
                 if (totalScore >= 30 || baseResult.score >= 25) {
                     const confidence = scoreToConfidence(totalScore);
@@ -606,16 +946,129 @@ function propagateFromMatches(
     return propagated;
 }
 
+/**
+ * The score of a match found through a relative of a person of the same name
+ * whom the name scores left out: for review (below the auto-confirm bar),
+ * above a match of unknown given name.
+ */
+const SAME_NAME_RELATIVE_SCORE = 50;
+
+/**
+ * Phase 2a: a person the name scores leave out — a given name alone ("Henry",
+ * no surname) and no dates, so a tree loaded before files' ids were kept
+ * (3.25.0) has nothing to pair the same file's record with — is the person in
+ * the tree of the same given name and surname (both empty too) who stands in
+ * the same relation (partner, child, parent, a sibling through a parent of
+ * no name, or an in-law through a spouse or child of no name) to the matched
+ * counterpart of a matched relative, when that relative has exactly one such
+ * person on each side. Their sex may not differ, their birth and death dates may not
+ * conflict, and every matched relative of the incoming person must be the
+ * same relative of the tree's person. Anything ambiguous on any path (two
+ * sons of one name, two seeds proposing different persons, one tree person
+ * proposed for two) leaves the person unmatched; `blocked` remembers that
+ * across rounds. Always 'medium', for review; a match found here seeds this
+ * phase again.
+ */
+function matchSameNamedRelatives(
+    existingData: StromData,
+    incomingData: StromData,
+    seeds: PersonMatch[],
+    usedExisting: Set<PersonId>,
+    usedIncoming: Set<PersonId>,
+    blocked: Set<PersonId>,
+    matched: readonly PersonMatch[] = seeds
+): PersonMatch[] {
+    const matchedTo = new Map<PersonId, PersonId>(matched.map(m => [m.incomingId, m.existingId] as const));
+    const nameKey = (p: Person): string | null => {
+        const first = normalizeName(p.firstName);
+        return first ? `${first}|${normalizeName(p.lastName)}` : null;
+    };
+    const candidate = (p: Person, used: Set<PersonId>): boolean => !p.isPlaceholder && !used.has(p.id) && nameKey(p) !== null;
+    const compatible = (existing: Person, incoming: Person): boolean =>
+        gendersCompatible(existing.gender, incoming.gender)
+        && compareEventDates(existing.birthDate, incoming.birthDate) !== 'conflict'
+        && compareEventDates(existing.deathDate, incoming.deathDate) !== 'conflict';
+    /** Every matched relative of the incoming person is the tree person's relative of the same kind. */
+    const consistent = (existing: Person, incoming: Person): boolean => UNKNOWN_NAME_RELATIONS.every(({ relatives }) => {
+        const theirs = new Set(relatives(existing, existingData).map(p => p.id));
+        return relatives(incoming, incomingData).every(r => {
+            const to = matchedTo.get(r.id);
+            return to === undefined || theirs.has(to);
+        });
+    });
+
+    const proposals = new Map<PersonId, { existing: Person; incoming: Person; reason: MatchReason }>();
+    for (const seed of seeds) {
+        for (const relation of UNKNOWN_NAME_RELATIONS) {
+            const incomingRelatives = relation.relatives(seed.incomingPerson, incomingData).filter(p => candidate(p, usedIncoming));
+            if (incomingRelatives.length === 0) continue;
+            const existingRelatives = relation.relatives(seed.existingPerson, existingData).filter(p => candidate(p, usedExisting));
+            for (const incoming of incomingRelatives) {
+                if (blocked.has(incoming.id)) continue;
+                const key = nameKey(incoming);
+                const twins = incomingRelatives.filter(p => nameKey(p) === key);
+                const named = existingRelatives.filter(p => nameKey(p) === key);
+                const existing = named.length === 1 && twins.length === 1 ? named[0] : undefined;
+                const earlier = proposals.get(incoming.id);
+                if (!existing || !compatible(existing, incoming) || !consistent(existing, incoming)
+                    || (earlier && earlier.existing.id !== existing.id)) {
+                    // No one of that name here: other seeds may still find the person.
+                    if (named.length === 0 && twins.length === 1 && !earlier) continue;
+                    blocked.add(incoming.id);
+                    proposals.delete(incoming.id);
+                    continue;
+                }
+                if (!earlier) proposals.set(incoming.id, { existing, incoming, reason: relation.reason });
+            }
+        }
+    }
+
+    const proposedFor = new Map<PersonId, number>();
+    for (const { existing } of proposals.values()) proposedFor.set(existing.id, (proposedFor.get(existing.id) ?? 0) + 1);
+    const found: PersonMatch[] = [];
+    for (const { existing, incoming, reason } of proposals.values()) {
+        if (proposedFor.get(existing.id)! > 1) {
+            blocked.add(incoming.id);
+            continue;
+        }
+        found.push({
+            existingId: existing.id,
+            incomingId: incoming.id,
+            confidence: 'medium',
+            reasons: ['name_similarity_relationships', reason],
+            score: SAME_NAME_RELATIVE_SCORE,
+            existingPerson: existing,
+            incomingPerson: incoming,
+            conflicts: detectConflicts(existing, incoming)
+        });
+        usedExisting.add(existing.id);
+        usedIncoming.add(incoming.id);
+    }
+    return found;
+}
+
 /** A person whose given name is unknown: '?', empty or punctuation only. */
 function hasUnknownGivenName(person: Person): boolean {
     return normalizeName(person.firstName) === '';
 }
 
 /**
- * The score of a match found through a relative of a person of unknown given
- * name: below the auto-confirm bar, so the wizard always asks for a look.
+ * Two records the file knows by the surname alone (a MyHeritage spouse
+ * written `/Novák/`): their names agree as far as they go, so a strong id
+ * they share can confirm them (the same file merged again).
  */
-const UNKNOWN_NAME_MATCH_SCORE = AUTO_CONFIRM_SCORE - 5;
+function sameSurnameOnly(existing: Person, incoming: Person, surnameSimilarity: number): boolean {
+    return hasUnknownGivenName(existing) && hasUnknownGivenName(incoming)
+        && normalizeName(existing.lastName) !== '' && surnameSimilarity >= 0.95;
+}
+
+/**
+ * The score of a match found through a relative of a person of unknown given
+ * name: below the auto-confirm bar, so the wizard always asks for a look, and
+ * below the 50 a name match with its context usually reaches, so it sorts
+ * after those.
+ */
+const UNKNOWN_NAME_MATCH_SCORE = 45;
 
 /** The relations a person of unknown given name is paired through. */
 const UNKNOWN_NAME_RELATIONS: Array<{
@@ -625,17 +1078,26 @@ const UNKNOWN_NAME_RELATIONS: Array<{
     { relatives: getPartners, reason: 'partner_of_matched' },
     { relatives: getChildren, reason: 'child_of_matched' },
     { relatives: getParents, reason: 'parent_of_matched' },
+    { relatives: getSiblingsThroughStandIns, reason: 'sibling_of_matched' },
+    { relatives: getInLawsThroughStandIns, reason: 'in_law_of_matched' },
 ];
 
 /**
  * Phase 2b: a person of unknown given name ("1 NAME /Nováková/" — MyHeritage
  * writes a wife known only by her surname this way) is the person in the tree
- * who stands in the same relation (partner, child or parent) to the matched
- * counterpart of a matched relative, when there is exactly one such person in
+ * who stands in the same relation (partner, child, parent, a sibling through
+ * a parent of no name, or an in-law through a spouse or child of no name) to
+ * the matched counterpart of a matched relative, when there is exactly one such person in
  * the tree of the same sex and surname (birth or after marriage) with an
  * unknown given name, no conflicting dates, and exactly one such person on the
  * incoming side too. Anything ambiguous on any path, or a tree person already
  * taken, leaves the person unmatched (`blocked` remembers that across rounds).
+ *
+ * Siblings nothing tells apart (`1 NAME /Legge/` four times in one family,
+ * nothing else): as many in the tree as in the file, each of them the same
+ * as each on the other side, pair by their place among the parent's children
+ * when their matched parents are the same (the same file merged again, or
+ * one more of its program). Without that, they stay unmatched.
  *
  * Such a match is always 'medium' with a score below AUTO_CONFIRM_SCORE: a
  * surname alone never confirms itself. Every match found by name or by
@@ -650,9 +1112,31 @@ function matchUnknownNamedRelatives(
     seeds: PersonMatch[],
     usedExisting: Set<PersonId>,
     usedIncoming: Set<PersonId>,
-    blocked: Set<PersonId>
+    blocked: Set<PersonId>,
+    matched: readonly PersonMatch[] = seeds
 ): PersonMatch[] {
     const proposals = new Map<PersonId, { existing: Person; incoming: Person; reason: MatchReason }>();
+    const matchedTo = new Map<PersonId, PersonId>(matched.map(m => [m.incomingId, m.existingId] as const));
+    /** The incoming child's parents (but a "?") are the existing child's, through the matches so far. */
+    const sameParents = (existing: Person, incoming: Person): boolean => {
+        const named = (ids: readonly PersonId[], data: StromData): PersonId[] =>
+            ids.filter(id => !!data.persons[id] && !data.persons[id].isPlaceholder);
+        const theirs = named(existing.parentIds, existingData);
+        const ours = named(incoming.parentIds, incomingData);
+        return ours.length > 0 && ours.length === theirs.length && ours.every(id => theirs.includes(matchedTo.get(id) as PersonId));
+    };
+    /**
+     * The existing sibling an incoming one is by place among the parent's children, when
+     * `candidates` (≥ 2) and the incoming ones like them are as many, none told apart.
+     */
+    const byPlace = (incoming: Person, candidates: Person[], incomingRelatives: Person[]): Person | undefined => {
+        if (candidates.length < 2) return undefined;
+        const twins = incomingRelatives.filter(i => samePerson(candidates[0], i));
+        if (twins.length !== candidates.length || !twins.includes(incoming)) return undefined;
+        if (!twins.every(t => candidates.every(c => samePerson(c, t)))) return undefined;
+        if (!twins.every((t, k) => sameParents(candidates[k], t))) return undefined;
+        return candidates[twins.indexOf(incoming)];
+    };
 
     const samePerson = (existing: Person, incoming: Person): boolean =>
         existing.gender === incoming.gender
@@ -671,11 +1155,12 @@ function matchUnknownNamedRelatives(
             for (const incoming of incomingRelatives) {
                 if (usedIncoming.has(incoming.id) || blocked.has(incoming.id)) continue;
                 const candidates = existingRelatives.filter(e => samePerson(e, incoming));
-                const existing = candidates.length === 1 ? candidates[0] : undefined;
+                const placed = relation.reason === 'child_of_matched' ? byPlace(incoming, candidates, incomingRelatives) : undefined;
+                const existing = placed ?? (candidates.length === 1 ? candidates[0] : undefined);
                 const earlier = proposals.get(incoming.id);
                 if (!existing
                     || usedExisting.has(existing.id)
-                    || incomingRelatives.filter(i => samePerson(existing, i)).length !== 1
+                    || (!placed && incomingRelatives.filter(i => samePerson(existing, i)).length !== 1)
                     || (earlier && earlier.existing.id !== existing.id)) {
                     blocked.add(incoming.id);
                     proposals.delete(incoming.id);
@@ -724,6 +1209,7 @@ function findRemainingMatches(
     usedIncoming: Set<PersonId>
 ): PersonMatch[] {
     const matches: PersonMatch[] = [];
+    const existingPersons = Object.values(existingData.persons);
 
     for (const incoming of Object.values(incomingData.persons)) {
         if (incoming.isPlaceholder) continue;
@@ -731,7 +1217,7 @@ function findRemainingMatches(
 
         const candidates: MatchCandidate[] = [];
 
-        for (const existing of Object.values(existingData.persons)) {
+        for (const existing of existingPersons) {
             if (existing.isPlaceholder) continue;
             if (usedExisting.has(existing.id)) continue;
 
@@ -792,13 +1278,21 @@ function calculateMatchScore(
     incoming: Person,
     existingData: StromData,
     incomingData: StromData
-): { score: number; reasons: MatchReason[] } {
+): ScoreResult {
     let score = 0;
     const reasons: MatchReason[] = [];
 
+    // The ids the loaded files gave both records. A shared strong id is the
+    // same person only when the names are alike, the sex is not a man and a
+    // woman, the birth years (when both are known) are at most 3 apart and
+    // no global id (_FSFTID, AFN, EXID) differs; otherwise it is a candidate
+    // to look at. A global id that differs keeps a name match below the
+    // auto-confirm bar.
+    const ids = idEvidence(existing, incoming, existingData, incomingData);
+
     // Gender must match
     if (!gendersCompatible(existing.gender, incoming.gender)) {
-        return { score: 0, reasons: [] };
+        return ids.same ? idCandidate(0, []) : { score: 0, reasons: [] };
     }
 
     // Analyze first names (handles middle names, multi-part names)
@@ -853,9 +1347,9 @@ function calculateMatchScore(
     } else if (firstNameMatch.prefix && lastNameMatch.similar) {
         // Prefix match on first name + similar last name
         score += 12;
-    } else {
+    } else if (!(ids.same && sameSurnameOnly(existing, incoming, lastNameMatch.similarity))) {
         // Names too different
-        return { score: 0, reasons: [] };
+        return ids.same ? idCandidate(0, []) : { score: 0, reasons: [] };
     }
 
     // Birth date matching
@@ -913,11 +1407,31 @@ function calculateMatchScore(
         }
     }
 
+    // The same xref or RIN in files of one program: only on top of a name
+    // match (the names passed above), never on its own.
+    if (ids.weak) {
+        score += WEAK_ID_BONUS;
+        reasons.unshift('id');
+    }
+
     // Ensure we have at least one reason
     if (score >= 30 && reasons.length === 0) {
         reasons.push('name_similarity_relationships');
     }
 
+    if (ids.same) {
+        const y1 = birthOrBaptismYear(existing);
+        const y2 = birthOrBaptismYear(incoming);
+        const yearsAgree = y1 === null || y2 === null || Math.abs(y1 - y2) <= ID_MAX_YEAR_GAP;
+        if (yearsAgree && !ids.globalDiffers && !idNamesSeveral(incoming, existingData, incomingData)) {
+            return { score: ID_MATCH_SCORE, reasons: ['id'], idConfirmed: true };
+        }
+        return idCandidate(score, reasons);
+    }
+    if (ids.globalDiffers) {
+        const cap = offerOnlyCap();
+        return { score: Math.min(score, cap), reasons, cap };
+    }
     return { score: Math.min(score, 100), reasons };
 }
 
@@ -1312,14 +1826,14 @@ export function quickMatch(p1: Person, p2: Person, data1?: StromData, data2?: St
     // The same rule/group answer full matching uses (Fíšek/Fíšková is one
     // family), so cross-tree suggestions agree with the merge matcher.
     const rulesSay = (data?: StromData): boolean =>
-        !!data && sameSurname(p1.lastName, p2.lastName, data);
+        !!data && sameSurnameIn(p1.lastName, p2.lastName, data);
     const lastNameSim = rulesSay(data1) || rulesSay(data2)
         ? 1.0
         : stringSimilarity(p1.lastName, p2.lastName);
     const nameSim = (firstNameSim + lastNameSim) / 2;
 
     // Names too different - no match
-    if (nameSim < 0.7) return NO_QUICK_MATCH;
+    if (nameSim < QUICK_NAME_MIN) return NO_QUICK_MATCH;
 
     const birth = compareEventDates(p1.birthDate, p2.birthDate);
     const death = compareEventDates(p1.deathDate, p2.deathDate);
@@ -1356,6 +1870,75 @@ export function quickMatch(p1: Person, p2: Person, data1?: StromData, data2?: St
     }
 
     return { score: Math.min(score, 100), reasons };
+}
+
+/** The least name similarity ((first + last) / 2) quickMatch takes. */
+const QUICK_NAME_MIN = 0.7;
+
+/**
+ * Whether two persons of these first names (both normalized, normalizeName)
+ * can pass quickMatch's name test at all: even with the surnames the same
+ * (similarity 1) the first names must carry the rest. Exact, never a guess:
+ * the test is the very expression quickMatch computes, with the surname's
+ * part at its most (floating-point addition is monotone, so a smaller part
+ * never gives more), and the similarity (1 - distance / longer length)
+ * falls as the edit distance grows, so it is the same as the distance
+ * staying within the largest one that still passes — which a distance
+ * computation may stop at as soon as it is exceeded. Lets cross-tree
+ * matching skip whole groups of people by their first name.
+ */
+export function firstNameMayQuickMatch(normalizedA: string, normalizedB: string): boolean {
+    if (matchPass) return memo2(matchPass.firstNameBound, normalizedA, normalizedB, () => firstNameMayQuickMatchNow(normalizedA, normalizedB));
+    return firstNameMayQuickMatchNow(normalizedA, normalizedB);
+}
+
+function firstNameMayQuickMatchNow(normalizedA: string, normalizedB: string): boolean {
+    const passes = (firstSim: number): boolean => (firstSim + 1.0) / 2 >= QUICK_NAME_MIN;
+    // As normalizedSimilarity: no name is 0, the same name 1.
+    if (normalizedA.length === 0 || normalizedB.length === 0) return passes(0);
+    if (normalizedA === normalizedB) return passes(1);
+    const maxLength = Math.max(normalizedA.length, normalizedB.length);
+    // The largest distance whose similarity, computed as normalizedSimilarity does, still passes.
+    let allowed = 0;
+    while (allowed < maxLength && passes(1 - (allowed + 1) / maxLength)) allowed++;
+    if (!passes(1 - allowed / maxLength)) return false;
+    // The distance is at least the difference of the lengths.
+    if (Math.abs(normalizedA.length - normalizedB.length) > allowed) return false;
+    return levenshteinWithin(normalizedA, normalizedB, allowed);
+}
+
+/** Two rows of levenshteinWithin's matrix, kept between calls. */
+let withinRows = new Int32Array(64);
+
+/**
+ * levenshteinDistance(a, b) <= limit, the same matrix row by row, stopping
+ * once a whole row exceeds the limit (the distance is at least a row's least
+ * value: every edit path crosses each row and no step costs less than 0).
+ */
+function levenshteinWithin(a: string, b: string, limit: number): boolean {
+    const width = a.length + 1;
+    if (withinRows.length < 2 * width) withinRows = new Int32Array(2 * width);
+    const rows = withinRows;
+    let previous = 0;
+    let current = width;
+    for (let j = 0; j < width; j++) rows[j] = j;
+    for (let i = 1; i <= b.length; i++) {
+        rows[current] = i;
+        let least = i;
+        const ch = b.charCodeAt(i - 1);
+        for (let j = 1; j < width; j++) {
+            const value = ch === a.charCodeAt(j - 1)
+                ? rows[previous + j - 1]
+                : Math.min(rows[previous + j - 1], rows[current + j - 1], rows[previous + j]) + 1;
+            rows[current + j] = value;
+            if (value < least) least = value;
+        }
+        if (least > limit) return false;
+        const done = previous;
+        previous = current;
+        current = done;
+    }
+    return rows[previous + width - 1] <= limit;
 }
 
 /** The score part of quickMatch (0-100, threshold 50+ = match). */
@@ -1619,11 +2202,13 @@ export function findSimilarPersons(
     };
 
     const results: SimilarPersonResult[] = [];
-    for (const person of Object.values(data.persons)) {
-        if (person.id === excludeId || person.isPlaceholder) continue;
-        const { score } = calculateMatchScore(person, incoming, data, data);
-        if (score >= SIMILAR_PERSON_THRESHOLD) results.push({ person, score });
-    }
+    inMatchPass([data], () => {
+        for (const person of Object.values(data.persons)) {
+            if (person.id === excludeId || person.isPlaceholder) continue;
+            const { score } = calculateMatchScore(person, incoming, data, data);
+            if (score >= SIMILAR_PERSON_THRESHOLD) results.push({ person, score });
+        }
+    });
     results.sort((a, b) => b.score - a.score);
     return results;
 }

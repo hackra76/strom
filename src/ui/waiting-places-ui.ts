@@ -24,8 +24,9 @@ import {
 } from '../places-bridge.js';
 import { waitingDaysAgo, waitingPhase } from '../research-waiting.js';
 import {
-    isPlaceQuestion, placeQuestionChoices, pickableCandidates, candidateLetter, placeQuestionKeys, placeQuestionFacts,
+    isPlaceQuestion, placeQuestionChoices, placesUnknownEverywhere, pickableCandidates, candidateLetter, placeQuestionKeys, placeQuestionFacts,
     placeQuestionsPersons, conflictOrigin, bulkAcceptable, bulkKeepable, bulkHandConflicts, placeAreas,
+    waitingMapPoints, waitingMapView, spreadPins,
     type PlaceQuestion, type PlaceChoiceButton,
 } from '../waiting-places.js';
 import { checkCandidate } from '../place-check.js';
@@ -33,11 +34,14 @@ import { checkFindingText } from '../places-dialog.js';
 import { findTreePoints } from '../place-find.js';
 import { formatPlaceDate } from '../place-identity.js';
 import { collectPlaces } from '../places.js';
-import { fitBounds, pointInViewport } from '../map.js';
+import { pointInViewport } from '../map.js';
+import { distanceKm } from '../person-page-map.js';
+import { sameCoords } from '../place-records.js';
 import { drawTiles, dotsHtml, mapSize, type SmallMapView } from './places-find-ui.js';
 import { fetchStatus, liveSession } from './research-ui.js';
 import { normalizeModal } from './modal-skeleton.js';
 import { uiModule } from './module.js';
+import { helpMark } from './help-mark.js';
 
 const MODAL_ID = 'waiting-places-modal';
 /** How long the toasts with Undo stand. */
@@ -47,7 +51,6 @@ const ANSWERED_HIDE_MS = 30_000;
 /** The small map beside the candidates (CSS px; on a phone it takes the card's width). */
 const MAP_W = 300;
 const MAP_H = 260;
-const MAP_MAX_ZOOM = 13;
 /** How long the research's status is waited for after an answer (not followed live). */
 const STATUS_TIMEOUT_MS = 4000;
 /** "Keep all" names the places up to this many. */
@@ -82,6 +85,8 @@ export interface WaitingPlacesAccess {
     canUndo: boolean;
     base: string | null;
     features: readonly string[];
+    /** The research takes Don't know for a conflict and a form too. */
+    unknownAll: boolean;
 }
 
 function geos(): Record<string, import('../types.js').PlaceGeo> | undefined {
@@ -104,7 +109,11 @@ export const waitingPlacesMethods = uiModule({
     waitingPlacesAccess(): WaitingPlacesAccess {
         const ctx = this.placesResearchContext();
         const canAnswer = !!ctx.researchId && !!ctx.base && ctx.features.includes(PLACES_ANSWER_FEATURE);
-        return { canAnswer, canUndo: canAnswer && ctx.features.includes(PLACES_UNDO_FEATURE), base: ctx.base, features: ctx.features };
+        const version = ctx.researchId ? this.researchStatusOf(ctx.researchId)?.version : undefined;
+        return {
+            canAnswer, canUndo: canAnswer && ctx.features.includes(PLACES_UNDO_FEATURE), base: ctx.base, features: ctx.features,
+            unknownAll: placesUnknownEverywhere(version),
+        };
     },
 
     /** The place questions to do, in the research's order, without those just answered here. */
@@ -155,6 +164,7 @@ export const waitingPlacesMethods = uiModule({
                     <button type="button" class="secondary" id="waiting-places-close" data-dismiss>${this.escapeHtml(strings.buttons.close)}</button>
                 </div>
             </div>`;
+        overlay.querySelector('#waiting-places-x')?.before(helpMark('places'));
         document.body.appendChild(overlay);
         const modal = overlay.querySelector('.modal') as HTMLElement;
         normalizeModal(modal);
@@ -172,7 +182,8 @@ export const waitingPlacesMethods = uiModule({
             const close = overlay.querySelector('#waiting-places-close') as HTMLButtonElement;
             (close.offsetParent ? close : overlay.querySelector('#waiting-places-x') as HTMLButtonElement).focus();
         }
-        // What the research says now (an older list may be shown first).
+        // What the research says now (an older list may be shown first); `data-status` says when it is read.
+        overlay.dataset.status = 'reading';
         void this.refreshWaitingPlacesStatus();
     },
 
@@ -356,7 +367,7 @@ export const waitingPlacesMethods = uiModule({
         ].filter(Boolean).join(' · ');
         const titleId = `waiting-place-${w.place}`;
         card.setAttribute('aria-labelledby', titleId);
-        const choices = access.canAnswer ? placeQuestionChoices(w) : [];
+        const choices = access.canAnswer ? placeQuestionChoices(w, { unknownAll: access.unknownAll }) : [];
         const sel = view.selected.get(w.place) ?? (w.question === 'conflict' ? 'c1' : '');
         card.innerHTML = `
             <header class="waiting-place-head">
@@ -435,10 +446,13 @@ export const waitingPlacesMethods = uiModule({
         const now = w.current?.label || w.forms?.[0] || w.place;
         const c = w.candidates?.[0];
         const where = c ? [c.district, c.country].filter(Boolean).join(' · ') : '';
+        // Where the location now is and how far from the suggestion: decidable without the map.
+        const nowWhere = w.current ? [this.waitingNowWhere(w, now), c ? this.waitingNowFar(w.current, c) : ''].filter(Boolean).join(' · ') : '';
         return `<div class="waiting-place-cand is-current${sel === 'now' ? ' is-selected' : ''}" data-cand="now">
                 <span class="waiting-place-letter is-current" aria-hidden="true">•</span>
                 <div class="waiting-place-cand-text">
                     <span class="waiting-place-cand-name">${esc(W.now(now))}</span>
+                    ${nowWhere ? `<span class="waiting-place-cand-where waiting-place-now-where">${esc(nowWhere)}</span>` : ''}
                     <span class="waiting-place-cand-where">${esc(src)}</span>
                 </div>
             </div>
@@ -451,6 +465,35 @@ export const waitingPlacesMethods = uiModule({
                     ${this.waitingSourceHtml(c)}
                 </div>
             </div>` : ''}`;
+    },
+
+    /**
+     * Where a conflict's location now is: the geocoder's full name of the
+     * place at that point without the name itself, at most three parts
+     * ("Lhotov, Lhotov District, Czechia"), else its coordinates.
+     */
+    waitingNowWhere(w: PlaceQuestion, name: string): string {
+        const cur = w.current!;
+        const all = geos();
+        for (const key of placeQuestionKeys(w)) {
+            const geo = all?.[key];
+            if (!geo?.label || !sameCoords(geo, cur)) continue;
+            const parts = geo.label.split(',').map(x => x.trim()).filter(Boolean);
+            const own = parts[0] && parts[0].toLocaleLowerCase() === name.trim().toLocaleLowerCase() ? parts.slice(1) : parts;
+            // A geocoder's long name (municipality, district, region, …, postcode, country): three parts are enough.
+            const rest = own.filter(x => !/^[\d\s-]+$/.test(x));
+            if (rest.length) return (rest.length > 3 ? [rest[0]!, rest[1]!, rest[rest.length - 1]!] : rest).join(', ');
+        }
+        // As the app writes coordinates elsewhere (a point placed by hand): a decimal point, four places.
+        return strings.places.waiting.nowAt(cur.lat.toFixed(4), cur.lon.toFixed(4));
+    },
+
+    /** How far the location now is from the suggestion ("34 km from the suggestion"). */
+    waitingNowFar(cur: { lat: number; lon: number }, c: WaitingPlaceCandidate): string {
+        const W = strings.places.waiting;
+        const km = distanceKm(cur, c);
+        if (km < 1) return W.nowNear;
+        return W.nowFar(km.toLocaleString(getCurrentLanguage(), { maximumFractionDigits: km < 10 ? 1 : 0 }));
     },
 
     /** A form question: how the facts write it, and what Yes and No do. */
@@ -524,23 +567,22 @@ export const waitingPlacesMethods = uiModule({
             const tree = findTreePoints(data, '', nameOf).filter(p => !own.has(p.key));
             const cands = w.question === 'conflict' ? (w.candidates ?? []).slice(0, 1) : pickableCandidates(w);
             const { width, height } = mapSize(map, MAP_W, MAP_H);
-            const points = [...cands, ...(w.current ? [w.current] : [])];
-            const fit = fitBounds(points.length ? [...points, ...tree] : tree, width, height, 26);
-            const v: SmallMapView = { center: fit.center, zoom: Math.min(fit.zoom, MAP_MAX_ZOOM) };
+            // The question's own points decide the view; the family's places are dots where they fall in it.
+            const v: SmallMapView = waitingMapView(waitingMapPoints(w), tree, width, height);
             drawTiles(map.querySelector('.place-mini-tiles') as HTMLElement, v, width, height);
             const esc = (s: string): string => this.escapeHtml(s);
             const sel = view.selected.get(w.place) ?? (w.question === 'conflict' ? 'c1' : '');
-            const pin = (at: { lat: number; lon: number }, cand: string, text: string, tone: string, title: string): string => {
-                const xy = pointInViewport(at, v.center, v.zoom, width, height);
-                return `<button type="button" class="place-mini-pin${sel === cand ? ' is-selected' : ''}" data-cand="${cand}" data-tone="${tone}" style="left:${xy.x.toFixed(1)}px;top:${xy.y.toFixed(1)}px" title="${esc(title)}" aria-label="${esc(`${text}: ${title}`)}" tabindex="-1">${esc(text)}</button>`;
-            };
-            const pins = [
-                ...(w.current ? [pin(w.current, 'now', '•', 'current', w.current.label || w.forms?.[0] || w.place)] : []),
-                ...cands.map(c => pin(c, c.id, candidateLetter(c.id), this.waitingCandidateWarning(w, c) ? 'warn' : 'near', c.name)),
-            ].join('');
-            const marks = map.querySelector('.place-mini-marks') as HTMLElement;
-            marks.innerHTML = dotsHtml(tree, v, width, height, esc) + pins;
-            marks.querySelectorAll<HTMLButtonElement>('.place-mini-pin').forEach(b => {
+            const marks: { at: { lat: number; lon: number }; cand: string; text: string; tone: string; title: string }[] = [
+                ...(w.current ? [{ at: w.current, cand: 'now', text: '•', tone: 'current', title: w.current.label || w.forms?.[0] || w.place }] : []),
+                ...cands.map(c => ({ at: c, cand: c.id, text: candidateLetter(c.id), tone: this.waitingCandidateWarning(w, c) ? 'warn' : 'near', title: c.name })),
+            ];
+            // Pins on one spot stand side by side: the location now never hides under a letter.
+            const xy = spreadPins(marks.map(m => pointInViewport(m.at, v.center, v.zoom, width, height)), width, height);
+            const pins = marks.map((m, i) =>
+                `<button type="button" class="place-mini-pin${sel === m.cand ? ' is-selected' : ''}" data-cand="${m.cand}" data-tone="${m.tone}" style="left:${xy[i]!.x.toFixed(1)}px;top:${xy[i]!.y.toFixed(1)}px" title="${esc(m.title)}" aria-label="${esc(`${m.text}: ${m.title}`)}" tabindex="-1">${esc(m.text)}</button>`).join('');
+            const layer = map.querySelector('.place-mini-marks') as HTMLElement;
+            layer.innerHTML = dotsHtml(tree, v, width, height, esc) + pins;
+            layer.querySelectorAll<HTMLButtonElement>('.place-mini-pin').forEach(b => {
                 b.onclick = () => this.selectWaitingCandidate(w.place, b.dataset.cand!);
             });
         });
@@ -651,8 +693,9 @@ export const waitingPlacesMethods = uiModule({
             const s = liveSession();
             if (s && !s.ended && s.researchId === ctx.researchId) {
                 try {
+                    const asked = s.workingEvents ?? 0;
                     const status = await fetchStatus(`${ctx.base}/status?poll=1`);
-                    if (status && !s.ended) this.onLiveStatus(s, status);
+                    if (status && !s.ended) this.onLiveStatus(s, status, asked);
                 } catch { /* not answering: what is known stays */ }
             } else {
                 // Not followed live: the remembered list is what the research says now.
@@ -665,6 +708,8 @@ export const waitingPlacesMethods = uiModule({
         this.refreshActionMenuBadges();
         this.renderLivePanel();
         this.renderWaitingPlaces();
+        const overlay = document.getElementById(MODAL_ID);
+        if (overlay) overlay.dataset.status = 'read';
     },
 
     /** A refused answer or undo, said; a question changed meanwhile reads "Awaiting action" again. */

@@ -92,6 +92,8 @@ export interface ChartLine {
     childAge?: number;
     /** The start is only the first known point (an undated union: the first common child's birth): it fades in. */
     fadeStart?: boolean;
+    /** A former partner: the line stops at the dated divorce or separation (`to`) and fades out there. */
+    fadeEnd?: boolean;
     anchor: string;
 }
 
@@ -325,8 +327,12 @@ export function lifeChartInput(tree: StromData, personId: PersonId, opts: LifeCh
     for (const { x, from, fade } of partnerLines) {
         if (!x.other || x.other.isPlaceholder || x.shielded) continue;
         const d = chartDate(x.other.deathDate, true);
+        // A divorce or separation with a known date: the line of the former partner ends there, so it does
+        // not read as a union lasting up to today; a death before that date still ends it (a widowhood).
+        const parted = x.u.status === 'divorced' || x.u.status === 'separated' ? chartDate(x.u.endDate, true) : undefined;
+        const split = parted && parted.at > from && (!d || parted.at < d.at) ? parted.at : undefined;
         lines.push({ kind: 'partner', name: x.other.firstName?.trim() || '', from,
-            ...(d ? { to: d.at, deathYear: d.year } : {}),
+            ...(split !== undefined ? { to: split, fadeEnd: true } : d ? { to: d.at, deathYear: d.year } : {}),
             ...(fade ? { fadeStart: true } : {}),
             anchor: fade ? anchorOf(p => p.kind === 'child' && !!p.relatedId && x.u.childIds.includes(p.relatedId as PersonId))
                 : anchorOf(p => p.kind === 'marriage' && p.partnershipId === x.u.id) });
@@ -469,7 +475,9 @@ export function chartSet(input: LifeChartInput, S: CS, ctx: LifeChartCtx, W: num
         const fits = !single && !!text && wpx(p.from, p.to) > text.length * CH_PX;
         const cls = single ? 'pp-ch-p--life' : `pp-ch-p--${p.kind === 'partnership' ? 'marriage' : p.kind}`;
         const href = p.anchor ? ` href="#${p.anchor}" data-pp-osa="${p.anchor}"` : '';
-        barParts.push(`<a class="pp-ch-p ${cls}"${href} style="left:${x(p.from)};width:${wpc(p.from, p.to)}"${title ? ` title="${esc(title)}"` : ''}></a>`);
+        // The whole life with no known periods has no title: its legend's words name the link.
+        const name = title || (p.kind === 'life' ? S.personPage.chart.legend.life : '');
+        barParts.push(`<a class="pp-ch-p ${cls}"${href} style="left:${x(p.from)};width:${wpc(p.from, p.to)}"${title ? ` title="${esc(title)}"` : ''}${name ? ` aria-label="${esc(name)}"` : ''}></a>`);
         if (fits) labelParts.push(`<span class="pp-ch-pl" style="left:${x(p.from)};width:${wpc(p.from, p.to)}">${esc(text)}</span>`);
     }
     rows.push(`<div class="pp-ch-row pp-ch-plabels" aria-hidden="true">${labelParts.join('')}</div>`);
@@ -628,6 +636,11 @@ function lineRow(l: ChartLine, input: LifeChartInput, S: CS, xpx: (y: number) =>
         to = Math.min(l.to, input.end);
         cls += ' pp-ch-ln--short';
         label = `${l.name} · ${C.age(l.childAge)}`;
+    } else if (l.fadeEnd && l.to !== undefined && l.to <= input.end) {
+        // A former partner: the line stops at the divorce, fading out there.
+        to = l.to;
+        cls += ' pp-ch-ln--fe';
+        label = l.name;
     } else if (l.to === undefined || l.to > input.end) {
         // The life goes on past the axis: to the right edge, fading out.
         to = input.end;

@@ -24,17 +24,24 @@
 
 import { researchHeaderLines, ResearchHeaderInfo, TitlesInGedcom } from './research-link.js';
 import { isPurePlaceholder } from './single-parent.js';
-import { APP_VERSION, StromData, Person, Partnership, PersonId, PartnershipId, LifeEventType, ParticipantRole, PlaceGeo, Story, ParentChildRelType, MediaOriginal, Attachment, FactStatus, coupleSides } from './types.js';
+import { APP_VERSION, StromData, Person, Partnership, CoupleEvent, EventParticipant, Source, PersonId, OriginalIds, PartnershipId, LifeEventType, LifeEvent, ParticipantRole, PlaceGeo, Story, ParentChildRelType, MediaOriginal, Attachment, AlsoChildOf, FactStatus, ResearchFactOrigin, ResearchFactWas, coupleSides } from './types.js';
 import { normalizeSha256 } from './sha256.js';
+import { sourceReadState } from './source-confirm.js';
 import { regionHeader, regionToStored } from './originals.js';
 import { strings } from './strings.js';
 import { COUPLE_EVENT_TAG, eventValueIsOnTag, sortCoupleEvents } from './events.js';
 import { placeKey } from './places.js';
-import { noName, PRIMARY_NAME_TAG } from './gedcom-names.js';
+import { GedcomNameParts, noName, PRIMARY_NAME_TAG, readGedcomName } from './gedcom-names.js';
 import { gedcomAge } from './recorded-age.js';
 import { isGedcomDateFormOf } from './gedcom-date-form.js';
+import { canonicalDate } from './dates.js';
 import { applyContentOptions, ContentOptions } from './privacy.js';
 import { lineageOverridesOf } from './lineage.js';
+import { citeLines, ExtraHolder, FactHolder, factImportTags, gedcomHtmlText, importedValueOf, IMPORT_TAG, joinedEventKey, joinedNoteBack, type JoinedRecord, joinedRecords, mediaDateValue, notedBack, NotedStructure, notedStructures, withoutCiteLines, withoutJoinedNotes, withoutNotedLines, XID_TAG } from './import-origin.js';
+import { CONFIRMED_TAG, EID_TAG, factResearchEid, factVerifyInfo } from './verify.js';
+import { importProgramName } from './import-next.js';
+import { composePage, hasEntryFields } from './source-location.js';
+import { citationQuality, type CitationHolder } from './citation-quality.js';
 
 /** What to leave out of a GEDCOM export (the export dialog's Content section). */
 export interface GedcomExportOptions {
@@ -64,6 +71,124 @@ export interface GedcomExportOptions {
      * a research that does not take them (`read.sync`, see researchSendsReadings).
      */
     readings?: boolean;
+    /**
+     * Write the research's origin of facts (`_STROM_ORIGIN`, `_STROM_SEX_ORIGIN`,
+     * `_STROM_WAS` with its `_STROM_IMPORT`, `_PART`, `_REF`), so a file export
+     * read back keeps it (spec 066). Only a file the user exports: never in what
+     * goes to the research (it keeps its own).
+     */
+    origins?: boolean;
+    /**
+     * Write the day a fact was confirmed by a person (`2 _STROM_CONFIRMED
+     * YYYY-MM-DD` under the fact, spec 065): the app's own confirmation while
+     * the value is unchanged, else the research's while the value is the one
+     * its file gave and it is not taken back here (handedConfirmations).
+     * Every confirmed fact carries it: the research
+     * reads what goes to it (sync, adoption) against `_STROM_HEAD` — one added
+     * is a confirmation, one left out a take-back — and a Strom file read
+     * back keeps it. Default: written; false: none. "Back to {prog}"
+     * (`backTo`) never writes it (the other program does not read it).
+     * The fact's id in the research (`2 _STROM_EID`) goes with it to the
+     * research only (`research`): the id is that research's, another one
+     * would read it as its own fact's.
+     */
+    confirmations?: boolean;
+    /**
+     * "Back to {prog}" with "Mark the research's facts with a note" (spec 066
+     * §4): under each fact the research added or corrected, a `2 NOTE` with
+     * this text of the record(s) it cites — for the other program, which
+     * reads no `_STROM_*` tag. The text is in the app's language.
+     */
+    researchNote?: (src: string) => string;
+    /**
+     * "Back to {prog}" (spec 066 K3.2): the import (StromData.imports id) the
+     * file goes back to. People and families from that program's files get
+     * their original xref where it is safe, and their id lines (`_UID`, `RIN`,
+     * `EXID`…) as level-1 lines; an xref that cannot be used goes as
+     * `REFN` + `TYPE {prog} xref`.
+     */
+    backTo?: string;
+    /**
+     * Write a source's place field by field (spec 075): `1 _STROM_FOLIO`,
+     * `_STROM_IMAGE` and `_STROM_LOCATOR` beside the PAGE composed of them.
+     * Default: written (the app's own file). False for a research that does not
+     * read them (no `sources.fields` in its features): it gets the composed
+     * PAGE alone, as from an older app. "Back to {prog}" never writes them.
+     */
+    sourceFields?: boolean;
+}
+
+/**
+ * An xref another program gave that this file can use as it is: GEDCOM
+ * 5.5.1's form (letters, digits, `_`; 22 characters with the @ signs).
+ */
+export function isSafeXref(xref: string): boolean {
+    return /^[A-Za-z0-9_]{1,20}$/.test(xref);
+}
+
+/** A record's ids in one import: `n _XREF @x@` and its id lines, under `n-1 _STROM_IMPORT Ix` or at level 1. */
+function pushOriginalIdLines(lines: string[], level: number, entry: OriginalIds, withXref: boolean): void {
+    if (withXref && entry.xref) lines.push(`${level} _XREF @${entry.xref}@`);
+    for (const id of entry.ids ?? []) {
+        lines.push(`${level} ${id.tag} ${id.value}`);
+        if (id.tag === 'EXID' && id.type) lines.push(`${level + 1} TYPE ${id.type}`);
+    }
+}
+
+/**
+ * A fact the research added or corrected: its origin is the research, or it
+ * keeps the family tree's earlier value (`_STROM_WAS`).
+ */
+export function isResearchFact(origin: ResearchFactOrigin | undefined): boolean {
+    return !!origin && (origin.kind === 'research' || !!origin.was);
+}
+
+/** The citations of one fact of a person or a couple. */
+function factCitations(holder: FactHolder, fact: string): readonly string[] {
+    if (fact.startsWith('event:')) {
+        const id = fact.slice(6);
+        return (holder.events ?? []).find(e => e?.id === id)?.sourceIds ?? [];
+    }
+    if ('person1Id' in holder) return fact === 'marriage' ? holder.sourceIds ?? [] : fact === 'divorce' ? holder.divorceSourceIds ?? [] : [];
+    return fact === 'birth' ? holder.birthSourceIds ?? [] : fact === 'death' ? holder.deathSourceIds ?? [] : [];
+}
+
+/**
+ * The record(s) a research fact rests on, for its note: the sources its
+ * origin names, else the fact's own citations; each as "title, reference",
+ * several joined by "; ". Null: no record in the tree (no note).
+ */
+export function researchNoteSource(data: Pick<StromData, 'sources'>, holder: FactHolder, fact: string): string | null {
+    const origin = holder.researchOrigins?.[fact];
+    if (!isResearchFact(origin)) return null;
+    const ids = origin!.sourceIds?.length ? origin!.sourceIds : factCitations(holder, fact);
+    const labels: string[] = [];
+    for (const id of ids) {
+        const s = data.sources?.[id];
+        if (!s) continue;
+        const label = [s.title, s.reference].filter(x => !!x?.trim()).map(x => x!.trim()).join(', ');
+        if (label && !labels.includes(label)) labels.push(label);
+    }
+    return labels.length ? labels.join('; ') : null;
+}
+
+/** Facts a research note can stand under: SEX takes no NOTE in GEDCOM. */
+const NOTE_FACT = (fact: string): boolean => fact !== 'sex';
+
+/**
+ * The first research fact of the tree that would get a note, its record(s)
+ * (the example in "Mark the research's facts with a note"); null: none.
+ */
+export function firstResearchNoteSource(data: StromData): string | null {
+    const holders: FactHolder[] = [...Object.values(data.persons), ...Object.values(data.partnerships)];
+    for (const h of holders) {
+        for (const fact of Object.keys(h.researchOrigins ?? {})) {
+            if (!NOTE_FACT(fact)) continue;
+            const src = researchNoteSource(data, h, fact);
+            if (src) return src;
+        }
+    }
+    return null;
 }
 
 /** Partnership statuses MARR/DIV cannot express, written as 1 _STAT. */
@@ -149,6 +274,9 @@ export function formatGedcomDate(isoDate: string | undefined, asWritten?: Record
     // loaded data may hold anything, also a valid form of another date.
     const kept = asWritten?.[isoDate];
     if (isGedcomDateFormOf(isoDate, kept)) return kept;
+    // A date written as text in the data ('Cca 5/1850') goes out as the
+    // date it reads as ('ABT MAY 1850').
+    isoDate = canonicalDate(isoDate);
 
     // Period 'a/b' -> FROM a TO b, 'a/' -> FROM a, '/b' -> TO b
     const slash = isoDate.indexOf('/');
@@ -230,6 +358,25 @@ function pushPlace(lines: string[], level: number, place: string, places?: Recor
 }
 
 /**
+ * Whether a NAME the import kept as written because its given name is a
+ * description ("Son //", see describedNameLines in the parser) still says
+ * the person's name: read again, it gives the person's given name ("?"),
+ * surname and titles, and the description the note had of it.
+ */
+function describedNameHolds(st: NotedStructure, person: Person): boolean {
+    const line = st.lines[0].replace(/^1 NAME ?/, '');
+    const parts: GedcomNameParts = {};
+    for (const l of st.lines.slice(1)) {
+        const m = /^2 (NPFX|GIVN|SPFX|SURN|NSFX) (.*)$/.exec(l);
+        if (m) parts[m[1].toLowerCase() as keyof GedcomNameParts] = m[2];
+    }
+    const read = readGedcomName(line, parts);
+    return st.texts.length === 1 && read.description === st.texts[0]
+        && read.firstName === (person.firstName || '?') && read.lastName === (person.lastName ?? '')
+        && (read.titleBefore ?? '') === (person.titleBefore ?? '') && (read.titleAfter ?? '') === (person.titleAfter ?? '');
+}
+
+/**
  * The person's main NAME. A name with a title (Person.titleBefore /
  * titleAfter) carries it in the line, so a program that reads no sub-tags
  * still shows it ("Ing. Jan /Novák/ ml."), and spells its parts out below:
@@ -239,9 +386,10 @@ function pushPlace(lines: string[], level: number, place: string, places?: Recor
  * One more name gets its GIVN and SURN: a person of no name ("?") with the
  * surname Unknown, so no reader takes it for no surname. `titles` (see
  * GedcomExportOptions.titles): 'tags' keeps the titles out of the line,
- * 'none' writes the name as if it had none.
+ * 'none' writes the name as if it had none. `parts` writes GIVN / SURN
+ * under every name ("Back to {prog}", whose file had them, spec 066 K3.1).
  */
-function pushName(lines: string[], person: Person, titles: TitlesInGedcom = 'line'): void {
+function pushName(lines: string[], person: Person, titles: TitlesInGedcom = 'line', parts = false): void {
     const before = titles === 'none' ? '' : person.titleBefore?.trim() ?? '';
     const after = titles === 'none' ? '' : person.titleAfter?.trim() ?? '';
     const name = formatGedcomName(person.firstName, person.lastName);
@@ -255,6 +403,10 @@ function pushName(lines: string[], person: Person, titles: TitlesInGedcom = 'lin
         if (noName(first) && last === 'Unknown') {
             if (!first.includes(',')) pushWrapped(lines, 2, 'GIVN', first);
             pushWrapped(lines, 2, 'SURN', last);
+        } else if (parts) {
+            // The parts of the name as it is now (as the file had them while unchanged).
+            if (first && !noName(first) && !first.includes(',')) pushWrapped(lines, 2, 'GIVN', first);
+            if (last && !last.includes(',')) pushWrapped(lines, 2, 'SURN', last);
         }
         return;
     }
@@ -320,7 +472,7 @@ const isRegionalIndicator = (cp: number): boolean => cp >= 0x1f1e6 && cp <= 0x1f
  * not around a zero-width joiner (👨‍👩‍👧) and not inside a flag's pair of
  * regional indicators. Some readers decode each physical line on its own.
  */
-function isClusterBoundary(text: string, i: number): boolean {
+export function isClusterBoundary(text: string, i: number): boolean {
     const unit = text.charCodeAt(i);
     if (unit >= 0xdc00 && unit <= 0xdfff) return false;
     if (unit < 0x80 && text.charCodeAt(i - 1) < 0x80) return true;
@@ -415,6 +567,26 @@ function pushLongValue(lines: string[], level: number, tag: string, text: string
     });
 }
 
+/** The value of `_STROM_ORIGIN`: `import I1 [DATE PLAC…]`, `user`, `research` or `tree`. */
+function researchOriginValue(o: ResearchFactOrigin): string {
+    return o.kind === 'import' ? ['import', o.importId ?? '', ...(o.importId ? o.parts ?? [] : [])].filter(Boolean).join(' ') : o.kind ?? '';
+}
+
+/** The family tree's earlier value of a fact: one `_STROM_WAS` per changed part when each has its own value. */
+function pushResearchWas(lines: string[], level: number, was: ResearchFactWas | undefined): void {
+    if (!was) return;
+    const parts = was.parts ?? [];
+    const each: { value: string; parts: string[] }[] = was.partValues && parts.length > 1
+        ? parts.map(p => ({ value: was.partValues![p] ?? '', parts: [p] }))
+        : [{ value: was.value, parts }];
+    for (const w of each) {
+        pushLongValue(lines, level, '_STROM_WAS', w.value);
+        if (was.importId) lines.push(`${level + 1} _STROM_IMPORT ${was.importId}`);
+        for (const p of w.parts) lines.push(`${level + 1} _PART ${p}`);
+        if (was.ref) lines.push(`${level + 1} _REF ${was.ref}`);
+    }
+}
+
 /** Emit a NOTE structure (see pushLongValue). */
 function pushNote(lines: string[], level: number, text: string): void {
     pushLongValue(lines, level, 'NOTE', text);
@@ -435,6 +607,76 @@ function pushDetails(lines: string[], d: { cause?: string; age?: string; address
  * The research's status of a fact (`2 _STROM_STATUS`), written back as it
  * came so a tree round-trips through the app unchanged.
  */
+/**
+ * An event without the note lines the import made of its `2 EMAIL` lines
+ * ("E-mail: …", in the language of the import), and the addresses whose line
+ * is still there; one taken out or edited by hand stays a note.
+ */
+function emailsBack(event: LifeEvent): { event: LifeEvent; emails: string[] } {
+    if (!event.gedcomEmails?.length || !event.note || eventValueIsOnTag(event.type)) return { event, emails: [] };
+    const noteLines = event.note.split('\n');
+    const emails: string[] = [];
+    for (const email of event.gedcomEmails) {
+        const i = noteLines.findIndex(l => {
+            const at = l.indexOf(': ');
+            return at > 0 && !l.slice(0, at).includes('@') && l.slice(at + 2).trim() === email;
+        });
+        if (i < 0) continue;
+        noteLines.splice(i, 1);
+        emails.push(email);
+    }
+    const note = noteLines.join('\n').trim();
+    return { event: { ...event, ...(note ? { note } : { note: undefined }) }, emails };
+}
+
+/**
+ * An event without the first line(s) of its note the import made of the
+ * value its file wrote on the event's line (`1 EDUC Gymnázium`), and that
+ * value while the note still begins with it; a note edited there stays a note.
+ */
+function lineValueBack(event: LifeEvent): { event: LifeEvent; value?: string } {
+    const value = event.gedcomValue;
+    if (!value || !event.note || eventValueIsOnTag(event.type)) return { event };
+    if (event.note !== value && !event.note.startsWith(`${value}\n`)) return { event };
+    const note = event.note.slice(value.length).replace(/^\n/, '').trim();
+    return { event: { ...event, ...(note ? { note } : { note: undefined }) }, value };
+}
+
+/**
+ * The event's ADDR as its file wrote it (`2 ADDR` / `3 ADR1 Ulice 5`) while
+ * the address is still the one read from it; null when it is not, or when
+ * the lines are not one such structure.
+ */
+function addressBack(event: LifeEvent): string[] | null {
+    const kept = event.gedcomAddress;
+    if (!kept || !event.address || event.address !== kept.value || !Array.isArray(kept.lines)) return null;
+    const [head, ...rest] = kept.lines;
+    if (typeof head !== 'string' || !/^2 ADDR( |$)/.test(head) || rest.length === 0 || rest.length > 20) return null;
+    const all = [head, ...rest];
+    if (!all.every(l => typeof l === 'string' && l.length <= 255 && !/[\r\n\0]/.test(l) && !/\s@[^@#\s][^@\s]*@/.test(l))) return null;
+    return rest.every(l => /^[3-9] [A-Z0-9_]+( |$)/.test(l)) ? all : null;
+}
+
+/**
+ * A source without the note line(s) the import made of its AUTH ("Author: …",
+ * in the language of the import), and the author while that line is still
+ * there; a line taken out or edited by hand stays a note (as emailsBack).
+ */
+function authorBack(source: Source): { source: Source; author?: string } {
+    if (!source.gedcomAuthor || !source.note) return { source };
+    const noteLines = source.note.split('\n');
+    const [first, ...rest] = source.gedcomAuthor.split('\n');
+    const i = noteLines.findIndex((l, at) => {
+        const colon = l.indexOf(': ');
+        return colon > 0 && !l.slice(0, colon).includes('@') && l.slice(colon + 2) === first
+            && rest.every((r, k) => noteLines[at + 1 + k] === r);
+    });
+    if (i < 0) return { source };
+    noteLines.splice(i, 1 + rest.length);
+    const note = noteLines.join('\n').trim();
+    return { source: { ...source, ...(note ? { note } : { note: undefined }) }, author: source.gedcomAuthor };
+}
+
 function pushStatus(lines: string[], status: FactStatus | undefined): void {
     if (status) lines.push(`2 _STROM_STATUS ${status}`);
 }
@@ -446,14 +688,59 @@ function pushStatus(lines: string[], status: FactStatus | undefined): void {
  * evidence and must not be mistaken for a NOTE on the record. Programs that do
  * not know the tag skip the whole block, which is exactly the right outcome.
  */
-function pushStory(lines: string[], level: number, story: Story): void {
+function pushStory(lines: string[], level: number, story: Story, sourceRef: (id: string) => string | undefined): void {
     lines.push(`${level} _STORY`);
     lines.push(`${level + 1} TYPE ${escapeGedcomText(story.kind || 'vypraveni')}`);
     if (story.title) pushLongValue(lines, level + 1, 'TITL', story.title);
     if (story.status) lines.push(`${level + 1} STAT ${story.status === 'final' ? 'hotovo' : 'navrh'}`);
     pushLongValue(lines, level + 1, 'TEXT', story.text);
     for (const fact of story.facts ?? []) pushLongValue(lines, level + 1, 'DATA', fact);
+    // The sources the story rests on, as Strom Research writes them: a pointer each.
+    for (const id of new Set(story.sources ?? [])) {
+        const ref = sourceRef(id);
+        if (ref) lines.push(`${level + 1} SOUR ${ref}`);
+    }
     if (story.note) pushLongValue(lines, level + 1, 'NOTE', story.note);
+}
+
+/**
+ * The other families a person was also recorded in as a child (spec 066 K3.1),
+ * written back as FAMC / CHIL instead of the "Also recorded as…" note line —
+ * while that line is still in the notes (deleting it drops the link) and the
+ * family still exists without the person among its own children.
+ */
+function alsoChildLinks(data: StromData): Map<PersonId, AlsoChildOf[]> {
+    const out = new Map<PersonId, AlsoChildOf[]>();
+    for (const [id, person] of Object.entries(data.persons) as [PersonId, Person][]) {
+        if (!person.alsoChildOf?.length) continue;
+        const noteLines = (person.notes ?? '').split('\n').map(l => l.trimEnd());
+        const links = person.alsoChildOf.filter((l, i, all) =>
+            noteLines.includes(l.note)
+            && data.partnerships[l.partnershipId] && !data.partnerships[l.partnershipId].childIds.includes(id)
+            && all.findIndex(o => o.partnershipId === l.partnershipId) === i);
+        if (links.length) out.set(id, links);
+    }
+    return out;
+}
+
+/** The notes without the lines its written links stand for (alsoChildLinks). */
+function notesWithoutLinks(notes: string, links: AlsoChildOf[]): string {
+    const lines = notes.split('\n');
+    for (const link of links) {
+        const at = lines.findIndex(l => l.trimEnd() === link.note);
+        if (at >= 0) lines.splice(at, 1);
+    }
+    return lines.join('\n').trim();
+}
+
+/**
+ * Whether a person is a record of a loaded file of the tree: it has its entry
+ * there (xref, ids). Not the import mark alone — a whole imported tree carries
+ * it, the "?" stand-ins the import made up for a missing parent too.
+ */
+function isFileRecord(data: StromData, p: Person): boolean {
+    const known = new Set((data.imports ?? []).map(r => r.id));
+    return (p.originalIds ?? []).some(e => known.has(e.from));
 }
 
 /**
@@ -467,6 +754,10 @@ function pushStory(lines: string[], level: number, story: Story): void {
 function standsInOnly(data: StromData, id: PersonId): boolean {
     if (!isPurePlaceholder(data, id)) return false;
     const p = data.persons[id];
+    // A record of a loaded file (a MyHeritage person known only as a spouse,
+    // `1 NAME //`, `1 SEX U`): the file had it, with its ids, so it goes out
+    // as its own record and its families keep both partners (spec 066 K3.2).
+    if (isFileRecord(data, p)) return false;
     const unions = p.partnerships.map(uid => data.partnerships[uid]).filter(Boolean);
     return unions.length > 0 && p.childIds.every(cid => unions.some(u => u.childIds.includes(cid)));
 }
@@ -505,7 +796,182 @@ export function countFamilies(data: StromData): number {
  */
 export const STROM_SEX_U_LINE = '1 _STROM_SEX_U Y';
 
+/** Another record of a couple "Back to {prog}" writes beside the couple's own (JOINED_TAG), with what the couple has of it. */
+interface JoinedBack {
+    xref: string;
+    /** Its xref in the program's file ('' unknown), without the @ signs. */
+    own: string;
+    from: string;
+    record: JoinedRecord;
+    children: PersonId[];
+    sources: string[];
+    /** The sources of its divorce's citations. */
+    divorceSources: string[];
+    events: CoupleEvent[];
+    /** The witnesses of its wedding (the couple's participants it named). */
+    witnesses: EventParticipant[];
+}
+
+/** What "Back to {prog}" writes of the records' ids (see backToXrefs). */
+interface BackXrefs {
+    /** The program the file goes back to ('' without one). */
+    program: string;
+    /** The original xrefs the file uses (without @), by record. */
+    persons: Map<PersonId, string>;
+    families: Map<PartnershipId, string>;
+    /** The record's ids in that program's file the export writes back. */
+    personEntries: Map<PersonId, OriginalIds>;
+    familyEntries: Map<PartnershipId, OriginalIds>;
+    /** Every original xref of that program (upper case), used or given up: no other record gets one. */
+    reserved: Set<string>;
+    /** The imports from that program (its own tags kept from them go back, spec 066 G8). */
+    imports: Set<string>;
+    /**
+     * The sources one record of that program's file became (one per page
+     * cited): each member's id -> the group's first member. They go back as
+     * that one record, the pages on their citations (spec 066 K3.1).
+     */
+    sourceGroups: Map<string, string>;
+    /** The original xref a group uses (without @), by its first member. */
+    sources: Map<string, string>;
+    /** A source's entry of that program's ids (`1 RIN MH:S1` goes back), by source. */
+    sourceEntries: Map<string, OriginalIds>;
+}
+
+/** Every source a citation names (what pushCitation writes): of a person, a fact, an event, a couple. */
+function citedSourceIds(data: StromData): Set<string> {
+    const out = new Set<string>();
+    const add = (ids: readonly string[] | undefined): void => { for (const id of ids ?? []) out.add(id); };
+    for (const p of Object.values(data.persons) as Person[]) {
+        if (!p) continue;
+        add(p.sourceIds); add(p.birthSourceIds); add(p.deathSourceIds);
+        for (const ev of p.events ?? []) add(ev.sourceIds);
+    }
+    for (const ps of Object.values(data.partnerships) as Partnership[]) {
+        if (!ps) continue;
+        add(ps.sourceIds); add(ps.divorceSourceIds);
+        for (const ev of ps.events ?? []) add(ev.sourceIds);
+    }
+    return out;
+}
+
+/** What a source record says itself, apart from the page and the entry's date (the citation's). */
+const sameSourceRecord = (a: Source, b: Source): boolean =>
+    a.title === b.title && (a.repository ?? '') === (b.repository ?? '') && (a.url ?? '') === (b.url ?? '')
+    && (a.note ?? '') === (b.note ?? '') && (!a.transcript || !b.transcript || a.transcript === b.transcript);
+
+/**
+ * The records' ids of "Back to {prog}" (spec 066 K3.2). A record's entry is
+ * that of the import the file goes back to, else of the latest other import
+ * from the same program. Its xref is used when it has GEDCOM's form and no
+ * other record claims it as strongly: an entry of the import itself before
+ * one of an older file; two equal claims both give it up (they go as REFN).
+ * Xrefs are compared without regard to case (some programs read them so).
+ * No generated xref takes one of them, used or not: the program would take
+ * that record for the one it once named so.
+ */
+function backToXrefs(data: StromData, backTo: string | undefined): BackXrefs {
+    const out: BackXrefs = {
+        program: '', persons: new Map(), families: new Map(), personEntries: new Map(), familyEntries: new Map(), reserved: new Set(),
+        imports: new Set(), sourceGroups: new Map(), sources: new Map(), sourceEntries: new Map(),
+    };
+    const rec = backTo ? data.imports?.find(r => r.id === backTo) : undefined;
+    if (!rec) return out;
+    out.program = importProgramName(rec);
+    const same = (data.imports ?? []).filter(r => importProgramName(r) === out.program).map(r => r.id);
+    out.imports = new Set(same);
+    // 0 for the import itself, then the later files before the earlier ones.
+    const rank = (from: string): number => (from === rec.id ? 0 : same.length - same.indexOf(from));
+    const pick = (holder: { originalIds?: OriginalIds[] }): OriginalIds | undefined => {
+        let best: OriginalIds | undefined;
+        for (const e of holder.originalIds ?? []) {
+            if (!same.includes(e.from)) continue;
+            if (!best || rank(e.from) < rank(best.from)) best = e;
+        }
+        return best;
+    };
+    const claims = new Map<string, { rank: number; n: number; assign: () => void }>();
+    const claim = (xref: string | undefined, r: number, assign: () => void): void => {
+        if (!xref || !isSafeXref(xref) || xref.toUpperCase() === 'SUBM1') return;
+        const key = xref.toUpperCase();
+        const have = claims.get(key);
+        if (!have || r < have.rank) claims.set(key, { rank: r, n: 1, assign });
+        else if (r === have.rank) have.n++;
+    };
+    for (const [id, person] of Object.entries(data.persons) as [PersonId, Person][]) {
+        if (!person || standsInOnly(data, id)) continue;
+        const entry = pick(person);
+        if (!entry) continue;
+        out.personEntries.set(id, entry);
+        claim(entry.xref, rank(entry.from), () => out.persons.set(id, entry.xref!));
+    }
+    for (const [id, ps] of Object.entries(data.partnerships) as [PartnershipId, Partnership][]) {
+        if (!ps) continue;
+        const entry = pick(ps);
+        if (!entry) continue;
+        out.familyEntries.set(id, entry);
+        claim(entry.xref, rank(entry.from), () => out.families.set(id, entry.xref!));
+    }
+    // The sources one record became, cited somewhere: one group per record
+    // while they say the same of it (a title edited here makes a record of its own).
+    const cited = citedSourceIds(data);
+    const groups = new Map<string, Source[][]>();
+    for (const src of Object.values(data.sources ?? {}) as Source[]) {
+        if (!src) continue;
+        const entry = pick(src);
+        if (entry) out.sourceEntries.set(src.id, entry);
+        if (!entry?.xref) continue;
+        out.reserved.add(entry.xref.toUpperCase());
+        if (!cited.has(src.id)) continue;
+        const key = entry.xref.toUpperCase();
+        const list = groups.get(key) ?? [];
+        groups.set(key, list);
+        const group = list.find(g => sameSourceRecord(g[0], src) && g.every(m => sameSourceRecord(m, src)));
+        if (group) group.push(src);
+        else list.push([src]);
+    }
+    for (const list of groups.values()) {
+        for (const [i, group] of list.entries()) {
+            const head = group[0].id;
+            for (const m of group) out.sourceGroups.set(m.id, head);
+            // The record's xref: the first group's (the others are records of their own now).
+            if (i === 0) {
+                const entry = pick(group[0])!;
+                claim(entry.xref, rank(entry.from), () => out.sources.set(head, entry.xref!));
+            }
+        }
+    }
+    // A record cited nowhere keeps its xref too, while no cited record has it.
+    for (const src of Object.values(data.sources ?? {}) as Source[]) {
+        if (!src || cited.has(src.id)) continue;
+        const entry = out.sourceEntries.get(src.id);
+        if (!entry?.xref || groups.has(entry.xref.toUpperCase())) continue;
+        claim(entry.xref, rank(entry.from), () => out.sources.set(src.id, entry.xref!));
+    }
+    for (const [key, c] of claims) {
+        out.reserved.add(key);
+        if (c.n === 1) c.assign();
+    }
+    return out;
+}
+
+/**
+ * How many source records "Back to {prog}" writes (`backTo`: the import the
+ * file goes back to). The sources one record of that program's file became
+ * (one per page cited, see the import) go back as that one record, so a
+ * register cited at 81 pages is one source there, not 81 (spec 066 K3.1).
+ */
+export function backSourceRecordCount(data: StromData, backTo: string | undefined): number {
+    const groups = backToXrefs(data, backTo).sourceGroups;
+    return Object.keys(data.sources ?? {}).filter(id => {
+        const head = groups.get(id);
+        return !head || head === id;
+    }).length;
+}
+
 export function exportToGedcom(data: StromData, treeName?: string, options: GedcomExportOptions = {}): GedcomExportResult {
+    // Before the content options: a family link stays even without the notes.
+    const alsoChild = alsoChildLinks(data);
     if (options.content) data = applyContentOptions(data, options.content);
     const writeReadings = options.readings !== false;
     const lines: string[] = [];
@@ -514,8 +980,99 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
     const personIdMap = new Map<PersonId, string>();
     const partnershipIdMap = new Map<PartnershipId, string>();
 
-    let personCounter = 1;
-    let familyCounter = 1;
+    // "Back to {prog}" (spec 066 K3.2): the records from that program's files
+    // keep their xref where it is safe; every other xref is made around them.
+    const back = backToXrefs(data, options.backTo);
+    /** A person or a family of that program's files ("Back to {prog}"). */
+    const isBackRecord = (holder: FactHolder): boolean =>
+        (!!holder.importId && back.imports.has(holder.importId)) || (holder.originalIds ?? []).some(e => back.imports.has(e.from));
+    /** Xrefs in use, without the @ signs (people, families, sources, repositories and the submitter share them). */
+    const taken = new Set<string>(['SUBM1', ...back.reserved]);
+    const counters: Record<string, number> = { I: 1, F: 1, S: 1, R: 1 };
+    /** The next free `@{prefix}n@`. */
+    const freshXref = (prefix: 'I' | 'F' | 'S' | 'R'): string => {
+        let n = counters[prefix];
+        while (taken.has(`${prefix}${n}`)) n++;
+        counters[prefix] = n + 1;
+        taken.add(`${prefix}${n}`);
+        return `@${prefix}${n}@`;
+    };
+
+    // "Back to {prog}": the couple's other records of that program's file
+    // (JOINED_TAG), written beside the couple's own; each keeps its xref
+    // while no other record has it (once, when two imports kept the same).
+    const joined = new Map<PartnershipId, JoinedBack[]>();
+    if (back.imports.size > 0) {
+        const seen = new Set<string>();
+        for (const [id, ps] of Object.entries(data.partnerships) as [PartnershipId, Partnership][]) {
+            for (const entry of ps?.gedcomExtra ?? []) {
+                if (!back.imports.has(entry.from)) continue;
+                for (const record of joinedRecords(entry.lines)) {
+                    const key = `${id}\n${record.xref}\n${record.lines.join('\n')}\n${record.text}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    const free = isSafeXref(record.xref) && !taken.has(record.xref.toUpperCase());
+                    if (free) taken.add(record.xref.toUpperCase());
+                    const list = joined.get(id) ?? [];
+                    joined.set(id, list);
+                    list.push({ xref: free ? `@${record.xref}@` : '', own: record.xref, from: entry.from, record, children: [], sources: [], divorceSources: [], events: [], witnesses: [] });
+                }
+            }
+        }
+    }
+    // What the couple has of each such record goes back with it, not with the
+    // first one: its children (by their xref in the file), the sources of its
+    // citations (by the record's xref and the page; also in the first record
+    // when that cited the page too) and its events (by what they say).
+    /** `${partnershipId}\n${childId}` of a child only another record of the couple has. */
+    const childElsewhere = new Set<string>();
+    /** Sources and events of a couple that go only with its other records. */
+    const sourcesElsewhere = new Map<PartnershipId, Set<string>>();
+    const divorceSourcesElsewhere = new Map<PartnershipId, Set<string>>();
+    const eventsElsewhere = new Set<CoupleEvent>();
+    /** Wedding witnesses of a couple that go only with its other records. */
+    const witnessesElsewhere = new Set<EventParticipant>();
+    for (const [id, list] of joined) {
+        const ps = data.partnerships[id];
+        const xrefIs = (holder: { originalIds?: OriginalIds[] } | undefined, xref: string): boolean =>
+            (holder?.originalIds ?? []).some(e => back.imports.has(e.from) && (e.xref ?? '').toUpperCase() === xref.toUpperCase());
+        const takenEvents = new Set<CoupleEvent>();
+        for (const j of list) {
+            for (const { xref, also } of j.record.children) {
+                const child = ps.childIds.find(c => !j.children.includes(c) && xrefIs(data.persons[c], xref));
+                if (!child) continue;
+                j.children.push(child);
+                // A child the first record names too stays there as well.
+                if (!also) childElsewhere.add(`${id}\n${child}`);
+            }
+            for (const cite of j.record.sources) {
+                const [cited, taken, elsewhere] = cite.divorce
+                    ? [ps.divorceSourceIds, j.divorceSources, divorceSourcesElsewhere] : [ps.sourceIds, j.sources, sourcesElsewhere];
+                const sid = (cited ?? []).find(s => !taken.includes(s) && xrefIs(data.sources?.[s], cite.xref)
+                    && (data.sources?.[s]?.reference ?? '').trim() === cite.page);
+                if (!sid) continue;
+                taken.push(sid);
+                if (!cite.also) (elsewhere.get(id) ?? elsewhere.set(id, new Set()).get(id)!).add(sid);
+            }
+            for (const key of j.record.events) {
+                const ev = (ps.events ?? []).find(e => !takenEvents.has(e) && joinedEventKey(e) === key);
+                if (!ev) continue;
+                takenEvents.add(ev);
+                eventsElsewhere.add(ev);
+                j.events.push(ev);
+            }
+            // Its wedding's witnesses, while it wrote that wedding: by their record's xref, or by the name.
+            const married = j.record.lines.some(l => l === '1 MARR' || l.startsWith('1 MARR '));
+            for (const w of married ? j.record.witnesses : []) {
+                const part = (ps.participants ?? []).find(p => !j.witnesses.includes(p) && (w.xref
+                    ? !!p.personId && xrefIs(data.persons[p.personId], w.xref)
+                    : !p.personId && (p.name ?? '').replace(/[\r\n]+/g, ' ').trim() === w.name));
+                if (!part) continue;
+                j.witnesses.push(part);
+                if (!w.also) witnessesElsewhere.add(part);
+            }
+        }
+    }
 
     // Map all persons to GEDCOM IDs — but a "?" stand-in that only marks the
     // unknown other parent of a family with children: no record of its own
@@ -523,14 +1080,31 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
     // parent and the children; a one-parent family reads back as the stand-in.
     for (const personId of Object.keys(data.persons) as PersonId[]) {
         if (standsInOnly(data, personId)) continue;
-        personIdMap.set(personId, `@I${personCounter}@`);
-        personCounter++;
+        const own = back.persons.get(personId);
+        personIdMap.set(personId, own ? `@${own}@` : freshXref('I'));
     }
 
     // Map all partnerships to GEDCOM IDs
     for (const partnershipId of Object.keys(data.partnerships) as PartnershipId[]) {
-        partnershipIdMap.set(partnershipId, `@F${familyCounter}@`);
-        familyCounter++;
+        const own = back.families.get(partnershipId);
+        partnershipIdMap.set(partnershipId, own ? `@${own}@` : freshXref('F'));
+    }
+    for (const list of joined.values()) for (const record of list) if (!record.xref) record.xref = freshXref('F');
+
+    // The other families a person is also a child of (alsoChildLinks): both
+    // ends written, the child's FAMC and the family's CHIL.
+    const alsoChildOf = new Map<PersonId, AlsoChildOf[]>();
+    const alsoChildren = new Map<PartnershipId, PersonId[]>();
+    for (const [personId, links] of alsoChild) {
+        if (!personIdMap.has(personId)) continue;
+        const written = links.filter(l => partnershipIdMap.has(l.partnershipId)
+            && !data.partnerships[l.partnershipId]?.childIds.includes(personId));
+        if (!written.length) continue;
+        alsoChildOf.set(personId, written);
+        for (const l of written) {
+            const list = alsoChildren.get(l.partnershipId);
+            if (list) list.push(personId); else alsoChildren.set(l.partnershipId, [personId]);
+        }
     }
 
     // Parent links outside any partnership (a parent added alone, the other
@@ -553,8 +1127,7 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             const key = [...loose].sort().join('|') + (loose.length === 1 ? `|${childId}` : '');
             let family = byParents.get(key);
             if (!family) {
-                family = { gedcomId: `@F${familyCounter}@`, parentIds: loose, childIds: [] };
-                familyCounter++;
+                family = { gedcomId: freshXref('F'), parentIds: loose, childIds: [] };
                 byParents.set(key, family);
                 looseFamilies.push(family);
                 for (const pid of loose) {
@@ -570,36 +1143,74 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         }
     }
 
-    // Map all sources to GEDCOM IDs (@S1@ ...)
+    // Map all sources to GEDCOM IDs (@S1@ ...). "Back to {prog}": the sources
+    // one record became share its xref (its own where it is safe).
     const sourceIdMap = new Map<string, string>();
-    let sourceCounter = 1;
     for (const sourceId of Object.keys(data.sources ?? {})) {
-        sourceIdMap.set(sourceId, `@S${sourceCounter}@`);
-        sourceCounter++;
+        const head = back.sourceGroups.get(sourceId);
+        if (head && head !== sourceId) continue;
+        const own = back.sources.get(sourceId);
+        sourceIdMap.set(sourceId, own ? `@${own}@` : freshXref('S'));
+    }
+    for (const [sourceId, head] of back.sourceGroups) {
+        if (head !== sourceId && sourceIdMap.has(head)) sourceIdMap.set(sourceId, sourceIdMap.get(head)!);
+    }
+    /** The members of each group, by its first member. */
+    const groupMembers = new Map<string, Source[]>();
+    for (const [sourceId, head] of back.sourceGroups) {
+        const src = data.sources?.[sourceId];
+        if (!src) continue;
+        const list = groupMembers.get(head) ?? [];
+        list.push(src);
+        groupMembers.set(head, list);
     }
     // Unique repository names -> @Rx@ records (standard 5.5.1 structure).
     const repoIdMap = new Map<string, string>();
-    let repoCounter = 1;
     for (const source of Object.values(data.sources ?? {})) {
         if (source.repository && !repoIdMap.has(source.repository)) {
-            repoIdMap.set(source.repository, `@R${repoCounter}@`);
-            repoCounter++;
+            repoIdMap.set(source.repository, freshXref('R'));
         }
     }
-    /** Citation emitter: the source reference belongs on the citation as PAGE. */
-    const pushCitation = (level: number, srcId: string): void => {
+    /**
+     * "Back to {prog}": what the citation said that Strom does not read
+     * (DATA > TEXT, EVEN > ROLE, see CITE_TAG), as written, at levels from 1
+     * under the citation; split into its DATA's lines and the rest.
+     */
+    const keptCiteLines = (src: Source | undefined): { data: string[]; rest: string[] } => {
+        const out = { data: [] as string[], rest: [] as string[] };
+        const entry = back.imports.size ? src?.gedcomExtra?.find(e => back.imports.has(e.from) && citeLines(e.lines).length) : undefined;
+        let inData = false;
+        for (const line of entry ? citeLines(entry.lines) : []) {
+            const level = Number(line.split(' ', 1)[0]);
+            if (level === 1) { inData = line === '1 DATA'; if (inData) continue; }
+            (inData ? out.data : out.rest).push(line);
+        }
+        return out;
+    };
+    /**
+     * Citation emitter: the source reference belongs on the citation as PAGE.
+     * `cited`: the list it is in, whose own QUAY of a citation wins over the
+     * source's (spec 077); without one the source's, as before.
+     */
+    const pushCitation = (level: number, srcId: string, cited?: { holder: CitationHolder; field: string }): void => {
         const ref = sourceIdMap.get(srcId);
         if (!ref) return;
         lines.push(`${level} SOUR ${ref}`);
         const src = data.sources?.[srcId];
-        if (src?.reference) pushLongValue(lines, level + 1, 'PAGE', src.reference);
+        const kept = keptCiteLines(src);
+        const at = (line: string): string => line.replace(/^\d+/, n => String(Number(n) + level));
+        const page = src ? composePage(src) : undefined;
+        if (page) pushLongValue(lines, level + 1, 'PAGE', page);
         // The entry recording date lives on the citation in 5.5.1 (DATA > DATE).
         const recorded = formatGedcomDate(src?.recordDate);
-        if (recorded) {
+        if (recorded || kept.data.length) {
             lines.push(`${level + 1} DATA`);
-            lines.push(`${level + 2} DATE ${recorded}`);
+            if (recorded) lines.push(`${level + 2} DATE ${recorded}`);
+            lines.push(...kept.data.map(at));
         }
-        if (src?.quality !== undefined) lines.push(`${level + 1} QUAY ${src.quality}`);
+        const quay = cited ? citationQuality(cited.holder, cited.field, srcId, data.sources) : src?.quality;
+        if (quay !== undefined) lines.push(`${level + 1} QUAY ${quay}`);
+        lines.push(...kept.rest.map(at));
     };
 
     // Get current date for header
@@ -622,6 +1233,168 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
     lines.push('1 CHAR UTF-8');
     lines.push(...researchHeaderLines(options.research));
     lines.push(STROM_SEX_U_LINE);
+
+    // The files the tree's facts came from (spec 066): one record per loaded
+    // file, named by its id under every record and fact still as it gave it.
+    const knownImports = new Set<string>();
+    for (const rec of data.imports ?? []) {
+        knownImports.add(rec.id);
+        lines.push(`1 ${IMPORT_TAG} ${rec.id}`);
+        if (rec.program) pushWrapped(lines, 2, 'SOUR', rec.program);
+        if (rec.version) pushWrapped(lines, 2, 'VERS', rec.version);
+        if (rec.fileDate) pushWrapped(lines, 2, 'DATE', rec.fileDate);
+        lines.push(`2 _AT ${rec.at}`);
+        if (rec.file) pushWrapped(lines, 2, 'FILE', rec.file);
+        if (rec.sha) lines.push(`2 _SHA ${rec.sha}`);
+    }
+    /** `n _STROM_IMPORT Ix` of a record from a known import. */
+    const pushRecordImport = (importId: string | undefined): void => {
+        if (importId && knownImports.has(importId)) lines.push(`1 ${IMPORT_TAG} ${importId}`);
+    };
+    /**
+     * A person's or a family's imports (spec 066 K3.2): `1 _STROM_IMPORT Ix`
+     * of the import it came from, with its ids there (`2 _XREF`, `2 _UID`…);
+     * the ids of each import it did not come from under `1 _STROM_XID Iy`
+     * (no origin: a person entered by hand stays the person's). "Back to
+     * {prog}" adds that program's ids as level-1 lines, and the original xref
+     * the file could not use as a REFN.
+     */
+    const pushHolderOrigin = (holder: FactHolder, xref: string, backEntry: OriginalIds | undefined): void => {
+        const entries = (holder.originalIds ?? []).filter(e => knownImports.has(e.from));
+        const first = holder.importId && knownImports.has(holder.importId) ? holder.importId : undefined;
+        if (first) {
+            lines.push(`1 ${IMPORT_TAG} ${first}`);
+            const entry = entries.find(e => e.from === first);
+            if (entry) pushOriginalIdLines(lines, 2, entry, true);
+        }
+        for (const entry of entries) {
+            if (entry.from === first) continue;
+            lines.push(`1 ${XID_TAG} ${entry.from}`);
+            pushOriginalIdLines(lines, 2, entry, true);
+        }
+        if (!backEntry) return;
+        pushOriginalIdLines(lines, 1, backEntry, false);
+        if (backEntry.xref && `@${backEntry.xref}@` !== xref) {
+            pushWrapped(lines, 1, 'REFN', backEntry.xref);
+            pushWrapped(lines, 2, 'TYPE', `${back.program} xref`);
+        }
+    };
+    /**
+     * "Back to {prog}" (spec 066 G8): the program's own level-1 tags the
+     * record had in its files, at the end of the record exactly as they were
+     * written (the same block from two of its files once). Never in another
+     * export: not in Strom's own file, not to the research.
+     */
+    const pushGedcomExtra = (holder: ExtraHolder): void => {
+        if (back.imports.size === 0 || !holder.gedcomExtra) return;
+        const written = new Set<string>();
+        for (const entry of holder.gedcomExtra) {
+            if (!back.imports.has(entry.from)) continue;
+            // (A citation's own lines go under the citation, see pushCitation;
+            // a structure that became lines of the note goes in their place, see notedOf.)
+            const entryLines = withoutNotedLines(withoutCiteLines(entry.lines));
+            let block: string[] = [];
+            const flush = (): void => {
+                const key = block.join('\n');
+                if (block.length > 0 && !written.has(key)) { written.add(key); lines.push(...block); }
+                block = [];
+            };
+            for (const line of entryLines) {
+                if (line.startsWith('1 ')) flush();
+                block.push(line);
+            }
+            flush();
+        }
+    };
+    /**
+     * "Back to {prog}": the structures of its file the import wrote into the
+     * record's note (NOTED_TAG), each while the note still has its lines, and
+     * the note without them. Every other export writes the note as it is.
+     */
+    const notedOf = (holder: ExtraHolder, note: string | undefined, keep: (st: NotedStructure) => boolean = () => true): { note: string | undefined; structures: NotedStructure[] } => {
+        if (back.imports.size === 0 || !holder.gedcomExtra) return { note, structures: [] };
+        const seen = new Set<string>();
+        // (The page sources of one record each keep the record's structures: once.)
+        const structures = holder.gedcomExtra.filter(e => back.imports.has(e.from)).flatMap(e => notedStructures(e.lines))
+            .filter(st => !seen.has(st.lines.join('\n')) && !!seen.add(st.lines.join('\n')) && keep(st));
+        return notedBack(note, structures);
+    };
+    /** Those structures of one fact (`1 BIRT` …), and the rest. */
+    const notedFact = (structures: NotedStructure[], tag: string): NotedStructure[] =>
+        structures.filter(st => st.lines[0] === `1 ${tag}` || st.lines[0].startsWith(`1 ${tag} `));
+    /** A structure's lines under the fact Strom writes, or the whole structure where it writes none. */
+    const pushNoted = (structures: NotedStructure[], under: boolean): void => {
+        for (const st of structures) lines.push(...(under ? st.lines.slice(1) : st.lines));
+    };
+    /**
+     * A fact's DATE the date field could not hold whole ("1815/1816", "10 JAN",
+     * another calendar), as the file wrote it with the lines under it, and the
+     * fact's other noted lines. It goes in place of the field's DATE while the
+     * field is empty or still has the date the import read from it; a date
+     * changed in the app wins.
+     */
+    const notedDate = (structures: NotedStructure[], holder: FactHolder, key: string, value: string | undefined): { date: string[]; rest: NotedStructure[] } => {
+        let date: string[] = [];
+        const rest: NotedStructure[] = [];
+        for (const st of structures) {
+            const at = st.lines.findIndex(l => l === '2 DATE' || l.startsWith('2 DATE '));
+            if (at < 0 || date.length) { rest.push(st); continue; }
+            let end = at + 1;
+            while (end < st.lines.length && !/^[0-2] /.test(st.lines[end])) end++;
+            date = st.lines.slice(at, end);
+            const left = [...st.lines.slice(0, at), ...st.lines.slice(end)];
+            if (left.length > 1) rest.push({ texts: st.texts, lines: left });
+        }
+        const kept = !value || importedValueOf(holder, key)?.value === value;
+        return { date: kept ? date : [], rest };
+    };
+    /**
+     * "Back to {prog}": a divorce with no date or place under it is said
+     * with Y (`1 DIV Y`), as GEDCOM asks of such an event. A bare
+     * wedding stays `1 MARR`: a couple entered as married writes it so.
+     */
+    const sayOccurred = (at: number): void => {
+        if (back.imports.size === 0 || lines[at] !== '1 DIV') return;
+        if (lines.slice(at + 1).some(l => /^2 (DATE|PLAC)\b/.test(l))) return;
+        lines[at] += ' Y';
+    };
+    /** The `2 _STROM_IMPORT` lines of a fact: only for parts whose value is still the file's. */
+    const pushFactImport = (holder: FactHolder, fact: string): void => {
+        for (const tag of factImportTags(holder, fact)) {
+            if (knownImports.has(tag.split(' ')[0])) lines.push(`2 ${IMPORT_TAG} ${tag}`);
+        }
+    };
+    /** `2 _STROM_CONFIRMED` under the facts (see GedcomExportOptions.confirmations). */
+    const writeConfirmations = options.confirmations !== false && !options.backTo;
+    /**
+     * The research's origin of a fact under it (`2 _STROM_ORIGIN`, `2 _STROM_WAS`),
+     * file exports only; and its confirmation (`2 _STROM_CONFIRMED`).
+     */
+    const pushFactOrigin = (holder: FactHolder, fact: string): void => {
+        if (options.researchNote && NOTE_FACT(fact)) {
+            const src = researchNoteSource(data, holder, fact);
+            if (src) pushNote(lines, 2, options.researchNote(src));
+        }
+        const confirmed = writeConfirmations ? factVerifyInfo(holder, fact).confirmed : undefined;
+        if (confirmed) lines.push(`2 ${CONFIRMED_TAG} ${confirmed}`);
+        // The fact's id in the research goes back with it (spec 065): the
+        // research takes a confirmation back only from a fact that carries it,
+        // one whose state the app saw (a copy from an older app has none).
+        // Only to the research: the id is that research's own.
+        const eid = writeConfirmations && options.research ? factResearchEid(holder, fact) : null;
+        if (eid) lines.push(`2 ${EID_TAG} ${eid}`);
+        const o = options.origins ? holder.researchOrigins?.[fact] : undefined;
+        if (!o) return;
+        if (o.kind && fact !== 'sex') lines.push(`2 _STROM_ORIGIN ${researchOriginValue(o)}`);
+        pushResearchWas(lines, 2, o.was);
+    };
+    /** The import of a child's link to the given parents (all of them from it), or none. */
+    const childLinkImport = (childId: PersonId, parentIds: readonly PersonId[]): string | undefined => {
+        const marks = data.persons[childId]?.importedParents;
+        if (!marks || parentIds.length === 0) return undefined;
+        const ids = parentIds.map(pid => marks[pid]);
+        return ids.every(id => !!id && knownImports.has(id)) ? ids[0] : undefined;
+    };
 
     // Surname-variant groups: no GEDCOM structure fits "these spellings mean one
     // family", so they ride in a header NOTE (standard, kept by every reader).
@@ -660,24 +1433,50 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         if (!gedcomId) continue;
 
         lines.push(`0 ${gedcomId} INDI`);
+        pushHolderOrigin(person, gedcomId, back.personEntries.get(personId));
+        const links = alsoChildOf.get(personId);
+        // A NAME the file wrote with a description for a given name ("Son //")
+        // goes back as written while the name still reads so (describedNameHolds).
+        const noted = notedOf(person, person.notes && links ? notesWithoutLinks(person.notes, links) : person.notes,
+            st => !st.lines[0].startsWith('1 NAME') || describedNameHolds(st, person));
+        const notedBirth = notedFact(noted.structures, 'BIRT');
+        const notedDeath = notedFact(noted.structures, 'DEAT');
+        const notedName = notedFact(noted.structures, 'NAME');
 
         // Name. Placeholders are exported with an empty name so they re-import
         // as placeholders (lossless), instead of being dropped.
-        if (person.isPlaceholder && (person.firstName === '?' || !person.firstName) && !person.lastName) {
+        const nameParts = back.imports.size > 0 && isBackRecord(person);
+        if (notedName.length) {
+            pushNoted(notedName.slice(0, 1), false);
+            // The import it came from, so the file read again reads it as that program's line.
+            const from = person.gedcomExtra?.find(e => back.imports.has(e.from)
+                && notedStructures(e.lines).some(st => st.lines.join('\n') === notedName[0].lines.join('\n')))?.from;
+            if (from && knownImports.has(from)) lines.push(`2 ${IMPORT_TAG} ${from}`);
+        } else if (person.isPlaceholder && (person.firstName === '?' || !person.firstName) && !person.lastName) {
             lines.push('1 NAME //');
         } else {
-            pushName(lines, person, options.titles);
+            pushName(lines, person, options.titles, nameParts);
         }
         // Which surname the person goes by (Person.primaryName), Strom's mark
         // under the chosen NAME: the birth name (the first one) or the married
         // one; none without a choice or a married surname.
         const married = person.marriedSurname?.trim();
         if (married && person.primaryName === 'birth') lines.push(`2 ${PRIMARY_NAME_TAG} Y`);
+        pushFactImport(person, 'name');
+        pushFactOrigin(person, 'name');
         // The surname after marriage as the name she had after it, right
-        // after the primary one (the birth name), as the research writes it.
+        // after the primary one (the birth name), as the research writes it;
+        // with its own given names when they are not the person's.
         if (married) {
-            pushWrapped(lines, 1, 'NAME', formatGedcomName(person.firstName, married));
+            const marriedFirst = person.marriedFirstName?.trim() || person.firstName;
+            pushWrapped(lines, 1, 'NAME', formatGedcomName(marriedFirst, married));
             lines.push('2 TYPE married');
+            // Its parts too in "Back to", as of the birth name (pushName).
+            if (nameParts) {
+                const first = (marriedFirst ?? '').trim();
+                if (first && !noName(first) && !first.includes(',')) pushWrapped(lines, 2, 'GIVN', first);
+                if (!married.includes(',')) pushWrapped(lines, 2, 'SURN', married);
+            }
             if (person.primaryName === 'married') lines.push(`2 ${PRIMARY_NAME_TAG} Y`);
         }
         // Other spellings as further NAME lines — the first one above stays the
@@ -688,29 +1487,44 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
 
         // Sex: M, F, or U for a sex the records do not give.
         lines.push(`1 SEX ${person.gender === 'male' ? 'M' : person.gender === 'female' ? 'F' : 'U'}`);
+        pushFactImport(person, 'sex');
+        pushFactOrigin(person, 'sex');
+        const sexOrigin = options.origins ? person.researchOrigins?.sex : undefined;
+        if (sexOrigin?.kind) lines.push(`1 _STROM_SEX_ORIGIN ${researchOriginValue(sexOrigin)}`);
         const lineTag = lineTagOf(personId);
         if (lineTag) lines.push(`1 ${STROM_LINE_TAG} ${lineTag}`);
 
         // Birth (with the citations of the birth entry: 2 SOUR)
-        if (person.birthDate || person.birthPlace || person.birthAddress || person.birthSourceIds?.length) {
+        const birthNoted = notedDate(notedBirth, person, 'birthDate', person.birthDate);
+        if (person.birthDate || person.birthPlace || person.birthAddress || person.birthAge || person.birthSourceIds?.length) {
             lines.push('1 BIRT');
-            if (person.birthDate) {
+            if (birthNoted.date.length) {
+                lines.push(...birthNoted.date);
+            } else if (person.birthDate) {
                 const date = formatGedcomDate(person.birthDate, person.gedcomDates);
                 if (date) lines.push(`2 DATE ${date}`);
             }
             if (person.birthPlace) {
                 pushPlace(lines, 2, person.birthPlace, data.places);
             }
-            pushDetails(lines, { address: person.birthAddress });
+            pushDetails(lines, { age: person.birthAge, address: person.birthAddress });
             pushStatus(lines, person.birthStatus);
-            for (const srcId of person.birthSourceIds ?? []) pushCitation(2, srcId);
+            for (const srcId of person.birthSourceIds ?? []) pushCitation(2, srcId, { holder: person, field: 'birthSourceIds' });
+            pushNoted(birthNoted.rest, true);
+            pushFactImport(person, 'birth');
+            pushFactOrigin(person, 'birth');
+        } else {
+            pushNoted(notedBirth, false);
         }
 
         // Death (a cited death without a date or place is a known death: DEAT Y)
         const deathDetail = person.deathCause || person.deathAge || person.deathAddress;
+        const deathNoted = notedDate(notedDeath, person, 'deathDate', person.deathDate);
         if (person.deathDate || person.deathPlace || deathDetail || person.deathSourceIds?.length) {
-            lines.push(person.deathDate || person.deathPlace || deathDetail ? '1 DEAT' : '1 DEAT Y');
-            if (person.deathDate) {
+            lines.push(person.deathDate || person.deathPlace || deathDetail || deathNoted.date.length ? '1 DEAT' : '1 DEAT Y');
+            if (deathNoted.date.length) {
+                lines.push(...deathNoted.date);
+            } else if (person.deathDate) {
                 const date = formatGedcomDate(person.deathDate, person.gedcomDates);
                 if (date) lines.push(`2 DATE ${date}`);
             }
@@ -719,11 +1533,23 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             }
             pushDetails(lines, { cause: person.deathCause, age: person.deathAge, address: person.deathAddress });
             pushStatus(lines, person.deathStatus);
-            for (const srcId of person.deathSourceIds ?? []) pushCitation(2, srcId);
+            for (const srcId of person.deathSourceIds ?? []) pushCitation(2, srcId, { holder: person, field: 'deathSourceIds' });
+            pushNoted(deathNoted.rest, true);
+            pushFactImport(person, 'death');
+            pushFactOrigin(person, 'death');
         } else if (person.isDeceased === true) {
             // Known to be dead, date unknown: the standard way to say so.
-            // Without it the person came back as possibly living.
-            lines.push('1 DEAT Y');
+            // Without it the person came back as possibly living. (A date
+            // the file wrote that the field could not hold goes in its place.)
+            lines.push(deathNoted.date.length ? '1 DEAT' : '1 DEAT Y');
+            lines.push(...deathNoted.date);
+            // Where that came from goes along (the research's DEAT Y has one).
+            pushStatus(lines, person.deathStatus);
+            pushNoted(deathNoted.rest, true);
+            pushFactImport(person, 'death');
+            pushFactOrigin(person, 'death');
+        } else {
+            pushNoted(notedDeath, false);
         }
 
         // User reference number (id in a paper archive / another program)
@@ -738,17 +1564,23 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
 
         // Note
         if (person.story) {
-            pushStory(lines, 1, person.story);
+            pushStory(lines, 1, person.story, id => sourceIdMap.get(id));
         }
 
-        if (person.notes) {
-            pushNote(lines, 1, person.notes);
-        }
+        if (noted.note) pushNote(lines, 1, noted.note);
+        pushNoted(noted.structures.filter(st => !notedBirth.includes(st) && !notedDeath.includes(st) && !notedName.includes(st)), false);
 
         // Life events. OCCU carries its detail as the tag value; the rest use
         // level-2 DATE/PLAC/NOTE. 'custom'/'military' have no dedicated tag and
         // ride on the generic EVEN with a TYPE label, so nothing is dropped.
-        for (const event of person.events ?? []) {
+        for (const fileEvent of person.events ?? []) {
+            // "Back to {prog}": the file's e-mail addresses go back as EMAIL,
+            // out of the note while it still has their line (spec 066 K3.1).
+            const backEvent = back.imports.size > 0 && isBackRecord(person);
+            // …and what it wrote on the event's line goes back there, its ADDR as written.
+            const { event: valued, value: lineValue } = backEvent ? lineValueBack(fileEvent) : { event: fileEvent, value: undefined };
+            const { event, emails } = backEvent ? emailsBack(valued) : { event: valued, emails: [] };
+            const addressLines = backEvent ? addressBack(event) : null;
             const tag = EVENT_TYPE_TO_TAG[event.type];
             let typeLabel: string | null = null;
             if (!tag) {
@@ -772,6 +1604,9 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
                 pushLongValue(lines, 1, tag, fact);
                 const remark = rest.join('\n').trim();
                 if (remark) pushNote(lines, 2, remark);
+            } else if (lineValue) {
+                pushLongValue(lines, 1, tag ?? 'EVEN', lineValue);
+                if (typeLabel) pushLongValue(lines, 2, 'TYPE', typeLabel);
             } else {
                 lines.push(`1 ${tag ?? 'EVEN'}`);
                 if (typeLabel) pushLongValue(lines, 2, 'TYPE', typeLabel);
@@ -783,7 +1618,9 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             if (event.place) {
                 pushPlace(lines, 2, event.place, data.places);
             }
-            pushDetails(lines, event);
+            pushDetails(lines, addressLines ? { ...event, address: undefined } : event);
+            if (addressLines) lines.push(...addressLines);
+            for (const email of emails) pushWrapped(lines, 2, 'EMAIL', email);
             pushStatus(lines, event.status);
             if (event.note && !eventValueIsOnTag(event.type)) {
                 pushNote(lines, 2, event.note);
@@ -811,18 +1648,20 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
 
             // Source citations on the event (2 SOUR @Sx@ + 3 PAGE).
             for (const srcId of event.sourceIds ?? []) {
-                pushCitation(2, srcId);
+                pushCitation(2, srcId, { holder: event, field: 'sourceIds' });
             }
+            pushFactImport(person, `event:${event.id}`);
+            pushFactOrigin(person, `event:${event.id}`);
         }
 
         // Source citations on the person (1 SOUR @Sx@ + 2 PAGE).
         for (const srcId of person.sourceIds ?? []) {
-            pushCitation(1, srcId);
+            pushCitation(1, srcId, { holder: person, field: 'sourceIds' });
         }
 
         // Media: portrait first (marked), then attachments. Data URLs are
         // CONC-wrapped to keep physical lines within the spec limit.
-        const pushMedia = (file: string, title: string, kind: 'photo' | '', note?: string, srcId?: string, original?: MediaOriginal, fileMime?: string): void => {
+        const pushMedia = (file: string, title: string, kind: 'photo' | '', note?: string, srcId?: string, original?: MediaOriginal, fileMime?: string, date?: string): void => {
             const mime = file.startsWith('data:') ? file.slice(5, file.indexOf(';')) : fileMime ?? '';
             const form = mime.includes('/') ? mime.split('/')[1] : 'jpeg';
             lines.push('1 OBJE');
@@ -842,14 +1681,17 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
                 if (o && o >= 2 && o <= 8) lines.push(`2 _STROM_ORIENT ${o}`);
             }
             pushWrapped(lines, 2, 'FILE', file);
+            // The picture's date from the program's file (spec 066 G8): back under its OBJE, "Back to {prog}" only.
+            const day = back.imports.size > 0 && date ? mediaDateValue(date) : undefined;
+            if (day) lines.push(`2 _DATE ${day}`);
         };
         if (person.photo) {
-            pushMedia(person.photo, person.photoOriginalName ?? '', 'photo');
+            pushMedia(person.photo, person.photoOriginalName ?? '', 'photo', undefined, undefined, undefined, undefined, person.photoDate);
         }
         for (const att of person.attachments ?? []) {
             // Only the original (the research holds it): the file's name and hash, no data.
-            if (att.originalOnly) pushMedia(att.name || 'file', att.name, '', att.note, att.sourceId, att.original, att.original?.mimeType ?? att.mimeType);
-            else pushMedia(att.dataUrl, att.name, '', att.note, att.sourceId, att.original);
+            if (att.originalOnly) pushMedia(att.name || 'file', att.name, '', att.note, att.sourceId, att.original, att.original?.mimeType ?? att.mimeType, att.date);
+            else pushMedia(att.dataUrl, att.name, '', att.note, att.sourceId, att.original, undefined, att.date);
         }
 
         // Family as spouse (FAMS) - partnerships where this person is a partner
@@ -857,6 +1699,7 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             const famId = partnershipIdMap.get(partnershipId);
             if (famId) {
                 lines.push(`1 FAMS ${famId}`);
+                for (const record of joined.get(partnershipId) ?? []) lines.push(`1 FAMS ${record.xref}`);
             }
         }
 
@@ -882,7 +1725,11 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             if (partnership.childIds.includes(personId)) {
                 const famId = partnershipIdMap.get(partnershipId);
                 if (famId) {
-                    lines.push(`1 FAMC ${famId}`);
+                    // The couple's record, or the other record of the couple the child is of (see joined).
+                    const famIds = [
+                        ...(childElsewhere.has(`${partnershipId}\n${personId}`) ? [] : [famId]),
+                        ...(joined.get(partnershipId) ?? []).filter(j => j.children.includes(personId)).map(j => j.xref),
+                    ];
                     // PEDI reflects the child's relationship to this family. GEDCOM
                     // has adopted/foster but no 'step' — step links export without
                     // PEDI (known-unsupported, see header).
@@ -890,10 +1737,20 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
                     const famRels = [partnership.person1Id, partnership.person2Id].map(pid => rels[pid]);
                     const pedi = famRels.includes('adoptive') ? 'adopted'
                         : famRels.includes('foster') ? 'foster' : null;
-                    if (pedi) lines.push(`2 PEDI ${pedi}`);
+                    for (const xref of famIds) {
+                        lines.push(`1 FAMC ${xref}`);
+                        if (pedi) lines.push(`2 PEDI ${pedi}`);
+                    }
                 }
             }
         }
+        // …and the families it was also recorded in, after the one it hangs from.
+        for (const link of alsoChildOf.get(personId) ?? []) {
+            lines.push(`1 FAMC ${partnershipIdMap.get(link.partnershipId)}`);
+            if (link.pedi) lines.push(`2 PEDI ${link.pedi}`);
+        }
+
+        pushGedcomExtra(person);
     }
 
     // ==================== FAMILIES ====================
@@ -905,6 +1762,7 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         const person2 = data.persons[partnership.person2Id];
 
         lines.push(`0 ${gedcomId} FAM`);
+        pushHolderOrigin(partnership, gedcomId, back.familyEntries.get(partnershipId));
 
         // Determine HUSB/WIFE by gender (male = HUSB, female = WIFE, a person
         // of unknown sex the role the other one leaves free). For a mixed
@@ -921,8 +1779,22 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             lines.push(`1 WIFE ${personIdMap.get(wifeId)}`);
         }
 
-        // Children
-        for (const childId of partnership.childIds) {
+        // Children (those only another record of the couple has go with it, see joined)
+        // Witnesses at the wedding, written like the ones on an event: in
+        // the tree → ASSO at their record, otherwise _WITN with the name.
+        const pushWitness = (part: EventParticipant): void => {
+            const xref = part.personId ? personIdMap.get(part.personId) : undefined;
+            if (xref) {
+                lines.push(`2 ASSO ${xref}`);
+            } else if (part.name) {
+                pushWrapped(lines, 2, '_WITN', part.name);
+            } else {
+                return;
+            }
+            lines.push(`3 RELA ${GEDCOM_RELA[part.role]}`);
+            if (part.note) pushNote(lines, 3, part.note);
+        };
+        const pushChild = (childId: PersonId): void => {
             const childGedcomId = personIdMap.get(childId);
             if (childGedcomId) {
                 lines.push(`1 CHIL ${childGedcomId}`);
@@ -940,8 +1812,15 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
                     }
                 } else if (toHusb === 'step') lines.push(`2 _FREL ${GEDCOM_CHILD_REL[toHusb]}`);
                 else if (toWife === 'step') lines.push(`2 _MREL ${GEDCOM_CHILD_REL[toWife]}`);
+                const linkImport = childLinkImport(childId, [husbId, wifeId].filter(pid => personIdMap.has(pid)));
+                if (linkImport) lines.push(`2 ${IMPORT_TAG} ${linkImport}`);
             }
+        };
+        for (const childId of partnership.childIds) {
+            if (!childElsewhere.has(`${partnershipId}\n${childId}`)) pushChild(childId);
         }
+        // Children that hang from another family but were also recorded in this one (alsoChildLinks).
+        for (const childId of alsoChildren.get(partnershipId) ?? []) lines.push(`1 CHIL ${personIdMap.get(childId)}`);
 
         // Marriage event (for married or divorced status) — not the bare status of a family whose other
         // parent is only a "?" stand-in (it would read as a wedding to someone unknown).
@@ -949,61 +1828,108 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         // childless one ("married, the spouse unknown") and one of siblings say it: with siblings it is what
         // keeps them one family there and back (R1 of the N1 round: split into a family per child).
         const withStandIn = (!personIdMap.has(partnership.person1Id) || !personIdMap.has(partnership.person2Id)) && partnership.childIds.length === 1;
-        const hasMarriage = ((partnership.status === 'married' || partnership.status === 'divorced') && !withStandIn) ||
-            !!partnership.startDate || !!partnership.startPlace || !!partnership.address
-            || Object.values(partnership.ages ?? {}).some(a => a.trim());
+        // A couple whose file wrote no MARR gets none either (spec 066 K3.1),
+        // unless the wedding has something to say now (its witnesses, its status).
+        // What the first record took from the couple's other records stays in them while unchanged (see joined).
+        const joinedHere = joined.get(partnershipId) ?? [];
+        const tookAll = joinedHere.flatMap(j => j.record.took);
+        const own = <T extends string | undefined>(key: string, value: T): T | undefined => {
+            const now = (value ?? '').replace(/[\r\n]+/g, ' ').trim();
+            return now && tookAll.some(t => t.key === key && t.value === now) ? undefined : value;
+        };
+        const startDate = own('startDate', partnership.startDate);
+        const startPlace = own('startPlace', partnership.startPlace);
+        const endDate = own('endDate', partnership.endDate);
+        const endPlace = own('endPlace', partnership.endPlace);
+        const address = own('address', partnership.address);
+        const ages: Record<string, string> = {};
+        for (const [n, pid] of [[1, partnership.person1Id], [2, partnership.person2Id]] as const) {
+            const age = own(`age${n}`, partnership.ages?.[pid]);
+            if (age) ages[pid] = age;
+        }
+        const marriageTook = tookAll.some(t => t.key === 'MARR');
+        // The wedding's witnesses but those only the couple's other records name (see joined).
+        const ownWitnesses = (partnership.participants ?? []).filter(p => !witnessesElsewhere.has(p));
+        const noMarriageSaid = (partnership.marriageUnrecorded === true || marriageTook)
+            && !ownWitnesses.length && !partnership.startStatus;
+        const hasMarriage = ((partnership.status === 'married' || partnership.status === 'divorced') && !withStandIn && !noMarriageSaid) ||
+            !!startDate || !!startPlace || !!address
+            || Object.values(ages).some(a => a.trim());
+        // What the couple's other records gave its note goes back with them (see joined), and their citations.
+        const ownSources = (partnership.sourceIds ?? []).filter(id => !sourcesElsewhere.get(partnershipId)?.has(id));
+        const ownDivorceSources = (partnership.divorceSourceIds ?? []).filter(id => !divorceSourcesElsewhere.get(partnershipId)?.has(id));
+        const hasDivorce = partnership.status === 'divorced' || !!endDate || !!endPlace;
+        // Divorce citations with no divorce written (the couple married again,
+        // say): with the couple's own, rather than lost or a divorce made up.
+        const familySources = hasDivorce ? ownSources : [...new Set([...ownSources, ...ownDivorceSources])];
+        /** The couple's list a citation of the wedding is in: the union's own, else (the divorce's written with them) the divorce's. */
+        const coupleCited = (srcId: string, wedding: readonly string[] = partnership.sourceIds ?? []): { holder: Partnership; field: string } =>
+            ({ holder: partnership, field: wedding.includes(srcId) ? 'sourceIds' : 'divorceSourceIds' });
+        const joinedNote = joinedNoteBack(partnership.note, joinedHere.map(j => j.record));
+        const famNoted = notedOf(partnership, joinedNote.note);
+        const notedMarriage = notedFact(famNoted.structures, 'MARR');
+        const notedDivorce = notedFact(famNoted.structures, 'DIV');
+        const marriageNoted = notedDate(notedMarriage, partnership, 'startDate', startDate);
+        const divorceNoted = notedDate(notedDivorce, partnership, 'endDate', endDate);
         if (hasMarriage) {
+            const at = lines.length;
             lines.push('1 MARR');
-            if (partnership.startDate) {
-                const date = formatGedcomDate(partnership.startDate, partnership.gedcomDates);
+            if (marriageNoted.date.length) {
+                lines.push(...marriageNoted.date);
+            } else if (startDate) {
+                const date = formatGedcomDate(startDate, partnership.gedcomDates);
                 if (date) lines.push(`2 DATE ${date}`);
             }
-            if (partnership.startPlace) {
-                pushPlace(lines, 2, partnership.startPlace, data.places);
+            if (startPlace) {
+                pushPlace(lines, 2, startPlace, data.places);
             }
-            pushDetails(lines, { address: partnership.address });
+            pushDetails(lines, { address });
             pushStatus(lines, partnership.startStatus);
             // Each partner's age at the wedding, under HUSB / WIFE.
             for (const [role, pid] of [['HUSB', husbId], ['WIFE', wifeId]] as const) {
-                const age = partnership.ages?.[pid]?.trim();
+                const age = ages[pid]?.trim();
                 if (!age) continue;
                 lines.push(`2 ${role}`);
                 pushWrapped(lines, 3, 'AGE', gedcomAge(age));
             }
-            // Witnesses at the wedding, written like the ones on an event: in
-            // the tree → ASSO at their record, otherwise _WITN with the name.
-            for (const part of partnership.participants ?? []) {
-                const xref = part.personId ? personIdMap.get(part.personId) : undefined;
-                if (xref) {
-                    lines.push(`2 ASSO ${xref}`);
-                } else if (part.name) {
-                    pushWrapped(lines, 2, '_WITN', part.name);
-                } else {
-                    continue;
-                }
-                lines.push(`3 RELA ${GEDCOM_RELA[part.role]}`);
-                if (part.note) pushNote(lines, 3, part.note);
-            }
+            for (const part of ownWitnesses) pushWitness(part);
             // The couple's citations are the marriage record's: under MARR, where
             // other programs and Strom Research read a marriage's evidence.
-            for (const srcId of partnership.sourceIds ?? []) pushCitation(2, srcId);
+            for (const srcId of familySources) pushCitation(2, srcId, coupleCited(srcId));
+            pushNoted(marriageNoted.rest, true);
+            pushFactImport(partnership, 'marriage');
+            pushFactOrigin(partnership, 'marriage');
+            sayOccurred(at);
+        } else {
+            pushNoted(notedMarriage, false);
         }
 
         // Divorce event
-        if (partnership.status === 'divorced' || partnership.endDate || partnership.endPlace) {
+        if (hasDivorce) {
+            const at = lines.length;
             lines.push('1 DIV');
-            if (partnership.endDate) {
-                const date = formatGedcomDate(partnership.endDate, partnership.gedcomDates);
+            if (divorceNoted.date.length) {
+                lines.push(...divorceNoted.date);
+            } else if (endDate) {
+                const date = formatGedcomDate(endDate, partnership.gedcomDates);
                 if (date) lines.push(`2 DATE ${date}`);
             }
-            if (partnership.endPlace) pushPlace(lines, 2, partnership.endPlace, data.places);
+            if (endPlace) pushPlace(lines, 2, endPlace, data.places);
             pushStatus(lines, partnership.endStatus);
+            // The divorce record's own citations, as the file had them under DIV.
+            for (const srcId of ownDivorceSources) pushCitation(2, srcId, { holder: partnership, field: 'divorceSourceIds' });
+            pushNoted(divorceNoted.rest, true);
+            pushFactImport(partnership, 'divorce');
+            pushFactOrigin(partnership, 'divorce');
+            sayOccurred(at);
+        } else {
+            pushNoted(notedDivorce, false);
         }
 
         // The couple's own events, each under its own tag (1 MARB, 1 CENS,
         // 1 EVEN + 2 TYPE …) — never as lines of the note, so another program
         // and the research read them as facts.
-        for (const event of sortCoupleEvents(partnership.events ?? [])) {
+        const pushEvent = (event: CoupleEvent): void => {
             lines.push(`1 ${COUPLE_EVENT_TAG[event.type]}`);
             if (event.type === 'custom') {
                 pushLongValue(lines, 2, 'TYPE', event.customLabel || strings.gedcomNotes.genericEvent);
@@ -1034,7 +1960,12 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
                 lines.push(`3 RELA ${GEDCOM_RELA[part.role]}`);
                 if (part.note) pushNote(lines, 3, part.note);
             }
-            for (const srcId of event.sourceIds ?? []) pushCitation(2, srcId);
+            for (const srcId of event.sourceIds ?? []) pushCitation(2, srcId, { holder: event, field: 'sourceIds' });
+            pushFactImport(partnership, `event:${event.id}`);
+            pushFactOrigin(partnership, `event:${event.id}`);
+        };
+        for (const event of sortCoupleEvents(partnership.events ?? [])) {
+            if (!eventsElsewhere.has(event)) pushEvent(event);
         }
 
         // A status MARR/DIV cannot say (partners, separated).
@@ -1042,17 +1973,61 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         if (stat) lines.push(`1 _STAT ${stat}`);
 
         if (partnership.story) {
-            pushStory(lines, 1, partnership.story);
+            pushStory(lines, 1, partnership.story, id => sourceIdMap.get(id));
         }
 
         // Note
-        if (partnership.note) {
-            pushNote(lines, 1, partnership.note);
-        }
+        if (famNoted.note) pushNote(lines, 1, famNoted.note);
+        pushNoted(famNoted.structures.filter(st => !notedMarriage.includes(st) && !notedDivorce.includes(st)), false);
 
         // Family citations of a couple without a marriage (partners).
-        for (const srcId of hasMarriage ? [] : partnership.sourceIds ?? []) {
-            pushCitation(1, srcId);
+        for (const srcId of hasMarriage ? [] : familySources) {
+            pushCitation(1, srcId, coupleCited(srcId));
+        }
+
+        // One parent alone the file wrote as not a couple (Partnership.noCouple):
+        // the mark back while the other parent is still the "?" left out and
+        // nothing here says they were a couple, so the family reads back whole.
+        const standInLeftOut = !personIdMap.has(partnership.person1Id) || !personIdMap.has(partnership.person2Id);
+        if (partnership.noCouple && standInLeftOut && !hasMarriage && !hasDivorce && !stat && !(partnership.events?.length)) {
+            lines.push('1 _STROM_NO_COUPLE Y');
+        }
+
+        pushGedcomExtra(partnership);
+
+        // The couple's other records of the program's file, as it wrote them (see joined).
+        for (const { xref, own, from, record, children, sources, divorceSources, events, witnesses } of joinedHere) {
+            lines.push(`0 ${xref} FAM`);
+            if (knownImports.has(from)) {
+                lines.push(`1 ${IMPORT_TAG} ${from}`);
+                if (own) lines.push(`2 _XREF @${own}@`);
+            }
+            if (personIdMap.has(husbId)) lines.push(`1 HUSB ${personIdMap.get(husbId)}`);
+            if (personIdMap.has(wifeId)) lines.push(`1 WIFE ${personIdMap.get(wifeId)}`);
+            for (const childId of children) pushChild(childId);
+            // Its notes while the couple's note still has what they gave it (else they stay there).
+            const kept = record.text && !joinedNote.found.has(record) ? withoutJoinedNotes(record.lines) : record.lines;
+            // Its citations under its wedding, as the couple's are (else on the record).
+            // …and its divorce's under its divorce (with the record's own when it wrote none).
+            const endOf = (tag: string): number => {
+                const at = kept.findIndex(l => l === `1 ${tag}` || l.startsWith(`1 ${tag} `));
+                if (at < 0) return -1;
+                const end = kept.findIndex((l, i) => i > at && l.startsWith('1 '));
+                return end < 0 ? kept.length : end;
+            };
+            const marriageEnd = endOf('MARR');
+            const divorceEnd = endOf('DIV');
+            const recordSources = divorceEnd < 0 ? [...new Set([...sources, ...divorceSources])] : sources;
+            for (let i = 0; i <= kept.length; i++) {
+                if (i === marriageEnd) {
+                    for (const part of witnesses) pushWitness(part);
+                    for (const srcId of recordSources) pushCitation(2, srcId, coupleCited(srcId, sources));
+                }
+                if (i === divorceEnd) for (const srcId of divorceSources) pushCitation(2, srcId, { holder: partnership, field: 'divorceSourceIds' });
+                if (i < kept.length) lines.push(kept[i]);
+            }
+            for (const event of sortCoupleEvents(events)) pushEvent(event);
+            if (marriageEnd < 0) for (const srcId of recordSources) pushCitation(1, srcId, coupleCited(srcId, sources));
         }
     }
 
@@ -1078,6 +2053,8 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             const toWife = wifeId ? rels[wifeId] ?? 'biological' : undefined;
             if (toHusb && (toHusb !== (toWife ?? toHusb) || toHusb === 'step')) lines.push(`2 _FREL ${GEDCOM_CHILD_REL[toHusb]}`);
             if (toWife && (toWife !== (toHusb ?? toWife) || toWife === 'step')) lines.push(`2 _MREL ${GEDCOM_CHILD_REL[toWife]}`);
+            const linkImport = childLinkImport(childId, family.parentIds);
+            if (linkImport) lines.push(`2 ${IMPORT_TAG} ${linkImport}`);
         }
         // Two parents who are not a couple: said so (else they would read back as one). One parent alone
         // reads back as the "?" family the app keeps — the same as such a family goes out.
@@ -1092,20 +2069,64 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
     // pointer; the reference/page lives on citations (see pushCitation). PAGE
     // is still emitted on the record too, purely for our own round-trip of
     // sources that are catalogued but not cited anywhere.
-    for (const [sourceId, source] of Object.entries(data.sources ?? {})) {
+    for (const [sourceId, recordSource] of Object.entries(data.sources ?? {})) {
         const gedcomId = sourceIdMap.get(sourceId);
         if (!gedcomId) continue;
-        lines.push(`0 ${gedcomId} SOUR`);
-        if (source.title) pushWrapped(lines, 1, 'TITL', source.title);
-        if (source.repository) {
-            const repoRef = repoIdMap.get(source.repository);
-            if (repoRef) lines.push(`1 REPO ${repoRef}`);
+        // "Back to {prog}": one record for the sources it became, written once (by its first member).
+        const members = groupMembers.get(sourceId);
+        if (!members && back.sourceGroups.has(sourceId)) continue;
+        let source: Source = recordSource;
+        let author: string | undefined;
+        if (members) {
+            ({ source, author } = authorBack(recordSource));
+            const transcript = members.find(m => m.transcript)?.transcript;
+            if (transcript && !source.transcript) source = { ...source, transcript };
         }
-        if (source.reference) pushLongValue(lines, 1, 'PAGE', source.reference);
+        lines.push(`0 ${gedcomId} SOUR`);
+        pushRecordImport(source.importId);
+        // Its xref in the file it came from, so the file read again knows the record
+        // (a file export; the research keeps the app's own, see keepImports).
+        const fromEntry = !options.research && source.importId && knownImports.has(source.importId)
+            ? source.originalIds?.find(e => e.from === source.importId && e.xref) : undefined;
+        if (fromEntry) pushOriginalIdLines(lines, 2, fromEntry, true);
+        // "Back to {prog}": the record's ids in that program (`1 RIN MH:S1`).
+        const backIds = back.sourceEntries.get(sourceId);
+        if (backIds) pushOriginalIdLines(lines, 1, backIds, false);
+        if (source.title) pushWrapped(lines, 1, 'TITL', source.title);
+        if (author) pushLongValue(lines, 1, 'AUTH', author);
+        // The archive, and the call number it files the book under (`2 CALN`; without an archive under a `1 REPO` of none).
+        const repoRef = source.repository ? repoIdMap.get(source.repository) : undefined;
+        const callNumber = source.callNumber?.trim();
+        if (repoRef) lines.push(`1 REPO ${repoRef}`);
+        else if (callNumber) lines.push('1 REPO');
+        if (callNumber) pushWrapped(lines, 2, 'CALN', callNumber);
+        // A record of another program's file has its pages on the citations (5.5.1 knows no PAGE on a record).
+        // The PAGE is composed of the folio, the rest and the image (an older source's: its reference exactly).
+        const recordPage = composePage(source);
+        if (recordPage && !members) pushLongValue(lines, 1, 'PAGE', recordPage);
+        // The place field by field, for a Strom app and a research that read them (an empty one is not written).
+        if (options.sourceFields !== false && !options.backTo && hasEntryFields(source)) {
+            if (source.folio?.trim()) pushWrapped(lines, 1, '_STROM_FOLIO', source.folio.trim());
+            if (source.image?.trim()) pushWrapped(lines, 1, '_STROM_IMAGE', source.image.trim());
+            if (source.reference?.trim()) pushLongValue(lines, 1, '_STROM_LOCATOR', source.reference);
+        }
         if (source.refn) pushWrapped(lines, 1, 'REFN', source.refn);
-        if (source.transcript) pushLongValue(lines, 1, 'TEXT', source.transcript);
+        // "Back to {prog}": its TEXT with the HTML it had, while the transcript is still its text.
+        const textAsWritten = members ? members.find(m => m.transcript)?.gedcomText : undefined;
+        if (source.transcript && textAsWritten && gedcomHtmlText(textAsWritten).trim() === source.transcript) {
+            pushLongValue(lines, 1, 'TEXT', textAsWritten);
+        } else if (source.transcript) pushLongValue(lines, 1, 'TEXT', source.transcript);
         // The user read the transcript from the record (Strom Research: the first reading).
         if (source.transcriptVerified && source.transcript) lines.push('1 _STROM_VERIFIED Y');
+        // Who read the entry, as the research said it (and the confirmation of its wording): back as it came.
+        const read = sourceReadState(source);
+        if (read.read) {
+            lines.push(`1 _STROM_READ ${read.read}`);
+            if (read.conf) lines.push(`2 _CONF ${read.conf}`);
+            if (read.txt) lines.push(`2 _TXT ${read.txt}`);
+        }
+        // The research can read the source again from its original here: back as it came.
+        if (source.originalInResearch) lines.push('1 _STROM_ORIG Y');
         // An entry of a research's reading: which reading and entry, and the page when no excerpt says it.
         if (writeReadings && source.reading && /^D\d{14}-[0-9a-f]{4}$/.test(source.reading)) {
             lines.push(`1 _STROM_READING ${source.reading}`);
@@ -1114,10 +2135,12 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             if (pageSha && !(source.excerpts ?? []).some(e => normalizeSha256(e.originalSha) === pageSha)) lines.push(`1 _STROM_SHA ${pageSha}`);
         }
         if (source.url) pushWrapped(lines, 1, 'WWW', source.url);
-        if (source.note) pushNote(lines, 1, source.note);
+        const srcNoted = notedOf(members ? { gedcomExtra: members.flatMap(m => m.gedcomExtra ?? []) } : source, source.note);
+        if (srcNoted.note) pushNote(lines, 1, srcNoted.note);
+        pushNoted(srcNoted.structures, false);
         // Crops of the entry, embedded like person media (other programs
         // cannot read data URLs — the content options can leave them out).
-        for (const exc of source.excerpts ?? []) {
+        for (const exc of members ? members.flatMap(m => m.excerpts ?? []) : source.excerpts ?? []) {
             const mime = exc.dataUrl.slice(5, exc.dataUrl.indexOf(';'));
             lines.push('1 OBJE');
             lines.push(`2 FORM ${mime.includes('/') ? mime.split('/')[1] : 'jpeg'}`);
@@ -1138,6 +2161,8 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             }
             pushWrapped(lines, 2, 'FILE', exc.dataUrl);
         }
+        // The record's own tags of another program, once (every page's source keeps them).
+        pushGedcomExtra(members ? { gedcomExtra: members.flatMap(m => m.gedcomExtra ?? []) } : source);
     }
 
     // ==================== REPOSITORIES ====================

@@ -59,8 +59,15 @@ import {
     ResearchHypothesisVariant,
     ResearchVariantLink,
     ResearchIsland,
+    ResearchDirections,
+    ResearchPlace,
+    ResearchWait,
     YearSpan,
     SourceImageHeld,
+    FactPart,
+    OriginalIdLine,
+    ResearchFactOrigin,
+    ResearchFactVerify,
     uniqueIdSuffix,
     PrimaryName,
 } from './types';
@@ -84,11 +91,22 @@ function surnameNoteGroups(noteLines: readonly string[] | null): string[][] {
     return groups;
 }
 import { excerptFromDataUrl } from './excerpts';
+import { unionCitations } from './citation-quality';
+import { imageRefSha, resolveImageFile } from './research-image-refs';
 import { normalizeSha256 } from './sha256';
+import { isConfirmDay, isTranscriptMark } from './source-confirm';
 import { ORIGINAL_ONLY_DATA_URL } from './validation';
 import { parseRegion, regionFromStored } from './originals';
 import { parseName, readGedcomName, PRIMARY_NAME_TAG, type GedcomNameParts } from './gedcom-names';
 import { appUnknownIsNoSurname } from './app-version';
+import { researchClaimValue } from './research-claim';
+import {
+    addGedcomExtra, addOriginalIds, CITE_TAG, gedcomHtmlText, joinedBlock, NOTED_TAG, notedBlock, notedStructures, type ExtraHolder, withoutCiteLines, mediaDateValue, cleanImportOrigin, cleanOriginalIdLine, cleanOriginalIds, factPartOf, ID_ENTRIES_MAX, ID_LINES_MAX,
+    IMPORT_TAG, markFactImported, markTreeImported, XID_TAG,
+    JOINED_TAG, joinedEventKey, type JoinedMarks, ORIGINAL_ID_TAGS, parseImportMark as readImportMark, sanitizeImports, validExtraBlock,
+    factValueSignature,
+} from './import-origin';
+import { FACT_MARK, parsePendingPosition, parseCheckedResult, parseReaders, parseVerifyPending, researchFactRef, researchFamilyRef, sanitizeResearchVerify } from './verify';
 
 /** The name parser lives with the rules it shares with the research (gedcom-names.ts). */
 export { parseName };
@@ -155,7 +173,7 @@ const WITNESS_RELA = 'witness';
  * the file's own words ('navrh'/'hotovo'); 'draft'/'final' are accepted too,
  * since another tool may well write the English ones.
  */
-function toStory(raw: RawStory | undefined): Story | undefined {
+function toStory(raw: RawStory | undefined, mapRefs: (refs?: string[]) => string[]): Story | undefined {
     if (!raw || !raw.text.trim()) return undefined;
     const stat = raw.stat.trim().toLowerCase();
     const status = (stat === 'navrh' || stat === 'draft') ? 'draft'
@@ -164,6 +182,8 @@ function toStory(raw: RawStory | undefined): Story | undefined {
     // rewritten, so a _DRAFT under one means nothing.
     const d = status === 'final' && raw.draft?.text.trim() ? raw.draft : undefined;
     const facts = d?.facts.filter(f => f.trim());
+    const sources = mapRefs(raw.sources);
+    const draftSources = d ? mapRefs(d.sources) : [];
     return {
         ...(raw.kind ? { kind: raw.kind } : {}),
         ...(raw.title ? { title: raw.title } : {}),
@@ -171,12 +191,14 @@ function toStory(raw: RawStory | undefined): Story | undefined {
         text: raw.text,
         ...(raw.facts.length > 0 ? { facts: raw.facts } : {}),
         ...(raw.note ? { note: raw.note } : {}),
+        ...(sources.length > 0 ? { sources } : {}),
         ...(d ? {
             draft: {
                 ...(d.title ? { title: d.title } : {}),
                 text: d.text,
                 ...(facts && facts.length > 0 ? { facts } : {}),
                 ...(d.note ? { note: d.note } : {}),
+                ...(draftSources.length > 0 ? { sources: draftSources } : {}),
                 ...(d.at.trim() ? { at: d.at.trim() } : {}),
             },
         } : {}),
@@ -188,12 +210,17 @@ function toStory(raw: RawStory | undefined): Story | undefined {
  * only): conflicting sources, hypotheses, what was searched.
  */
 interface RawResearch {
-    conflicts: { id: string; fact: string; title: string; stat: string; take: string; values: RawResearchValue[]; decision?: RawResearchValue }[];
-    hypotheses: { id: string; title: string; note: string; stat: string; chosen: string; variants: RawResearchVariant[] }[];
+    conflicts: { id: string; fact: string; title: string; stat: string; take: string; kind?: string; values: RawResearchValue[]; decision?: RawResearchValue }[];
+    hypotheses: RawResearchHypothesis[];
     searched: { title: string; date: string; resn: string; at: string }[];
     /** The _STROM_EDGE / _STROM_ISLAND block: its value and the lines under it (level, tag, value). */
     edge?: RawResearchBlock;
     island?: RawResearchBlock;
+    /** Each `1 _STROM_DIRECTION` (places in the lines) and `1 _STROM_WAIT` block, as written. */
+    directions?: RawResearchBlock[];
+    waits?: RawResearchBlock[];
+    /** `1 _STROM_ADDED`, as written. */
+    added?: string;
 }
 
 interface RawResearchBlock {
@@ -209,6 +236,21 @@ interface RawResearchValue {
     raw?: string;
 }
 
+/** `1 _STROM_HYPO` as written (spec 060, 074). */
+interface RawResearchHypothesis {
+    id: string; title: string; note: string; stat: string; chosen: string; by: string; deci: string; at: string;
+    variants: RawResearchVariant[];
+    /** 2 _PICK, 2 _LEFT. */
+    pick: string;
+    left: string;
+    /** 2 _PREV › 3 _BY, DECI, _AT. */
+    prev?: { value: string; by: string; deci: string; at: string };
+    /** 2 _REOPEN › 3 TYPE, _COUNT, _STAYS. */
+    reopen?: { value: string; type: string; count: string; stays: string[] };
+    /** 2 _PROP › 3 DECI, _AT. */
+    prop?: { value: string; deci: string; at: string };
+}
+
 /** 3 _LINK / 3 _INTREE under a variant: its kind and pointers, as written. */
 interface RawResearchVariantLink { kind: string; persons: string[]; family: string[]; parents: string[] }
 
@@ -219,6 +261,10 @@ interface RawResearchVariant {
     links: RawResearchVariantLink[];
     inTree: RawResearchVariantLink[];
     sourceRefs: string[];
+    /** 3 _AGAINST › 4 CONC/CONT, 4 SOUR. */
+    against: { text: string; sourceRefs: string[] }[];
+    /** 3 _PEOPLE. */
+    people: string;
 }
 
 /** What the research's pointers name: a person's REFN, a family's partners (pointers). */
@@ -229,7 +275,7 @@ interface ResearchRefs {
 
 /** The research block being read, the level-2 line inside it and the level-3 line under that. */
 interface OpenResearch {
-    kind: 'conflict' | 'hypo' | 'searched' | 'edge' | 'island';
+    kind: 'conflict' | 'hypo' | 'searched' | 'edge' | 'island' | 'direction' | 'wait';
     sub: string | null;
     sub3?: string | null;
 }
@@ -261,11 +307,93 @@ function researchIsoDate(value: string): string {
 }
 
 /** Raw research lines → the person's `research`, citations resolved (undefined: nothing kept). */
+/**
+ * The research's origin of one fact from its lines (see RawFactOrigin), or
+ * null when it says nothing the app knows. Several `_STROM_WAS` (one per
+ * changed part) become one earlier value with each part's own value.
+ */
+function toResearchOrigin(raw: RawFactOrigin, mapRefs: (refs?: string[]) => string[]): ResearchFactOrigin | null {
+    const out: ResearchFactOrigin = {};
+    const words = (raw.origin ?? '').trim().split(/\s+/).filter(Boolean);
+    const kind = words[0]?.toLowerCase();
+    if (kind === 'import') {
+        out.kind = 'import';
+        const mark = words.length > 1 ? readImportMark(words.slice(1).join(' ')) : null;
+        if (mark) {
+            out.importId = mark.id;
+            if (mark.parts) out.parts = mark.parts;
+        }
+    } else if (kind === 'user' || kind === 'research' || kind === 'tree') {
+        out.kind = kind;
+    }
+    if (raw.was.length > 0) {
+        const parts: FactPart[] = [];
+        const partValues: Partial<Record<FactPart, string>> = {};
+        for (const w of raw.was) {
+            for (const p of w.parts.map(factPartOf)) {
+                if (!p || parts.includes(p)) continue;
+                parts.push(p);
+                partValues[p] = w.value.trim();
+            }
+        }
+        const first = raw.was[0];
+        const importId = raw.was.map(w => w.importId?.trim()).find(Boolean);
+        const ref = raw.was.map(w => w.ref?.trim()).find(Boolean);
+        out.was = {
+            value: first.value.trim(),
+            ...(importId ? { importId } : {}),
+            ...(parts.length > 0 ? { parts } : {}),
+            ...(ref ? { ref } : {}),
+            ...(raw.was.length > 1 && parts.length > 1 ? { partValues } : {}),
+        };
+    }
+    const sourceIds = [...new Set(mapRefs(raw.sourceRefs))];
+    if (sourceIds.length > 0) out.sourceIds = sourceIds;
+    return out.kind || out.was ? out : null;
+}
+
+/**
+ * The research's re-verification of one fact from its lines (spec 065), or
+ * null when it says nothing valid: `_STROM_CONFIRMED` (a day), `_STROM_VERIFY`
+ * (why it waits), `_STROM_CHECKED` with its day, reason and readers.
+ */
+function toResearchVerify(raw: RawFactVerify | undefined): ResearchFactVerify | null {
+    if (!raw) return null;
+    const checked = raw.checked ? parseCheckedResult(raw.checked.result) : null;
+    const readers = raw.checked?.readers !== undefined ? parseReaders(raw.checked.readers) : null;
+    const confirmed = raw.confirmed !== undefined ? researchIsoDate(raw.confirmed) : '';
+    const position = raw.position !== undefined ? parsePendingPosition(raw.position) : null;
+    const eid = raw.eid !== undefined ? researchFactRef(raw.eid) : null;
+    const txt = eid && raw.txt !== undefined && FACT_MARK.test(raw.txt) ? raw.txt.toLowerCase() : null;
+    return sanitizeResearchVerify({
+        ...(txt ? { txt } : {}),
+        ...(confirmed ? { confirmed } : {}),
+        ...(raw.pending !== undefined ? { pending: parseVerifyPending(raw.pending) ?? undefined } : {}),
+        ...(position ? { position } : {}),
+        ...(eid ? { eid } : {}),
+        ...(checked ? {
+            checked: {
+                result: checked,
+                ...(raw.checked?.date ? { date: researchIsoDate(raw.checked.date) || raw.checked.date.trim() } : {}),
+                ...(raw.checked?.why ? { why: raw.checked.why } : {}),
+                ...(readers ? { readers } : {}),
+            },
+        } : {}),
+    });
+}
+
+/** Whose value a conflict proposes to change (GEDCOM 2 _STROM_KIND import | user); anything else says nothing. */
+function conflictKindOf(value: string | undefined): 'import' | 'user' | undefined {
+    const v = value?.trim().toLowerCase();
+    return v === 'import' || v === 'user' ? v : undefined;
+}
+
 function toPersonResearch(raw: RawResearch | undefined, mapRefs: (refs: string[]) => string[], refs?: ResearchRefs): PersonResearch | undefined {
     if (!raw) return undefined;
     const value = (v: RawResearchValue): ResearchConflictValue => {
         const ids = mapRefs(v.sourceRefs);
-        return { value: v.value, ...(ids.length > 0 ? { sourceIds: ids } : {}) };
+        // A batch's source label left in front of the claim goes (researchClaimValue).
+        return { value: researchClaimValue(v.value), ...(ids.length > 0 ? { sourceIds: ids } : {}) };
     };
     const sideOf = (v: RawResearchValue): 'user' | 'research' | undefined => {
         const side = v.side?.trim().toLowerCase();
@@ -297,6 +425,7 @@ function toPersonResearch(raw: RawResearch | undefined, mapRefs: (refs: string[]
                 values: c.values.filter(v => v.value || sideOf(v)).map(v => claim(v, fact)),
                 ...(decided && c.decision?.value ? { decision: value(c.decision) } : {}),
                 ...(c.take.trim().toUpperCase() === 'Y' ? { take: true as const } : {}),
+                ...(conflictKindOf(c.kind) ? { kind: conflictKindOf(c.kind)! } : {}),
             };
         })
         .filter(c => c.values.some(v => v.value));
@@ -306,13 +435,33 @@ function toPersonResearch(raw: RawResearch | undefined, mapRefs: (refs: string[]
             const status = researchWord(h.stat);
             const chosen = researchVariantLabel(h.chosen);
             const variants = researchVariants(h.variants, mapRefs, refs);
+            // Who decided, why and when: only of a decided or abandoned one.
+            const settled = status === 'decided' || status === 'abandoned';
+            const decision = settled ? h.deci.trim() : '';
+            const at = settled ? researchIsoDay(h.at) : undefined;
+            const by = settled ? researchDecider(h.by) : undefined;
+            // spec 074: what the app decides by (the research's word), the decision before, why it
+            // cannot be reopened (decided or abandoned), the agent's proposal and "left open" (open).
+            const open = !status || status === 'open';
+            const previous = researchHypothesisPrevious(h.prev);
+            const reopen = settled ? researchHypothesisReopen(h.reopen) : undefined;
+            const proposal = open ? researchHypothesisProposal(h.prop) : undefined;
+            const left = open ? researchIsoDay(h.left) : undefined;
             return {
                 ...(RESEARCH_ID.H.test(h.id.trim()) ? { id: h.id.trim() } : {}),
                 title: h.title.trim(),
                 ...(h.note.trim() ? { note: h.note.trim() } : {}),
                 ...(status ? { status } : {}),
                 ...(chosen && status === 'decided' ? { chosen } : {}),
+                ...(by ? { decidedBy: by } : {}),
+                ...(decision ? { decision } : {}),
+                ...(at ? { decidedAt: at } : {}),
                 ...(variants.length > 0 ? { variants } : {}),
+                ...(h.pick.trim().toUpperCase() === 'Y' ? { pickable: true as const } : {}),
+                ...(previous ? { previous } : {}),
+                ...(reopen ? { reopen } : {}),
+                ...(proposal ? { proposal } : {}),
+                ...(left ? { leftOpen: left } : {}),
             };
         });
     if (hypotheses.length > 0) out.hypotheses = hypotheses;
@@ -331,6 +480,12 @@ function toPersonResearch(raw: RawResearch | undefined, mapRefs: (refs: string[]
     if (edge) out.edge = edge;
     const island = raw.island ? researchIslandFromLines(raw.island) : null;
     if (island) out.island = island;
+    const places = researchPlacesFromLines(raw.directions ?? []);
+    if (places.length > 0) out.places = places;
+    const waits = (raw.waits ?? []).map(researchWaitFromLines).filter((w): w is ResearchWait => !!w);
+    if (waits.length > 0) out.waits = waits;
+    const added = raw.added ? researchInstant(raw.added) : undefined;
+    if (added) out.added = added;
     return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -343,6 +498,56 @@ const RESEARCH_ID = {
 function researchVariantLabel(value: string): string | undefined {
     const v = value.trim();
     return /^[A-Z]{1,3}$/.test(v) ? v : undefined;
+}
+
+/** A day as the research writes it (ISO "YYYY-MM-DD"), or undefined. */
+function researchIsoDay(value: string | undefined): string | undefined {
+    return /^\d{4}-\d{2}-\d{2}$/.exec((value ?? '').trim())?.[0];
+}
+
+/** Who decided (2 _BY / 3 _BY): the agent, or a person by a link from the app; anything else is the person in the research. */
+function researchDecider(value: string | undefined): 'agent' | 'app' | undefined {
+    const v = (value ?? '').trim().toLowerCase();
+    return v === 'agent' || v === 'app' ? v : undefined;
+}
+
+/** A version's letter or `none` (no version holds: null); undefined for anything else. */
+function researchVariantOrNone(value: string): string | null | undefined {
+    return value.trim().toLowerCase() === 'none' ? null : researchVariantLabel(value);
+}
+
+/** 2 _PREV: the decision before (its version or none, who, why, when); undefined when its value is not one. */
+function researchHypothesisPrevious(raw: RawResearchHypothesis['prev']): ResearchHypothesis['previous'] {
+    if (!raw) return undefined;
+    const variant = researchVariantOrNone(raw.value);
+    if (variant === undefined) return undefined;
+    const by = researchDecider(raw.by);
+    const reason = raw.deci.trim();
+    const day = researchIsoDay(raw.at);
+    return { variant, ...(by ? { by } : {}), ...(reason ? { reason } : {}), ...(day ? { day } : {}) };
+}
+
+/** 2 _REOPEN no: why it cannot be reopened, how many links, the versions that leave the tree as it is; undefined otherwise. */
+function researchHypothesisReopen(raw: RawResearchHypothesis['reopen']): ResearchHypothesis['reopen'] {
+    if (!raw || raw.value.trim().toLowerCase() !== 'no') return undefined;
+    const type = raw.type.trim().toLowerCase();
+    const count = researchInt(raw.count, 1, 1e6);
+    const stays = [...new Set(raw.stays.map(researchVariantLabel).filter((v): v is string => !!v))];
+    return {
+        ok: false, type: /^[a-z][a-z0-9_-]{0,31}$/.test(type) ? type : '',
+        ...(count !== undefined ? { count } : {}),
+        ...(stays.length > 0 ? { stays } : {}),
+    };
+}
+
+/** 2 _PROP: the agent's proposal (its version or none, its sentence, its day); undefined when its value is not one. */
+function researchHypothesisProposal(raw: RawResearchHypothesis['prop']): ResearchHypothesis['proposal'] {
+    if (!raw) return undefined;
+    const variant = researchVariantOrNone(raw.value);
+    if (variant === undefined) return undefined;
+    const text = raw.deci.trim();
+    const day = researchIsoDay(raw.at);
+    return { variant, ...(text ? { text } : {}), ...(day ? { day } : {}) };
 }
 
 /**
@@ -416,10 +621,16 @@ function researchVariants(raw: RawResearchVariant[], mapRefs: (refs: string[]) =
         }
         const title = v.title.trim();
         const sourceIds = mapRefs(v.sourceRefs);
+        // What speaks against it (spec 074): a text each, with the sources it names in the file.
+        const against = v.against.map(a => ({ text: a.text.trim(), ids: mapRefs(a.sourceRefs) })).filter(a => a.text)
+            .map(a => ({ text: a.text, ...(a.ids.length > 0 ? { sourceIds: a.ids } : {}) }));
+        const joins = researchInt(v.people, 1, 1e7);
         out.push({
             id, ...(title ? { title } : {}), links,
             ...(inTree.length > 0 ? { inTree } : {}),
             ...(sourceIds.length > 0 ? { sourceIds } : {}),
+            ...(against.length > 0 ? { against } : {}),
+            ...(joins !== undefined ? { people: joins } : {}),
         });
     }
     return out;
@@ -560,6 +771,154 @@ export function researchEdgeFromLines(block: RawResearchBlock): ResearchEdge | n
     return edge;
 }
 
+/** A side branch's id: B-P… (the branch of person P…). */
+const BRANCH_ID = /^B-(P\d{1,7})$/;
+
+/** An ISO instant or day as the research wrote it (normalised by Date); undefined otherwise. */
+function researchInstant(value: string): string | undefined {
+    const v = value.trim();
+    if (!/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(v)) return undefined;
+    const t = Date.parse(v.replace(' ', 'T'));
+    if (Number.isNaN(t)) return undefined;
+    return v.length === 10 ? v : new Date(t).toISOString();
+}
+
+/** A value from a closed list (lower case), undefined when not in it. */
+function researchOneOf<T extends string>(value: string, list: readonly T[]): T | undefined {
+    const v = value.trim().toLowerCase();
+    return (list as readonly string[]).includes(v) ? v as T : undefined;
+}
+
+const PLACE_ROLES = ['line', 'partner', 'branch', 'island'] as const;
+
+/**
+ * The person's `1 _STROM_DIRECTION [G…]` blocks → their places in the lines,
+ * the narrowest first, as written. A block without a known role goes, so does
+ * a line role without a line; a repeated place is kept once.
+ */
+export function researchPlacesFromLines(blocks: RawResearchBlock[]): ResearchPlace[] {
+    const out: ResearchPlace[] = [];
+    const seen = new Set<string>();
+    for (const block of blocks.slice(0, 50)) {
+        const line = block.value.trim();
+        let role: ResearchPlace['role'] | undefined;
+        let branch: string | undefined;
+        for (const { level, tag, value } of block.lines) {
+            if (level !== 2) continue;
+            if (tag === 'TYPE') role ??= researchOneOf(value, PLACE_ROLES);
+            else if (tag === '_BRANCH' && BRANCH_ID.test(value.trim())) branch ??= value.trim();
+        }
+        if (!role) continue;
+        const lineOk = RESEARCH_ID.G.test(line);
+        if ((role === 'line' || role === 'partner') && !lineOk) continue;
+        const place: ResearchPlace = { role, ...(lineOk ? { line } : {}), ...(branch ? { branch } : {}) };
+        const key = `${place.role}|${place.line ?? ''}|${place.branch ?? ''}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(place);
+    }
+    return out;
+}
+
+const WAIT_TYPES = ['letter', 'family', 'web', 'images', 'check', 'permission', 'other'] as const;
+const WAIT_GROUP_TYPES = ['archive', 'office', 'family', 'web', 'other'] as const;
+
+/** One `1 _STROM_WAIT T…` block → the wait (null without a task id). Unknown tags are skipped. */
+export function researchWaitFromLines(block: RawResearchBlock): ResearchWait | null {
+    const id = block.value.trim();
+    if (!RESEARCH_ID.T.test(id)) return null;
+    const wait: ResearchWait = { id };
+    let sub = '';
+    for (const { level, tag, value } of block.lines) {
+        const v = value.trim();
+        if (level === 2) {
+            sub = tag;
+            switch (tag) {
+                case 'TYPE': { const t = researchOneOf(v, WAIT_TYPES); if (t) wait.type = t; break; }
+                case 'TITL': if (v) wait.title = v; break;
+                case '_ON': if (v) wait.on = v; break;
+                case '_GROUP': if (v) wait.group = { name: v }; break;
+                case 'STAT': { const t = researchOneOf(v, ['todo', 'sent'] as const); if (t) wait.stat = t; break; }
+                case '_SENT': { const at = researchInstant(v); if (at) wait.sent = at; break; }
+                case '_PRIO': { const n = researchInt(v, 0, 999); if (n !== undefined) wait.prio = n; break; }
+            }
+        } else if (level === 3) {
+            if ((tag === 'CONC' || tag === 'CONT') && (sub === 'TITL' || sub === '_ON')) {
+                const key = sub === 'TITL' ? 'title' : 'on';
+                const joined = (wait[key] ?? '') + (tag === 'CONT' ? ' ' : '') + value;
+                if (joined.trim()) wait[key] = joined;
+            } else if (sub === '_GROUP' && wait.group) {
+                if (tag === 'TYPE') { const t = researchOneOf(v, WAIT_GROUP_TYPES); if (t) wait.group.type = t; }
+                else if (tag === '_KEY' && v) wait.group.key = v;
+                else if (tag === '_URL' && /^https?:\/\//i.test(v)) wait.group.url = v;
+            }
+        }
+    }
+    return wait;
+}
+
+const LINE_KINDS = ['ancestors', 'descendants', 'person', 'question'] as const;
+const LINE_STATES = ['active', 'paused', 'done'] as const;
+const BRANCH_RELS = ['sibling', 'partner', 'child', 'parent', 'other'] as const;
+const BRANCH_MODES = ['never', 'occasional', 'last', 'normal'] as const;
+
+/**
+ * The header's `1 _STROM_DIRECTION G…` and `1 _STROM_BRANCH B-P…` blocks
+ * (tag, value, lines) → the research's lines and side branches, in the
+ * file's order. A line without a name, a repeated id and unknown tags go.
+ */
+export function researchDirectionsFromHead(complete: boolean, blocks: (RawResearchBlock & { tag: string })[]): ResearchDirections {
+    const lines: ResearchDirections['lines'] = [];
+    const branches: ResearchDirections['branches'] = [];
+    const seen = new Set<string>();
+    for (const block of blocks.slice(0, 2000)) {
+        const id = block.value.trim();
+        if (seen.has(id)) continue;
+        if (block.tag === '_STROM_DIRECTION' && RESEARCH_ID.G.test(id)) {
+            let name = '';
+            const line: ResearchDirections['lines'][number] = { id, name };
+            let sub = '';
+            for (const { level, tag, value } of block.lines) {
+                const v = value.trim();
+                if (level === 2) {
+                    sub = tag;
+                    if (tag === 'NAME') name = value;
+                    else if (tag === 'TYPE') { const k = researchOneOf(v, LINE_KINDS); if (k) line.kind = k; }
+                    else if (tag === '_FOCUS' && RESEARCH_ID.P.test(v)) line.focus = v;
+                    else if (tag === 'STAT') { const st = researchOneOf(v, LINE_STATES); if (st) line.state = st; }
+                } else if (level === 3 && sub === 'NAME' && (tag === 'CONC' || tag === 'CONT')) {
+                    name += (tag === 'CONT' ? ' ' : '') + value;
+                }
+            }
+            line.name = name.trim();
+            if (!line.name) continue;
+            seen.add(id);
+            lines.push(line);
+        } else if (block.tag === '_STROM_BRANCH') {
+            const m = BRANCH_ID.exec(id);
+            if (!m) continue;
+            const branch: ResearchDirections['branches'][number] = { id, person: m[1] };
+            let sub = '';
+            for (const { level, tag, value } of block.lines) {
+                const v = value.trim();
+                if (level === 2) {
+                    sub = tag;
+                    if (tag === '_VIA' && RESEARCH_ID.P.test(v)) branch.via = { person: v };
+                    else if (tag === '_NEAREST' && RESEARCH_ID.G.test(v)) branch.nearest = v;
+                    else if (tag === '_DIRECTION' && RESEARCH_ID.G.test(v)) branch.line = v;
+                    else if (tag === '_MODE') { const mo = researchOneOf(v, BRANCH_MODES); if (mo) branch.mode = mo; }
+                } else if (level === 3 && sub === '_VIA' && tag === 'TYPE' && branch.via) {
+                    const rel = researchOneOf(v, BRANCH_RELS);
+                    if (rel) branch.via.rel = rel;
+                }
+            }
+            seen.add(id);
+            branches.push(branch);
+        }
+    }
+    return { complete, lines, branches };
+}
+
 /** The lines under one `1 _STROM_ISLAND n` → the island (null without a size). */
 export function researchIslandFromLines(block: RawResearchBlock): ResearchIsland | null {
     const size = researchInt(block.value, 1, 1e6);
@@ -638,6 +997,25 @@ const NOTED_INDI_TAGS = new Set(['BLES', 'RETI', 'CAST', 'DSCR', 'IDNO', 'NCHI',
 // The couple's events (banns, a contract, a census…) are events of their own
 // since data version 10 (see coupleEventTypeOfTag); only the count is left.
 const NOTED_FAM_TAGS = new Set(['NCHI']);
+/**
+ * Lines under a birth, a death, a wedding or a divorce that may go to the
+ * record's note (a remark, the denomination at the act, an age, a cause or an
+ * address with no field left for it, a date the date field cannot hold
+ * whole — "1815/1816", "10 JAN", another calendar): kept as written for
+ * "Back to {prog}" when they do (see NOTED_TAG).
+ */
+const NOTED_DETAIL_TAGS = new Set(['NOTE', 'RELI', 'CAUS', 'AGE', 'ADDR', 'HUSB', 'WIFE', 'DATE', 'TYPE']);
+/**
+ * Of those, the lines Strom reads nowhere, not even into the note (a
+ * wedding's `2 TYPE civil`): kept as written all the same, with no line of
+ * the note to stand for them.
+ */
+const NOTED_SILENT_TAGS = new Set(['TYPE']);
+
+/** The parts of an address structure (ADDR > ADR1 …), read where the ADDR line has no value. */
+const ADDRESS_PART_TAGS = new Set(['ADR1', 'ADR2', 'ADR3', 'CITY', 'STAE', 'POST', 'CTRY']);
+/** A field's label written as its value (`3 ADR1 Email`, MyHeritage): no address. */
+const ADDRESS_PART_LABEL = /^e-?mail$/i;
 
 /** A fact being read: its value on the tag line, its date and place below it. */
 interface RawNoteFact {
@@ -750,7 +1128,9 @@ function originalMimeOf(name: string): string {
 }
 
 interface RawMedia {
-    /** _PRIM / _PERSONALPHOTO Y — preferred as the person's portrait. */
+    /** `1 OBJE @O1@`: the media record the link points at (its FILE, TITL… come from there). */
+    ref?: string;
+    /** _PRIM / _PRIMARY / _PERSONALPHOTO Y — preferred as the person's portrait. */
     primary?: boolean;
     title: string;
     form: string;
@@ -765,6 +1145,16 @@ interface RawMedia {
     sha?: string;
     /** _STROM_ORIENT: that original's EXIF orientation. */
     orient?: number;
+    /** _DATE: the picture's date as written (MyHeritage), kept with the picture (spec 066 G8). */
+    date?: string;
+    /**
+     * Written in place (`1 OBJE` with its lines): where in the file, and those
+     * lines as written; a link to a media record: the record's lines written in place.
+     */
+    rawLine?: number;
+    rawLines?: string[];
+    /** A link to a media record (`1 OBJE @O1@`): where the link is in the file. */
+    linkLine?: number;
 }
 
 interface RawEvent {
@@ -786,7 +1176,55 @@ interface RawEvent {
     tagValue?: string;
     /** 2 _STROM_STATUS: the research's status of the event. */
     status?: FactStatus;
+    /** 2 EMAIL under the event as written (LifeEvent.gedcomEmails). */
+    emails?: string[];
+    /** The value written on the event's own line, where Strom has no field for it (LifeEvent.gedcomValue). */
+    lineValue?: string;
+    /** The ADDR structure as written and the address read from it (LifeEvent.gedcomAddress). */
+    addressLines?: string[];
+    addressValue?: string;
+    /** 2 _STROM_IMPORT: which import the event's parts still come from (app files only). */
+    imports?: RawImportMark[];
+    /** The research's origin of the event (Strom's own files only). */
+    origin?: RawFactOrigin;
 }
+
+/**
+ * `_STROM_IMPORT I1 [DATE PLAC…]` as an app-written file gives it: the import
+ * a record or a fact comes from, and — when only some parts still do — which.
+ */
+interface RawImportMark {
+    id: string;
+    parts?: FactPart[];
+}
+
+/**
+ * The research's origin of one fact as its file gives it (research files
+ * only, spec 066): `2 _STROM_ORIGIN import I1 [DATE PLAC…] | user | research`,
+ * each `2 _STROM_WAS <value>` (one per changed part) with its `3 _STROM_IMPORT`,
+ * `3 _PART` and `3 _REF`, and the `2 SOUR @S…@` cited under the fact.
+ */
+interface RawFactOrigin {
+    origin?: string;
+    was: { value: string; importId?: string; parts: string[]; ref?: string }[];
+    sourceRefs: string[];
+    /** The research's re-verification of the fact (spec 065), as written. */
+    verify?: RawFactVerify;
+}
+
+/** `2 _STROM_CONFIRMED`, `2 _STROM_VERIFY` (with `3 _POS`), `2 _STROM_CHECKED` (with `3 DATE`, `3 _WHY`, `3 _READERS`), `2 _STROM_EID` under a fact. */
+interface RawFactVerify {
+    confirmed?: string;
+    pending?: string;
+    position?: string;
+    eid?: string;
+    /** `3 _TXT` under `_STROM_EID`: the research's mark of what the fact says. */
+    txt?: string;
+    checked?: { result: string; date?: string; why?: string; readers?: string };
+}
+
+type RawPersonFact = 'name' | 'sex' | 'birth' | 'death';
+type RawCoupleFact = 'marriage' | 'divorce';
 
 /** An event of the couple under FAM (MARB, CENS, EVEN…), as the file gave it. */
 interface RawCoupleEvent {
@@ -806,6 +1244,10 @@ interface RawCoupleEvent {
     tagValue?: string;
     /** 2 _STROM_STATUS: the research's status of the event. */
     status?: FactStatus;
+    /** 2 _STROM_IMPORT (app files only). */
+    imports?: RawImportMark[];
+    /** The research's origin of the event (Strom's own files only). */
+    origin?: RawFactOrigin;
 }
 
 /**
@@ -823,6 +1265,8 @@ interface RawStory {
     text: string;
     facts: string[];
     note: string;
+    /** `2 SOUR @S…@`: the sources the story rests on, pointers as written. */
+    sources: string[];
     /** `2 _DRAFT`: the new version waiting beside an approved story (research files only). */
     draft?: RawStoryDraft;
 }
@@ -833,11 +1277,13 @@ interface RawStoryDraft {
     text: string;
     facts: string[];
     note: string;
+    /** `3 SOUR @S…@`: the sources of the new version. */
+    sources: string[];
     at: string;
 }
 
 const newStory = (): RawStory =>
-    ({ kind: '', title: '', stat: '', text: '', facts: [], note: '' });
+    ({ kind: '', title: '', stat: '', text: '', facts: [], note: '', sources: [] });
 
 /** A participant as it comes out of the file, before ids are resolved. */
 interface RawParticipant {
@@ -849,14 +1295,59 @@ interface RawParticipant {
     note?: string;
 }
 
+/** A level-1 `_XXX` of another program with the lines under it, as the file wrote them (spec 066 G8). */
+interface RawExtra {
+    tag: string;
+    lines: string[];
+    /** Bookkeeping kept only to go back (`_UPD`): not named in the import's summary. */
+    quiet?: boolean;
+}
+
+/** `1 _STROM_IMPORT Ix` of a person or a family with its `2 _XREF` and id lines (spec 066 K3.2). */
+interface RawOriginalIds {
+    from: string;
+    xref?: string;
+    ids: OriginalIdLine[];
+}
+
+/** One citation of a source record (`n SOUR @Sx@`) and what it says itself. */
+interface CitationSlot {
+    /** Where its pointer was written. */
+    list: string[];
+    index: number;
+    /** The source record's xref. */
+    id: string;
+    /** Its level and line in the file (its DATA > DATE is told apart by them). */
+    level: number;
+    line: number;
+    page?: string;
+    /** DATA > DATE: when the entry was written. */
+    date?: string;
+    quay?: number;
+    /** Its DATA > TEXT (with CONC / CONT) as written, levels from the citation's (TEXT = 2). */
+    dataText?: string[];
+    /** Its EVEN (with ROLE) as written, levels from the citation's (EVEN = 1). */
+    even?: string[];
+}
+
 /** Raw GEDCOM source record (0 @Sx@ SOUR). */
 interface RawSource {
     id: string;
+    /** 1 _STROM_IMPORT: the import the record came from (app files only). */
+    importMark?: string;
     title: string;
     repository: string;
     reference: string;
     url: string;
     note: string;
+    /** The first `2 CALN` under the record's `1 REPO`: the book's call number (spec 075). */
+    callNumber?: string;
+    /** `1 _STROM_FOLIO` / `_STROM_IMAGE` / `_STROM_LOCATOR` (spec 075): with any of them the fields hold, not PAGE. */
+    folio?: string;
+    image?: string;
+    locator?: string;
+    /** The record carried any of the `_STROM_FOLIO/_IMAGE/_LOCATOR` lines (its PAGE is composed of them). */
+    placeFields?: boolean;
     /** QUAY seen on the record or a citation (first wins). */
     quality?: number;
     /** ABBR: the short title, used when the record has no TITL. */
@@ -869,6 +1360,12 @@ interface RawSource {
     verified?: boolean;
     /** _STROM_READ: who read the entry (a Strom Research file). */
     readBy?: SourceReadBy;
+    /** 2 _CONF under _STROM_READ: the day the user confirmed the transcript. */
+    readConfirmed?: string;
+    /** 2 _TXT under _STROM_READ: the research's mark of the transcript's wording. */
+    readMark?: string;
+    /** _STROM_ORIG Y: the research has the source's original and can read it again. */
+    original?: boolean;
     /** _STROM_READING (+ 2 _STROM_ENTRY): the research's reading the entry was written from. */
     reading?: string;
     readingEntry?: string;
@@ -882,10 +1379,24 @@ interface RawSource {
     imageHeld?: SourceImageHeld;
     /** Its 2 _STROM_CLIP lines: the left-out excerpts. */
     heldClips?: string[];
+    /** Another program's own level-1 tags kept as written (spec 066 G8). */
+    extras?: RawExtra[];
+    /** The first AUTH as written (its CONT lines joined by line breaks); also a line of the note. */
+    author?: string;
+    /** `2 _XREF` under the record's `1 _STROM_IMPORT`: its xref in the file it came from (app files only). */
+    importXref?: string;
+    /** The id lines under the record's `1 _STROM_IMPORT` (`2 RIN`, `2 _UID`…): its ids in that file (app files only). */
+    importIdLines?: OriginalIdLine[];
+    /** The record's ids in the program that wrote the file (`1 RIN`, `1 _UID`…; see GedcomIndividual.fileIds). */
+    fileIds?: OriginalIdLine[];
+    /** A page's source of its own: the record (xref) it was cut from. */
+    derivedFrom?: string;
 }
 
 /** Raw OBJE under a source record. */
 interface RawSourceMedia {
+    /** `1 OBJE @O1@`: the media record the link points at. */
+    ref?: string;
     title: string;
     file: string;
     /** _URL: the page in the archive's image viewer. */
@@ -905,6 +1416,18 @@ interface RawSourceMedia {
 /** Raw GEDCOM individual record */
 interface GedcomIndividual {
     id: string;
+    /** 1 _STROM_IMPORT: the import the person came from (app files only). */
+    importMark?: string;
+    /** Level-1 `_UID`, `UID`, `RIN`, `EXID` (+ TYPE), `_FSFTID`, `AFN`: the record's ids (another program's file). */
+    fileIds?: OriginalIdLine[];
+    /** The ids under each `1 _STROM_IMPORT Ix` (Strom's own files). */
+    importIds?: RawOriginalIds[];
+    /** Another program's own level-1 tags kept as written (spec 066 G8). */
+    extras?: RawExtra[];
+    /** 2 _STROM_IMPORT under the primary NAME, SEX, BIRT and DEAT. */
+    factImports?: Partial<Record<RawPersonFact, RawImportMark[]>>;
+    /** The research's origin of the primary NAME, the sex (1 _STROM_SEX_ORIGIN), BIRT and DEAT (Strom's own files only). */
+    factOrigins?: Partial<Record<RawPersonFact, RawFactOrigin>>;
     /** Every DATE of the birth, death and events as written, by flex value (see noteDateForm). */
     dateForms?: Record<string, string>;
     name: string;
@@ -930,6 +1453,8 @@ interface GedcomIndividual {
     marnm: string[];
     /** The surname after marriage (Person.marriedSurname), set after the names are read. */
     marriedSurname?: string;
+    /** The given names of that married name when they are not the person's own (Person.marriedFirstName). */
+    marriedFirstName?: string;
     /**
      * The NAME with Strom's mark of the name the person goes by
      * (`2 _STROM_PRIMARY Y`, the first one counts): -1 the primary name, k the
@@ -954,6 +1479,8 @@ interface GedcomIndividual {
     deathPlace: string;
     /** BIRT > ADDR, DEAT > CAUS / AGE / ADDR (the first BIRT/DEAT block). */
     birthAddress?: string;
+    /** BIRT > AGE of a Strom file (kept, not shown). */
+    birthAge?: string;
     deathCause?: string;
     deathAge?: string;
     deathAddress?: string;
@@ -1010,6 +1537,32 @@ interface GedcomIndividual {
 /** Raw GEDCOM family record */
 interface GedcomFamily {
     id: string;
+    /** 1 _STROM_IMPORT: the import the couple came from (app files only). */
+    importMark?: string;
+    /** The family record's ids (see GedcomIndividual.fileIds). */
+    fileIds?: OriginalIdLine[];
+    /** The ids under each `1 _STROM_IMPORT Ix` (Strom's own files). */
+    importIds?: RawOriginalIds[];
+    /** Another program's own level-1 tags kept as written (spec 066 G8). */
+    extras?: RawExtra[];
+    /** `1 OBJE @O1@`: the family's links to media records, and where each link is in the file. */
+    mediaLinks?: { ref: string; line: number }[];
+    /** The media records whose lines the family keeps for "Back to {prog}" (see extras). */
+    keptMedia?: string[];
+    /** The record's `0 @F1@ FAM` line in the file. */
+    recordLine?: number;
+    /**
+     * The record's lines as written, from level 1 (not of the research's
+     * files): only of a couple with another record, or of a record that
+     * marries the two again after a divorce (see laterUnionStructures).
+     */
+    recordLines?: string[];
+    /** 2 _STROM_IMPORT under MARR and DIV. */
+    factImports?: Partial<Record<RawCoupleFact, RawImportMark[]>>;
+    /** The research's origin of MARR and DIV (Strom's own files only). */
+    factOrigins?: Partial<Record<RawCoupleFact, RawFactOrigin>>;
+    /** CHIL > 2 _STROM_IMPORT: the import a child's link to these parents came from, by child. */
+    childImports?: Map<string, string>;
     /** Every DATE of the wedding, divorce and events as written, by flex value (see noteDateForm). */
     dateForms?: Record<string, string>;
     /** The couple's events besides the wedding and the divorce (ENGA, MARB, CENS, EVEN…). */
@@ -1039,11 +1592,20 @@ interface GedcomFamily {
      * otherwise.
      */
     unionEvents: { type: 'marriage' | 'divorce'; date: string }[];
+    /**
+     * The research's file: the wedding is its first MARR alone, dated or not,
+     * never another one's date (a further one is the research's own record of it).
+     */
+    firstMarriageOnly?: boolean;
+    /** Which of the family's MARR / DIV records is the fact's (by order, see isFactUnionRecord). */
+    factUnionRecords?: { marriage?: number; divorce?: number };
     note: string;
     /** Standard facts with no field of their own — folded into the note. */
     noteFacts: RawNoteFact[];
     /** 1 SOUR citations on the family (marriage record etc.). */
     sourceRefs: string[];
+    /** 2 SOUR citations under DIV (the divorce's own record). */
+    divorceSourceRefs: string[];
     /** Witnesses named under 1 MARR (2 ASSO / 2 _WITN). */
     marriageParticipants: RawParticipant[];
     /**
@@ -1057,6 +1619,11 @@ interface GedcomFamily {
     story?: RawStory;
     /** 1 _STAT: the relationship status as written (Married, Partners …). */
     stat?: string;
+    /**
+     * 1 _RELATIONSHIP_STATUS (another program's word for the same thing), kept
+     * only when statusFromStat knows its value; _STAT wins when both are there.
+     */
+    relationshipStatus?: string;
     /** The CHIL line being read (its _FREL/_MREL follow it). */
     lastChil?: string;
     /**
@@ -1070,6 +1637,12 @@ interface GedcomFamily {
 
 /** Parsed GEDCOM data */
 export interface ParsedGedcom {
+    /**
+     * The QUAY of each citation, by the list its pointer is in (the very
+     * array) and the source it cites: undefined when it is its source's
+     * default, `null` when the citation gave none while the source has one.
+     */
+    citationQuay?: Map<string[], Map<string, number | null | undefined>>;
     individuals: Map<string, GedcomIndividual>;
     families: Map<string, GedcomFamily>;
     sources: Map<string, RawSource>;
@@ -1099,6 +1672,57 @@ export interface ParsedGedcom {
     stromResearch?: boolean;
     /** Header `1 _STROM_ASOF`: when the research wrote it (as written). */
     researchAsOf?: string;
+    /** Header `1 _STROM_DIRECTIONS`, `_STROM_DIRECTION`, `_STROM_BRANCH`: the research's lines (research files only). */
+    researchDirections?: ResearchDirections;
+    /** Header `1 SOUR STROM`: written by the Strom app. */
+    stromApp?: boolean;
+    /** What the header says of the program that wrote the file (HEAD > SOUR, DATE, FILE). */
+    head?: GedcomHead;
+    /** Header `1 _STROM_IMPORT Ix` records as written (app and research files only), for sanitizeImports. */
+    stromImports?: Record<string, string>[];
+    /** `0 @O1@ OBJE` media records, by xref: what `1 OBJE @O1@` links point at. */
+    mediaRecords?: Map<string, RawMedia>;
+}
+
+/** The file's own header: the program that wrote it and when. */
+export interface GedcomHead {
+    /** HEAD > SOUR > NAME, else the SOUR value. */
+    program?: string;
+    /** HEAD > SOUR > VERS. */
+    version?: string;
+    /** HEAD > DATE, as written. */
+    date?: string;
+    /** HEAD > FILE. */
+    file?: string;
+}
+
+/** What a loaded file is, for the origin of its facts (spec 066). */
+export interface GedcomImportOrigin {
+    /** The day it was loaded (ISO, local). */
+    at: string;
+    /** The file's name as picked. */
+    file?: string;
+    /** The encoding the import read it in. */
+    encoding?: string;
+    /** sha256 of the file's bytes (hex). */
+    sha?: string;
+}
+
+/** Options of convertToStrom. */
+export interface GedcomConvertOptions {
+    /**
+     * Record where the facts came from: a file another program wrote becomes
+     * one import record (I1) and marks everything in it; a Strom file keeps the
+     * records and marks it carries. Without it nothing is recorded.
+     */
+    importOrigin?: GedcomImportOrigin;
+    /**
+     * The images a research's file names by their hash (`FILE strom-image:<sha>`,
+     * spec 071), as the data URLs the file with its images in it would carry.
+     * A reference not in it (or without it) leaves its image out, as such a
+     * file was always read; the reference itself never comes into the tree.
+     */
+    images?: ReadonlyMap<string, string>;
 }
 
 /** Result of GEDCOM to Strom conversion */
@@ -1114,10 +1738,14 @@ export interface ExternalMediaRef {
     isUrl?: boolean;
     /** Platform marked this as the person's primary portrait. */
     primary?: boolean;
+    /** The picture's date as the file wrote it (`_DATE`), for the photo or attachment it becomes. */
+    date?: string;
 }
 
 export interface GedcomConversionResult {
     data: StromData;
+    /** The import record made for this file (a file another program wrote, with importOrigin). */
+    importId?: string;
     /**
      * OBJE FILE references pointing OUTSIDE the file (platform exports ship
      * media as a separate folder/zip). The import summary offers to bulk-match
@@ -1141,8 +1769,22 @@ export interface GedcomConversionResult {
          * on the child.
          */
         otherFamilyLinks: number;
-        /** Embedded media skipped because of their type (only images and PDFs come in). */
+        /**
+         * Family records of a couple that already has one (a record per
+         * wedding): joined to that couple's partnership, their weddings kept
+         * for "Back to {prog}".
+         */
+        joinedFamilies: number;
+        /**
+         * Media not carried over: embedded ones of another type (only images and
+         * PDFs come in), a link to a media record the file does not have, a
+         * record with no file, a record no person or source takes.
+         */
         skippedMedia: number;
+        /** Another program's own level-1 tags kept for "Back to {prog}" (spec 066 G8). */
+        keptTags: number;
+        /** Their tags, most frequent first ("_FOO, _BAR"). Empty when none. */
+        keptTagSummary: string;
         totalGedFamilies: number;
     };
 }
@@ -1182,7 +1824,7 @@ function generateId(prefix: string): string {
 
 /**
  * ANSEL (ANSI Z39.47 / MARC-8 extended Latin) -> Unicode, spacing characters.
- * Includes the GEDCOM addition 0xCF (ß).
+ * Includes the GEDCOM additions (0xBE, 0xBF, 0xCD, 0xCE and 0xCF ß).
  */
 const ANSEL_SPACING: Record<number, string> = {
     0xA1: 'Ł', 0xA2: 'Ø', 0xA3: 'Đ', 0xA4: 'Þ', 0xA5: 'Æ',
@@ -1191,8 +1833,14 @@ const ANSEL_SPACING: Record<number, string> = {
     0xB0: 'ʻ', 0xB1: 'ł', 0xB2: 'ø', 0xB3: 'đ', 0xB4: 'þ',
     0xB5: 'æ', 0xB6: 'œ', 0xB7: 'ʺ', 0xB8: 'ı', 0xB9: '£',
     0xBA: 'ð', 0xBC: 'ơ', 0xBD: 'ư',
+    // The LDS extensions of the GEDCOM 5.5 ANSEL table: empty and black box,
+    // midline e and o (written as the letters, as Gramps reads them too).
+    0xBE: '\u25A1', 0xBF: '\u25A0',
     0xC0: '°', 0xC1: 'ℓ', 0xC2: '℗', 0xC3: '©', 0xC4: '♯',
-    0xC5: '¿', 0xC6: '¡', 0xCF: 'ß',
+    0xC5: '¿', 0xC6: '¡',
+    // MARC-21's later additions: eszett and the euro sign.
+    0xC7: 'ß', 0xC8: '€',
+    0xCD: 'e', 0xCE: 'o', 0xCF: 'ß',
 };
 
 /**
@@ -1252,36 +1900,179 @@ export function decodeAnsel(bytes: Uint8Array): string {
     return out.normalize('NFC');
 }
 
-/**
- * Decode a raw GEDCOM file to text, honouring what the file says about itself:
- * a BOM wins outright, otherwise the HEAD > CHAR declaration decides (its line
- * is ASCII-compatible in every charset GEDCOM allows, so peeking at the header
- * bytes is safe). ANSEL gets the real decoder above — reading it as UTF-8
- * silently mangled every diacritic. Unknown or absent CHAR falls back to UTF-8.
- */
-export function decodeGedcomFile(buffer: ArrayBuffer): string {
-    const bytes = new Uint8Array(buffer);
-    if (bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
-        return new TextDecoder('utf-8').decode(bytes);
+/** Encodings a GEDCOM file can be read in (the import summary offers the single-byte ones). */
+export type GedcomEncoding =
+    | 'utf-8' | 'utf-16le' | 'utf-16be' | 'ansel' | 'windows-1250' | 'windows-1252' | 'iso-8859-2';
+
+/** The encodings the import summary lets a person switch between, in menu order. */
+export const GEDCOM_ENCODING_CHOICES: readonly GedcomEncoding[] =
+    ['utf-8', 'windows-1250', 'windows-1252', 'iso-8859-2', 'ansel'];
+
+/** A decoded GEDCOM file and how its encoding was settled. */
+export interface GedcomDecoding {
+    text: string;
+    encoding: GedcomEncoding;
+    /** The HEAD > CHAR value as written in the file, or null when it names none. */
+    declared: string | null;
+    /** bom = byte order mark; declared = CHAR named it; content = guessed from the bytes; chosen = forced by the caller. */
+    how: 'bom' | 'declared' | 'content' | 'chosen';
+    /** The file has bytes outside ASCII, i.e. the encoding matters for the text at all. */
+    nonAscii: boolean;
+}
+
+/** CHAR values (upper-cased, spaces and underscores dropped) that name one encoding outright. */
+const DECLARED_ENCODINGS: Record<string, GedcomEncoding> = {
+    'ANSEL': 'ansel',
+    'UTF-8': 'utf-8', 'UTF8': 'utf-8',
+    'CP1250': 'windows-1250', 'CP-1250': 'windows-1250', 'WINDOWS-1250': 'windows-1250',
+    'WINDOWS1250': 'windows-1250', 'WIN1250': 'windows-1250', 'WIN-1250': 'windows-1250', 'MS-EE': 'windows-1250',
+    'CP1252': 'windows-1252', 'CP-1252': 'windows-1252', 'WINDOWS-1252': 'windows-1252',
+    'WINDOWS1252': 'windows-1252', 'WIN1252': 'windows-1252', 'WIN-1252': 'windows-1252',
+    // Browsers decode latin1 as windows-1252 anyway (a superset for text).
+    'ISO-8859-1': 'windows-1252', 'ISO8859-1': 'windows-1252', 'LATIN1': 'windows-1252', 'LATIN-1': 'windows-1252',
+    'ISO-8859-2': 'iso-8859-2', 'ISO8859-2': 'iso-8859-2', 'LATIN2': 'iso-8859-2', 'LATIN-2': 'iso-8859-2',
+};
+
+function isValidUtf8(bytes: Uint8Array): boolean {
+    try {
+        new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        return true;
+    } catch {
+        return false;
     }
-    if (bytes[0] === 0xFF && bytes[1] === 0xFE) return new TextDecoder('utf-16le').decode(bytes);
-    if (bytes[0] === 0xFE && bytes[1] === 0xFF) return new TextDecoder('utf-16be').decode(bytes);
+}
+
+// Byte classes for telling Windows-1250 (Central Europe) from Windows-1252
+// (Western Europe) when a file only says "ANSI". The two code pages agree on
+// á é í ó ú ý ä ö ü ß š ž and differ on the rest.
+/** Letters in 1250 (ť ź Ť Ź Ł Ą Ż ł ą ľ Ľ ż), symbols or nothing in 1252 (¹ ³ ¿ £ …): a strong 1250 sign. */
+const CP1250_ONLY_LETTERS = new Set([0x8D, 0x8F, 0x9D, 0x9F, 0xA3, 0xA5, 0xAF, 0xB3, 0xB9, 0xBC, 0xBE, 0xBF]);
+/** Czech and Slovak letters (č ě ř ů ň ď and capitals) that read as è ì ø ù ò ï in 1252. */
+const CP1250_CORE = new Set([0xE8, 0xEC, 0xF8, 0xF9, 0xF2, 0xEF, 0xC8, 0xCC, 0xD8, 0xD9, 0xD2, 0xCF]);
+/** Same byte in both code pages, frequent in Czech and Slovak words: š ž Š Ž á í ý ú Á Í Ý Ú. */
+const CENTRAL_COMPANIONS = new Set([0x8A, 0x8E, 0x9A, 0x9E, 0xE1, 0xED, 0xFD, 0xFA, 0xC1, 0xCD, 0xDD, 0xDA]);
+/** Western companions of è and friends: à ç ê é À Ç Ê É œ Œ. */
+const WESTERN_COMPANIONS = new Set([0xE0, 0xE7, 0xEA, 0xE9, 0xC0, 0xC7, 0xCA, 0xC9, 0x9C, 0x8C]);
+/** Italian/French final grave vowels: à è ì ò ù. */
+const WESTERN_FINAL = new Set([0xE0, 0xE8, 0xEC, 0xF2, 0xF9]);
+
+function isWordByte(b: number): boolean {
+    return (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A)
+        || (b >= 0xC0 && b !== 0xD7 && b !== 0xF7)
+        || b === 0x8A || b === 0x8C || b === 0x8E || b === 0x9A || b === 0x9C || b === 0x9E
+        || CP1250_ONLY_LETTERS.has(b);
+}
+
+/**
+ * Guess between Windows-1250 and Windows-1252 from the words of the file.
+ * A word votes 1250 when it holds a letter only 1250 has (ł ą ż ť …) or a
+ * Czech/Slovak letter next to š ž á í ý ú ("Kučerová", "Dvořák"); it votes
+ * 1252 when è-like letters sit next to Western companions ("Thérèse",
+ * "François") or end an Italian/French word ("Niccolò"). Words with neither
+ * ("Matěj") do not vote. No votes keeps the GEDCOM meaning of ANSI (1252).
+ */
+export function guessSingleByteEncoding(bytes: Uint8Array): 'windows-1250' | 'windows-1252' {
+    let votes1250 = 0;
+    let votes1252 = 0;
+    let i = 0;
+    while (i < bytes.length) {
+        if (!isWordByte(bytes[i])) { i++; continue; }
+        const start = i;
+        while (i < bytes.length && isWordByte(bytes[i])) i++;
+        let strong = false, core = false, central = false, western = false;
+        for (let j = start; j < i; j++) {
+            const b = bytes[j];
+            if (CP1250_ONLY_LETTERS.has(b)) {
+                // Spanish "¿Quién": ¿ opens a word and a capital follows; Polish
+                // "żona" has a small letter after ż.
+                const next = bytes[j + 1] ?? 0;
+                if (!(b === 0xBF && j === start && !(next >= 0x61 && next <= 0x7A))) strong = true;
+            }
+            if (CP1250_CORE.has(b)) core = true;
+            if (CENTRAL_COMPANIONS.has(b)) central = true;
+            if (WESTERN_COMPANIONS.has(b)) western = true;
+        }
+        const last = bytes[i - 1];
+        const finalGrave = i - start >= 3 && WESTERN_FINAL.has(last) && bytes[i - 2] < 0x80;
+        if (strong || (core && central)) votes1250++;
+        else if (core && (western || finalGrave)) votes1252++;
+    }
+    return votes1250 > votes1252 ? 'windows-1250' : 'windows-1252';
+}
+
+function decodeAs(bytes: Uint8Array, encoding: GedcomEncoding): string {
+    if (encoding === 'ansel') return decodeAnsel(bytes);
+    return new TextDecoder(encoding).decode(bytes);
+}
+
+/**
+ * Decode a raw GEDCOM file, honouring what the file says about itself: a BOM
+ * wins outright, otherwise the HEAD > CHAR declaration decides (its line is
+ * ASCII-compatible in every charset GEDCOM allows, so peeking at the header
+ * bytes is safe). ANSEL gets the real decoder above. "ANSI" means the Windows
+ * code page of the computer that wrote it: valid UTF-8 stays UTF-8, otherwise
+ * the bytes decide between Central (1250: č ř ě) and Western (1252) Europe.
+ * A file without CHAR, or with CHAR UTF-8 that is not valid UTF-8, is guessed
+ * the same way. `forced` overrides everything (the summary's encoding menu).
+ */
+export function decodeGedcomBytes(buffer: ArrayBuffer, forced?: GedcomEncoding): GedcomDecoding {
+    const bytes = new Uint8Array(buffer);
+    const nonAscii = bytes.some(b => b >= 0x80);
 
     // Peek HEAD for "1 CHAR <value>". NULs are stripped so a BOM-less UTF-16
     // header still matches; latin1 maps every byte so decoding cannot throw.
     const head = new TextDecoder('latin1').decode(bytes.subarray(0, 4096)).replace(/\0/g, '');
     const charMatch = /^\s*1\s+CHAR\s+(.+?)\s*$/m.exec(head);
-    const charset = (charMatch?.[1] ?? '').toUpperCase();
+    const declared = charMatch?.[1] ?? null;
+    const result = (encoding: GedcomEncoding, how: GedcomDecoding['how'], body: Uint8Array = bytes): GedcomDecoding =>
+        ({ text: decodeAs(body, encoding), encoding, declared, how, nonAscii });
 
-    if (charset === 'ANSEL') return decodeAnsel(bytes);
-    if (charset === 'UNICODE' || charset === 'UTF-16') {
+    if (forced) {
+        // A forced single-byte or UTF-8 reading must not keep a BOM as text.
+        const skip = forced === 'utf-8' && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF ? 3 : 0;
+        return result(forced, 'chosen', bytes.subarray(skip));
+    }
+    if (bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) return result('utf-8', 'bom');
+    if (bytes[0] === 0xFF && bytes[1] === 0xFE) return result('utf-16le', 'bom');
+    if (bytes[0] === 0xFE && bytes[1] === 0xFF) return result('utf-16be', 'bom');
+
+    const charset = (declared ?? '').toUpperCase().replace(/[\s_]+/g, '');
+    if (charset === 'UNICODE' || charset === 'UTF-16' || charset === 'UTF16') {
         // No BOM to tell the byte order: the first character of a GEDCOM is
         // ASCII ('0'), so a leading zero byte means big-endian.
-        return new TextDecoder(bytes[0] === 0 ? 'utf-16be' : 'utf-16le').decode(bytes);
+        return result(bytes[0] === 0 ? 'utf-16be' : 'utf-16le', 'declared');
     }
-    if (charset === 'ANSI') return new TextDecoder('windows-1252').decode(bytes);
-    // ASCII, UTF-8, unknown, or no header at all.
-    return new TextDecoder('utf-8').decode(bytes);
+    const named = DECLARED_ENCODINGS[charset];
+    if (named && named !== 'utf-8') return result(named, 'declared');
+    // UTF-8, ANSI, ASCII, unknown or no CHAR: valid UTF-8 is UTF-8 (a
+    // single-byte Central European text is practically never valid UTF-8).
+    if (!nonAscii) return result(named ?? 'utf-8', named ? 'declared' : 'content');
+    if (isValidUtf8(bytes)) return result('utf-8', named === 'utf-8' ? 'declared' : 'content');
+    return result(guessSingleByteEncoding(bytes), 'content');
+}
+
+/**
+ * A few full names of a converted file for the import summary's encoding row:
+ * names with non-ASCII letters first (they show whether the encoding fits),
+ * no repeats, at most `max`.
+ */
+export function gedcomSampleNames(data: StromData, max = 5): string[] {
+    const seen = new Set<string>();
+    const all: string[] = [];
+    for (const p of Object.values(data.persons)) {
+        if (p.isPlaceholder) continue;
+        const name = [p.firstName, p.lastName].filter(Boolean).join(' ').trim();
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        all.push(name);
+    }
+    const accented = all.filter(n => /[^\x00-\x7F]/.test(n));
+    return [...accented, ...all.filter(n => !/[^\x00-\x7F]/.test(n))].slice(0, max);
+}
+
+/** Decode a raw GEDCOM file to text (see decodeGedcomBytes). */
+export function decodeGedcomFile(buffer: ArrayBuffer): string {
+    return decodeGedcomBytes(buffer).text;
 }
 
 // ==================== MAIN PARSER ====================
@@ -1294,6 +2085,8 @@ interface GedLine {
     level: number;
     tag: string;
     value: string;
+    /** Index of its (first) physical line in the file: kept tags are taken from the file as written. */
+    src: number;
 }
 
 /**
@@ -1302,7 +2095,8 @@ interface GedLine {
  * name, witness, citation page, web address or label. Joined up front, so a
  * value split to respect the 255-byte line limit reads back whole.
  */
-const JOINED_VALUE_TAGS = new Set(['PLAC', 'NAME', '_WITN', 'WITN', 'PAGE', 'WWW', 'URL', 'REFN', 'TYPE', 'SOUR', '_QUESTION']);
+const JOINED_VALUE_TAGS = new Set(['PLAC', 'NAME', '_WITN', 'WITN', 'PAGE', 'WWW', 'URL', 'REFN', 'TYPE', 'SOUR', '_QUESTION',
+    '_STROM_FOLIO', '_STROM_IMAGE', '_STROM_LOCATOR', 'CALN']);
 
 /**
  * Split the file into lines and do the reading that needs the whole file:
@@ -1319,7 +2113,8 @@ function preprocessGedcomLines(lines: string[]): {
     inlineSources: Map<string, string>;
 } {
     const parsed: GedLine[] = [];
-    for (const line of lines) {
+    for (let src = 0; src < lines.length; src++) {
+        const line = lines[src];
         const match = line.match(/^(\d+)\s+(@[^@\s]+@|\w+)\s*(.*)?$/);
         if (!match) continue;
         let tag = match[2];
@@ -1331,7 +2126,7 @@ function preprocessGedcomLines(lines: string[]): {
         const value = (conc ? conc[1].trimEnd() : (match[3] || '').trim()).replace(/@@/g, '@');
         // GEDCOM 7 shared-note pointer: the same thing as a NOTE pointer.
         if (tag === 'SNOTE' && GED_POINTER.test(value)) tag = 'NOTE';
-        parsed.push({ level: parseInt(match[1]), tag, value });
+        parsed.push({ level: parseInt(match[1]), tag, value, src });
     }
 
     const noteRecords = new Map<string, string>();
@@ -1353,7 +2148,7 @@ function preprocessGedcomLines(lines: string[]): {
                     text += (next.tag === 'CONT' ? '\n' : '') + next.value;
                 }
                 noteRecords.set(rec.tag, text);
-                records.push({ level: 0, tag: rec.tag, value: m[1] });
+                records.push({ level: 0, tag: rec.tag, value: m[1], src: rec.src });
                 continue;
             }
         }
@@ -1373,7 +2168,7 @@ function preprocessGedcomLines(lines: string[]): {
                 }
                 value = id;
             }
-            records.push({ level: rec.level, tag: rec.tag, value });
+            records.push({ level: rec.level, tag: rec.tag, value, src: rec.src });
             continue;
         }
         records.push(rec);
@@ -1407,6 +2202,7 @@ function readMarriedSurname(
 ): void {
     if (indi.primaryNameType === 'married') return;
     let married = '';
+    let marriedGiven = '';
     // The mark of the name the person goes by: on the birth name (the
     // primary one), on the married name taken here, or elsewhere (nothing).
     let markedMarried = false;
@@ -1423,6 +2219,8 @@ function readMarriedSurname(
         const read = readGedcomName(indi.nameVariants[k], indi.variantNameParts[k], { ...opts, descriptions: false });
         if (!read.lastName) continue;
         married = read.lastName;
+        // Given names of its own ("Jana Kateřina /Nováková/" beside "Jana /…/") stay with it.
+        if (read.firstName && read.firstName !== '?' && read.firstName.trim() !== (indi.firstName ?? '').trim()) marriedGiven = read.firstName.trim();
         dropVariant(k);
         break;
     }
@@ -1434,9 +2232,10 @@ function readMarriedSurname(
     }
     if (!married) return;
     indi.marriedSurname = married;
+    if (marriedGiven) indi.marriedFirstName = marriedGiven;
     // "Marie Nováková" beside the field says nothing more.
     const key = (v: string): string => v.replace(/\//g, ' ').replace(/\s+/g, ' ').trim().normalize('NFC').toLocaleLowerCase();
-    const repeat = key(`${indi.firstName} ${married}`);
+    const repeat = key(`${marriedGiven || indi.firstName} ${married}`);
     for (let k = indi.nameVariants.length - 1; k >= 0; k--) {
         if (key(indi.nameVariants[k]) !== repeat) continue;
         // A mark there is on the married name too (it is that name).
@@ -1450,7 +2249,7 @@ function readMarriedSurname(
 const KNOWN_INDI_TAGS = new Set(['NAME', 'SEX', 'FAMS', 'FAMC', 'NOTE', 'SOUR', 'BIRT', 'DEAT', 'OBJE', 'REFN', 'ASSO', '_STORY', '_QUESTION', '_MARNM',
     ...Object.keys(EVENT_TAG_TO_TYPE)]);
 /** Level-1 FAM tags the parser understands. */
-const KNOWN_FAM_TAGS = new Set(['HUSB', 'WIFE', 'CHIL', 'NOTE', 'MARR', 'DIV', 'SOUR', '_STORY', '_STAT']);
+const KNOWN_FAM_TAGS = new Set(['HUSB', 'WIFE', 'CHIL', 'NOTE', 'MARR', 'DIV', 'SOUR', '_STORY', '_STAT', '_RELATIONSHIP_STATUS']);
 /** Level-0 record types (handled or structural). */
 /**
  * Labels for ALTERNATIVE birth/death facts. Platforms (MyHeritage) allow several
@@ -1461,27 +2260,121 @@ const KNOWN_FAM_TAGS = new Set(['HUSB', 'WIFE', 'CHIL', 'NOTE', 'MARR', 'DIV', '
 // Labels are read from strings at USE time (not module load) so the note lands
 // in the app's current language — see each call site.
 
-const KNOWN_RECORD_TYPES = new Set(['INDI', 'FAM', 'SOUR', 'REPO', 'HEAD', 'TRLR', 'SUBM', 'SUBN', 'NOTE', 'SNOTE']);
+/** HEAD > 1 _STROM_IMPORT Ix: the lines under it, by the record's field. */
+const HEAD_IMPORT_FIELDS: Record<string, string> = {
+    SOUR: 'program', VERS: 'version', DATE: 'fileDate', _AT: 'at', FILE: 'file', _SHA: 'sha',
+};
 
-/**
- * Pure bookkeeping tags (platform sync ids, change stamps). Ignored WITHOUT
- * counting them as unsupported — a MyHeritage export carries three of these
- * per person and the "1079 unsupported records" number needlessly scared
- * migrating users even though no user data was involved.
- */
+const KNOWN_RECORD_TYPES = new Set(['INDI', 'FAM', 'SOUR', 'REPO', 'HEAD', 'TRLR', 'SUBM', 'SUBN', 'NOTE', 'SNOTE', 'OBJE']);
+
 /** A `_STROM_IMG_OMITTED` value: the research's reason, or `other` for one this app does not know. */
 export function imageHeldReason(value: string): SourceImageHeld {
     const why = value.trim().toLowerCase();
     return why === 'scope' || why === 'limit' || why === 'later' || why === 'missing' ? why : 'other';
 }
 
-const IGNORED_BOOKKEEPING_TAGS = new Set(['_UPD', 'RIN', '_UID', 'CHAN', '_PROJECT_GUID', '_EXPORTED_FROM_SITE_ID']);
+/**
+ * Pure bookkeeping tags (platform sync ids, change stamps). Ignored WITHOUT
+ * counting them as unsupported — a MyHeritage export carries three of these
+ * per person and the "1079 unsupported records" number needlessly scared
+ * migrating users even though no user data was involved. GEDCOM 7 adds its
+ * own: UID (a record's lasting id), CREA (when the record was created, with
+ * DATE/TIME under it) and EXID (the record's id in another system, TYPE under
+ * it) — ids and stamps of the program that wrote the file, not of the family.
+ * On a person and a family the ids (`_UID`, `UID`, `RIN`, `EXID`, with
+ * `_FSFTID` and `AFN`) are kept as its original ids (ORIGINAL_ID_TAGS, read
+ * before this set is asked); elsewhere they are ignored.
+ */
+const IGNORED_BOOKKEEPING_TAGS = new Set(['_UPD', 'RIN', '_UID', 'CHAN', '_PROJECT_GUID', '_EXPORTED_FROM_SITE_ID',
+    'UID', 'CREA', 'EXID']);
+
+/**
+ * Bookkeeping another program wants back on its records: MyHeritage's change
+ * stamp (`1 _UPD`) of a person, a family, a source. Kept as written for "Back
+ * to {prog}" like the program's other own tags, but, being bookkeeping, never
+ * named in the import's summary (spec 066 K3.1).
+ */
+const KEPT_BOOKKEEPING_TAGS: ReadonlySet<string> = new Set(['_UPD']);
+
+/**
+ * MyHeritage's bookkeeping under a photo: its size, its record numbers (of
+ * the photo, of the photo a face was cut from) and where a face sits on it
+ * (the cut-out's position, the photo it was cut from). A MyHeritage export
+ * carries several per photo; counted, they made hundreds of "unsupported"
+ * lines out of photos that came in. Not counted either.
+ */
+const IGNORED_MEDIA_BOOKKEEPING_TAGS = new Set(['_FILESIZE', '_PHOTO_RIN', '_PARENTRIN',
+    '_POSITION', '_CUTOUT', '_PRIM_CUTOUT', '_PARENTPHOTO', '_PERSONALPHOTO']);
+
+/**
+ * Where a face sits on a photo, under any photo (of a person, an event, a
+ * family): MyHeritage names these after the photo they belong to
+ * (`_MH_EVENT_PHOTO_CUTOUT_POSITION` under an event's photo), so a rule
+ * takes them, not a list — every `_` tag with a CUTOUT part, and every one
+ * with a PHOTO part that ends in POSITION. A POSITION without a photo in its
+ * name (a job's, a rank's) stays counted.
+ */
+const MEDIA_CUTOUT_TAG = /^_(?:[A-Z0-9]+_)*CUTOUT(?:_[A-Z0-9]+)*$|^_(?:[A-Z0-9]+_)*PHOTO(?:_[A-Z0-9]+)*_POSITION$/;
+
+/**
+ * The `_` tags this reader takes somewhere (spec 066 G8), Strom's own
+ * `_STROM_…` aside. A deeper `_XXX` (level 2 or more) of another program's
+ * file that is none of them, and not under a line already kept or counted,
+ * is counted as not carried over (it used to vanish without a word). A test
+ * keeps the list complete: every `'_XXX'` the reader names is in it.
+ */
+export const GEDCOM_READ_UNDERSCORE_TAGS: ReadonlySet<string> = new Set([
+    '_ACCESS', '_AGAINST', '_AT', '_BASIS', '_BOOK', '_BRANCH', '_BY', '_CHOSEN', '_CONF', '_CONFLICT', '_COST', '_COUNT', '_COVERED', '_DATE',
+    '_DIRECTION', '_DRAFT', '_DUP', '_END', '_EST', '_EXPORTED_FROM_SITE_ID', '_FAM', '_FOCUS', '_FREL', '_FSFTID', '_GEN',
+    '_GROUP', '_HELD', '_HYPO', '_INTREE', '_ISLAND', '_JOIN', '_KEY', '_LAST', '_LEFT', '_LEVEL', '_LINK', '_MARNM', '_MILI',
+    '_MILT', '_MODE', '_MREL', '_NEAREST', '_NEXT', '_NORECORDS', '_ON', '_PAR', '_PART', '_PARTIAL', '_PEOPLE', '_PERS',
+    '_PERSONALPHOTO', '_PICK', '_POS', '_PREV', '_PRIM', '_PRIMARY', '_PRIO', '_PROJECT_GUID', '_PROP', '_QUESTION', '_READERS',
+    '_RECORDS', '_REF', '_RELATIONSHIP_STATUS', '_REOPEN', '_RESEARCH', '_SCOPE', '_SEARCHES', '_SENT', '_SESSIONS', '_SOUR',
+    '_STAT', '_STAYS', '_STORY', '_TASK',
+    '_TEST', '_TRIED', '_TXT', '_UID', '_UNTIL', '_UPD', '_URL', '_VAR', '_VIA', '_WHY', '_WITN', '_XREF',
+]);
+
+/** Another program's `_XXX` the reader takes nowhere (and no bookkeeping, no id). */
+export function isUnreadUnderscoreTag(tag: string): boolean {
+    return tag.startsWith('_') && !tag.startsWith('_STROM_') && !GEDCOM_READ_UNDERSCORE_TAGS.has(tag)
+        && !IGNORED_BOOKKEEPING_TAGS.has(tag) && !IGNORED_MEDIA_BOOKKEEPING_TAGS.has(tag) && !MEDIA_CUTOUT_TAG.test(tag)
+        && !ORIGINAL_ID_TAGS.has(tag);
+}
+
+/** A data URL inside a line: never kept outside the photos and attachments it makes. */
+const DATA_URL_IN_LINE = /data:[^,;\s]*;base64,/i;
 
 /** Attach a DATE to the MARR/DIV it sits under — the most recent one seen. */
 function lastUnionEvent(fam: GedcomFamily, type: 'marriage' | 'divorce', date: string): void {
     for (let i = fam.unionEvents.length - 1; i >= 0; i--) {
         if (fam.unionEvents[i].type === type) { fam.unionEvents[i].date = date; return; }
     }
+}
+
+/**
+ * The primary NAME of a person whose given name the file wrote as a
+ * description ("Son", "Mrtvě narozený"), as written: its line and its
+ * parts (NPFX, GIVN, SPFX, SURN, NSFX).
+ */
+function describedNameLines(indi: GedcomIndividual): string[] {
+    const parts = indi.primaryNameParts;
+    const out = [indi.name ? `1 NAME ${indi.name}` : '1 NAME'];
+    for (const [tag, value] of [['NPFX', parts.npfx], ['GIVN', parts.givn], ['SPFX', parts.spfx], ['SURN', parts.surn], ['NSFX', parts.nsfx]] as const) {
+        if (value) out.push(`2 ${tag} ${value}`);
+    }
+    return out;
+}
+
+/**
+ * A family's MARR/DIV events with the divorces written before its first
+ * wedding moved right after it: a divorce cannot end a marriage that has not
+ * begun, so it is that wedding's (some programs, PAF among them, write DIV
+ * first). A family with no wedding keeps its events as they are.
+ */
+function divorcesAfterFirstMarriage<T extends { type: 'marriage' | 'divorce' }>(events: T[]): T[] {
+    const first = events.findIndex(e => e.type === 'marriage');
+    if (first <= 0) return events;
+    return [events[first], ...events.slice(0, first), ...events.slice(first + 1)];
 }
 
 /**
@@ -1504,7 +2397,7 @@ function resolveUnionStatus(fam: GedcomFamily): {
     const divorcedAtAll = divorces.length > 0 || fam.divorced || !!fam.divorceDate;
     // The union began at the FIRST marriage; a remarriage is a later chapter of
     // the same couple, not a new start date.
-    const startDate = marriages.find(e => e.date)?.date ?? fam.marriageDate;
+    const startDate = fam.firstMarriageOnly ? fam.marriageDate : marriages.find(e => e.date)?.date ?? fam.marriageDate;
 
     if (!divorcedAtAll) return { status: 'married', startDate, endDate: '', remarriage: null };
 
@@ -1538,19 +2431,146 @@ function resolveUnionStatus(fam: GedcomFamily): {
 }
 
 /**
+ * Words for a relationship status in the files of other programs (English,
+ * and the Polish, German and Czech ones a program in those languages writes).
+ * A registered or civil partnership is no marriage: partners.
+ */
+const STATUS_WORDS: Record<PartnershipStatus, readonly string[]> = {
+    married: ['married', 'marriage', 'małżeństwo', 'małżonkowie', 'żonaci', 'verheiratet', 'ehe', 'ehepaar',
+        'manželé', 'manželství', 'sezdaní'],
+    divorced: ['divorced', 'divorce', 'rozwiedzeni', 'rozwód', 'geschieden', 'scheidung', 'rozvedeni', 'rozvedení', 'rozvod'],
+    separated: ['separated', 'separation', 'w separacji', 'separacja', 'getrennt', 'getrennt lebend',
+        'odloučeni', 'odloučení', 'odluka', 'v odluce'],
+    partners: ['partners', 'partner', 'unmarried', 'unmarried couple', 'never married', 'cohabiting', 'living together',
+        'domestic partnership', 'common law', 'common-law', 'civil union', 'civil partnership', 'registered partnership',
+        'partnerzy', 'związek nieformalny', 'związek partnerski', 'konkubinat',
+        'partnerschaft', 'lebensgemeinschaft', 'lebenspartnerschaft', 'eingetragene lebenspartnerschaft',
+        'nichteheliche lebensgemeinschaft', 'unverheiratet',
+        'partneři', 'partnerství', 'registrované partnerství', 'druh a družka', 'nesezdaní'],
+};
+
+/**
  * 1 _STAT (Strom's own tag, also written by Legacy and FTM in similar words)
- * -> the relationship status, or undefined for a value it does not name.
- * MARR/DIV can only say married or divorced; partners and separated need it.
+ * or 1 _RELATIONSHIP_STATUS -> the relationship status, or undefined for a
+ * value it does not name. MARR/DIV can only say married or divorced;
+ * partners and separated need it.
  */
 function statusFromStat(value: string | undefined): PartnershipStatus | undefined {
-    const v = (value ?? '').trim().toLowerCase();
+    const v = (value ?? '').normalize('NFC').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
     if (!v) return undefined;
-    if (v === 'married') return 'married';
-    if (v === 'divorced') return 'divorced';
-    if (v === 'separated') return 'separated';
-    if (['partners', 'partner', 'unmarried', 'unmarried couple', 'never married',
-        'cohabiting', 'living together', 'domestic partnership'].includes(v)) return 'partners';
+    for (const status of ['married', 'divorced', 'separated', 'partners'] as const) {
+        if (STATUS_WORDS[status].includes(v)) return status;
+    }
     return undefined;
+}
+
+/** The line of the couple's note that says they divorced and married again. */
+function remarriageLine({ divorced, married }: { divorced: string; married: string }): string {
+    return divorced ? strings.gedcomNotes.remarriage(divorced, married) : strings.gedcomNotes.remarriageNoDate(married);
+}
+
+/** A line that names a record by its xref (the export renumbers them; a calendar's escape, `@#DJULIAN@`, is none). */
+const NAMES_A_RECORD = /^\d+ @|\s@[^@#\s][^@\s]*@/;
+
+/** A record's lines from level 1, as one list per level-1 structure. */
+function structuresOf(lines: readonly string[]): string[][] {
+    const out: string[][] = [];
+    for (const line of lines) {
+        if (line.startsWith('1 ')) out.push([line]);
+        else out[out.length - 1]?.push(line);
+    }
+    return out;
+}
+
+/** A structure without its lines that name a record, and the lines under those. */
+function withoutRecordPointers(structure: readonly string[]): string[] {
+    const out: string[] = [];
+    let below = -1;
+    for (const line of structure) {
+        const level = Number(/^(\d+)/.exec(line)?.[1] ?? 0);
+        if (below >= 0 && level > below) continue;
+        below = -1;
+        if (NAMES_A_RECORD.test(line)) { below = level; continue; }
+        out.push(line);
+    }
+    return out;
+}
+
+/** A wedding's lines without its named witnesses (`2 _WITN Name` / `2 WITN Name` and what is under them). */
+function withoutWitnessLines(structure: readonly string[]): string[] {
+    const out: string[] = [];
+    let below = -1;
+    for (const line of structure) {
+        const level = Number(/^(\d+)/.exec(line)?.[1] ?? 0);
+        if (below >= 0 && level > below) continue;
+        below = -1;
+        if (/^2 _?WITN \S/.test(line)) { below = level; continue; }
+        out.push(line);
+    }
+    return out;
+}
+
+/**
+ * A family record's weddings and divorces after its first wedding, as
+ * written, while the first of them is a divorce (MARR / DIV / MARR: the
+ * couple married again). null when there is none, or a line names a record.
+ */
+function laterUnionStructures(fam: GedcomFamily): string[] | null {
+    const union = structuresOf(fam.recordLines ?? []).filter(st => /^1 (MARR|DIV)( |$)/.test(st[0]));
+    const first = union.findIndex(st => /^1 MARR( |$)/.test(st[0]));
+    const later = first < 0 ? [] : union.slice(first + 1);
+    if (later.length === 0 || !/^1 DIV( |$)/.test(later[0][0]) || later.flat().some(l => NAMES_A_RECORD.test(l))) return null;
+    return later.flat();
+}
+
+/**
+ * The line a remarriage became in the couple's note, kept with the record's
+ * later weddings and divorces as written (NOTED_TAG): "Back to {prog}"
+ * writes them in place of the line. What a divorce's own details became in
+ * the note (its NOTE, a date the field could not hold) goes with them.
+ * Returns whether it was kept.
+ */
+function noteRemarriage(fam: GedcomFamily, line: string): boolean {
+    const later = laterUnionStructures(fam);
+    if (!later) return false;
+    const divorceOf = (e: RawExtra): boolean =>
+        e.tag === NOTED_TAG && /^1 DIV( |$)/.test(notedStructures(e.lines)[0]?.lines[0] ?? '');
+    const divorces = (fam.extras ?? []).filter(divorceOf);
+    const block = notedBlock([line, ...divorces.flatMap(e => notedStructures(e.lines)[0].texts)], later);
+    if (!block) return false;
+    fam.extras = [...(fam.extras ?? []).filter(e => !divorceOf(e)), { tag: NOTED_TAG, lines: block, quiet: true }];
+    return true;
+}
+
+/**
+ * Another record of a couple the import joins to the first one (see
+ * JOINED_TAG): its weddings, divorces and ids as written, the lines naming
+ * a record left out, and its change stamp. Its xref is the one the file gave it (a Strom file's:
+ * the one its program gave it). The other kept lines of the record go to the
+ * partnership, except those of a wedding or a divorce noted (the block has them).
+ */
+function keepJoinedRecord(gedFamId: string, fam: GedcomFamily, marks: JoinedMarks): boolean {
+    if (!fam.recordLines) return false;
+    const own = fam.importIds?.find(b => b.xref)?.xref ?? gedFamId;
+    const xref = /^@([^@]+)@$/.exec(own)?.[1] ?? '';
+    const structures = structuresOf(fam.recordLines)
+        .filter(st => /^1 (MARR|DIV|REFN|NOTE|NCHI)( |$)/.test(st[0]) || ORIGINAL_ID_TAGS.has(st[0].split(' ')[1])
+            || KEPT_BOOKKEEPING_TAGS.has(st[0].split(' ')[1]));
+    const kept = structures.map(withoutRecordPointers);
+    // A note it names by xref (a NOTE record) the block cannot write: its lines stay in the couple's note.
+    const notes = (st: readonly string[]): string[] => st.filter(l => /^(1 (NOTE|NCHI)|2 NOTE)( |$)/.test(l));
+    const noteLost = structures.some((st, i) => notes(st).length !== notes(kept[i]).length);
+    // The witnesses of its wedding the marks name are written from the couple's (see JoinedMarks.witnesses).
+    const named = !noteLost && (marks.witnesses?.length ?? 0) > 0;
+    const lines = named ? kept.map(st => /^1 MARR( |$)/.test(st[0]) ? withoutWitnessLines(st) : st) : kept;
+    const block = joinedBlock(xref.startsWith('__') ? '' : xref, lines.flat(), noteLost ? {} : marks);
+    if (!block) return false;
+    // What of it became lines of the couple's note the block writes itself (its
+    // notes, its weddings and divorces as written); its change stamp (`_UPD`)
+    // is the record's own: in the block, not the partnership's.
+    fam.extras = [...(fam.extras ?? []).filter(e => e.tag !== NOTED_TAG && !KEPT_BOOKKEEPING_TAGS.has(e.tag)),
+        { tag: JOINED_TAG, lines: block, quiet: true }];
+    return true;
 }
 
 /** Put the resolved marriage/divorce outcome onto a partnership. */
@@ -1560,13 +2580,13 @@ function applyUnionOutcome(partnership: Partnership, fam: GedcomFamily): void {
     if (outcome.endDate) partnership.endDate = outcome.endDate;
     // An explicit status wins over what MARR/DIV imply: a couple of partners
     // whose start date rides on MARR (the only place for it) is not married.
-    partnership.status = statusFromStat(fam.stat) ?? outcome.status;
+    partnership.status = statusFromStat(fam.stat) ?? statusFromStat(fam.relationshipStatus) ?? outcome.status;
     if (outcome.remarriage) {
-        const { divorced, married } = outcome.remarriage;
-        const line = divorced
-            ? strings.gedcomNotes.remarriage(divorced, married)
-            : strings.gedcomNotes.remarriageNoDate(married);
+        const line = remarriageLine(outcome.remarriage);
         partnership.note = partnership.note ? `${partnership.note}\n${line}` : line;
+        // "Back to {prog}" writes the divorce (with its place) and the
+        // wedding again as written, not the line.
+        if (noteRemarriage(fam, line)) { delete partnership.endPlace; delete partnership.endStatus; }
     }
 }
 
@@ -1700,14 +2720,47 @@ export function parseGedcom(content: string): ParsedGedcom {
     const noteQuay = (ref: string | null, value: string): void => {
         const q = parseInt(value, 10);
         if (ref && q >= 0 && q <= 3 && !citationQuality.has(ref)) citationQuality.set(ref, q);
+        // This citation's own QUAY, for the page's source of its own (see the derived sources).
+        const c = currentCitation;
+        if (c && ref && c.id === ref && q >= 0 && q <= 3 && c.quay === undefined) c.quay = q;
     };
     const droppedTags = new Map<string, number>();
-    const drop = (tag: string) => droppedTags.set(tag, (droppedTags.get(tag) ?? 0) + 1);
+    const count = (tag: string): void => { droppedTags.set(tag, (droppedTags.get(tag) ?? 0) + 1); };
+    /** The level of the line being read, and where it is in the file. */
+    let lineLevel = 0;
+    let lineIndex = -1;
+    /**
+     * The level of a line already counted (or kept): nothing under it is
+     * counted again (spec 066 G8). Cleared by the next line at its level or above.
+     */
+    let quietBelow: number | null = null;
+    /** A tag of the line being read was not carried over: counted, and its lines with it. */
+    const drop = (tag: string): void => {
+        count(tag);
+        if (quietBelow === null || lineLevel < quietBelow) quietBelow = lineLevel;
+    };
+    /** `0 @O1@ OBJE` media records, by xref. */
+    const mediaRecords = new Map<string, RawMedia>();
+    /** Where each media record starts in the file (a family's picture keeps its lines). */
+    const mediaRecordLines = new Map<string, number>();
+    /** The media record being read, its level-1 tag, and whether that FILE is the record's first (later ones are left). */
+    let currentObje: RawMedia | null = null;
+    let objeSubTag: string | null = null;
+    let objeFirstFile = false;
+    /**
+     * Another program's level-1 `_XXX` of a person or a family being kept
+     * (spec 066 G8): from its line in the file down; a pointer under it (an
+     * xref the reader renumbers) means the block cannot be kept as written.
+     */
+    let extraBlock: { target: { extras?: RawExtra[] }; tag: string; start: number; pointer: boolean; quiet?: boolean } | null = null;
     /** Citation DATA > DATE -> the source's record date (first wins, like PAGE). */
     const citationDates = new Map<string, string>();
     let citeLevel: number | null = null;
     let citeRef: string | null = null;
+    let citeLine = -1;
     let inCiteData = false;
+    /** The citation's unread lines being kept: its DATA > TEXT, its EVEN (see CitationSlot). */
+    let citeKeep: 'text' | 'even' | null = null;
 
     let currentRecord: GedcomIndividual | GedcomFamily | null = null;
     let currentType: 'INDI' | 'FAM' | 'SOUR' | null = null;
@@ -1731,7 +2784,18 @@ export function parseGedcom(content: string): ParsedGedcom {
      * hang level-3 lines (PAGE, RELA, CONT) on.
      */
     let currentFactSubTag: string | null = null;
+    /**
+     * The `1 MARR` / `1 DIV` being read is not the family's first of its kind.
+     * Its re-verification, id and origin never become the fact's: the fact is
+     * the first record's. In the research's file (which keeps one per record
+     * it joined) the fact is the first record's alone: a later one gives it
+     * no date, place, status or detail either (the research reads a further
+     * one missing from what the app sends as the shape of the union).
+     */
+    let laterUnionRecord = false;
     let currentSource: RawSource | null = null;
+    /** The source record's first AUTH is being read (its CONT/CONC lines join Source.author). */
+    let readingAuthor = false;
     /** Which name the current 1 NAME line was: -1 the primary, else its variant index. */
     let currentNameSlot: number | null = null;
     let currentMedia: RawMedia | null = null;
@@ -1739,29 +2803,41 @@ export function parseGedcom(content: string): ParsedGedcom {
     let currentMediaSubTag: string | null = null;
     /** Level-2 tag inside an OBJE on a source record (FILE continuations). */
     let sourceMediaSubTag: string | null = null;
+    /** The tag of the source record's level-2 line being read (a `3 TYPE` belongs to `2 EXID`). */
+    let sourceLevel2Tag: string | null = null;
     /** @Sx@ of the most recent citation (PAGE lines attach to it). */
     let currentCitationId: string | null = null;
     /** Where that citation's pointer was written (its PAGE may point it to a source of its own). */
     let currentCitationSlot: { list: string[]; index: number } | null = null;
-    /** Every citation that named a page: its pointer's place, the source and the page. */
-    const pagedCitations: { list: string[]; index: number; id: string; page: string }[] = [];
+    /**
+     * Every citation of a source record: its pointer's place, the source, and
+     * what the citation itself says (its page, the entry's date, its QUAY).
+     */
+    const citations: CitationSlot[] = [];
+    /** The citation being read (its PAGE, DATA > DATE and QUAY land on it). */
+    let currentCitation: CitationSlot | null = null;
     /** A citation pointer pushed onto `list`: remembered so its PAGE can find it. */
     const cite = (list: string[], value: string): void => {
         list.push(value);
         currentCitationId = value;
         currentCitationSlot = { list, index: list.length - 1 };
+        currentCitation = { list, index: list.length - 1, id: value, level: lineLevel, line: lineIndex };
+        citations.push(currentCitation);
     };
     /** A citation's PAGE: the source's reference (first wins) and this citation's own page. */
     const citePage = (value: string): void => {
         if (!currentCitationId) return;
         if (!citationPages.has(currentCitationId)) citationPages.set(currentCitationId, value);
         const slot = currentCitationSlot;
-        if (slot && slot.list[slot.index] === currentCitationId && value.trim()) {
-            pagedCitations.push({ ...slot, id: currentCitationId, page: value.trim() });
+        const c = currentCitation;
+        if (slot && slot.list[slot.index] === currentCitationId && value.trim() && c && c.id === currentCitationId && c.page === undefined) {
+            c.page = value.trim();
         }
     };
     /** 0 @Rx@ REPO record currently open. */
     let currentRepoId: string | null = null;
+    /** Inside a `0 @N1@ NOTE` record (its text is read ahead, see preprocessGedcomLines). */
+    let inNoteRecord = false;
     /**
      * Where a detail line under the current fact goes: the event's note, the
      * person's note labelled "Birth:"/"Death:" (birth and death are fields,
@@ -1789,6 +2865,8 @@ export function parseGedcom(content: string): ParsedGedcom {
         } else if (currentType === 'FAM' && currentRecord
             && (currentSubTag === 'MARR' || currentSubTag === 'DIV')) {
             const fam = currentRecord as GedcomFamily;
+            // A divorce's line says it is the divorce's (a wedding's is the couple's own).
+            if (currentSubTag === 'DIV') return line => { fam.note = join(fam.note, strings.gedcomNotes.divorceNote(line)); };
             return line => { fam.note = join(fam.note, line); };
         }
         return null;
@@ -1810,6 +2888,11 @@ export function parseGedcom(content: string): ParsedGedcom {
             if (ev) return { get: () => ev[key], set: v => { ev[key] = v; } };
             if (currentSubTag === 'BIRT' && key === 'address') {
                 return { get: () => indi.birthAddress, set: v => { indi.birthAddress = v; } };
+            }
+            // An age at the birth from Strom's own file goes back as it came:
+            // a note made of it would come back to the research as new.
+            if (currentSubTag === 'BIRT' && key === 'age' && (stromResearch || stromApp)) {
+                return { get: () => indi.birthAge, set: v => { indi.birthAge = v; } };
             }
             if (currentSubTag === 'DEAT') {
                 const field = key === 'cause' ? 'deathCause' : key === 'age' ? 'deathAge' : 'deathAddress';
@@ -1836,14 +2919,36 @@ export function parseGedcom(content: string): ParsedGedcom {
      * A detail line being read (AGE, CAUS, ADDR under a fact), open until the
      * next line at its own level or above, so its CONT/CONC lines join it.
      */
-    let openDetail: { level: number; text: string; done: (text: string) => void; sep: string } | null = null;
+    let openDetail: {
+        level: number; text: string; done: (text: string) => void; sep: string;
+        /** ADDR: its ADR1 / CITY / … values, the address when the ADDR line itself has none. */
+        parts?: string[];
+        /** ADDR under a person's event: its line in the file, to keep the structure as written. */
+        start?: number;
+        event?: RawEvent;
+    } | null = null;
     const flushDetail = (): void => {
-        const text = openDetail?.text.trim();
-        if (openDetail && text) openDetail.done(text);
+        const open = openDetail;
         openDetail = null;
+        if (!open) return;
+        const text = open.text.trim() || (open.parts ?? []).join(', ');
+        if (!text) return;
+        const ev = open.event;
+        const had = ev?.address;
+        open.done(text);
+        // The address of an event the file wrote in parts, or over more lines:
+        // the structure as written, for "Back to {prog}" (LifeEvent.gedcomAddress).
+        if (ev && open.start !== undefined && !had && ev.address === text) {
+            const structure = structureAt(open.start);
+            if (structure.length > 1) { ev.addressLines = structure; ev.addressValue = text; }
+        }
     };
     /** Where a finished detail goes: its field (an age in the UI language), else the fact's note, labelled. */
     const detailTarget = (tag: string, partner?: 'HUSB' | 'WIFE'): ((text: string) => void) | null => {
+        // The research's later record of a wedding or a divorce: its age or
+        // address is neither the fact's nor a line of the note (sent back, the
+        // note would grow by it on every round).
+        if (stromResearch && laterUnionRecord && currentType === 'FAM' && !currentFamEvent) return () => {};
         const sink = factDetailSink();
         const field = factDetailField(tag, partner);
         if (!sink && !field) return null;
@@ -1882,14 +2987,244 @@ export function parseGedcom(content: string): ParsedGedcom {
     let stromResearch = false;
     /** Written by the Strom app itself (HEAD > SOUR STROM). */
     let stromApp = false;
+    /**
+     * Whether a level-1 `_XXX` tag is another program's, kept as written for
+     * "Back to {prog}" (spec 066 G8): in its file, and in Strom's own "Back to"
+     * file that carried it there (taken back by the record's import mark) —
+     * never Strom's own tags nor the research's.
+     */
+    const keepsExtra = (tag: string): boolean => !stromResearch && !(stromApp && /^_STROM_/.test(tag));
     /** The app's version under it (HEAD > SOUR STROM > VERS; the older apps wrote a fixed "1.0"). */
     let stromAppVersion: string | undefined;
     /** The header line being read is under HEAD > SOUR STROM. */
     let inStromSour = false;
+    /** HEAD > SOUR, DATE and FILE of the file, whoever wrote it (the origin of a loaded file). */
+    const head: GedcomHead = {};
+    let headSourName = '';
+    let headSourValue = '';
+    /** The header line being read is under HEAD > SOUR (any program). */
+    let inHeadSour = false;
+    /** HEAD > `1 _STROM_IMPORT Ix`: the import records an app or research file carries, as written. */
+    const headImports: Record<string, string>[] = [];
+    let openHeadImport: Record<string, string> | null = null;
+    let openHeadImportField: string | null = null;
     let researchAsOf = '';
+    // The header's lines and side branches (read only for a research file, decided at the end).
+    let headDirectionsComplete = false;
+    const headDirectionBlocks: (RawResearchBlock & { tag: string })[] = [];
+    let openHeadDirection: (RawResearchBlock & { tag: string }) | null = null;
     let lineageMarker = false;
     /** The _STROM_CONFLICT / _HYPO / _SEARCHED block being read. */
     let currentResearch: OpenResearch | null = null;
+    /** The research's `_STROM_WAS` being read (its `3 _STROM_IMPORT`, `_PART`, `_REF` follow). */
+    let openWas: { level: number; was: RawFactOrigin['was'][number] } | null = null;
+    /** The research's `_STROM_CHECKED` being read (its `3 DATE`, `_WHY`, `_READERS` follow; `field`: the last of them, for CONC/CONT). */
+    let openChecked: { level: number; checked: NonNullable<RawFactVerify['checked']>; field?: string } | null = null;
+    /** The research's `_STROM_VERIFY` being read (its `3 _POS` follows). */
+    let openPending: { level: number; verify: RawFactVerify | null } | null = null;
+    /** `2 _STROM_EID` whose `3 _TXT` may follow. */
+    let openEid: { level: number; verify: RawFactVerify | null } | null = null;
+    /**
+     * The id lines being read (spec 066 K3.2): under `1 _STROM_IMPORT Ix` of a
+     * Strom file (`entry`), or the `2 TYPE` of a level-1 `EXID`. Its deeper
+     * lines are read here and nowhere else.
+     */
+    let idBlock = null as { level: number; entry?: RawOriginalIds; last?: OriginalIdLine } | null;
+    /** A level-1 id line of a person or a family (another program's file keeps them). */
+    const readFileId = (target: { fileIds?: OriginalIdLine[] }, tag: string, value: string): void => {
+        const line: OriginalIdLine = { tag, value: value.trim() };
+        // More id lines than a record keeps (ID_LINES_MAX): left out, counted.
+        if (line.value && (target.fileIds?.length ?? 0) >= ID_LINES_MAX) count(tag);
+        else if (line.value) (target.fileIds ??= []).push(line);
+        idBlock = { level: 1, last: line };
+    };
+    /** `1 _STROM_IMPORT Ix` of a person or a family: its import, and the ids that follow under it. */
+    const readRecordImport = (target: { importMark?: string; importIds?: RawOriginalIds[] }, value: string, idsOnly = false): void => {
+        const mark = readImportMark(value);
+        if (!mark) return;
+        // The first `_STROM_IMPORT` says where the record came from; a further
+        // one and every `_STROM_XID` only bring ids, never an origin.
+        if (!idsOnly) target.importMark ??= mark.id;
+        // More blocks than a record keeps (ID_ENTRIES_MAX): their lines are passed over.
+        if ((target.importIds?.length ?? 0) >= ID_ENTRIES_MAX) { idBlock = { level: 1 }; return; }
+        const entry: RawOriginalIds = { from: mark.id, ids: [] };
+        (target.importIds ??= []).push(entry);
+        idBlock = { level: 1, entry };
+    };
+    /** The research's origin of the fact being read: an event's, the primary name's, the sex, birth, death, wedding, divorce. */
+    const factOriginTarget = (): RawFactOrigin | null => {
+        const fresh = (): RawFactOrigin => ({ was: [], sourceRefs: [] });
+        if (currentType === 'INDI') {
+            if (currentEvent) return currentEvent.origin ??= fresh();
+            const indi = currentRecord as GedcomIndividual;
+            const fact: RawPersonFact | null = currentSubTag === 'NAME' ? (currentNameSlot === -1 ? 'name' : null)
+                : currentSubTag === 'SEX' || currentSubTag === '_STROM_SEX_ORIGIN' ? 'sex'
+                : currentSubTag === 'BIRT' ? 'birth'
+                : currentSubTag === 'DEAT' ? 'death' : null;
+            return fact ? ((indi.factOrigins ??= {})[fact] ??= fresh()) : null;
+        }
+        if (currentType === 'FAM') {
+            if (currentFamEvent) return currentFamEvent.origin ??= fresh();
+            const fam = currentRecord as GedcomFamily;
+            const fact: RawCoupleFact | null = currentSubTag === 'MARR' ? 'marriage' : currentSubTag === 'DIV' ? 'divorce' : null;
+            // A family's further MARR / DIV: the fact is the first one's (laterUnionRecord).
+            return fact && !laterUnionRecord ? ((fam.factOrigins ??= {})[fact] ??= fresh()) : null;
+        }
+        return null;
+    };
+
+    /** A line of a media record: FILE (5.5.1 and 7 with FORM and TITL under it, 5.5 beside it), TITL, the portrait marks, Strom's own. */
+    const readMediaRecordLine = (m: RawMedia, level: number, tag: string, value: string): void => {
+        if (level === 1) {
+            objeSubTag = tag;
+            if (tag === 'FILE') {
+                objeFirstFile = !m.file;
+                if (objeFirstFile) m.file = value;
+            } else if (tag === 'FORM') { if (!m.form) m.form = value; }
+            else if (tag === 'TITL') { if (!m.title) m.title = value; }
+            else if (tag === 'NOTE') m.note = m.note ? `${m.note}\n${value}` : value;
+            else if (tag === '_STROM_KIND') m.stromKind = value;
+            else if (tag === '_SOUR' || tag === 'SOUR') m.sourceXref = value;
+            else if (tag === '_STROM_SHA') m.sha = normalizeSha256(value) ?? undefined;
+            else if (tag === '_STROM_ORIENT' && /^[2-8]$/.test(value.trim())) m.orient = Number(value.trim());
+            else if ((tag === '_PRIM' || tag === '_PRIMARY' || tag === '_PERSONALPHOTO') && value.trim() === 'Y') m.primary = true;
+            else if (tag === '_DATE') { if (!m.date) m.date = mediaDateValue(value); }
+            else if (isUnreadUnderscoreTag(tag) && !stromApp && !stromResearch) drop(tag);
+        } else if (level === 2 && objeSubTag === 'FILE' && objeFirstFile) {
+            // Data-URL payloads are CONC-wrapped (255-char physical lines).
+            if (tag === 'CONC') m.file += value;
+            else if (tag === 'FORM') { if (!m.form) m.form = value; }
+            else if (tag === 'TITL') { if (!m.title) m.title = value; }
+        } else if (level === 2 && objeSubTag === 'NOTE' && (tag === 'CONT' || tag === 'CONC')) {
+            m.note = (m.note ?? '') + (tag === 'CONT' ? '\n' : '') + value;
+        }
+    };
+    /**
+     * The kept block ends before line `end` of the file: its lines as written
+     * go to the record, or, when they cannot be kept as they are (a pointer,
+     * a data URL, a line that is not one), the tag is counted.
+     */
+    const closeExtra = (end: number): void => {
+        const block = extraBlock;
+        extraBlock = null;
+        if (!block) return;
+        const raw = lines.slice(block.start, end).filter(l => l.trim() !== '');
+        if (!block.pointer && validExtraBlock(raw) && !raw.some(l => DATA_URL_IN_LINE.test(l))) {
+            (block.target.extras ??= []).push({ tag: block.tag, lines: raw, ...(block.quiet ? { quiet: true } : {}) });
+        } else if (!block.quiet) {
+            count(block.tag);
+        }
+    };
+
+    /**
+     * A structure of another program's file that becomes lines of the
+     * record's note (NOTED_TAG), being read: the whole structure (`1 NCHI`,
+     * `1 PUBL`), or those lines under a fact Strom has that go to the note
+     * (`2 NOTE` under `1 BIRT`, a wedding's `2 NOTE`). Kept on the record, so
+     * "Back to {prog}" writes them as they were and not as a note; not from
+     * the research's files.
+     */
+    let noted: {
+        target: { extras?: RawExtra[] };
+        note: () => string;
+        /** The structure's level-1 line in the file. */
+        head: number;
+        /** The whole structure became one line of the note: that line, once read. */
+        whole?: () => string;
+        /** The note's lines of the structure's lines read so far, and those lines as written. */
+        texts: string[];
+        body: string[];
+        /** A level-2 line under the fact being read (its tag), and the note's length before it. */
+        sub: { start: number; before: number; tag: string } | null;
+    } | null = null;
+    /** The file's level-1 line being read (the head of a fact's lines). */
+    let notedHead = -1;
+    const lineLevelAt = (i: number): number => {
+        const m = /^\s*(\d+)\s/.exec(lines[i] ?? '');
+        return m ? Number(m[1]) : -1;
+    };
+    /** Line `start` and the lines under it, as written (blank and broken lines left out). */
+    const structureAt = (start: number): string[] => {
+        const level = lineLevelAt(start);
+        const out = [lines[start].trimStart()];
+        for (let i = start + 1; i < lines.length; i++) {
+            const l = lineLevelAt(i);
+            if (l < 0) continue;
+            if (l <= level) break;
+            out.push(lines[i].trimStart());
+        }
+        return out;
+    };
+    /**
+     * Whether the `1 MARR` / `1 DIV` being read is the family's record of the
+     * fact: its first one with a date or a place, else its first one. An
+     * empty record ahead of the dated one (MyHeritage: `1 MARR`, then `1 MARR`
+     * with DATE and PLAC; the research keeps both) is not the fact's: its
+     * date and place would be lost.
+     */
+    const isFactUnionRecord = (fam: GedcomFamily, type: 'marriage' | 'divorce'): boolean => {
+        const seen = fam.unionEvents.filter(e => e.type === type).length;
+        const chosen = (fam.factUnionRecords ??= {})[type] ??= (() => {
+            if (fam.recordLine === undefined) return 0;
+            const tag = type === 'marriage' ? 'MARR' : 'DIV';
+            const own = structuresOf(structureAt(fam.recordLine).slice(1)).filter(st => new RegExp(`^1 ${tag}( |$)`).test(st[0]));
+            const at = own.findIndex(st => st.some(l => /^2 (DATE|PLAC) \S/.test(l)));
+            return at < 0 ? 0 : at;
+        })();
+        return seen === chosen;
+    };
+    const readNoted = (src: number, level: number, tag: string): void => {
+        const open = noted;
+        if (open?.sub && level <= 2) {
+            const text = open.note().slice(open.sub.before).replace(/^\n/, '');
+            if (text) { open.texts.push(text); open.body.push(...structureAt(open.sub.start)); }
+            else if (NOTED_SILENT_TAGS.has(open.sub.tag)) open.body.push(...structureAt(open.sub.start));
+            open.sub = null;
+        }
+        if (open && level <= 1) {
+            noted = null;
+            const texts = open.whole ? [open.whole()].filter(Boolean) : open.texts;
+            const structure = open.whole ? structureAt(open.head) : [lines[open.head].trimStart(), ...open.body];
+            // A pointer in it would name a record by an xref the export renumbers
+            // (a calendar's escape, `@#DJULIAN@`, is none).
+            const block = structure.some(l => /^\d+ @|\s@[^@#\s][^@\s]*@/.test(l)) || (open.whole && texts.length === 0)
+                ? null : notedBlock(texts, structure);
+            if (block) (open.target.extras ??= []).push({ tag: NOTED_TAG, lines: block, quiet: true });
+        }
+        if (level === 1) notedHead = src;
+        if (stromResearch || level === 0) return;
+        if (level === 1 && currentType === 'INDI' && currentRecord && NOTED_INDI_TAGS.has(tag)) {
+            const indi = currentRecord as GedcomIndividual;
+            const at = indi.noteFacts.length;
+            noted = { target: indi, note: () => indi.notes, head: src, texts: [], body: [], sub: null,
+                whole: () => { const fact = indi.noteFacts[at]; return fact ? factToNoteLine(fact) : ''; } };
+        } else if (level === 1 && currentType === 'FAM' && currentRecord && NOTED_FAM_TAGS.has(tag)) {
+            const fam = currentRecord as GedcomFamily;
+            const at = fam.noteFacts.length;
+            noted = { target: fam, note: () => fam.note, head: src, texts: [], body: [], sub: null,
+                whole: () => { const fact = fam.noteFacts[at]; return fact ? factToNoteLine(fact) : ''; } };
+        } else if (level === 1 && currentType === 'SOUR' && currentSource && tag === 'PUBL') {
+            const s = currentSource;
+            const before = s.note.length;
+            noted = { target: s, note: () => s.note, head: src, texts: [], body: [], sub: null,
+                whole: () => s.note.slice(before).replace(/^\n/, '') };
+        } else if (level === 2 && NOTED_DETAIL_TAGS.has(tag) && currentRecord) {
+            // A line under birth, death (the person's note), a wedding or a
+            // divorce (the couple's): whether it went to the note shows once it is read.
+            let target: { extras?: RawExtra[] } | null = null;
+            let note: (() => string) | null = null;
+            if (currentType === 'INDI' && !currentEvent && (currentSubTag === 'BIRT' || currentSubTag === 'DEAT')) {
+                const indi = currentRecord as GedcomIndividual;
+                target = indi; note = () => indi.notes;
+            } else if (currentType === 'FAM' && !currentFamEvent && (currentSubTag === 'MARR' || currentSubTag === 'DIV')) {
+                const fam = currentRecord as GedcomFamily;
+                target = fam; note = () => fam.note;
+            }
+            if (!target || !note) return;
+            noted ??= { target, note, head: notedHead, texts: [], body: [], sub: null };
+            noted.sub = { start: src, before: noted.note().length, tag };
+        }
+    };
 
     const { records: gedLines, noteRecords, inlineSources } = preprocessGedcomLines(lines);
 
@@ -1897,6 +3232,48 @@ export function parseGedcom(content: string): ParsedGedcom {
         const level = rec.level;
         const tag = rec.tag;
         let value = rec.value;
+        lineLevel = level;
+        lineIndex = rec.src;
+
+        // Another program's own level-1 tag being kept (spec 066 G8): the
+        // lines under it are taken from the file as written, nothing reads them.
+        if (extraBlock) {
+            if (level > 1) {
+                if (GED_POINTER.test(tag) || (GED_POINTER.test(value.trim()) && !value.startsWith('@__inline'))) extraBlock.pointer = true;
+                continue;
+            }
+            closeExtra(rec.src);
+        }
+        if (quietBelow !== null && level <= quietBelow) quietBelow = null;
+        // A deeper `_XXX` of another program that the reader takes nowhere
+        // (under an event, a citation, a name…): counted, with its lines.
+        if (level >= 2 && quietBelow === null && !inHeader && !stromApp && !stromResearch && isUnreadUnderscoreTag(tag)) drop(tag);
+        // The lines of a media record (0 @O1@ OBJE).
+        if (currentObje && level > 0) {
+            readMediaRecordLine(currentObje, level, tag, value);
+            continue;
+        }
+
+        // The lines under a record's id (spec 066 K3.2): `2 _XREF`, `2 _UID`…
+        // under `1 _STROM_IMPORT Ix`, `2 TYPE` under `1 EXID`, `3 TYPE` under
+        // `2 EXID`. Nothing else reads them.
+        if (idBlock && level <= idBlock.level) idBlock = null;
+        if (idBlock) {
+            const block = idBlock;
+            const v = value.trim();
+            if (level === block.level + 1 && block.entry) {
+                block.last = undefined;
+                if (tag === '_XREF') { if (!block.entry.xref && v) block.entry.xref = v; }
+                else if (ORIGINAL_ID_TAGS.has(tag) && v && block.entry.ids.length < ID_LINES_MAX) {
+                    block.last = { tag, value: v };
+                    block.entry.ids.push(block.last);
+                }
+            } else if (tag === 'TYPE' && v && block.last?.tag === 'EXID' && !block.last.type
+                && level === block.level + (block.entry ? 2 : 1)) {
+                block.last.type = v;
+            }
+            continue;
+        }
         // A pointer to a shared note record (1 NOTE @N1@, GEDCOM 7 SNOTE) reads
         // as the note's text wherever a NOTE may stand. A pointer to a note the
         // file never defines says nothing and is read as an empty note.
@@ -1918,14 +3295,27 @@ export function parseGedcom(content: string): ParsedGedcom {
         // Citation DATA > DATE (the entry recording date) may sit under a
         // citation at any depth — on the person, a name, an event, a family —
         // so it is tracked here by level, apart from the per-record dispatch.
-        if (citeLevel !== null && level <= citeLevel) { citeLevel = null; citeRef = null; inCiteData = false; }
+        if (citeLevel !== null && level <= citeLevel) { citeLevel = null; citeRef = null; inCiteData = false; citeKeep = null; }
         if (tag === 'SOUR' && level > 0 && currentType !== 'SOUR' && GED_POINTER.test(value)) {
-            citeLevel = level; citeRef = value; inCiteData = false;
+            citeLevel = level; citeRef = value; inCiteData = false; citeLine = rec.src; citeKeep = null;
         } else if (citeLevel !== null && citeRef) {
             if (level === citeLevel + 1) inCiteData = tag === 'DATA';
-            else if (level === citeLevel + 2 && inCiteData && tag === 'DATE' && value
-                && !citationDates.has(citeRef)) {
-                citationDates.set(citeRef, parseGedcomDate(value));
+            else if (level === citeLevel + 2 && inCiteData && tag === 'DATE' && value) {
+                const date = parseGedcomDate(value);
+                if (!citationDates.has(citeRef)) citationDates.set(citeRef, date);
+                // The date of this very citation (one read through cite()).
+                const c = currentCitation as CitationSlot | null;
+                if (c && c.id === citeRef && c.line === citeLine && c.date === undefined) c.date = date;
+            }
+            // What the citation says that Strom does not read (DATA > TEXT, EVEN > ROLE)
+            // is kept as written for "Back to {prog}" (not from the research's files).
+            if (level === citeLevel + 1) citeKeep = tag === 'EVEN' ? 'even' : null;
+            else if (level === citeLevel + 2 && inCiteData) citeKeep = tag === 'TEXT' ? 'text' : null;
+            const c = currentCitation as CitationSlot | null;
+            if (citeKeep && !stromResearch && c && c.id === citeRef && c.line === citeLine) {
+                const kept = lines[rec.src].trimStart().replace(/^\d+/, String(level - citeLevel));
+                if (citeKeep === 'text') (c.dataText ??= []).push(kept);
+                else (c.even ??= []).push(kept);
             }
         }
 
@@ -1971,7 +3361,12 @@ export function parseGedcom(content: string): ParsedGedcom {
                 continue;
             }
             if (level <= openDetail.level) flushDetail();
+            else if (level === openDetail.level + 1 && openDetail.parts && ADDRESS_PART_TAGS.has(tag)
+                && value.trim() && !ADDRESS_PART_LABEL.test(value.trim())) {
+                openDetail.parts.push(value.trim());
+            }
         }
+        readNoted(rec.src, level, tag);
         if (level === 2 && (tag === 'AGE' || tag === 'CAUS' || tag === 'ADDR' || tag === 'DATE')) {
             const sink = factDetailSink();
             if (sink && tag === 'DATE') {
@@ -1982,10 +3377,22 @@ export function parseGedcom(content: string): ParsedGedcom {
                 const phrase = gedcomDatePhrase(value);
                 if (phrase) sink(strings.gedcomNotes.datePhrase(phrase));
             } else if (tag !== 'DATE') {
-                // ADDR: only its own value and CONT lines. ADR1/CITY/POST
-                // repeat the place or carry junk ("ADR1 Email", MyHeritage).
+                // ADDR: its own value and CONT lines; its ADR1 / CITY / POST
+                // repeat that, so they are the address only where the ADDR
+                // line has none (MyHeritage writes `2 ADDR` / `3 ADR1 Ulice 5`).
+                // A field's label written as its value ("ADR1 Email",
+                // MyHeritage) is no address.
                 const done = detailTarget(tag);
-                if (done) openDetail = { level, text: value, done, sep: tag === 'ADDR' ? ', ' : '\n' };
+                if (done) {
+                    openDetail = { level, text: value, done, sep: tag === 'ADDR' ? ', ' : '\n' };
+                    if (tag === 'ADDR') {
+                        openDetail.parts = [];
+                        if (currentType === 'INDI' && currentEvent && !stromResearch) {
+                            openDetail.start = rec.src;
+                            openDetail.event = currentEvent;
+                        }
+                    }
+                }
             }
         } else if (level === 3 && tag === 'AGE' && currentType === 'FAM' && currentSubTag === 'MARR'
             && (currentFactSubTag === 'HUSB' || currentFactSubTag === 'WIFE')) {
@@ -1997,6 +3404,113 @@ export function parseGedcom(content: string): ParsedGedcom {
             // 1 MARB / 2 HUSB / 3 AGE 25y — each partner's age at the banns.
             const done = detailTarget(tag, currentFamEventSubTag);
             if (done) openDetail = { level, text: value, done, sep: ' ' };
+        }
+
+        // The research's origin of a fact (spec 066): read from a file Strom
+        // wrote (the research's, or the app's own export carrying it back; the
+        // header comes first), apart from the fact's own lines. Another
+        // program's file reads these lines as before (an unknown tag).
+        if (openWas && level <= openWas.level) openWas = null;
+        if (openWas) {
+            if (level === openWas.level + 1) {
+                const w = openWas.was;
+                if (tag === IMPORT_TAG) w.importId = value.trim();
+                else if (tag === '_PART') w.parts.push(value.trim());
+                else if (tag === '_REF') w.ref = value.trim();
+                else if (tag === 'CONC') w.value += value;
+                else if (tag === 'CONT') w.value += '\n' + value;
+            }
+            continue;
+        }
+        if (openChecked && level <= openChecked.level) openChecked = null;
+        if (openChecked) {
+            const c = openChecked.checked;
+            if (level === openChecked.level + 1) {
+                openChecked.field = tag;
+                if (tag === 'DATE') c.date = value.trim();
+                else if (tag === '_WHY') c.why = value;
+                else if (tag === '_READERS') c.readers = value.trim();
+            } else if (level === openChecked.level + 2 && openChecked.field === '_WHY' && c.why !== undefined) {
+                if (tag === 'CONC') c.why += value;
+                else if (tag === 'CONT') c.why += '\n' + value;
+            }
+            continue;
+        }
+        if (openEid && level <= openEid.level) openEid = null;
+        if (openEid) {
+            if (level === openEid.level + 1 && tag === '_TXT' && openEid.verify) openEid.verify.txt = value.trim();
+            continue;
+        }
+        if (openPending && level <= openPending.level) openPending = null;
+        if (openPending) {
+            if (level === openPending.level + 1 && tag === '_POS' && openPending.verify) openPending.verify.position = value.trim();
+            continue;
+        }
+        if ((stromResearch || stromApp) && level === 2 && currentRecord && !currentResearch && (currentType === 'INDI' || currentType === 'FAM')
+            && (tag === '_STROM_CONFIRMED' || tag === '_STROM_VERIFY' || tag === '_STROM_CHECKED' || tag === '_STROM_EID')) {
+            // The research's re-verification of the fact and its id there
+            // (spec 065); whether the file is trusted with it is the converter's call.
+            const o = factOriginTarget();
+            const v = o ? (o.verify ??= {}) : null;
+            if (tag === '_STROM_CONFIRMED') { if (v) v.confirmed = value.trim(); }
+            else if (tag === '_STROM_EID') {
+                if (v) v.eid = value.trim();
+                openEid = { level, verify: v };
+            }
+            else if (tag === '_STROM_VERIFY') {
+                if (v) v.pending = value.trim();
+                openPending = { level, verify: v };
+            } else {
+                const checked = { result: value.trim() };
+                if (v) v.checked = checked;
+                openChecked = { level, checked };
+            }
+            continue;
+        }
+        if ((stromResearch || stromApp) && level === 2 && currentRecord && !currentResearch && (currentType === 'INDI' || currentType === 'FAM')
+            && (tag === '_STROM_ORIGIN' || tag === '_STROM_WAS' || (tag === 'SOUR' && GED_POINTER.test(value)))) {
+            const o = factOriginTarget();
+            if (tag === '_STROM_ORIGIN') {
+                if (o) o.origin = value;
+                continue;
+            }
+            if (tag === '_STROM_WAS') {
+                const was = { value, parts: [] as string[] };
+                if (o) o.was.push(was);
+                openWas = { level, was };
+                continue;
+            }
+            // The citation stays the fact's own as well (read below).
+            if (o) o.sourceRefs.push(value.trim());
+        }
+
+        // 2 _STROM_IMPORT under a fact of a person or a couple: which import the
+        // fact (or the listed parts of it) still comes from. Read here so no
+        // fact's own reading takes it for one of its lines; whether the file
+        // is trusted with it is the converter's call. Level 3 (under the
+        // research's _STROM_WAS) is never a mark of the fact.
+        if (level === 2 && tag === IMPORT_TAG && currentRecord && !currentResearch
+            && (currentType === 'INDI' || currentType === 'FAM')) {
+            const mark = readImportMark(value);
+            if (mark && currentType === 'INDI') {
+                const indi = currentRecord as GedcomIndividual;
+                const fact = currentEvent ? null
+                    : currentSubTag === 'NAME' ? (currentNameSlot === -1 ? 'name' : null)
+                    : currentSubTag === 'SEX' ? 'sex'
+                    : currentSubTag === 'BIRT' ? 'birth'
+                    : currentSubTag === 'DEAT' ? 'death' : null;
+                if (currentEvent) (currentEvent.imports ??= []).push(mark);
+                else if (fact) ((indi.factImports ??= {})[fact] ??= []).push(mark);
+            } else if (mark) {
+                const fam = currentRecord as GedcomFamily;
+                if (currentFamEvent) (currentFamEvent.imports ??= []).push(mark);
+                else if (currentSubTag === 'MARR' || currentSubTag === 'DIV') {
+                    ((fam.factImports ??= {})[currentSubTag === 'MARR' ? 'marriage' : 'divorce'] ??= []).push(mark);
+                } else if (currentSubTag === 'CHIL' && fam.lastChil && !fam.childImports?.has(fam.lastChil)) {
+                    (fam.childImports ??= new Map()).set(fam.lastChil, mark.id);
+                }
+            }
+            continue;
         }
 
         if (level === 0) {
@@ -2013,6 +3527,8 @@ export function parseGedcom(content: string): ParsedGedcom {
             // must never reach the unsupported-tag summary.
             const recordType = hasXref ? value.split(/\s+/)[0] : tag;
             const recordId = hasXref ? tag : `@__anon${anonRecordSeq++}__@`;
+            currentObje = null;
+            objeSubTag = null;
 
             if (recordType === 'INDI') {
                 currentRecord = {
@@ -2060,6 +3576,15 @@ export function parseGedcom(content: string): ParsedGedcom {
                 currentRecord = null;
                 currentType = 'SOUR';
                 sources.set(recordId, currentSource);
+            } else if (recordType === 'OBJE' && hasXref) {
+                // A media record (spec 066 G8): `1 OBJE @O1@` links of people
+                // and sources take its file like an OBJE written in place.
+                currentObje = { title: '', form: '', file: '', stromKind: '' };
+                mediaRecords.set(recordId, currentObje);
+                mediaRecordLines.set(recordId, rec.src);
+                currentRecord = null;
+                currentType = null;
+                currentSource = null;
             } else if (recordType === 'REPO') {
                 currentRepoId = recordId;
                 repositories.set(recordId, '');
@@ -2080,9 +3605,12 @@ export function parseGedcom(content: string): ParsedGedcom {
                     note: '',
                     events: [],
                     sourceRefs: [],
+                    divorceSourceRefs: [],
                     marriageParticipants: [],
                     childRels: new Map(),
-                    noteFacts: []
+                    noteFacts: [],
+                    recordLine: rec.src,
+                    ...(stromResearch ? { firstMarriageOnly: true } : {}),
                 };
                 currentType = 'FAM';
                 currentSource = null;
@@ -2104,15 +3632,38 @@ export function parseGedcom(content: string): ParsedGedcom {
             currentResearch = null;
             currentMedia = null;
             currentMediaSubTag = null;
-            currentCitationId = null; currentCitationSlot = null;
+            currentCitationId = null; currentCitationSlot = null; currentCitation = null;
             currentPlaceValue = null;
             inHeader = recordType === 'HEAD';
+            openHeadDirection = null;
+            inNoteRecord = recordType === 'NOTE' || recordType === 'SNOTE';
             inSurnameNote = false;
             if (recordType !== 'REPO') currentRepoId = null;
         } else if (inHeader) {
-            // Header sub-lines. The only one we read is the surname-groups NOTE
-            // (see the exporter's SURNAME_GROUPS_MARKER); everything else in the
-            // header is bookkeeping the data model does not carry.
+            // Header sub-lines: the surname-groups NOTE (see the exporter's
+            // SURNAME_GROUPS_MARKER), the writer's own marks, and who wrote the
+            // file and when (the origin of a loaded file, spec 066).
+            if (level === 1) {
+                inHeadSour = tag === 'SOUR';
+                if (tag === 'SOUR') headSourValue = value.trim();
+                else if (tag === 'DATE') head.date = value.trim();
+                else if (tag === 'FILE') head.file = value.trim();
+                openHeadImport = null;
+                openHeadImportField = null;
+                if (tag === IMPORT_TAG && headImports.length < 1000) {
+                    openHeadImport = { id: value.trim() };
+                    headImports.push(openHeadImport);
+                }
+            } else if (level === 2 && inHeadSour) {
+                if (tag === 'NAME') headSourName = value.trim();
+                else if (tag === 'VERS') head.version = value.trim();
+            }
+            if (level === 2 && openHeadImport) {
+                openHeadImportField = HEAD_IMPORT_FIELDS[tag] ?? null;
+                if (openHeadImportField) openHeadImport[openHeadImportField] = value.trim();
+            } else if (level === 3 && openHeadImport && openHeadImportField && (tag === 'CONC' || tag === 'CONT')) {
+                openHeadImport[openHeadImportField] += (tag === 'CONT' ? ' ' : '') + value;
+            }
             if (level === 1) {
                 inSurnameNote = tag !== 'NOTE' ? false
                     : value.trim() === SURNAME_GROUPS_MARKER ? 'groups'
@@ -2125,7 +3676,15 @@ export function parseGedcom(content: string): ParsedGedcom {
                 if (tag === 'SOUR' && value.trim() === 'STROM_RESEARCH') stromResearch = true;
                 else if (inStromSour) stromApp = true;
                 else if (tag === '_STROM_ASOF') researchAsOf = value.trim();
+                else if (tag === '_STROM_DIRECTIONS') headDirectionsComplete = value.trim().toUpperCase() === 'Y';
                 else if (tag === '_STROM_LINES') lineageMarker = true;
+                openHeadDirection = null;
+                if ((tag === '_STROM_DIRECTION' || tag === '_STROM_BRANCH') && headDirectionBlocks.length < 5000) {
+                    openHeadDirection = { tag, value, lines: [] };
+                    headDirectionBlocks.push(openHeadDirection);
+                }
+            } else if (openHeadDirection && level >= 2) {
+                openHeadDirection.lines.push({ level, tag, value });
             } else if (level === 2 && inStromSour && tag === 'VERS') {
                 stromAppVersion = value.trim();
             } else if (inSurnameNote && level === 2 && tag === 'CONT') {
@@ -2141,6 +3700,11 @@ export function parseGedcom(content: string): ParsedGedcom {
             }
         } else if (currentRepoId !== null && level === 1 && tag === 'NAME') {
             repositories.set(currentRepoId, value);
+        } else if ((currentRepoId !== null || inNoteRecord) && level === 1) {
+            // A repository is kept as its name, a note record as its text in
+            // the places that cite it: another program's own tag on either
+            // record has nowhere to stay — counted, never lost without a word.
+            if (isUnreadUnderscoreTag(tag) && !stromApp && !stromResearch) drop(tag);
         } else if (currentType === 'SOUR' && currentSource) {
             // Source record sub-lines. reference <- PAGE (spec mapping), the
             // transcript <- TEXT, refn <- REFN, excerpts <- OBJE.
@@ -2148,18 +3712,21 @@ export function parseGedcom(content: string): ParsedGedcom {
             // The source has one note, and everything else the record says that
             // has no field of its own lands there: every NOTE (a second one used
             // to overwrite the first), the publication (PUBL), the author (AUTH)
-            // and the call number the repository files it under (REPO > CALN)
-            // — each labelled, each with its continuation lines.
+            // — each labelled, each with its continuation lines. The call number
+            // the repository files it under (REPO > CALN) is a field of its own
+            // (spec 075; the first of them when the record names several).
             const src = currentSource;
             const addLine = (line: string, sep: string): void => {
                 src.note = src.note ? `${src.note}${sep}${line}` : line;
             };
-            const plain = (text: string): string =>
-                currentSubTag === 'TEXT' || currentSubTag === 'PUBL' ? text.replace(/<[^>]*>/g, '') : text;
+            // (The TEXT is read as written, its HTML turned to text once it is whole: a tag may span lines.)
+            const plain = (text: string): string => currentSubTag === 'PUBL' ? gedcomHtmlText(text) : text;
             if (level === 1) {
                 currentSubTag = tag;
+                readingAuthor = false;
                 if (tag === 'TITL') src.title = value;
-                else if (tag === 'REPO') src.repository = value;
+                // The first archive named (as its first CALN is the call number; Strom Research reads the same).
+                else if (tag === 'REPO') { if (!src.repository) src.repository = value; }
                 else if (tag === 'PAGE') src.reference = value;
                 else if (tag === 'TEXT') {
                     // The entry's wording has a field of its own: the transcript.
@@ -2169,16 +3736,26 @@ export function parseGedcom(content: string): ParsedGedcom {
                     const label = tag === 'PUBL' ? strings.gedcomNotes.sourcePublication
                         : strings.gedcomNotes.sourceAuthor;
                     addLine(label(plain(value).trim()).trimEnd(), '\n');
+                    // The author as written too: "Back to {prog}" gives it back as AUTH (spec 066 K3.1).
+                    if (tag === 'AUTH' && src.author === undefined) { src.author = value.trim(); readingAuthor = true; }
                 }
                 else if (tag === 'REFN') { if (value) src.refn = value; }
                 else if (tag === '_STROM_VERIFIED') { if (value.trim().toUpperCase() === 'Y') src.verified = true; }
+                // Where the entry stands, field by field (spec 075): the PAGE is then composed of them.
+                else if (tag === '_STROM_FOLIO') { src.placeFields = true; if (value.trim()) src.folio = value.trim(); }
+                else if (tag === '_STROM_IMAGE') { src.placeFields = true; if (value.trim()) src.image = value.trim(); }
+                else if (tag === '_STROM_LOCATOR') { src.placeFields = true; if (value.trim()) src.locator = value; }
                 else if (tag === '_STROM_READ') {
                     const who = value.trim().toLowerCase();
                     if (who === 'user' || who === 'research' || who === 'both') src.readBy = who;
                 }
+                else if (tag === '_STROM_ORIG') { if (value.trim().toUpperCase() === 'Y') src.original = true; }
                 else if (tag === '_STROM_READING') { if (/^D\d{14}-[0-9a-f]{4}$/.test(value.trim())) src.reading = value.trim(); }
                 else if (tag === '_STROM_SHA') src.readingSha = normalizeSha256(value) ?? undefined;
-                else if (tag === 'OBJE') src.media.push({ title: '', file: '' });
+                else if (tag === IMPORT_TAG) { const mark = readImportMark(value); if (mark) src.importMark = mark.id; }
+                // The record's ids in the program that wrote the file (`1 RIN MH:S1`), for "Back to {prog}".
+                else if (ORIGINAL_ID_TAGS.has(tag)) readFileId(src, tag, value);
+                else if (tag === 'OBJE') src.media.push({ title: '', file: '', ...(GED_POINTER.test(value.trim()) ? { ref: value.trim() } : {}) });
                 else if (tag === '_STROM_IMG_OMITTED') src.imageHeld = imageHeldReason(value);
                 else if (tag === 'QUAY') { const q = parseInt(value, 10); if (q >= 0 && q <= 3) src.quality = q; }
                 else if (tag === 'WWW' || tag === 'URL') src.url = value;
@@ -2189,10 +3766,16 @@ export function parseGedcom(content: string): ParsedGedcom {
                 // The short title some programs write beside (or instead of)
                 // TITL: the title when there is no other.
                 else if (tag === 'ABBR') src.abbr = value;
+                // Another program's own tag (MyHeritage's _TYPE, _MEDI): kept as
+                // written for "Back to {prog}" (spec 066 G8), like a person's.
+                else if (tag.startsWith('_') && keepsExtra(tag) && (!IGNORED_BOOKKEEPING_TAGS.has(tag) || KEPT_BOOKKEEPING_TAGS.has(tag))) {
+                    extraBlock = { target: src, tag, start: rec.src, pointer: GED_POINTER.test(value.trim()), quiet: KEPT_BOOKKEEPING_TAGS.has(tag) };
+                }
                 // Anything else on the record (DATA, OBJE, REFN …) reached us
                 // and was not read — the contract says so, and so does the summary.
                 else if (!IGNORED_BOOKKEEPING_TAGS.has(tag)) drop(tag);
             } else if (level === 2) {
+                sourceLevel2Tag = tag;
                 // Multi-line continuations for title / note / the labelled lines.
                 if (currentSubTag === 'TITL') {
                     if (tag === 'CONT') src.title += '\n' + value;
@@ -2204,15 +3787,29 @@ export function parseGedcom(content: string): ParsedGedcom {
                     || currentSubTag === 'PUBL' || currentSubTag === 'AUTH') {
                     if (tag === 'CONT') src.note += (src.note ? '\n' : '') + plain(value);
                     else if (tag === 'CONC') src.note += plain(value);
+                    if (readingAuthor && tag === 'CONT') src.author += '\n' + value;
+                    else if (readingAuthor && tag === 'CONC') src.author += value;
+                } else if (currentSubTag === IMPORT_TAG && tag === '_XREF') {
+                    const xref = value.trim();
+                    if (GED_POINTER.test(xref) && src.importXref === undefined) src.importXref = xref.slice(1, -1);
+                } else if (currentSubTag === IMPORT_TAG && ORIGINAL_ID_TAGS.has(tag) && value.trim()
+                    && (src.importIdLines?.length ?? 0) < ID_LINES_MAX) {
+                    (src.importIdLines ??= []).push({ tag, value: value.trim() });
                 } else if (currentSubTag === '_STROM_IMG_OMITTED' && tag === '_STROM_CLIP') {
                     const mark = value.trim();
                     if (/^[A-Za-z0-9-]{1,32}$/.test(mark) && !src.heldClips?.includes(mark)) {
                         (src.heldClips ??= []).push(mark);
                     }
+                } else if (currentSubTag === '_STROM_READ' && tag === '_CONF') {
+                    const day = value.trim();
+                    if (src.readBy && isConfirmDay(day)) src.readConfirmed = day;
+                } else if (currentSubTag === '_STROM_READ' && tag === '_TXT') {
+                    const mark = value.trim();
+                    if (src.readBy && isTranscriptMark(mark)) src.readMark = mark;
                 } else if (currentSubTag === '_STROM_READING' && tag === '_STROM_ENTRY') {
                     if (src.reading && /^[A-Za-z][A-Za-z0-9_-]{0,20}$/.test(value.trim())) src.readingEntry = value.trim();
                 } else if (currentSubTag === 'REPO' && tag === 'CALN' && value) {
-                    addLine(strings.gedcomNotes.sourceCallNumber(value), '\n');
+                    if (src.callNumber === undefined && value.trim()) src.callNumber = value.trim();
                 } else if (currentSubTag === 'OBJE' && src.media.length > 0) {
                     const media = src.media[src.media.length - 1];
                     sourceMediaSubTag = tag;
@@ -2229,6 +3826,10 @@ export function parseGedcom(content: string): ParsedGedcom {
             } else if (level === 3 && currentSubTag === 'OBJE' && sourceMediaSubTag === 'FILE'
                 && tag === 'CONC' && src.media.length > 0) {
                 src.media[src.media.length - 1].file += value;
+            } else if (level === 3 && currentSubTag === IMPORT_TAG && tag === 'TYPE' && value.trim()) {
+                // `3 TYPE` under `2 EXID` of the record's `1 _STROM_IMPORT`: the system of that id.
+                const last = src.importIdLines?.[src.importIdLines.length - 1];
+                if (last?.tag === 'EXID' && !last.type && sourceLevel2Tag === 'EXID') last.type = value.trim();
             }
         } else if (currentRecord) {
             if (level === 1) {
@@ -2238,12 +3839,13 @@ export function parseGedcom(content: string): ParsedGedcom {
                 currentFamEvent = null;
                 currentFamEventSubTag = null;
                 currentFactSubTag = null;
+                laterUnionRecord = false;
                 currentStory = null;
                 currentStorySubTag = null;
                 currentResearch = null;
                 if (tag !== 'OBJE') currentMedia = null;
                 currentMediaSubTag = null;
-                if (tag !== 'SOUR') { currentCitationId = null; currentCitationSlot = null; }
+                if (tag !== 'SOUR') { currentCitationId = null; currentCitationSlot = null; currentCitation = null; }
 
                 if (currentType === 'INDI') {
                     const indi = currentRecord as GedcomIndividual;
@@ -2271,6 +3873,24 @@ export function parseGedcom(content: string): ParsedGedcom {
                         }
                         case 'SEX':
                             indi.sex = value;
+                            break;
+                        case IMPORT_TAG:
+                            // The import the person came from, with the person's
+                            // ids in it (read from app files only).
+                            readRecordImport(indi, value);
+                            break;
+                        case XID_TAG:
+                            // The person's ids in an import it did not come from.
+                            readRecordImport(indi, value, true);
+                            break;
+                        case '_UID': case 'UID': case 'RIN': case 'EXID': case '_FSFTID': case 'AFN':
+                            // The person's ids in the program that wrote the file.
+                            readFileId(indi, tag, value);
+                            break;
+                        case '_STROM_SEX_ORIGIN':
+                            // The research's origin of the sex (spec 066), Strom's own files only.
+                            if (stromResearch || stromApp) ((indi.factOrigins ??= {}).sex ??= { was: [], sourceRefs: [] }).origin = value;
+                            else drop(tag);
                             break;
                         case '_STROM_LINE': {
                             // The person's lineage correction (data v14); an
@@ -2317,7 +3937,10 @@ export function parseGedcom(content: string): ParsedGedcom {
                         case '_STROM_HYPO':
                         case '_STROM_SEARCHED':
                         case '_STROM_EDGE':
-                        case '_STROM_ISLAND': {
+                        case '_STROM_ISLAND':
+                        case '_STROM_DIRECTION':
+                        case '_STROM_WAIT':
+                        case '_STROM_ADDED': {
                             // What Strom Research knows about the person. Only
                             // its own files are trusted with it; elsewhere the
                             // tag is as unknown as it always was.
@@ -2327,7 +3950,7 @@ export function parseGedcom(content: string): ParsedGedcom {
                                 research.conflicts.push({ id: value.trim(), fact: '', title: '', stat: '', take: '', values: [] });
                                 currentResearch = { kind: 'conflict', sub: null };
                             } else if (tag === '_STROM_HYPO') {
-                                research.hypotheses.push({ id: value.trim(), title: '', note: '', stat: '', chosen: '', variants: [] });
+                                research.hypotheses.push({ id: value.trim(), title: '', note: '', stat: '', chosen: '', by: '', deci: '', at: '', variants: [], pick: '', left: '' });
                                 currentResearch = { kind: 'hypo', sub: null };
                             } else if (tag === '_STROM_EDGE' || tag === '_STROM_ISLAND') {
                                 // A snapshot: one per person (a second replaces the first).
@@ -2335,6 +3958,15 @@ export function parseGedcom(content: string): ParsedGedcom {
                                 if (tag === '_STROM_EDGE') research.edge = block;
                                 else research.island = block;
                                 currentResearch = { kind: tag === '_STROM_EDGE' ? 'edge' : 'island', sub: null };
+                            } else if (tag === '_STROM_DIRECTION' || tag === '_STROM_WAIT') {
+                                // Several per person: each its own block.
+                                const block = { value, lines: [] };
+                                if (tag === '_STROM_DIRECTION') (research.directions ??= []).push(block);
+                                else (research.waits ??= []).push(block);
+                                currentResearch = { kind: tag === '_STROM_DIRECTION' ? 'direction' : 'wait', sub: null };
+                            } else if (tag === '_STROM_ADDED') {
+                                research.added = value.trim();
+                                currentResearch = null;
                             } else {
                                 research.searched.push({ title: '', date: '', resn: '', at: '' });
                                 currentResearch = { kind: 'searched', sub: null };
@@ -2371,7 +4003,12 @@ export function parseGedcom(content: string): ParsedGedcom {
                             }
                             break;
                         case 'OBJE': {
+                            // Written in place, or a link to a media record (`1 OBJE @O1@`).
                             const media: RawMedia = { title: '', form: '', file: '', stromKind: '' };
+                            if (GED_POINTER.test(value.trim())) {
+                                media.ref = value.trim();
+                                if (level === 1) media.linkLine = rec.src;
+                            } else if (level === 1) media.rawLine = rec.src;
                             indi.media.push(media);
                             currentMedia = media;
                             break;
@@ -2388,6 +4025,13 @@ export function parseGedcom(content: string): ParsedGedcom {
                                 if (value && eventValueIsOnTag(evType)) ev.note = value;
                                 // `1 _MILT Army`: the service itself, kept as the note.
                                 else if (value && evType === 'military' && value !== 'Y') ev.note = value;
+                                // What a program wrote on a line GEDCOM gives no value
+                                // (`1 EDUC Gymnázium`, `1 BURI By the church, grave 12`):
+                                // the note's first line, and as written for "Back to {prog}".
+                                else if (value && value !== 'Y') {
+                                    ev.note = value;
+                                    if (!stromResearch) ev.lineValue = value;
+                                }
                                 indi.events.push(ev);
                                 currentEvent = ev;
                             } else if (tag === 'EVEN' || tag === 'CENS') {
@@ -2407,9 +4051,18 @@ export function parseGedcom(content: string): ParsedGedcom {
                                 // No field of its own, but the register said it:
                                 // keep it as a labelled line in the note.
                                 indi.noteFacts.push({ tag, value, date: '', place: '' });
+                            } else if (KEPT_BOOKKEEPING_TAGS.has(tag) && keepsExtra(tag)) {
+                                // Its change stamp: back with the record, never in the summary.
+                                extraBlock = { target: indi, tag, start: rec.src, pointer: false, quiet: true };
                             } else if (!KNOWN_INDI_TAGS.has(tag) && tag !== 'BIRT' && tag !== 'DEAT'
                                 && !IGNORED_BOOKKEEPING_TAGS.has(tag)) {
-                                drop(tag);
+                                // Another program's own tag: kept as written for
+                                // "Back to {prog}" (spec 066 G8); anything else counted.
+                                if (tag.startsWith('_') && keepsExtra(tag)) {
+                                    extraBlock = { target: indi, tag, start: rec.src, pointer: GED_POINTER.test(value.trim()) };
+                                } else {
+                                    drop(tag);
+                                }
                             }
                             break;
                         }
@@ -2441,8 +4094,23 @@ export function parseGedcom(content: string): ParsedGedcom {
                             // Strom's relationship status (see resolveStatTag).
                             fam.stat = value;
                             break;
+                        case '_RELATIONSHIP_STATUS':
+                            // The same status in another program's tag. A value
+                            // it does not know stays unsupported (MARR/DIV decide).
+                            if (statusFromStat(value)) fam.relationshipStatus = value;
+                            else drop(tag);
+                            break;
                         case '_STROM_NO_COUPLE':
                             fam.noCouple = value !== 'N';
+                            break;
+                        case IMPORT_TAG:
+                            readRecordImport(fam, value);
+                            break;
+                        case XID_TAG:
+                            readRecordImport(fam, value, true);
+                            break;
+                        case '_UID': case 'UID': case 'RIN': case 'EXID': case '_FSFTID': case 'AFN':
+                            readFileId(fam, tag, value);
                             break;
                         case 'NOTE':
                             fam.note = fam.note ? `${fam.note}\n${value}` : value;
@@ -2450,6 +4118,7 @@ export function parseGedcom(content: string): ParsedGedcom {
                         case 'DIV':
                             // A bare DIV (no date sub-record) still means divorced.
                             fam.divorced = true;
+                            laterUnionRecord = !isFactUnionRecord(fam, 'divorce');
                             fam.unionEvents.push({ type: 'divorce', date: '' });
                             break;
                         case 'SOUR':
@@ -2457,6 +4126,7 @@ export function parseGedcom(content: string): ParsedGedcom {
                             if (value) cite(fam.sourceRefs, value);
                             break;
                         case 'MARR':
+                            laterUnionRecord = !isFactUnionRecord(fam, 'marriage');
                             fam.unionEvents.push({ type: 'marriage', date: '' });
                             break;
                         case '_STORY':
@@ -2483,6 +4153,19 @@ export function parseGedcom(content: string): ParsedGedcom {
                             }
                             if (NOTED_FAM_TAGS.has(tag)) {
                                 fam.noteFacts.push({ tag, value, date: '', place: '' });
+                            } else if (tag === 'OBJE' && GED_POINTER.test(value.trim())) {
+                                // A family's link to a media record: its lines are kept
+                                // for "Back to {prog}" below; a record nothing takes is
+                                // counted once (convertToStrom).
+                                if (level === 1 && keepsExtra(tag)) (fam.mediaLinks ??= []).push({ ref: value.trim(), line: rec.src });
+                            } else if (tag === 'OBJE' && level === 1 && keepsExtra(tag)) {
+                                // A family's picture written in place: Strom has no
+                                // picture of a couple, so its lines are kept as written
+                                // for "Back to {prog}" (spec 066 G8).
+                                extraBlock = { target: fam, tag, start: rec.src, pointer: false };
+                            } else if (tag.startsWith('_') && !KNOWN_FAM_TAGS.has(tag)
+                                && (!IGNORED_BOOKKEEPING_TAGS.has(tag) || KEPT_BOOKKEEPING_TAGS.has(tag)) && keepsExtra(tag)) {
+                                extraBlock = { target: fam, tag, start: rec.src, pointer: GED_POINTER.test(value.trim()), quiet: KEPT_BOOKKEEPING_TAGS.has(tag) };
                             } else if (!KNOWN_FAM_TAGS.has(tag) && !IGNORED_BOOKKEEPING_TAGS.has(tag)) {
                                 drop(tag);
                             }
@@ -2495,6 +4178,9 @@ export function parseGedcom(content: string): ParsedGedcom {
                 const open = currentResearch;
                 if (open.kind === 'edge' || open.kind === 'island') {
                     (open.kind === 'edge' ? research.edge : research.island)?.lines.push({ level, tag, value });
+                } else if (open.kind === 'direction' || open.kind === 'wait') {
+                    const blocks = open.kind === 'direction' ? research.directions : research.waits;
+                    blocks?.[blocks.length - 1]?.lines.push({ level, tag, value });
                 } else if (open.kind === 'conflict') {
                     const c = research.conflicts[research.conflicts.length - 1];
                     const lastValue = (): RawResearchValue | undefined =>
@@ -2505,6 +4191,7 @@ export function parseGedcom(content: string): ParsedGedcom {
                         else if (tag === 'TITL') c.title = value;
                         else if (tag === 'STAT') c.stat = value;
                         else if (tag === '_STROM_TAKE') c.take = value;
+                        else if (tag === '_STROM_KIND') c.kind = value;
                         else if (tag === 'VAL') c.values.push({ value: value.trim(), sourceRefs: [] });
                         else if (tag === 'DECI') c.decision = { value: value.trim(), sourceRefs: [] };
                     } else if (level === 3) {
@@ -2519,6 +4206,8 @@ export function parseGedcom(content: string): ParsedGedcom {
                 } else if (open.kind === 'hypo') {
                     const h = research.hypotheses[research.hypotheses.length - 1];
                     // 2 _VAR > 3 TITL (4 CONC/CONT) / 3 _LINK, _INTREE > 4 _PERS, _FAM, _PAR / 3 SOUR
+                    //          / 3 _AGAINST (4 CONC/CONT, 4 SOUR) / 3 _PEOPLE
+                    // 2 _PREV > 3 _BY, DECI (4 CONC/CONT), _AT · 2 _REOPEN > 3 TYPE, _COUNT, _STAYS · 2 _PROP > 3 DECI (4 CONC/CONT), _AT
                     const variant = open.sub === '_VAR' ? h.variants[h.variants.length - 1] : undefined;
                     if (level === 2) {
                         open.sub = tag;
@@ -2527,17 +4216,53 @@ export function parseGedcom(content: string): ParsedGedcom {
                         else if (tag === 'NOTE') h.note = h.note ? `${h.note}\n${value}` : value;
                         else if (tag === 'STAT') h.stat = value;
                         else if (tag === '_CHOSEN') h.chosen = value;
-                        else if (tag === '_VAR') h.variants.push({ label: value, title: '', links: [], inTree: [], sourceRefs: [] });
+                        // Who decided it, why and when (Strom Research 1.29, spec 060).
+                        else if (tag === '_BY') h.by = value;
+                        else if (tag === 'DECI') h.deci = value;
+                        else if (tag === '_AT') h.at = value;
+                        else if (tag === '_VAR') h.variants.push({ label: value, title: '', links: [], inTree: [], sourceRefs: [], against: [], people: '' });
+                        // Deciding in the app (spec 074): one each (a second replaces the first).
+                        else if (tag === '_PICK') h.pick = value;
+                        else if (tag === '_LEFT') h.left = value;
+                        else if (tag === '_PREV') h.prev = { value, by: '', deci: '', at: '' };
+                        else if (tag === '_REOPEN') h.reopen = { value, type: '', count: '', stays: [] };
+                        else if (tag === '_PROP') h.prop = { value, deci: '', at: '' };
                     } else if (level === 3 && variant) {
                         open.sub3 = tag;
                         if (tag === 'TITL') variant.title = value;
                         else if (tag === '_LINK') variant.links.push({ kind: value.trim().toLowerCase(), persons: [], family: [], parents: [] });
                         else if (tag === '_INTREE') variant.inTree.push({ kind: value.trim().toLowerCase(), persons: [], family: [], parents: [] });
                         else if (tag === 'SOUR' && GED_POINTER.test(value)) variant.sourceRefs.push(value);
+                        else if (tag === '_AGAINST') variant.against.push({ text: value, sourceRefs: [] });
+                        else if (tag === '_PEOPLE') variant.people = value;
                     } else if (level === 3 && (tag === 'CONC' || tag === 'CONT')) {
                         const glue = tag === 'CONT' ? '\n' + value : value;
                         if (open.sub === 'TITL') h.title += tag === 'CONT' ? ' ' + value : value;
                         else if (open.sub === 'NOTE') h.note += glue;
+                        else if (open.sub === 'DECI') h.deci += glue;
+                    } else if (level === 3 && (open.sub === '_PREV' || open.sub === '_REOPEN' || open.sub === '_PROP')) {
+                        open.sub3 = tag;
+                        if (open.sub === '_PREV' && h.prev) {
+                            if (tag === '_BY') h.prev.by = value;
+                            else if (tag === 'DECI') h.prev.deci = value;
+                            else if (tag === '_AT') h.prev.at = value;
+                        } else if (open.sub === '_REOPEN' && h.reopen) {
+                            if (tag === 'TYPE') h.reopen.type = value;
+                            else if (tag === '_COUNT') h.reopen.count = value;
+                            else if (tag === '_STAYS') h.reopen.stays.push(value);
+                        } else if (open.sub === '_PROP' && h.prop) {
+                            if (tag === 'DECI') h.prop.deci = value;
+                            else if (tag === '_AT') h.prop.at = value;
+                        }
+                    } else if (level === 4 && open.sub3 === 'DECI' && (tag === 'CONC' || tag === 'CONT')) {
+                        const glue = tag === 'CONT' ? '\n' + value : value;
+                        if (open.sub === '_PREV' && h.prev) h.prev.deci += glue;
+                        else if (open.sub === '_PROP' && h.prop) h.prop.deci += glue;
+                    } else if (level === 4 && variant && open.sub3 === '_AGAINST') {
+                        const against = variant.against[variant.against.length - 1];
+                        if (tag === 'CONC') against.text += value;
+                        else if (tag === 'CONT') against.text += '\n' + value;
+                        else if (tag === 'SOUR' && GED_POINTER.test(value)) against.sourceRefs.push(value);
                     } else if (level === 4 && variant) {
                         const link = open.sub3 === '_LINK' ? variant.links[variant.links.length - 1]
                             : open.sub3 === '_INTREE' ? variant.inTree[variant.inTree.length - 1] : undefined;
@@ -2571,7 +4296,7 @@ export function parseGedcom(content: string): ParsedGedcom {
                         case '_DRAFT':
                             // The research's new version beside an approved
                             // story: trusted from its own files only.
-                            if (stromResearch) currentStory.draft = { title: '', text: '', facts: [], note: '', at: '' };
+                            if (stromResearch) currentStory.draft = { title: '', text: '', facts: [], note: '', sources: [], at: '' };
                             else drop(tag);
                             break;
                         case 'TYPE': currentStory.kind = value; break;
@@ -2580,6 +4305,8 @@ export function parseGedcom(content: string): ParsedGedcom {
                         case 'TEXT': currentStory.text = value; break;
                         case 'DATA': currentStory.facts.push(value); break;
                         case 'NOTE': currentStory.note = value; break;
+                        // A source the story rests on (Strom Research 1.26): a pointer only.
+                        case 'SOUR': if (GED_POINTER.test(value.trim())) currentStory.sources.push(value.trim()); break;
                     }
                 } else if (currentStorySubTag === '_DRAFT') {
                     // 3 TITL / TEXT / DATA / NOTE / _AT, continued at level 4 —
@@ -2592,6 +4319,7 @@ export function parseGedcom(content: string): ParsedGedcom {
                             case 'TEXT': draft.text = value; break;
                             case 'DATA': draft.facts.push(value); break;
                             case 'NOTE': draft.note = value; break;
+                            case 'SOUR': if (GED_POINTER.test(value.trim())) draft.sources.push(value.trim()); break;
                             case '_AT': draft.at = value; break;
                         }
                     } else if (draft && level === 4 && tag === 'TEXT' && currentDraftSubTag === 'DATA') {
@@ -2734,7 +4462,8 @@ export function parseGedcom(content: string): ParsedGedcom {
                         else if (tag === '_SOUR' || tag === 'SOUR') currentMedia.sourceXref = value;
                         else if (tag === '_STROM_SHA') currentMedia.sha = normalizeSha256(value) ?? undefined;
                         else if (tag === '_STROM_ORIENT' && /^[2-8]$/.test(value.trim())) currentMedia.orient = Number(value.trim());
-                        else if ((tag === '_PRIM' || tag === '_PERSONALPHOTO') && value === 'Y') currentMedia.primary = true;
+                        else if ((tag === '_PRIM' || tag === '_PRIMARY' || tag === '_PERSONALPHOTO') && value === 'Y') currentMedia.primary = true;
+                        else if (tag === '_DATE') { if (!currentMedia.date) currentMedia.date = mediaDateValue(value); }
                     } else if (NOTED_INDI_TAGS.has(currentSubTag ?? '') && indi.noteFacts.length > 0) {
                         attachToFact(indi.noteFacts[indi.noteFacts.length - 1], tag, value);
                     } else if (currentSubTag === 'SOUR' && tag === 'PAGE' && currentCitationId) {
@@ -2761,6 +4490,7 @@ export function parseGedcom(content: string): ParsedGedcom {
                             const tagValue = currentEvent.tagValue;
                             if (tagValue) {
                                 currentEvent.note = currentEvent.note ? `${tagValue}\n${currentEvent.note}` : tagValue;
+                                if (!stromResearch) currentEvent.lineValue = tagValue;
                                 delete currentEvent.tagValue;
                             }
                         }
@@ -2776,13 +4506,19 @@ export function parseGedcom(content: string): ParsedGedcom {
                             // more than one line. Without this the tail of a
                             // chunked value was read as nothing and vanished on
                             // the next import.
-                            currentEvent.note = (currentEvent.note ?? '')
-                                + (tag === 'CONT' ? '\n' : '') + value;
+                            const more = (tag === 'CONT' ? '\n' : '') + value;
+                            // (Still the line's own value: it goes back on the line.)
+                            if (currentEvent.lineValue !== undefined && currentEvent.note === currentEvent.lineValue) {
+                                currentEvent.lineValue += more;
+                            }
+                            currentEvent.note = (currentEvent.note ?? '') + more;
                         } else if (tag === 'EMAIL' && value) {
-                            // MyHeritage keeps contact e-mail under RESI.
+                            // MyHeritage keeps contact e-mail under RESI: a line of
+                            // the note to read, the address itself to go back.
                             const line = strings.gedcomNotes.email(value);
                             currentEvent.note = currentEvent.note
                                 ? `${currentEvent.note}\n${line}` : line;
+                            (currentEvent.emails ??= []).push(value.trim());
                         } else if (tag === 'ASSO' && value) {
                             // Godparent/witness who has a record of their own.
                             (currentEvent.participants ??= []).push({ ref: value });
@@ -2799,15 +4535,21 @@ export function parseGedcom(content: string): ParsedGedcom {
                         noteQuay(currentCitationId, value);
                     } else if (currentSubTag === 'MARR') {
                         currentFactSubTag = tag;
+                        // The research's later record of the wedding: the date
+                        // still orders the union's course, nothing of it is the fact's.
+                        const own = !(stromResearch && laterUnionRecord);
                         if (tag === 'DATE') {
-                            fam.marriageDate = parseGedcomDate(value);
-                            noteDateForm(fam, value, fam.marriageDate);
-                            lastUnionEvent(fam, 'marriage', fam.marriageDate);
+                            const date = parseGedcomDate(value);
+                            if (own) {
+                                fam.marriageDate = date;
+                                noteDateForm(fam, value, date);
+                            }
+                            lastUnionEvent(fam, 'marriage', date);
                         }
                         // First wins: the union's startDate comes from the FIRST
                         // marriage, so its place must not drift to a later one.
-                        if (tag === 'PLAC' && !fam.marriagePlace) fam.marriagePlace = value;
-                        if (tag === '_STROM_STATUS' && !fam.marriageStatus) fam.marriageStatus = parseFactStatus(value);
+                        if (tag === 'PLAC' && own && !fam.marriagePlace) fam.marriagePlace = value;
+                        if (tag === '_STROM_STATUS' && own && !fam.marriageStatus) fam.marriageStatus = parseFactStatus(value);
                         // The marriage record's own citation, note and witnesses
                         // sit here, not on the FAM — reading only DATE/PLAC lost
                         // every one of them.
@@ -2821,12 +4563,27 @@ export function parseGedcom(content: string): ParsedGedcom {
                             fam.marriageParticipants.push({ name: value, rela: WITNESS_RELA });
                         }
                     } else if (currentSubTag === 'DIV') {
-                        if (tag === 'PLAC' && value && !fam.divorcePlace) fam.divorcePlace = value;
-                        if (tag === '_STROM_STATUS' && !fam.divorceStatus) fam.divorceStatus = parseFactStatus(value);
+                        currentFactSubTag = tag;
+                        // The divorce record's own citation (with its PAGE, QUAY
+                        // and DATA below): the divorce's, not the wedding's.
+                        if (tag === 'SOUR' && value) cite(fam.divorceSourceRefs, value);
+                        // A remark on the divorce: a line of the couple's note,
+                        // with its CONT / CONC (it was not read at all).
+                        if (tag === 'NOTE' && !GED_POINTER.test(value)) {
+                            const sink = factDetailSink();
+                            if (sink) openDetail = { level, text: value, done: sink, sep: '\n' };
+                        }
+                        // The research's later record of a divorce: as for the wedding.
+                        const own = !(stromResearch && laterUnionRecord);
+                        if (tag === 'PLAC' && value && own && !fam.divorcePlace) fam.divorcePlace = value;
+                        if (tag === '_STROM_STATUS' && own && !fam.divorceStatus) fam.divorceStatus = parseFactStatus(value);
                         if (tag === 'DATE') {
-                            fam.divorceDate = parseGedcomDate(value);
-                            noteDateForm(fam, value, fam.divorceDate);
-                            lastUnionEvent(fam, 'divorce', fam.divorceDate);
+                            const date = parseGedcomDate(value);
+                            if (own) {
+                                fam.divorceDate = date;
+                                noteDateForm(fam, value, date);
+                            }
+                            lastUnionEvent(fam, 'divorce', date);
                         }
                     } else if (currentFamEvent) {
                         const ev = currentFamEvent;
@@ -2871,7 +4628,7 @@ export function parseGedcom(content: string): ParsedGedcom {
                 }
             } else if (level === 3 && currentFactSubTag
                 && (currentSubTag === 'BIRT' || currentSubTag === 'DEAT' || currentSubTag === 'MARR'
-                    || (currentSubTag === 'NAME' && currentFactSubTag === 'SOUR'))) {
+                    || ((currentSubTag === 'NAME' || currentSubTag === 'DIV') && currentFactSubTag === 'SOUR'))) {
                 // Level-3 lines under the field-backed facts: the citation's
                 // PAGE/QUAY, a witness's RELA/NOTE, a note's continuation.
                 const indi = currentType === 'INDI' ? currentRecord as GedcomIndividual : null;
@@ -2948,8 +4705,35 @@ export function parseGedcom(content: string): ParsedGedcom {
         }
     }
 
+    // A kept block on the last lines of the file.
+    closeExtra(lines.length);
+    readNoted(lines.length, 0, '');
     // A detail line on the very last line of the file has no successor to close it.
     flushDetail();
+
+    // A divorce written ahead of the family's first wedding (PAF: `1 DIV Y`,
+    // then `1 MARR`) ends that wedding, not one before it: read in file order,
+    // the wedding came last and the couple was married again.
+    for (const fam of families.values()) fam.unionEvents = divorcesAfterFirstMarriage(fam.unionEvents);
+
+    // The lines of a couple's records when the couple has more than one, or
+    // when one record marries the two again after a divorce: kept as written
+    // for "Back to {prog}" (see JOINED_TAG, laterUnionStructures).
+    if (!stromResearch) {
+        const recordsOf = new Map<string, number>();
+        const coupleOf = (fam: GedcomFamily): string => (fam.husb && fam.wife ? [fam.husb, fam.wife].sort().join('|') : '');
+        for (const fam of families.values()) {
+            const key = coupleOf(fam);
+            if (key) recordsOf.set(key, (recordsOf.get(key) ?? 0) + 1);
+        }
+        for (const fam of families.values()) {
+            const key = coupleOf(fam);
+            const again = fam.unionEvents.some((e, i) => e.type === 'marriage' && fam.unionEvents.slice(0, i).some(d => d.type === 'divorce'));
+            if (fam.recordLine !== undefined && ((key && recordsOf.get(key)! > 1) || again)) {
+                fam.recordLines = structureAt(fam.recordLine).slice(1);
+            }
+        }
+    }
 
     // A person's surname here is the birth one (a woman's maiden name). A file
     // that lists her married name first and marks another NAME as the birth
@@ -2982,8 +4766,16 @@ export function parseGedcom(content: string): ParsedGedcom {
     // version it names (HEAD > SOUR STROM > VERS "1.0" or missing), and in the research's
     // file; from that app version on (it writes "? //") it is the surname Unknown (N13).
     const unknownIsNoSurname = stromResearch || (stromApp && appUnknownIsNoSurname(stromAppVersion));
+    // In the app's own "Back to {prog}" file a NAME marked as another
+    // program's import (`2 _STROM_IMPORT Ix`, HEAD > _STROM_IMPORT Ix > SOUR
+    // not Strom) is that program's line as written ("Son //"): read by its
+    // rules, so the file read again gives what its import gave.
+    const programOf = new Map(headImports.map(h => [h.id, h.program ?? '']));
+    const otherProgramName = (indi: GedcomIndividual): boolean => stromApp && !stromResearch
+        && (indi.factImports?.name ?? []).some(m => { const p = programOf.get(m.id); return !!p && !/^STROM(_RESEARCH)?$/i.test(p); });
     for (const indi of individuals.values()) {
-        const read = readGedcomName(indi.name, indi.primaryNameParts, { fromStrom, unknownIsNoSurname });
+        const read = readGedcomName(indi.name, indi.primaryNameParts,
+            { fromStrom, unknownIsNoSurname, ...(otherProgramName(indi) ? { descriptions: true } : {}) });
         indi.firstName = read.firstName;
         indi.lastName = read.lastName;
         if (read.description) indi.nameDescription = read.description;
@@ -2991,7 +4783,7 @@ export function parseGedcom(content: string): ParsedGedcom {
         // without a name as "? //" ("? /Unknown/" before 3.10): in its own
         // file only the first is a stand-in.
         const line = indi.name.trim();
-        if (stromApp && read.firstName === '?' && !read.lastName && line && !/^\/\s*\/$/.test(line)) indi.knownNameless = true;
+        if (stromApp && read.firstName === '?' && !read.lastName && line && !/^\/\s*\/$/.test(line) && !read.description) indi.knownNameless = true;
         if (read.titleBefore) indi.titleBefore = read.titleBefore;
         if (read.titleAfter) indi.titleAfter = read.titleAfter;
         readMarriedSurname(indi, { fromStrom, unknownIsNoSurname });
@@ -3015,17 +4807,85 @@ export function parseGedcom(content: string): ParsedGedcom {
 
     // Resolve repository pointers (1 REPO @Rx@) to names, and citation PAGEs
     // into the source's reference when the record itself carried none.
+    /** What the record itself says of its page and quality (a citation's are the citation's). */
+    const recordPage = new Map<string, string>();
+    const recordQuality = new Map<string, number | undefined>();
+    for (const src of sources.values()) {
+        recordPage.set(src.id, src.reference.trim());
+        recordQuality.set(src.id, src.quality);
+        // A record with its place field by field (spec 075): the fields hold,
+        // its PAGE is composed of them (a citation carrying that PAGE cites the
+        // record itself); the rest of the location is _STROM_LOCATOR's alone.
+        if (src.placeFields) src.reference = src.locator ?? '';
+    }
+    /** The record's own PAGE as a citation's is compared with it: as written on the record (composed, for a record with fields). */
+    const ownPage = (src: RawSource): string => src.placeFields ? recordPage.get(src.id) ?? '' : src.reference.trim();
     for (const src of sources.values()) {
         const m = src.repository.match(/^@\w+@$/);
         if (m) src.repository = repositories.get(src.repository) ?? '';
-        if (!src.reference && citationPages.has(src.id)) {
+        if (!src.reference && !src.placeFields && citationPages.has(src.id)) {
             src.reference = citationPages.get(src.id)!;
         }
         if (src.quality === undefined && citationQuality.has(src.id)) {
             src.quality = citationQuality.get(src.id);
         }
-        if (!src.recordDate && citationDates.has(src.id)) {
-            src.recordDate = citationDates.get(src.id);
+    }
+
+    // A picture by a link to a media record (a person's or a family's): the
+    // record's lines go under the link as a picture written in place (one
+    // level deeper), the link's own lines after them — the form a program
+    // reads without the record. Kept as written for "Back to {prog}" like one
+    // written in place.
+    /** The lines below line `at` of the file (deeper than it), trimmed. */
+    const linesBelow = (at: number): string[] => {
+        const out: string[] = [];
+        const top = parseInt(lines[at].trim(), 10);
+        for (let i = at + 1; i < lines.length; i++) {
+            const l = lines[i].trim();
+            if (!l) continue;
+            if (!(parseInt(l, 10) > top)) break;
+            out.push(l);
+        }
+        return out;
+    };
+    /** A link to media record `ref` (at line `linkLine`) as a picture written in place; null when it cannot be kept. */
+    const linkedMediaBlock = (ref: string, linkLine: number): string[] | null => {
+        const start = mediaRecordLines.get(ref);
+        if (start === undefined) return null;
+        const block = ['1 OBJE', ...linesBelow(start).map(l => l.replace(/^\d+/, n => String(Number(n) + 1))), ...linesBelow(linkLine)];
+        if (!validExtraBlock(block) || block.some(l => DATA_URL_IN_LINE.test(l) || /^\d+ @|\s@[^@\s]+@|^\d+ _STROM_/.test(l))) return null;
+        return block;
+    };
+
+    // A picture written in place: its lines as written, for a link that stays
+    // one (a path or an address, no file to take) — "Back to {prog}" gives it
+    // back; a link to a media record the same, as the record wrote it.
+    for (const indi of individuals.values()) {
+        for (const media of indi.media) {
+            if (media.ref && media.linkLine !== undefined) {
+                const block = linkedMediaBlock(media.ref, media.linkLine);
+                if (block) media.rawLines = block;
+                continue;
+            }
+            if (media.rawLine === undefined) continue;
+            const block = [lines[media.rawLine].trim()];
+            for (let i = media.rawLine + 1; i < lines.length; i++) {
+                const l = lines[i].trim();
+                if (!l) continue;
+                const lv = parseInt(l, 10);
+                if (!(lv >= 2)) break;
+                block.push(l);
+            }
+            media.rawLines = block;
+        }
+    }
+
+    for (const fam of families.values()) {
+        for (const link of fam.mediaLinks ?? []) {
+            const block = linkedMediaBlock(link.ref, link.line);
+            if (!block) continue;
+            (fam.extras ??= []).push({ tag: 'OBJE', lines: block });
+            (fam.keptMedia ??= []).push(link.ref);
         }
     }
 
@@ -3033,24 +4893,88 @@ export function parseGedcom(content: string): ParsedGedcom {
     // here a source is the entry and its reference the page, so a citation of
     // another page than the source's gets a source of its own — same book,
     // its page. With one source for all, every citation showed the first page
-    // and the export wrote it to each of them.
+    // and the export wrote it to each of them. An entry's date (DATA > DATE)
+    // is the entry's too: the same page cited with another date is another
+    // entry, and a citation without one is not given one (spec 066 K3.1).
+    // Its QUAY is the citation's own (spec 077): the same page cited at two
+    // facts with another QUAY each is one entry, each citation keeps its QUAY.
     const pageSources = new Map<string, string>();
-    for (const c of pagedCitations) {
+    /** The date, QUAY and unread lines the record's own citations carry: the first of them says them. */
+    const ownCite = new Map<string, { date: string; quay: number | undefined; kept: string }>();
+    /** Each citation's QUAY and the source it cites now (the record, or a page's source of its own). */
+    const citedQuay: { c: CitationSlot; target: string; quay: number | undefined }[] = [];
+    /** A citation's unread lines as a kept block (CITE_TAG): none, or `1 _STROM_CITE` and its lines a level deeper. */
+    const citeBlock = (c: CitationSlot): string[] => {
+        const body = [...(c.dataText?.length ? ['1 DATA', ...c.dataText] : []), ...(c.even ?? [])];
+        const block = body.length ? [`1 ${CITE_TAG}`, ...body.map(l => l.replace(/^\d+/, n => String(Number(n) + 1)))] : [];
+        return validExtraBlock(block) ? block : [];
+    };
+    for (const c of citations) {
         const src = sources.get(c.id);
-        if (!src || c.page === src.reference.trim()) continue;
-        const key = `${c.id}\u0000${c.page}`;
+        if (!src || c.list[c.index] !== c.id) continue;
+        // A citation without a page cites the record's own page, if it has one (not another citation's).
+        const page = c.page || recordPage.get(c.id) || '';
+        const date = c.date ?? '';
+        const quay = c.quay ?? recordQuality.get(c.id);
+        const block = citeBlock(c);
+        const kept = block.join('\n');
+        if (page === ownPage(src)) {
+            if (!ownCite.has(c.id)) {
+                ownCite.set(c.id, { date, quay, kept });
+                if (block.length) (src.extras ??= []).push({ tag: CITE_TAG, lines: block, quiet: true });
+            }
+            const own = ownCite.get(c.id)!;
+            if (own.date === date && own.kept === kept) { citedQuay.push({ c, target: c.id, quay }); continue; }
+        }
+        const key = `${c.id}\u0000${page}\u0000${date}\u0000${kept}`;
         let derived = pageSources.get(key);
         if (!derived) {
             derived = `${c.id}~${pageSources.size + 1}`;
             pageSources.set(key, derived);
+            const quality = quay;
             sources.set(derived, {
-                id: derived, title: src.title, repository: src.repository, reference: c.page, url: src.url,
-                note: src.note, media: [],
+                id: derived, title: src.title, repository: src.repository, reference: page, url: src.url,
+                note: src.note, media: [], derivedFrom: c.id,
+                // Another page of the same book: its call number too (the folio and image are the record's page's).
+                ...(src.callNumber ? { callNumber: src.callNumber } : {}),
                 ...(src.abbr ? { abbr: src.abbr } : {}),
-                ...(src.quality !== undefined ? { quality: src.quality } : {}),
+                ...(quality !== undefined ? { quality } : {}),
+                ...(date ? { recordDate: date } : {}),
+                ...(src.importMark ? { importMark: src.importMark } : {}),
+                ...(src.importXref ? { importXref: src.importXref } : {}),
+                ...(src.importIdLines ? { importIdLines: src.importIdLines } : {}),
+                ...(src.fileIds ? { fileIds: src.fileIds } : {}),
+                ...(src.author !== undefined ? { author: src.author } : {}),
+                ...(block.length ? { extras: [{ tag: CITE_TAG, lines: block, quiet: true }] } : {}),
             });
         }
         c.list[c.index] = derived;
+        citedQuay.push({ c, target: derived, quay });
+    }
+    // The record's own date: that of its own citations, else (a citation read
+    // elsewhere, e.g. under a name) the first one seen, as before.
+    for (const src of sources.values()) {
+        if (src.derivedFrom) continue;
+        const own = ownCite.get(src.id);
+        // Its quality: that of its own citations (another page's QUAY is that page's).
+        if (own) {
+            if (own.quay !== undefined) src.quality = own.quay;
+            else delete src.quality;
+        }
+        if (src.recordDate) continue;
+        if (own) { if (own.date) src.recordDate = own.date; }
+        else if (citationDates.has(src.id)) src.recordDate = citationDates.get(src.id);
+    }
+    // A citation whose QUAY is not its source's keeps its own (`null`: it gave
+    // none). The first citation of a source in a list says it (a list names
+    // each source once).
+    const citationQuay = new Map<string[], Map<string, number | null | undefined>>();
+    for (const { c, target, quay } of citedQuay) {
+        const list = citationQuay.get(c.list) ?? new Map<string, number | null | undefined>();
+        citationQuay.set(c.list, list);
+        if (list.has(target)) continue;
+        const def = sources.get(target)?.quality;
+        list.set(target, quay === def ? undefined : quay ?? null);
     }
 
     closePlaceRecord();
@@ -3074,7 +4998,22 @@ export function parseGedcom(content: string): ParsedGedcom {
         ...(surnameRejections.length > 0 ? { surnameRejections } : {}),
         ...(surnameMarkers.groups || surnameMarkers.rejections ? { surnameMarkers } : {}),
         ...(lineageMarker ? { lineageMarker } : {}),
-        ...(stromResearch ? { stromResearch, ...(researchAsOf ? { researchAsOf } : {}) } : {}),
+        ...(stromResearch ? {
+            stromResearch,
+            ...(researchAsOf ? { researchAsOf } : {}),
+            ...(headDirectionsComplete || headDirectionBlocks.length > 0
+                ? { researchDirections: researchDirectionsFromHead(headDirectionsComplete, headDirectionBlocks) } : {}),
+        } : {}),
+        ...(stromApp ? { stromApp } : {}),
+        head: {
+            ...((headSourName || headSourValue) ? { program: headSourName || headSourValue } : {}),
+            ...(head.version ? { version: head.version } : {}),
+            ...(head.date ? { date: head.date } : {}),
+            ...(head.file ? { file: head.file } : {}),
+        },
+        ...((stromApp || stromResearch) && headImports.length > 0 ? { stromImports: headImports } : {}),
+        ...(mediaRecords.size > 0 ? { mediaRecords } : {}),
+        ...(citationQuay.size > 0 ? { citationQuay } : {}),
     };
 }
 
@@ -3083,8 +5022,25 @@ export function parseGedcom(content: string): ParsedGedcom {
 /**
  * Convert parsed GEDCOM data to Strom data format
  */
-export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
+export function convertToStrom(gedcom: ParsedGedcom, options: GedcomConvertOptions = {}): GedcomConversionResult {
     const { individuals, families, sources: gedSources, droppedTags } = gedcom;
+    /** A file the app or the research wrote keeps the import marks it carries (spec 066). */
+    const ownFile = !!(gedcom.stromApp || gedcom.stromResearch);
+    const readMarks = !!options.importOrigin && ownFile;
+    /**
+     * Strom's own file (the research's tree, or the app's export coming back)
+     * keeps the research's origin of facts as it carries it (spec 066).
+     * Another program's file never gives one, whatever it says.
+     */
+    const readOrigins = ownFile;
+    /** The research's origin of each event made from the file, until the end (Strom's own files only). */
+    const eventOrigins = new WeakMap<LifeEvent | CoupleEvent, RawFactOrigin>();
+    /** The marks of each event made from the file, until the end (app files only). */
+    const eventMarks = new WeakMap<LifeEvent | CoupleEvent, RawImportMark[]>();
+    /** The partnership each family became (the same couple's second family: the first one's). */
+    const famPartnership = new Map<string, Partnership>();
+    /** Parent links a family's CHIL marks as imported: child, its parents there, the import. */
+    const parentMarks: { childId: PersonId; parents: PersonId[]; importId: string }[] = [];
     /** Excerpts with a `_STROM_REGION` on their original, until the page attachments exist. */
     const excerptRegions = new Map<SourceExcerpt, { x: number; y: number; w: number; h: number }>();
 
@@ -3094,6 +5050,38 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
     let unknownSexPersons = 0;
     let otherFamilyLinks = 0;
     let skippedMedia = 0;
+    /** A media link or record not carried over: counted with the OBJEs. */
+    const skipMedia = (): void => {
+        skippedMedia++;
+        droppedTags.set('OBJE', (droppedTags.get('OBJE') ?? 0) + 1);
+    };
+    /** Media records a person's or a source's link took; the others are counted once at the end. */
+    const usedMedia = new Set<string>();
+    /**
+     * A person's link to a media record (`1 OBJE @O1@`) read as if the OBJE
+     * were written in place: the record's file and marks, the link's own
+     * title and portrait mark first. Null when the file has no such record.
+     */
+    const linkedMedia = (m: RawMedia): RawMedia | null => {
+        if (!m.ref) return m;
+        const rec = gedcom.mediaRecords?.get(m.ref);
+        if (!rec) return null;
+        usedMedia.add(m.ref);
+        return {
+            ...rec, title: m.title || rec.title, stromKind: m.stromKind || rec.stromKind,
+            note: m.note ?? rec.note, sourceXref: m.sourceXref ?? rec.sourceXref, sha: m.sha ?? rec.sha, orient: m.orient ?? rec.orient,
+            date: m.date ?? rec.date,
+            ...(m.primary || rec.primary ? { primary: true } : {}),
+        };
+    };
+    /** A source's link to a media record, the same way. */
+    const linkedSourceMedia = (m: RawSourceMedia): RawSourceMedia | null => {
+        if (!m.ref) return m;
+        const rec = gedcom.mediaRecords?.get(m.ref);
+        if (!rec) return null;
+        usedMedia.add(m.ref);
+        return { ...m, file: rec.file, title: m.title || rec.title, sha: m.sha ?? rec.sha, orient: m.orient ?? rec.orient };
+    };
 
     // Build the source catalog and a GEDCOM-id -> new-id map for citations.
     const sourceIdMap = new Map<string, string>();
@@ -3103,28 +5091,44 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
         sourceIdMap.set(gedId, newId);
         const src: Source = { id: newId, title: raw.title || raw.abbr || '?' };
         if (raw.repository) src.repository = raw.repository;
+        if (raw.callNumber) src.callNumber = raw.callNumber;
+        if (raw.folio) src.folio = raw.folio;
+        if (raw.image) src.image = raw.image;
         if (raw.reference) src.reference = raw.reference;
         if (raw.url) src.url = raw.url;
         if (raw.note) src.note = raw.note;
         if (raw.quality !== undefined) src.quality = raw.quality;
-        if (raw.transcript?.trim()) src.transcript = raw.transcript.trim();
+        const transcript = raw.transcript ? gedcomHtmlText(raw.transcript).trim() : '';
+        if (transcript) src.transcript = transcript;
+        // HTML in another program's TEXT (a link of MyHeritage): as written, for "Back to {prog}".
+        if (transcript && !gedcom.stromResearch && raw.transcript!.trim() !== transcript) src.gedcomText = raw.transcript!.trim();
         if (raw.refn) src.refn = raw.refn;
         if (raw.verified && src.transcript) src.transcriptVerified = true;
-        if (raw.readBy) src.readBy = raw.readBy;
+        if (raw.readBy) {
+            src.readBy = raw.readBy;
+            if (raw.readConfirmed) src.readConfirmed = raw.readConfirmed;
+            if (raw.readMark) src.readMark = raw.readMark;
+        }
         if (raw.reading) {
             src.reading = raw.reading;
             if (raw.readingEntry) src.readingEntry = raw.readingEntry;
         }
         if (raw.readingSha) src.readingSha = raw.readingSha;
+        if (raw.original) src.originalInResearch = true;
         if (raw.imageHeld) {
             src.imageHeld = raw.imageHeld;
             if (raw.heldClips?.length) src.heldClips = raw.heldClips;
         }
         if (raw.recordDate) src.recordDate = raw.recordDate;
+        if (raw.author !== undefined && raw.author !== '' && src.note) src.gedcomAuthor = raw.author;
         // Images on a source record are crops of its entry. Only embedded
         // raster images come in; a path or URL (another program's media
         // folder) or any other payload is skipped and counted.
-        for (const media of raw.media) {
+        for (const link of raw.media) {
+            const linked = linkedSourceMedia(link);
+            if (!linked) { skipMedia(); continue; }
+            // An image named by its hash: the image itself (or left out).
+            const media = imageRefSha(linked.file) ? { ...linked, file: resolveImageFile(linked.file, options.images) } : linked;
             const exc = media.file.startsWith('data:')
                 ? excerptFromDataUrl(media.file, { caption: media.title, pageUrl: media.pageUrl, clip: media.clip, originalSha: media.sha, orient: media.orient })
                 : null;
@@ -3132,8 +5136,7 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
             const region = exc?.originalSha ? parseRegion(media.region) : null;
             if (exc && region) excerptRegions.set(exc, region);
             if (!exc) {
-                skippedMedia++;
-                droppedTags.set('OBJE', (droppedTags.get('OBJE') ?? 0) + 1);
+                skipMedia();
                 continue;
             }
             (src.excerpts ??= []).push(exc);
@@ -3146,6 +5149,25 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
      */
     const mapRefs = (refs?: string[]): string[] =>
         [...new Set((refs ?? []).map(r => sourceIdMap.get(r)).filter((id): id is string => !!id))];
+    /**
+     * The own QUAY of a list's citations by catalog id (spec 077): those whose
+     * QUAY is not their source's; the first citation of a source says it, as
+     * mapRefs keeps it.
+     */
+    const quayOf = (refs?: string[]): Record<string, number | null> | undefined => {
+        const said = refs ? gedcom.citationQuay?.get(refs) : undefined;
+        if (!refs || !said) return undefined;
+        const out: Record<string, number | null> = {};
+        const seen = new Set<string>();
+        for (const ref of refs) {
+            const id = sourceIdMap.get(ref);
+            if (!id || seen.has(id)) continue;
+            seen.add(id);
+            const q = said.get(ref);
+            if (q !== undefined) out[id] = q;
+        }
+        return Object.keys(out).length ? out : undefined;
+    };
     /** The research's pointers in what its hypotheses say: a person's number, a family's partners. */
     const researchRefs: ResearchRefs = {
         person: xref => individuals.get(xref)?.refn || undefined,
@@ -3207,6 +5229,7 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
         if (indi.titleBefore) person.titleBefore = indi.titleBefore;
         if (indi.titleAfter) person.titleAfter = indi.titleAfter;
         if (indi.marriedSurname) person.marriedSurname = indi.marriedSurname;
+        if (indi.marriedSurname && indi.marriedFirstName) person.marriedFirstName = indi.marriedFirstName;
         if (indi.marriedSurname && indi.primaryName) person.primaryName = indi.primaryName;
 
         // Add extended info if present
@@ -3218,6 +5241,7 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
         if (indi.deceased && !indi.deathDate) person.isDeceased = true;
         if (indi.deathPlace) person.deathPlace = indi.deathPlace;
         if (indi.birthAddress) person.birthAddress = indi.birthAddress;
+        if (indi.birthAge) person.birthAge = indi.birthAge;
         if (indi.deathCause) person.deathCause = indi.deathCause;
         if (indi.deathAge) person.deathAge = indi.deathAge;
         if (indi.deathAddress) person.deathAddress = indi.deathAddress;
@@ -3232,7 +5256,13 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
         // What the file wrote in place of a name ("Mrtvě narozený"), kept as
         // written — after the rest, and only once.
         const description = indi.nameDescription;
-        if (description && !allNotes.some(n => n.split('\n').some(l => l.trim() === description))) allNotes.push(description);
+        if (description && !allNotes.some(n => n.split('\n').some(l => l.trim() === description))) {
+            allNotes.push(description);
+            // "Back to {prog}" writes the NAME as the file had it ("Son //"),
+            // not "//" and the description as a note (see NOTED_TAG).
+            const block = gedcom.stromResearch ? null : notedBlock([description], describedNameLines(indi));
+            if (block) (indi.extras ??= []).push({ tag: NOTED_TAG, lines: block, quiet: true });
+        }
         if (allNotes.length > 0) person.notes = allNotes.join('\n');
         if (indi.refn) person.refn = indi.refn;
         if (indi.question) person.question = indi.question;
@@ -3270,12 +5300,23 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
                 if (ev.address) out.address = ev.address;
                 if (ev.note) out.note = ev.note;
                 if (ev.status) out.status = ev.status;
+                if (ev.emails?.length && ev.note) out.gedcomEmails = ev.emails;
+                if (ev.lineValue && ev.note && (ev.note === ev.lineValue || ev.note.startsWith(`${ev.lineValue}\n`))) {
+                    out.gedcomValue = ev.lineValue;
+                }
+                if (ev.addressLines && ev.addressValue && ev.address === ev.addressValue) {
+                    out.gedcomAddress = { value: ev.addressValue, lines: ev.addressLines };
+                }
                 const evRefs = mapRefs(ev.sourceRefs);
                 if (evRefs.length > 0) out.sourceIds = evRefs;
+                const evQuay = quayOf(ev.sourceRefs);
+                if (evQuay) out.citationQuay = { sourceIds: evQuay };
 
                 const parts = (ev.participants ?? [])
                     .map(toParticipant).filter((p): p is EventParticipant => !!p);
                 if (parts.length > 0) out.participants = parts;
+                if (readMarks && ev.imports) eventMarks.set(out, ev.imports);
+                if (readOrigins && ev.origin) eventOrigins.set(out, ev.origin);
                 return out;
             });
         }
@@ -3344,7 +5385,7 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
         rehomeParticipants(indi.birthParticipants, 'birth');
         rehomeParticipants(indi.deathParticipants, 'death');
 
-        const story = toStory(indi.story);
+        const story = toStory(indi.story, mapRefs);
         if (story) person.story = story;
 
         const research = gedcom.stromResearch ? toPersonResearch(indi.research, mapRefs, researchRefs) : undefined;
@@ -3356,11 +5397,22 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
         if (birthRefs.length > 0) person.birthSourceIds = birthRefs;
         const deathRefs = mapRefs(indi.deathSourceRefs);
         if (deathRefs.length > 0) person.deathSourceIds = deathRefs;
+        const personQuay = {
+            ...(quayOf(indi.sourceRefs) ? { sourceIds: quayOf(indi.sourceRefs) } : {}),
+            ...(quayOf(indi.birthSourceRefs) ? { birthSourceIds: quayOf(indi.birthSourceRefs) } : {}),
+            ...(quayOf(indi.deathSourceRefs) ? { deathSourceIds: quayOf(indi.deathSourceRefs) } : {}),
+        };
+        if (Object.keys(personQuay).length) person.citationQuay = personQuay;
 
         // OBJE media: a data-URL FILE is either the portrait (Strom marker)
         // or an attachment. External file paths cannot be embedded — counted
         // as dropped so the import summary mentions them.
-        for (const media of indi.media) {
+        for (const link of indi.media) {
+            const linked = linkedMedia(link);
+            if (!linked) { skipMedia(); continue; }
+            // An image named by its hash: the image itself, else left out (never a file path).
+            const media = imageRefSha(linked.file) ? { ...linked, file: resolveImageFile(linked.file, options.images) } : linked;
+            if (!media.file && linked.file) { skipMedia(); continue; }
             if (media.file.startsWith('data:')) {
                 // Only the formats the app itself stores come in: a portrait
                 // is a raster image, a document an image or a PDF. Anything
@@ -3368,13 +5420,13 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
                 // skipped — and counted, so the summary says so.
                 const wantsPhoto = media.stromKind === 'photo';
                 if (!(wantsPhoto ? SAFE_PHOTO_DATA_URL : SAFE_ATTACHMENT_DATA_URL).test(media.file)) {
-                    skippedMedia++;
-                    droppedTags.set('OBJE', (droppedTags.get('OBJE') ?? 0) + 1);
+                    skipMedia();
                     continue;
                 }
                 if (wantsPhoto) {
                     person.photo = media.file;
                     if (media.title) person.photoOriginalName = media.title;
+                    if (media.date) person.photoDate = media.date;
                 } else {
                     const att: Attachment = {
                         id: generateId('att'),
@@ -3384,6 +5436,7 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
                         sizeBytes: Math.round((media.file.length - media.file.indexOf(',') - 1) * 0.75),
                     };
                     if (media.note) att.note = media.note;
+                    if (media.date) att.date = media.date;
                     if (media.sha) {
                         att.original = {
                             sha256: media.sha, name: att.name, mimeType: att.mimeType, bytes: 0,
@@ -3403,6 +5456,7 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
                     original: { sha256: media.sha, name, mimeType, bytes: 0, ...(media.orient ? { orientation: media.orient } : {}) },
                 };
                 if (media.note) att.note = media.note;
+                if (media.date) att.date = media.date;
                 const attSource = media.sourceXref ? sourceIdMap.get(media.sourceXref) : undefined;
                 if (attSource) att.sourceId = attSource;
                 (person.attachments ??= []).push(att);
@@ -3416,7 +5470,16 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
                     ...(media.title ? { title: media.title } : {}),
                     ...(isUrl ? { isUrl: true } : {}),
                     ...(media.primary ? { primary: true } : {}),
+                    ...(media.date ? { date: media.date } : {}),
                 };
+                // The link as the file wrote it, for "Back to {prog}" while no file
+                // takes its place (spec 066 G8): another program's file, or Strom's
+                // "Back to" file read again, where it goes back to the import the
+                // record's `1 _STROM_IMPORT Ix` names (never a picture of Strom's own).
+                if (link.rawLines && options.importOrigin && !gedcom.stromResearch
+                    && !link.rawLines.some(l => /^\d+ @|\s@[^@\s]+@|^\d+ _STROM_/.test(l))) {
+                    (indi.extras ??= []).push({ tag: 'OBJE', lines: link.rawLines, quiet: true });
+                }
                 // Primary portraits first so the photo (not a crop) wins.
                 if (media.primary) {
                     const firstOfPerson = externalMedia.findIndex(m => m.personId === personId);
@@ -3425,11 +5488,18 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
                 } else {
                     externalMedia.push(ref);
                 }
+            } else if (link.ref) {
+                // A media record with no file to take (a BLOB of GEDCOM 5.5, nothing at all).
+                skipMedia();
             }
         }
 
         persons[personId] = person;
     }
+    // A family's picture kept as written (or counted with the family's other kept tags).
+    for (const fam of gedcom.families.values()) for (const ref of fam.keptMedia ?? []) usedMedia.add(ref);
+    // Media records no person, family or source took (one nobody links): counted once each.
+    for (const ref of gedcom.mediaRecords?.keys() ?? []) if (!usedMedia.has(ref)) skipMedia();
 
     /** Is this link the one the child was born into? No PEDI means birth. */
     const isBirthLink = (pedi: string): boolean => !pedi || pedi === 'birth';
@@ -3452,13 +5522,25 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
      * rather than silently thrown away.
      */
     const childFamily = new Map<string, string>();
+    /**
+     * Where the child's own FAMC lines put a family (-1: none). The app writes
+     * the family a child hangs from first, its other ones after (alsoChildOf):
+     * in its own file that order decides between two of one kind.
+     */
+    const famcRank = (childGedId: string, famGedId: string): number =>
+        individuals.get(childGedId)?.famcLinks.findIndex(l => l.famId === famGedId) ?? -1;
     for (const [gedFamId, fam] of families) {
         for (const childGedId of fam.children) {
             const chosen = childFamily.get(childGedId);
             if (!chosen) { childFamily.set(childGedId, gedFamId); continue; }
-            if (isBirthLink(pediFor(childGedId, gedFamId))
-                && !isBirthLink(pediFor(childGedId, chosen))) {
+            const birth = isBirthLink(pediFor(childGedId, gedFamId));
+            const chosenBirth = isBirthLink(pediFor(childGedId, chosen));
+            if (birth && !chosenBirth) {
                 childFamily.set(childGedId, gedFamId);
+            } else if (gedcom.stromApp && birth === chosenBirth) {
+                const rank = famcRank(childGedId, gedFamId);
+                const chosenRank = famcRank(childGedId, chosen);
+                if (rank >= 0 && (chosenRank < 0 || rank < chosenRank)) childFamily.set(childGedId, gedFamId);
             }
         }
     }
@@ -3466,6 +5548,12 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
     /** Children this family actually keeps (the others hang from their own). */
     const childrenOf = (gedFamId: string, fam: GedcomFamily): string[] =>
         fam.children.filter(c => childFamily.get(c) === gedFamId);
+    /** Does the family name a child (one the tree has) who hangs from another family? */
+    const recordedElsewhere = (gedFamId: string, fam: GedcomFamily): boolean =>
+        fam.children.some(c => {
+            const id = personIdMap.get(c);
+            return !!id && !!persons[id] && childFamily.get(c) !== gedFamId;
+        });
 
     // Create partnerships and link relationships
     const partnerships: Record<PartnershipId, Partnership> = {};
@@ -3506,6 +5594,13 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
         if (Object.keys(ages).length > 0) partnership.ages = ages;
         if (fam.note) partnership.note = fam.note;
         applyUnionOutcome(partnership, fam);
+        // No MARR in the family record: "married" (or "divorced" by a DIV
+        // alone) is only how a couple is read. Noted, so no export adds an
+        // empty MARR the file never had (spec 066 K3.1); Strom's own files
+        // write one for every couple said to be married, so theirs agree.
+        if (!fam.unionEvents.some(e => e.type === 'marriage') && (partnership.status === 'married' || partnership.status === 'divorced')) {
+            partnership.marriageUnrecorded = true;
+        }
         const dateForms = keptDateForms(fam.dateForms);
         if (dateForms) partnership.gedcomDates = dateForms;
 
@@ -3526,9 +5621,13 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
                 if (ev.status) out.status = ev.status;
                 const refs = mapRefs(ev.sourceRefs);
                 if (refs.length > 0) out.sourceIds = refs;
+                const evQuay = quayOf(ev.sourceRefs);
+                if (evQuay) out.citationQuay = { sourceIds: evQuay };
                 const parts = (ev.participants ?? []).map(toWitness)
                     .filter((p): p is EventParticipant => !!p);
                 if (parts.length > 0) out.participants = parts;
+                if (readMarks && ev.imports) eventMarks.set(out, ev.imports);
+                if (readOrigins && ev.origin) eventOrigins.set(out, ev.origin);
                 return out;
             });
         }
@@ -3541,13 +5640,20 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
 
         const famRefs = mapRefs(fam.sourceRefs);
         if (famRefs.length > 0) partnership.sourceIds = [...new Set(famRefs)];
+        const divorceRefs = mapRefs(fam.divorceSourceRefs);
+        if (divorceRefs.length > 0) partnership.divorceSourceIds = [...new Set(divorceRefs)];
+        const famQuay = quayOf(fam.sourceRefs);
+        const divorceQuay = quayOf(fam.divorceSourceRefs);
+        if (famQuay || divorceQuay) {
+            partnership.citationQuay = { ...(famQuay ? { sourceIds: famQuay } : {}), ...(divorceQuay ? { divorceSourceIds: divorceQuay } : {}) };
+        }
 
         // Witnesses at the wedding, named under 1 MARR.
         const witnesses = fam.marriageParticipants.map(toWitness)
             .filter((p): p is EventParticipant => !!p);
         if (witnesses.length > 0) partnership.participants = witnesses;
 
-        const famStory = toStory(fam.story);
+        const famStory = toStory(fam.story, mapRefs);
         if (famStory) partnership.story = famStory;
     };
 
@@ -3556,18 +5662,33 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
      * record) is the same union: its facts join the first instead of drawing
      * the couple twice.
      */
-    const joinUnion = (into: Partnership, from: Partnership): void => {
-        if (!into.startDate && from.startDate) into.startDate = from.startDate;
+    const joinUnion = (into: Partnership, from: Partnership): JoinedMarks => {
+        const marks: JoinedMarks = {};
+        // What the first record lacked and takes from this one: the couple shows it,
+        // "Back to {prog}" leaves it in this record (while unchanged).
+        const took: { key: string; value: string }[] = [];
+        for (const key of ['startDate', 'startPlace', 'endDate', 'endPlace', 'address'] as const) {
+            if (into[key] || !from[key]) continue;
+            into[key] = from[key];
+            took.push({ key, value: from[key]! });
+        }
         if (from.gedcomDates) into.gedcomDates = { ...from.gedcomDates, ...(into.gedcomDates ?? {}) };
-        if (!into.startPlace && from.startPlace) into.startPlace = from.startPlace;
-        if (!into.endDate && from.endDate) into.endDate = from.endDate;
-        if (!into.endPlace && from.endPlace) into.endPlace = from.endPlace;
-        if (!into.address && from.address) into.address = from.address;
-        if (from.ages) into.ages = { ...from.ages, ...(into.ages ?? {}) };
+        if (from.ages) {
+            for (const [n, pid] of [[1, into.person1Id], [2, into.person2Id]] as const) {
+                const age = from.ages[pid]?.trim();
+                if (age && !into.ages?.[pid]?.trim()) took.push({ key: `age${n}`, value: age });
+            }
+            into.ages = { ...from.ages, ...(into.ages ?? {}) };
+        }
+        if (into.marriageUnrecorded && !from.marriageUnrecorded) took.push({ key: 'MARR', value: '' });
+        if (took.length) marks.took = took;
         if (from.note && !(into.note ?? '').includes(from.note)) {
             into.note = into.note ? `${into.note}\n${from.note}` : from.note;
+            marks.text = from.note;
         }
-        if (from.sourceIds?.length) into.sourceIds = [...new Set([...(into.sourceIds ?? []), ...from.sourceIds])];
+        // (A citation only this record has keeps its own QUAY.)
+        unionCitations(into, from, 'sourceIds');
+        unionCitations(into, from, 'divorceSourceIds');
         if (from.participants?.length) {
             const seen = new Set((into.participants ?? []).map(p => p.personId ?? p.name));
             for (const part of from.participants) {
@@ -3577,8 +5698,16 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
         }
         if (!into.story && from.story) into.story = from.story;
         if (from.events?.length) into.events = [...(into.events ?? []), ...from.events];
+        // A marriage in either of the couple's families is one.
+        if (!from.marriageUnrecorded) delete into.marriageUnrecorded;
+        return marks;
     };
     const unionOfCouple = new Map<string, PartnershipId>();
+    /** The records each partnership was read from, the first one first (more than one: joined, see joinUnion). */
+    const recordsOfUnion = new Map<PartnershipId, [string, GedcomFamily][]>();
+    /** The couple's other records kept as written for "Back to {prog}" (JOINED_TAG): their ids go there, not on the partnership. */
+    const joinedKept = new Set<string>();
+    let joinedFamilies = 0;
 
     /**
      * Hang one child under a partnership (both parents, PEDI, _FREL/_MREL) —
@@ -3599,6 +5728,8 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
             if (!child.parentIds.includes(pid)) child.parentIds.push(pid);
             if (!persons[pid].childIds.includes(childId)) persons[pid].childIds.push(childId);
         }
+        const linkMark = readMarks ? fam.childImports?.get(childGedId) : undefined;
+        if (linkMark) parentMarks.push({ childId, parents, importId: linkMark });
 
         // Pedigree type (PEDI) applies to the child's link to THIS family →
         // set the real parents' relationship type accordingly. Read from the
@@ -3631,18 +5762,31 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
     for (const [gedFamId, fam] of families) {
         if (!fam.noCouple) continue;
         if (fam.unionEvents.length || fam.events.length || fam.note || fam.noteFacts.length
-            || fam.sourceRefs.length || fam.marriageParticipants.length || fam.story || fam.stat) continue;
+            || fam.sourceRefs.length || fam.divorceSourceRefs.length || fam.marriageParticipants.length || fam.story || fam.stat || fam.relationshipStatus) continue;
         const husb = fam.husb ? personIdMap.get(fam.husb) : undefined;
         const wife = fam.wife ? personIdMap.get(fam.wife) : undefined;
         const real = {
             ...(husb && persons[husb] ? { husb } : {}),
             ...(wife && persons[wife] && wife !== husb ? { wife } : {}),
         };
-        if (!real.husb && !real.wife) continue;
+        // One parent alone: the "?" family the app keeps of one parent, read
+        // below as one family of all its children, its import marks and its
+        // ids on it (Partnership.noCouple writes the mark back). Taken as
+        // loose links it became a "?" family per child and lost them; a child
+        // recorded here who hangs from another family (an adoptive father
+        // beside the birth parents) keeps a family to point at (spec 066 K3.1/K3.2).
+        if (!real.husb || !real.wife) continue;
         noCoupleFamilies.add(gedFamId);
         for (const childGedId of childrenOf(gedFamId, fam)) linkChild(null, childGedId, gedFamId, fam, real);
     }
 
+    /** The couple of a family by its two partners ('' without both), as coupleKey below. */
+    const coupleOfFamily = (gedFamId: string): string => {
+        const fam = families.get(gedFamId);
+        const husb = fam?.husb ? personIdMap.get(fam.husb) : undefined;
+        const wife = fam?.wife ? personIdMap.get(fam.wife) : undefined;
+        return husb && wife ? [husb, wife].sort().join('|') : '';
+    };
     for (const [gedFamId, fam] of families) {
         if (noCoupleFamilies.has(gedFamId)) continue;
         const partnershipId = partnershipIdMap.get(gedFamId)!;
@@ -3673,8 +5817,54 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
         let target: Partnership;
         if (sameCouple) {
             target = partnerships[sameCouple];
-            joinUnion(target, partnership);
+            const marks = joinUnion(target, partnership);
+            // Its children, citations and events, so "Back to {prog}" writes them in it.
+            const bare = (x: string): string => /^@?([^@]*)@?$/.exec(x.trim())?.[1] ?? '';
+            // A child it names goes back to it, also one that hangs from another
+            // record of the couple; the first record keeps a child it names too.
+            const firstFam = recordsOfUnion.get(sameCouple)?.[0];
+            marks.children = [];
+            for (const c of new Set(fam.children)) {
+                const hangs = childFamily.get(c);
+                if (!hangs || (hangs !== gedFamId && coupleOfFamily(hangs) !== coupleKey)) continue;
+                const xref = bare(individuals.get(c)?.importIds?.find(b => b.xref)?.xref ?? c);
+                if (xref) marks.children.push({ xref, also: !!firstFam?.[1].children.includes(c) });
+            }
+            // The witnesses of its wedding go back under it (the first record's
+            // stay there; one both name, in both).
+            const witnessKey = (raw: RawParticipant): string => (raw.ref ? personIdMap.get(raw.ref) : undefined) ?? raw.name ?? '';
+            const firstWitnesses = new Set((firstFam?.[1].marriageParticipants ?? []).map(witnessKey).filter(Boolean));
+            marks.witnesses = [];
+            for (const raw of fam.marriageParticipants) {
+                const also = firstWitnesses.has(witnessKey(raw));
+                if (raw.ref && personIdMap.get(raw.ref)) {
+                    const xref = bare(individuals.get(raw.ref)?.importIds?.find(b => b.xref)?.xref ?? raw.ref);
+                    if (xref && !xref.startsWith('__')) marks.witnesses.push({ xref, also });
+                } else if (raw.name) marks.witnesses.push({ name: raw.name, also });
+            }
+            // Its divorce's citations likewise, marked so (they go back under its DIV).
+            marks.sources = [];
+            for (const divorce of [false, true]) {
+                const refsOf = (f: GedcomFamily): string[] => divorce ? f.divorceSourceRefs : f.sourceRefs;
+                const firstRefs = new Set(firstFam ? mapRefs(refsOf(firstFam[1])) : []);
+                const cited = new Set<string>();
+                for (const ref of refsOf(fam)) {
+                    const sid = sourceIdMap.get(ref);
+                    const raw = gedSources.get(ref);
+                    if (!sid || !raw || cited.has(sid)) continue;
+                    cited.add(sid);
+                    const xref = bare(raw.importXref ?? raw.derivedFrom ?? ref);
+                    if (xref && !xref.startsWith('__')) {
+                        marks.sources.push({ xref, page: (raw.reference ?? '').trim(), also: firstRefs.has(sid), ...(divorce ? { divorce } : {}) });
+                    }
+                }
+            }
+            marks.events = (partnership.events ?? []).map(joinedEventKey);
+            recordsOfUnion.get(sameCouple)?.push([gedFamId, fam]);
+            joinedFamilies++;
+            if (keepJoinedRecord(gedFamId, fam, marks)) joinedKept.add(gedFamId);
         } else {
+            recordsOfUnion.set(partnershipId, [[gedFamId, fam]]);
             unionOfCouple.set(coupleKey, partnershipId);
             partnerships[partnershipId] = partnership;
             target = partnership;
@@ -3682,9 +5872,38 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
             persons[person2Id]?.partnerships.push(partnershipId);
         }
 
+        famPartnership.set(gedFamId, target);
         for (const childGedId of childrenOf(gedFamId, fam)) {
             linkChild(target, childGedId, gedFamId, fam, { husb: person1Id, wife: person2Id });
         }
+    }
+
+    // A couple divorced in one record and married again in another (a record
+    // per wedding): married, as when one record says both, and the divorce
+    // and the new wedding said in the note. The first record's divorce goes
+    // to "Back to {prog}" as written in place of that line, the new wedding
+    // with its own record (JOINED_TAG).
+    for (const [pid, records] of recordsOfUnion) {
+        const target = partnerships[pid];
+        const fams = records.map(([, fam]) => fam);
+        const first = fams[0];
+        if (fams.length < 2 || target.status !== 'divorced' || resolveUnionStatus(first).remarriage) continue;
+        if (fams.some(f => statusFromStat(f.stat) ?? statusFromStat(f.relationshipStatus))) continue;
+        const outcome = resolveUnionStatus({
+            ...first,
+            unionEvents: fams.flatMap(f => f.unionEvents),
+            divorced: fams.some(f => f.divorced),
+            divorceDate: fams.map(f => f.divorceDate).find(Boolean) ?? '',
+            marriageDate: fams.map(f => f.marriageDate).find(Boolean) ?? '',
+        });
+        if (outcome.status !== 'married' || !outcome.remarriage) continue;
+        const line = remarriageLine(outcome.remarriage);
+        if (!noteRemarriage(first, line)) continue;
+        target.status = 'married';
+        delete target.endDate;
+        delete target.endPlace;
+        delete target.endStatus;
+        target.note = target.note ? `${target.note}\n${line}` : line;
     }
 
     /** A "?" stand-in for a parent the family does not name. */
@@ -3720,10 +5939,20 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
         // Childless, one spouse — kept only when the family says something of its own (a wedding or a
         // divorce, even undated, a status, a note, a source…): Strom writes a "?" partner's family so,
         // without a record for the "?" ("married, the spouse unknown").
-        const saysSomething = fam.unionEvents.length > 0 || fam.divorced || !!fam.stat || !!fam.marriageDate || !!fam.marriagePlace
-            || fam.events.length > 0 || !!fam.note || fam.noteFacts.length > 0 || fam.sourceRefs.length > 0
+        const saysSomething = fam.unionEvents.length > 0 || fam.divorced || !!fam.stat || !!fam.relationshipStatus || !!fam.marriageDate || !!fam.marriagePlace
+            || fam.events.length > 0 || !!fam.note || fam.noteFacts.length > 0 || fam.sourceRefs.length > 0 || fam.divorceSourceRefs.length > 0
             || fam.marriageParticipants.length > 0 || !!fam.story;
-        if (ownChildren.length === 0 && !(parentId && saysSomething)) continue;
+        // A record of a loaded file (an import that keeps where its records came
+        // from, or the research's tree marking it so) is kept too, with nothing
+        // else of its own or with its children hanging from another family: its
+        // ids go back with "Back to {prog}", and a child recorded in it as well
+        // keeps the link (FAMC / CHIL), not a note (spec 066 K3.1/K3.2).
+        const fileRecord = (!!options.importOrigin && !ownFile) || !!fam.importMark || (fam.importIds?.length ?? 0) > 0;
+        // Strom's own file (the research's tree, the app's export) writes such a
+        // family only for a child kept in it besides the one it hangs from: the
+        // link comes back as it went, not as a note the research would take as new.
+        const ownLink = ownFile && recordedElsewhere(gedFamId, fam);
+        if (ownChildren.length === 0 && !(parentId && (saysSomething || fileRecord || ownLink))) continue;
 
         // A family naming children but neither parent still says they are
         // SIBLINGS. The model knows siblings only through shared parents, so
@@ -3763,7 +5992,9 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
             status: 'married'
         };
         fillUnion(partnership, fam);
+        if (fam.noCouple && parentId) partnership.noCouple = true;
         partnerships[partnershipId] = partnership;
+        famPartnership.set(gedFamId, partnership);
 
         // Add partnership to both persons
         persons[person1Id].partnerships.push(partnershipId);
@@ -3804,6 +6035,10 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
         for (const gedFamId of familiesOfChild.get(childGedId) ?? []) {
             if (gedFamId === keptFamId) continue;
             const fam = families.get(gedFamId)!;
+            // Another record of the same couple (joined, see joinUnion): the child
+            // is the couple's already, and "Back to {prog}" names it in both records.
+            const here = famPartnership.get(gedFamId);
+            if (here && here === famPartnership.get(keptFamId) && (joinedKept.has(gedFamId) || joinedKept.has(keptFamId))) continue;
 
             const parentNames = [fam.husb, fam.wife]
                 .map(p => (p ? personIdMap.get(p) : undefined))
@@ -3823,6 +6058,10 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
             const child = persons[childId];
             child.notes = child.notes ? `${child.notes}\n${line}` : line;
             otherFamilyLinks++;
+            // The family itself, when it is one here: an export writes the
+            // link back (FAMC / CHIL) instead of this line (spec 066 K3.1).
+            const other = famPartnership.get(gedFamId);
+            if (other) (child.alsoChildOf ??= []).push({ partnershipId: other.id, ...(pedi ? { pedi } : {}), note: line });
         }
     }
 
@@ -3856,9 +6095,7 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
         ? { ...(lineFounders.length ? { founders: lineFounders } : {}), ...(lineNotCarriers.length ? { notCarriers: lineNotCarriers } : {}) }
         : null;
 
-    const result: GedcomConversionResult = {
-        externalMedia,
-        data: {
+    const data: StromData = {
             persons,
             partnerships,
             ...(Object.keys(sources).length > 0 ? { sources } : {}),
@@ -3875,12 +6112,318 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
                 ? { surnameRejections: (gedcom.surnameRejections ?? []).map(forms => ({ forms })) } : {}),
             ...(gedcom.stromResearch && gedcom.researchAsOf && researchIsoDate(gedcom.researchAsOf)
                 ? { researchAsOf: researchIsoDate(gedcom.researchAsOf) } : {}),
+            ...(gedcom.stromResearch && gedcom.researchDirections ? { researchDirections: gedcom.researchDirections } : {}),
             // Like the surname markers: with the header mark the file's list
             // (even an empty one) is what it says; without it, nothing said.
             ...(lineageOverrides || gedcom.lineageMarker ? { lineageOverrides: lineageOverrides ?? {} } : {}),
-        },
+    };
+
+    // Where the facts came from (spec 066), only when the caller asks.
+    let importId: string | undefined;
+    /** Another program's own tags kept for "Back to {prog}", by tag (spec 066 G8). */
+    const keptTags = new Map<string, number>();
+    let extrasKept = false;
+    const origin = options.importOrigin;
+    if (origin && !ownFile) {
+        // A file another program wrote: all of it is that file's, whatever
+        // marks of ours it may carry (they are never read from it).
+        const head = gedcom.head ?? {};
+        const record = sanitizeImports([{
+            id: 'I1',
+            program: head.program ?? '',
+            version: head.version,
+            fileDate: head.date,
+            at: origin.at,
+            file: origin.file || head.file,
+            encoding: origin.encoding,
+            sha: origin.sha,
+        }]);
+        if (record) {
+            data.imports = record;
+            importId = record[0].id;
+            markTreeImported(data, importId);
+            applyForeignIds(importId);
+            applyFileExtras(importId);
+        }
+    } else if (origin) {
+        applyFileImportMarks();
+        applyFileOriginalIds();
+        applyFileExtras();
+        if (readOrigins) applyResearchOrigins();
+        cleanImportOrigin(data, gedcom.stromImports);
+    } else if (readOrigins) {
+        // All three are read; any one is reason to clean against the records.
+        // The record's own import (`1 _STROM_IMPORT Rx`) too: without it an
+        // export wrote it back as an import the record did not come from.
+        const origins = applyResearchOrigins();
+        const ids = applyFileOriginalIds();
+        const marks = applyRecordImportMarks();
+        if (origins || ids || marks) cleanImportOrigin(data, gedcom.stromImports);
+    }
+    // Confirmations and the research's re-verification of facts (spec 065):
+    // only from a file Strom wrote.
+    if (readOrigins) applyFactVerify();
+
+    // Another program's own tags with no import to keep them for (the file is
+    // not loaded as an import): not carried over, so counted.
+    if (!extrasKept) {
+        for (const raw of [...individuals.values(), ...families.values(), ...gedSources.values()]) {
+            for (const e of raw.extras ?? []) if (!e.quiet) droppedTags.set(e.tag, (droppedTags.get(e.tag) ?? 0) + 1);
+        }
+    }
+
+    /**
+     * Another program's level-1 `_XXX` tags of each person, family and source,
+     * kept as written for "Back to {prog}" (spec 066 G8): from its file, all of
+     * them for that import (`from`); from Strom's own "Back to" file read
+     * again, a record's go back to the import its `1 _STROM_IMPORT Ix` mark
+     * names (cleaned against the records afterwards). A record with no import
+     * to keep them for keeps none, and they are counted.
+     */
+    function applyFileExtras(from?: string): void {
+        extrasKept = true;
+        const put = (holder: ExtraHolder | undefined, mark: string | undefined, extras: RawExtra[] | undefined): void => {
+            for (const e of extras ?? []) {
+                const to = from ?? mark;
+                if (!holder || !to) { if (!e.quiet) droppedTags.set(e.tag, (droppedTags.get(e.tag) ?? 0) + 1); continue; }
+                addGedcomExtra(holder, { from: to, lines: e.lines });
+                if (!e.quiet) keptTags.set(e.tag, (keptTags.get(e.tag) ?? 0) + 1);
+            }
+        };
+        for (const [gedId, indi] of individuals) {
+            const pid = personIdMap.get(gedId);
+            put(pid ? persons[pid] : undefined, indi.importMark, indi.extras);
+        }
+        for (const [gedFamId, fam] of families) put(famPartnership.get(gedFamId), fam.importMark, fam.extras);
+        for (const [gedId, raw] of gedSources) {
+            const sid = sourceIdMap.get(gedId);
+            put(sid ? sources[sid] : undefined, raw.importMark, raw.extras);
+        }
+        // A page's source of its own keeps its record's tags too (not counted again).
+        for (const [gedId, raw] of gedSources) {
+            const sid = sourceIdMap.get(gedId);
+            const base = raw.derivedFrom ? sources[sourceIdMap.get(raw.derivedFrom) ?? ''] : undefined;
+            if (!sid || !sources[sid] || !base) continue;
+            for (const entry of base.gedcomExtra ?? []) {
+                // (Not the record's own citation's lines: this page's citation has its own.)
+                const lines = withoutCiteLines(entry.lines);
+                if (lines.length) addGedcomExtra(sources[sid], { from: entry.from, lines });
+            }
+        }
+    }
+
+    /**
+     * Another program's file: each person and family keeps its xref and its id
+     * lines there (spec 066 K3.2), as written. A couple read from two families
+     * keeps the first one's xref and the lines of both.
+     */
+    function applyForeignIds(from: string): void {
+        const known = new Set([from]);
+        const put = (holder: Person | Partnership, gedId: string, lines: OriginalIdLine[] | undefined): void => {
+            const entry = cleanOriginalIds({ from, xref: gedId.startsWith('@__anon') ? undefined : gedId, ids: lines ?? [] }, known);
+            if (entry) addOriginalIds(holder, entry);
+            // A line that is not taken (a control character, U+FFFD, too long) is counted.
+            const kept = holder.originalIds?.find(e => e.from === from)?.ids ?? [];
+            for (const raw of lines ?? []) {
+                const line = cleanOriginalIdLine(raw);
+                const taken = line && kept.some(l => l.tag === line.tag && l.value === line.value && (l.type ?? '') === (line.type ?? ''));
+                if (!taken) droppedTags.set(raw.tag, (droppedTags.get(raw.tag) ?? 0) + 1);
+            }
+        };
+        for (const [gedId, indi] of individuals) {
+            const pid = personIdMap.get(gedId);
+            const person = pid ? persons[pid] : undefined;
+            if (person) put(person, gedId, indi.fileIds);
+        }
+        for (const [gedFamId, fam] of families) {
+            const ps = famPartnership.get(gedFamId);
+            if (ps && !joinedKept.has(gedFamId)) put(ps, gedFamId, fam.fileIds);
+        }
+        // A source record's xref, on every source it became (one per page cited).
+        for (const [gedId, raw] of gedSources) {
+            const sid = sourceIdMap.get(gedId);
+            const xref = (raw.derivedFrom ?? gedId).match(/^@([^@]+)@$/)?.[1];
+            if (!sid || !sources[sid] || !xref || xref.startsWith('__')) continue;
+            // The record's ids (`1 RIN MH:S1`), on a page's source of its own too.
+            const ids = (raw.derivedFrom ? gedSources.get(raw.derivedFrom)?.fileIds : raw.fileIds) ?? [];
+            const entry = cleanOriginalIds({ from, xref, ids }, known);
+            if (entry) addOriginalIds(sources[sid], entry);
+        }
+    }
+
+    /**
+     * A Strom file's ids of its records in the loaded files (the blocks under
+     * `1 _STROM_IMPORT Ix`), cleaned against its import records afterwards.
+     * Its own xrefs are never original ids. Returns whether there were any.
+     */
+    function applyFileOriginalIds(): boolean {
+        let any = false;
+        const put = (holder: Person | Partnership, blocks: RawOriginalIds[] | undefined): void => {
+            for (const b of blocks ?? []) {
+                if (!b.xref && b.ids.length === 0) continue;
+                addOriginalIds(holder, { from: b.from, ...(b.xref ? { xref: b.xref } : {}), ids: b.ids });
+                any = true;
+            }
+        };
+        for (const [gedId, indi] of individuals) {
+            const pid = personIdMap.get(gedId);
+            const person = pid ? persons[pid] : undefined;
+            if (person) put(person, indi.importIds);
+        }
+        for (const [gedFamId, fam] of families) {
+            const ps = famPartnership.get(gedFamId);
+            if (ps && !joinedKept.has(gedFamId)) put(ps, fam.importIds);
+        }
+        // A source record's xref in the file it came from (`2 _XREF` under its `1 _STROM_IMPORT`).
+        for (const [gedId, raw] of gedSources) {
+            const sid = sourceIdMap.get(gedId);
+            if (!sid || !sources[sid] || !raw.importMark || !raw.importXref) continue;
+            addOriginalIds(sources[sid], { from: raw.importMark, xref: raw.importXref, ids: raw.importIdLines ?? [] });
+            any = true;
+        }
+        return any;
+    }
+
+    /**
+     * The re-verification of facts a Strom file carries (spec 065): from the
+     * research's file its whole state (Person/Partnership.researchVerify), a
+     * confirmation with the value the fact has in the file;
+     * from the app's own export only a confirmation, which becomes the
+     * tree's own, valid for the value the fact has in the file. A family the
+     * file writes twice keeps the first record's.
+     */
+    function applyFactVerify(): void {
+        const put = (holder: Person | Partnership, fact: string, raw: RawFactOrigin | undefined): void => {
+            if (!raw?.verify) return;
+            if (gedcom.stromResearch) {
+                if (holder.researchVerify?.[fact]) return;
+                const v = toResearchVerify(raw.verify);
+                if (!v) return;
+                // The value it was confirmed with: a change here ends the confirmation.
+                const value = v.confirmed ? factValueSignature(holder, fact) : '';
+                if (value) v.value = value;
+                // The value the research's mark stands for: confirming another one is not sent with it.
+                if (v.txt) v.txtValue = factValueSignature(holder, fact);
+                (holder.researchVerify ??= {})[fact] = v;
+                return;
+            }
+            if (holder.confirmed?.[fact]) return;
+            const at = raw.verify.confirmed !== undefined ? researchIsoDate(raw.verify.confirmed) : '';
+            const value = factValueSignature(holder, fact);
+            if (at && value) (holder.confirmed ??= {})[fact] = { at, value };
+        };
+        for (const [gedId, indi] of individuals) {
+            const pid = personIdMap.get(gedId);
+            const person = pid ? persons[pid] : undefined;
+            if (!person) continue;
+            for (const [fact, raw] of Object.entries(indi.factOrigins ?? {})) put(person, fact, raw);
+            for (const ev of person.events ?? []) put(person, `event:${ev.id}`, eventOrigins.get(ev));
+        }
+        for (const [gedFamId, fam] of families) {
+            const ps = famPartnership.get(gedFamId);
+            if (!ps) continue;
+            // The family's id in the research (`0 @F0003@ FAM`), what /verify {family} names.
+            if (gedcom.stromResearch && !ps.researchId) {
+                const id = researchFamilyRef(/^@([^@]+)@$/.exec(gedFamId)?.[1]);
+                if (id) ps.researchId = id;
+            }
+            for (const [fact, raw] of Object.entries(fam.factOrigins ?? {})) put(ps, fact, raw);
+        }
+        for (const ps of Object.values(partnerships)) {
+            for (const ev of ps.events ?? []) put(ps, `event:${ev.id}`, eventOrigins.get(ev));
+        }
+    }
+
+    /**
+     * The research's origin of the facts (`_STROM_ORIGIN`, `_STROM_WAS`,
+     * `_STROM_SEX_ORIGIN`) and its import records (HEAD `1 _STROM_IMPORT R1`).
+     * Returns whether there was anything (a research without the feature
+     * writes none of it: nothing is added then).
+     */
+    function applyResearchOrigins(): boolean {
+        let any = (gedcom.stromImports?.length ?? 0) > 0;
+        const put = (holder: Person | Partnership, fact: string, raw: RawFactOrigin | undefined): void => {
+            const o = raw ? toResearchOrigin(raw, mapRefs) : null;
+            if (!o) return;
+            (holder.researchOrigins ??= {})[fact] = o;
+            any = true;
+        };
+        for (const [gedId, indi] of individuals) {
+            const pid = personIdMap.get(gedId);
+            const person = pid ? persons[pid] : undefined;
+            if (!person) continue;
+            for (const [fact, raw] of Object.entries(indi.factOrigins ?? {})) put(person, fact, raw);
+            for (const ev of person.events ?? []) put(person, `event:${ev.id}`, eventOrigins.get(ev));
+        }
+        for (const [gedFamId, fam] of families) {
+            const ps = famPartnership.get(gedFamId);
+            if (!ps) continue;
+            for (const [fact, raw] of Object.entries(fam.factOrigins ?? {})) if (!ps.researchOrigins?.[fact]) put(ps, fact, raw);
+        }
+        for (const ps of Object.values(partnerships)) {
+            for (const ev of ps.events ?? []) put(ps, `event:${ev.id}`, eventOrigins.get(ev));
+        }
+        return any;
+    }
+
+    /** A Strom file's own marks, as it carries them (cleaned against its records afterwards). */
+    function applyFileImportMarks(): void {
+        const markFact = (holder: Person | Partnership, fact: string, marks: RawImportMark[] | undefined): void => {
+            for (const mark of marks ?? []) markFactImported(holder, fact, mark.id, mark.parts);
+        };
+        applyRecordImportMarks();
+        for (const [gedId, indi] of individuals) {
+            const pid = personIdMap.get(gedId);
+            const person = pid ? persons[pid] : undefined;
+            if (!person) continue;
+            for (const [fact, marks] of Object.entries(indi.factImports ?? {})) markFact(person, fact, marks);
+            for (const ev of person.events ?? []) markFact(person, `event:${ev.id}`, eventMarks.get(ev));
+        }
+        for (const [gedFamId, fam] of families) {
+            const ps = famPartnership.get(gedFamId);
+            if (!ps) continue;
+            for (const [fact, marks] of Object.entries(fam.factImports ?? {})) markFact(ps, fact, marks);
+        }
+        for (const ps of Object.values(partnerships)) {
+            for (const ev of ps.events ?? []) markFact(ps, `event:${ev.id}`, eventMarks.get(ev));
+        }
+        for (const { childId, parents, importId: from } of parentMarks) {
+            const child = persons[childId];
+            if (!child) continue;
+            for (const pid of parents) if (child.parentIds.includes(pid)) (child.importedParents ??= {})[pid] = from;
+        }
+    }
+
+    /**
+     * The import each record came from, as a Strom file (the app's or the
+     * research's) carries it: `1 _STROM_IMPORT Ix` on the person, the family,
+     * the source. Returns whether there was any.
+     */
+    function applyRecordImportMarks(): boolean {
+        let any = false;
+        for (const [gedId, indi] of individuals) {
+            const pid = personIdMap.get(gedId);
+            const person = pid ? persons[pid] : undefined;
+            if (person && indi.importMark) { person.importId = indi.importMark; any = true; }
+        }
+        for (const [gedFamId, fam] of families) {
+            const ps = famPartnership.get(gedFamId);
+            if (ps && fam.importMark && !ps.importId) { ps.importId = fam.importMark; any = true; }
+        }
+        for (const [gedId, raw] of gedSources) {
+            const sid = sourceIdMap.get(gedId);
+            if (raw.importMark && sid && sources[sid]) { sources[sid].importId = raw.importMark; any = true; }
+        }
+        return any;
+    }
+
+    const result: GedcomConversionResult = {
+        externalMedia,
+        data,
+        ...(importId ? { importId } : {}),
         stats: {
             otherFamilyLinks,
+            joinedFamilies,
             totalPersons: Object.keys(persons).length,
             totalPartnerships: Object.keys(partnerships).length,
             placeholderPersons,
@@ -3891,6 +6434,8 @@ export function convertToStrom(gedcom: ParsedGedcom): GedcomConversionResult {
                 .join(', '),
             unknownSexPersons,
             skippedMedia,
+            keptTags: [...keptTags.values()].reduce((a, b) => a + b, 0),
+            keptTagSummary: [...keptTags.entries()].sort((a, b) => b[1] - a[1]).map(([tag]) => tag).join(', '),
             totalGedFamilies: families.size
         }
     };

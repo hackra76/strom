@@ -1,0 +1,2374 @@
+import { test, expect, Page, Locator } from '@playwright/test';
+import { card, openApp } from './helpers.js';
+
+/**
+ * Following a research live: every section of the small panel folds on its
+ * own (remembered, folded by itself when short of room, "Awaiting action"
+ * never, and a new task unfolds it), the panel lists the last five changes;
+ * the Research overview (⤢) beside the tree: the tree narrows, a summary,
+ * Waiting cards with the person, Progress with filters, hover and "Show
+ * changed in tree", Escape back to the panel. Tablet: over the tree; phone:
+ * a strip that opens a sheet. Invented data only.
+ */
+
+const UUID = '3f2c9a10-7b1e-4c55-9d2a-0e8f6b4a1c77';
+const BRIDGE = 'http://127.0.0.1:5996/0123456789abcdef0123456789abcdef';
+const cors = { 'access-control-allow-origin': '*' };
+const ALL = ['send', 'excerpt', 'app', 'open', 'chat', 'task', 'review', 'research',
+    'new', 'update', 'sessions', 'conflict', 'story', 'sync-undo', 'setup', 'live'];
+
+function ged(extra: boolean): string {
+    return [
+        '0 HEAD', '1 SOUR STROM_RESEARCH', '1 DATE 27 SEP 2026', `1 _STROM_TREE ${UUID}`, '1 CHAR UTF-8', '1 NOTE Fíškovi',
+        '0 @S12@ SOUR', '1 TITL Křestní matrika Chlumy 1865', '1 REFN S0012',
+        ...(extra ? ['0 @S31@ SOUR', '1 TITL Sčítání lidu 1880', '1 REFN S0031'] : []),
+        '0 @P0001@ INDI', '1 NAME Josef /Fíšek/', '1 SEX M', '1 BIRT', '2 DATE 1840', '1 REFN P0001', '1 FAMS @F0001@',
+        '0 @P0002@ INDI', '1 NAME Anna /Svobodová/', '1 SEX F', '1 REFN P0002', '1 FAMS @F0001@',
+        '0 @P0012@ INDI', '1 NAME Jan /Fíšek/', '1 SEX M', '1 BIRT', '2 DATE 1865', '2 SOUR @S12@', '1 REFN P0012', '1 FAMC @F0001@',
+        '1 _STROM_CONFLICT X0007', '2 TYPE BIRT', '2 STAT open', '2 VAL 3 FEB 1865', '2 VAL 1866',
+        ...(extra ? [
+            '0 @P0004@ INDI', '1 NAME Ludmila /Fíšková/', '1 SEX F', '1 REFN P0004', '1 FAMC @F0001@',
+            '0 @P0005@ INDI', '1 NAME Marie /Fíšková/', '1 SEX F', '1 REFN P0005', '1 FAMC @F0001@',
+            '0 @P0006@ INDI', '1 NAME Karel /Fíšek/', '1 SEX M', '1 REFN P0006', '1 FAMC @F0001@',
+        ] : []),
+        '0 @F0001@ FAM', '1 HUSB @P0001@', '1 WIFE @P0002@', '1 CHIL @P0012@',
+        ...(extra ? ['1 CHIL @P0004@', '1 CHIL @P0005@', '1 CHIL @P0006@'] : []),
+        '0 TRLR',
+    ].join('\n');
+}
+
+const CHANGE = [
+    '+P0004 Ludmila /Fíšková/ · E0006 BIRT 1868 [lead]',
+    '+P0005 Marie /Fíšková/',
+    '+P0006 Karel /Fíšek/',
+    '+S0031 Sčítání lidu 1880',
+    'P0012 _STORY navrh',
+    'F0001 +child P0006',
+];
+
+/** A write to the bridge from "Awaiting action" (variant B). */
+interface Write { method: string; path: string; body: string; headers: Record<string, string> }
+interface Bridge {
+    waiting: Record<string, unknown>[]; gedCalls: number; log: Record<string, unknown> | null; events: boolean; paused: Record<string, unknown> | null;
+    workPerson: string; workDone: boolean; changeEntries: Record<string, unknown>[] | null; features?: string[]; recent?: Record<string, unknown>;
+    spend?: Record<string, unknown>; accepts?: Record<string, unknown>;
+    /** Every write it got (POST waiting / group, GET group note, PUT media). */
+    writes: Write[];
+    /** The asks of the reconnect chain so far (/events, /status without ?poll): each comes after the one before it was read. */
+    chain: number;
+    /** Refuse the writes so (a status and its code), or 'abort': no answer. */
+    refuse?: { status: number; code: string } | 'abort';
+    /** The text of a place's queries. */
+    note?: Record<string, unknown>;
+    /** A place's Sent answers without naming the tasks it marked. */
+    groupSentSilent?: boolean;
+    /**
+     * An item's write answers so (the task's phase as the research has it), changing nothing;
+     * with phase 'sent' the task is sent in the bridge's status from then on (the research marked it
+     * meanwhile, after the status the app last read).
+     */
+    itemReply?: Record<string, unknown>;
+    /** The heads of the research before and after its one change (default h1, h2). */
+    heads?: [string, string];
+    /** A write of "Awaiting action" commits: its answer says this head (and parent); the research is at that head from then on. */
+    writeHead?: { head: string; parent?: string };
+    /** The head the research is at after such a write. */
+    committed?: string;
+    /** Every /status asked (the stream's chain and the regular ask). */
+    statusCalls?: number;
+    /** Streams (/events) left unanswered while `events` is off. */
+    eventsHeld?: number;
+}
+
+/** A bridge that sends one change of six lines, then keeps quiet. */
+async function follow(page: Page, size: { width: number; height: number } = { width: 1440, height: 900 },
+    setup: (b: Bridge) => void = () => {}): Promise<Bridge> {
+    await page.setViewportSize(size);
+    await page.addInitScript((links) => {
+        if (sessionStorage.getItem('seeded')) return;
+        sessionStorage.setItem('seeded', '1');
+        localStorage.setItem('strom-research-links', JSON.stringify({ actions: links, at: new Date().toISOString() }));
+    }, ALL);
+    const bridge: Bridge = {
+        waiting: [
+            { id: 'T0004', what: 'Uložte snímek oddací matriky', person: 'P0012', at: new Date().toISOString() },
+            { id: 'T0005', what: 'Potvrďte otce Jana', at: new Date().toISOString() },
+        ],
+        gedCalls: 0,
+        log: null,
+        events: true,
+        paused: null,
+        workPerson: 'P0012',
+        workDone: false,
+        changeEntries: null,
+        writes: [],
+        chain: 0,
+    };
+    setup(bridge);
+    const status = () => ({
+        tree: { id: UUID, name: 'Fíškovi' }, head: bridge.committed ?? (bridge.heads ?? ['h1', 'h2'])[bridge.gedCalls > 1 ? 1 : 0], persons: 3,
+        working: bridge.workDone ? [] : [{ who: 'agent-matriky', since: new Date(Date.now() - 16 * 60_000).toISOString(), ...(bridge.paused ? { paused: bridge.paused } : { task: 'Sčítání 1921', person: bridge.workPerson }) }],
+        waiting: bridge.waiting, links: ALL,
+        queue: [{ id: 'T0101', text: 'Matriky Chlumy', state: 'next', person: 'P0001' }, { id: 'T0102', text: 'Pozemková kniha', state: 'next' }],
+        queueMore: 3,
+        spend: bridge.spend ?? { month: '2026-09', sessions: 4, amount: 3.2, currency: 'USD' },
+        ...(bridge.features ? { features: bridge.features } : {}),
+        ...(bridge.recent ? { recent: bridge.recent } : {}),
+        ...(bridge.accepts ? { accepts: bridge.accepts } : {}),
+    });
+    const json = (status: number, body: unknown) => ({ status, headers: { ...cors, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const sendable = (w: Record<string, unknown>) => w.phase !== 'sent' && ['letter', 'family', 'other'].includes(String(w.kind));
+    await page.route(`${BRIDGE}/**`, async (route) => {
+        const url = new URL(route.request().url());
+        const path = url.pathname;
+        if (path.endsWith('/events') || (path.endsWith('/status') && !url.searchParams.has('poll'))) bridge.chain++;
+        if (path.endsWith('/status')) {
+            bridge.statusCalls = (bridge.statusCalls ?? 0) + 1;
+            return route.fulfill({ status: 200, headers: { ...cors, 'content-type': 'application/json' }, body: JSON.stringify(status()) });
+        }
+        if (path.endsWith('/tree.ged')) {
+            bridge.gedCalls++;
+            return route.fulfill({ status: 200, headers: { ...cors, 'content-type': 'text/plain; charset=utf-8' }, body: ged(bridge.gedCalls > 1) });
+        }
+        if (path.endsWith('/log') && bridge.log) {
+            return route.fulfill({ status: 200, headers: { ...cors, 'content-type': 'application/json' }, body: JSON.stringify(bridge.log) });
+        }
+        if (path.endsWith('/events')) {
+            if (!bridge.events) { bridge.eventsHeld = (bridge.eventsHeld ?? 0) + 1; return new Promise(() => {}); }
+            const body = `event: hello\ndata: ${JSON.stringify(status())}\n\n`
+                + `event: change\ndata: ${JSON.stringify({ head: bridge.committed ?? (bridge.heads ?? ['h1', 'h2'])[1], what: CHANGE, at: new Date().toISOString(), ...(bridge.changeEntries ? { entries: bridge.changeEntries } : {}) })}\n\n`;
+            return route.fulfill({ status: 200, headers: { ...cors, 'content-type': 'text/event-stream' }, body });
+        }
+        // "Awaiting action" written through the bridge (variant B): what came is kept, the list follows.
+        const req = route.request();
+        if (req.method() === 'OPTIONS') {
+            return route.fulfill({ status: 204, headers: { ...cors, 'access-control-allow-methods': 'GET, POST, PUT', 'access-control-allow-headers': '*' } });
+        }
+        const write = /\/(waiting\/T\d+|group\/[^/]+(?:\/note)?|media\/[0-9a-f]{64})$/.exec(path);
+        if (write) {
+            bridge.writes.push({ method: req.method(), path: write[1], body: req.postData() ?? '', headers: req.headers() });
+            if (bridge.refuse === 'abort') return route.abort('connectionrefused');
+            if (bridge.refuse) return route.fulfill(json(bridge.refuse.status, { error: 'refused', code: bridge.refuse.code }));
+            // A write the research commits: it is at the new head from now on, each answer says it.
+            const commit = req.method() !== 'GET' ? bridge.writeHead : undefined;
+            if (commit) bridge.committed = commit.head;
+            const reply = (status: number, body: unknown) => json(status, commit ? { ...(body as Record<string, unknown>), ...commit } : body);
+            if (write[1].startsWith('media/')) return route.fulfill(reply(200, { input: 'I0042' }));
+            if (write[1].endsWith('/note')) return route.fulfill(reply(200, bridge.note ?? { text: '' }));
+            const what = (JSON.parse(req.postData() || '{}') as { do?: string }).do;
+            const at = new Date().toISOString();
+            if (write[1].startsWith('waiting/')) {
+                const w = bridge.waiting.find(x => x.id === write[1].slice('waiting/'.length));
+                if (!w) return route.fulfill(reply(404, { error: 'not waiting', code: 'waiting.none' }));
+                if (bridge.itemReply) {
+                    if (bridge.itemReply.phase === 'sent' && w.phase !== 'sent') Object.assign(w, { phase: 'sent', sentAt: at });
+                    return route.fulfill(reply(200, { ...bridge.itemReply, task: w.id }));
+                }
+                if (what === 'sent') {
+                    Object.assign(w, { phase: 'sent', sentAt: at });
+                    return route.fulfill(reply(200, { sent: [w.id] }));
+                }
+                delete w.phase; delete w.sentAt;
+                return route.fulfill(reply(200, { unsent: [w.id] }));
+            }
+            const key = decodeURIComponent(write[1].slice('group/'.length));
+            const inPlace = (w: Record<string, unknown>) => (w.group as { key?: string } | undefined)?.key === key;
+            if (what === 'unsent') {
+                // Back to do: only the tasks named, of them those in the place and sent; none named: 400.
+                const tasks = (JSON.parse(req.postData() || '{}') as { tasks?: unknown }).tasks;
+                if (!Array.isArray(tasks) || tasks.length === 0) return route.fulfill(reply(400, { error: 'tasks missing', code: 'waiting.bad-body' }));
+                const back = bridge.waiting.filter(w => tasks.includes(w.id) && inPlace(w) && w.phase === 'sent');
+                for (const w of back) { delete w.phase; delete w.sentAt; }
+                return route.fulfill(reply(200, { unsent: back.map(w => w.id) }));
+            }
+            const marked = bridge.waiting.filter(w => inPlace(w) && sendable(w));
+            for (const w of marked) Object.assign(w, { phase: 'sent', sentAt: at });
+            return route.fulfill(reply(200, bridge.groupSentSilent ? {} : { sent: marked.map(w => w.id) }));
+        }
+        return route.fulfill({ status: 404, headers: cors, body: '' });
+    });
+    await page.goto(`/strom.html?live=${encodeURIComponent(BRIDGE)}`);
+    return bridge;
+}
+
+const head = (page: Page, root: string, title: string | RegExp) =>
+    page.locator(`${root} .live-section__head`).filter({ has: page.locator('.live-section__title', { hasText: title }) });
+
+test.describe('small live panel', () => {
+    test('each section folds, the choice survives a reload; five changes and a way to all', async ({ page }) => {
+        await follow(page);
+        const panel = page.locator('#live-panel');
+        await expect(panel.locator('.live-changes li')).toHaveCount(5);
+        // Newest first; the people in a change are links.
+        await expect(panel.locator('.live-change-text .live-person-link').first()).toHaveText('Karel Fíšek');
+        await expect(panel.locator('.live-section__title')).toHaveText(['At work', 'Awaiting action · 2', 'Latest changes', 'Up next']);
+        await expect(head(page, '#live-panel', 'At work').locator('.live-section__sum')).toHaveText(/agent-matriky · 1[67] min/);
+        await expect(panel.locator('.live-working .live-time')).toHaveText(/^since (?:\S+ )?\d{1,2}:\d{2}.* · 1[67] min$/);   // a date before the time across midnight
+        await expect(head(page, '#live-panel', 'Up next').locator('.live-section__sum')).toHaveText('5 tasks');
+
+        // Folded for lack of room or not, Changes unfolds on a click; all changes are in the overview.
+        const changes = head(page, '#live-panel', 'Latest changes');
+        if (await changes.getAttribute('aria-expanded') === 'false') await changes.click();
+        await expect(changes).toHaveAttribute('aria-expanded', 'true');
+        await panel.locator('.live-all-changes').click();
+        await expect(page.locator('#research-overview')).toBeVisible();
+        await page.keyboard.press('Escape');
+        await expect(panel).toBeVisible();
+
+        // A click flips a section (folded by the panel itself or not) and is remembered.
+        const work = head(page, '#live-panel', 'At work');
+        const was = await work.getAttribute('aria-expanded');
+        const now = was === 'true' ? 'false' : 'true';
+        await work.click();
+        await expect(work).toHaveAttribute('aria-expanded', now);
+        await expect(page.locator(`#${await work.getAttribute('aria-controls')}`)).toBeVisible({ visible: now === 'true' });
+        expect(await page.evaluate(() => JSON.parse(localStorage.getItem('strom-live-section-prefs') ?? '{}').s)).toMatchObject({ working: now === 'false' ? 'collapsed' : 'expanded' });
+        await page.reload();
+        await expect(head(page, '#live-panel', 'At work')).toHaveAttribute('aria-expanded', now);
+        await expect(head(page, '#live-panel', 'Awaiting action · 2')).toHaveAttribute('aria-expanded', 'true');
+    });
+
+    test('short of room: Up next, then Changes fold by themselves, Waiting never; folded by hand, a new task keeps it folded and counts as new', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 520 });
+        const panel = page.locator('#live-panel');
+        await expect(panel.locator('.live-changes li').first()).toBeAttached();
+        await expect(head(page, '#live-panel', 'Up next')).toHaveAttribute('aria-expanded', 'false');
+        await expect(head(page, '#live-panel', 'Awaiting action · 2')).toHaveAttribute('aria-expanded', 'true');
+        // Folding by itself is not remembered.
+        expect(await page.evaluate(() => JSON.parse(localStorage.getItem('strom-live-section-prefs') ?? '{}').s)).toEqual({});
+
+        await head(page, '#live-panel', 'Awaiting action · 2').click();
+        await expect(head(page, '#live-panel', 'Awaiting action · 2')).toHaveAttribute('aria-expanded', 'false');
+        await expect(head(page, '#live-panel', 'Awaiting action · 2').locator('.live-panel-new')).toHaveCount(0);
+        bridge.waiting = [...bridge.waiting, { id: 'T0009', what: 'Nový úkol', at: new Date().toISOString() }];
+        // Kept folded: the count and "1 new" in its heading (inside its button), nothing unfolds.
+        const waiting = head(page, '#live-panel', 'Awaiting action · 3');
+        await expect(waiting.locator('.live-panel-new')).toHaveText('1 new', { timeout: 15000 });
+        await expect(waiting).toHaveAttribute('aria-expanded', 'false');
+        await expect(waiting).toHaveAccessibleName(/^Awaiting action · 3\s*,\s*1 new/);
+    });
+});
+
+/** Choose how sections show (spec 044) as Customize panel does: the record, then its event. */
+async function setPrefs(page: Page, prefs: Record<string, string>): Promise<void> {
+    await page.evaluate((p) => {
+        localStorage.setItem('strom-live-section-prefs', JSON.stringify({ v: 1, s: p }));
+        document.dispatchEvent(new CustomEvent('strom:live-section-prefs'));
+    }, prefs);
+}
+
+/** The whole record v2 (spec 057: the order and the top), then its event. */
+async function setRecord(page: Page, rec: { s?: Record<string, string>; o?: string[]; t?: Record<string, boolean> }): Promise<void> {
+    await page.evaluate((r) => {
+        localStorage.setItem('strom-live-section-prefs', JSON.stringify({ v: 2, s: {}, ...r }));
+        document.dispatchEvent(new CustomEvent('strom:live-section-prefs'));
+    }, rec);
+}
+
+const storedPrefs = (page: Page) => page.evaluate(() => JSON.parse(localStorage.getItem('strom-live-section-prefs') ?? 'null'));
+
+test.describe('section choices: expanded, collapsed, hidden (spec 044)', () => {
+    test('the old fold choices are taken over once: the panel\'s over the overview\'s, its own "waiting: false" is no choice', async ({ page }) => {
+        await page.addInitScript(() => {
+            if (sessionStorage.getItem('seeded-prefs')) return;
+            sessionStorage.setItem('seeded-prefs', '1');
+            localStorage.setItem('strom-live-sections', JSON.stringify({ working: true, waiting: false, queue: false }));
+            localStorage.setItem('strom-live-overview-sections', JSON.stringify({ queue: true, timeline: true, waiting: false }));
+        });
+        await follow(page);
+        const panel = page.locator('#live-panel');
+        await expect(head(page, '#live-panel', 'At work')).toHaveAttribute('aria-expanded', 'false');
+        await expect(head(page, '#live-panel', 'Awaiting action · 2')).toHaveAttribute('aria-expanded', 'true');
+        await expect(head(page, '#live-panel', 'Up next')).toHaveAttribute('aria-expanded', 'true');
+        expect(await storedPrefs(page)).toEqual({ v: 2, s: { working: 'collapsed', queue: 'expanded', changes: 'collapsed' } });
+        // The old records stay as they were (an older version still reads them).
+        expect(await page.evaluate(() => localStorage.getItem('strom-live-sections'))).toBe(JSON.stringify({ working: true, waiting: false, queue: false }));
+        // One choice for both places: the panel's Up next expanded is the overview's Queue too.
+        await panel.locator('.live-panel-expand').click();
+        await expect(head(page, '#research-overview', 'Queue')).toHaveAttribute('aria-expanded', 'true');
+        await expect(head(page, '#research-overview', 'Progress')).toHaveAttribute('aria-expanded', 'false');
+        await expect(head(page, '#research-overview', /^Now/)).toHaveAttribute('aria-expanded', 'false');
+    });
+
+    test('Awaiting action collapsed stays so: a new item counts as new in the panel and the overview, over a reload; expanding clears it', async ({ page }) => {
+        const bridge = await follow(page);
+        const panel = page.locator('#live-panel');
+        await expect(head(page, '#live-panel', 'Awaiting action · 2')).toHaveAttribute('aria-expanded', 'true');
+        await head(page, '#live-panel', 'Awaiting action · 2').click();
+        expect((await storedPrefs(page)).s).toEqual({ waiting: 'collapsed' });
+
+        bridge.waiting = [...bridge.waiting, { id: 'T0009', what: 'Nový úkol', at: new Date().toISOString() }];
+        const waiting = head(page, '#live-panel', 'Awaiting action · 3');
+        await expect(waiting.locator('.live-panel-new')).toHaveText('1 new', { timeout: 15000 });
+        await expect(waiting).toHaveAttribute('aria-expanded', 'false');
+        await expect(waiting.locator('.live-panel-new')).not.toHaveClass(/is-important/);
+        // The heading's title may wrap, nothing scrolls sideways.
+        expect(await panel.locator('.live-panel-body').evaluate((b) => b.scrollWidth <= b.clientWidth)).toBe(true);
+
+        await page.reload();
+        await expect(head(page, '#live-panel', 'Awaiting action · 3')).toHaveAttribute('aria-expanded', 'false');
+        await expect(head(page, '#live-panel', 'Awaiting action · 3').locator('.live-panel-new')).toHaveText('1 new');
+
+        // The same in the overview; expanding there is the choice for both, and the new ones are seen.
+        await panel.locator('.live-panel-expand').click();
+        const ovWaiting = head(page, '#research-overview', 'Awaiting action · 3');
+        await expect(ovWaiting).toHaveAttribute('aria-expanded', 'false');
+        await expect(ovWaiting.locator('.live-panel-new')).toHaveText('1 new');
+        await ovWaiting.click();
+        await expect(ovWaiting).toHaveAttribute('aria-expanded', 'true');
+        await expect(ovWaiting.locator('.live-panel-new')).toHaveCount(0);
+        expect((await storedPrefs(page)).s).toEqual({ waiting: 'expanded' });
+        await page.keyboard.press('Escape');
+        await expect(head(page, '#live-panel', 'Awaiting action · 3')).toHaveAttribute('aria-expanded', 'true');
+        await expect(panel.locator('.live-panel-new')).toHaveCount(0);
+        // Collapsed again: nothing new.
+        await head(page, '#live-panel', 'Awaiting action · 3').click();
+        await expect(head(page, '#live-panel', 'Awaiting action · 3').locator('.live-panel-new')).toHaveCount(0);
+    });
+
+    test('a new item that is important marks "N new" amber; one that comes already sent counts nothing', async ({ page }) => {
+        const bridge = await follow(page, undefined, (b) => { b.features = ['waiting.groups']; });
+        await setPrefs(page, { waiting: 'collapsed' });
+        const waiting = () => head(page, '#live-panel', 'Awaiting action');
+        await expect(waiting()).toHaveAttribute('aria-expanded', 'false');
+        bridge.waiting = [...bridge.waiting, { id: 'T0010', what: 'Odeslaný dotaz', kind: 'letter', section: 'letter', phase: 'sent', sentAt: new Date().toISOString(), at: new Date().toISOString() }];
+        await expect(head(page, '#live-panel', 'Awaiting action · 2').locator('.live-section__sum')).toHaveText('awaiting a reply 1', { timeout: 15000 });
+        await expect(waiting().locator('.live-panel-new')).toHaveCount(0);
+        bridge.waiting = [...bridge.waiting, { id: 'T0011', what: 'Smí agent číst archiv?', kind: 'permission', host: 'katalog.archiv-chlumy.cz', at: new Date().toISOString() }];
+        await expect(waiting().locator('.live-panel-new')).toHaveText('1 new', { timeout: 15000 });
+        await expect(waiting().locator('.live-panel-new')).toHaveClass(/is-important/);
+        await expect(waiting()).toHaveAttribute('aria-expanded', 'false');
+    });
+
+    test('Awaiting action hidden: its count stays in the head; the chip shows it in the overview until that closes, the choice stays', async ({ page }) => {
+        await follow(page);
+        const panel = page.locator('#live-panel');
+        await expect(head(page, '#live-panel', 'Awaiting action · 2')).toBeVisible();
+        await setPrefs(page, { waiting: 'hidden' });
+        await expect(head(page, '#live-panel', 'Awaiting action')).toHaveCount(0);
+        const chip = panel.locator('.live-panel-actions > .live-panel-waitchip');
+        await expect(chip).toHaveText('Waiting 2');
+        await expect(chip).toHaveAttribute('aria-label', 'Awaiting action: 2. Opens the overview.');
+        await expect(chip).not.toHaveClass(/is-important/);
+        // First in the head's group of buttons.
+        await expect(panel.locator('.live-panel-actions > :first-child')).toHaveClass(/live-panel-waitchip/);
+
+        await chip.click();
+        const ov = page.locator('#research-overview');
+        const shown = head(page, '#research-overview', 'Awaiting action · 2');
+        await expect(shown).toHaveAttribute('aria-expanded', 'true');
+        await expect(shown).toHaveAttribute('aria-disabled', 'true');
+        await expect(shown.locator('.live-section__tag')).toHaveText('hidden');
+        await expect(ov.locator('.live-section__once')).toContainText('Hidden section, shown until the overview closes.');
+        await expect(ov.locator('.live-section__once .link-button')).toHaveText('Customize panel');
+        await expect(shown).toBeFocused();
+        // Its heading does not fold; the choice is unchanged.
+        await shown.click({ force: true });
+        await expect(shown).toHaveAttribute('aria-expanded', 'true');
+        expect((await storedPrefs(page)).s).toEqual({ waiting: 'hidden' });
+        // The overview's head keeps the count too.
+        await expect(ov.locator('.research-overview__sub .live-panel-waitchip')).toHaveText('Waiting 2');
+
+        // Closed and opened again: hidden as chosen, the chip there shows it.
+        await page.keyboard.press('Escape');
+        await expect(head(page, '#live-panel', 'Awaiting action')).toHaveCount(0);
+        await panel.locator('.live-panel-expand').click();
+        await expect(head(page, '#research-overview', 'Awaiting action')).toHaveCount(0);
+        await ov.locator('.research-overview__sub .live-panel-waitchip').click();
+        await expect(head(page, '#research-overview', 'Awaiting action · 2')).toHaveAttribute('aria-disabled', 'true');
+    });
+
+    test('an important item waiting (a permission) makes the chip solid amber with a hint; a folded panel keeps the chip in its summary', async ({ page }) => {
+        await follow(page, undefined, (b) => {
+            b.waiting = [...b.waiting, { id: 'T0012', what: 'Smí agent číst archiv?', kind: 'permission', host: 'katalog.archiv-chlumy.cz', at: new Date().toISOString() }];
+        });
+        const panel = page.locator('#live-panel');
+        await expect(head(page, '#live-panel', 'Awaiting action · 3')).toBeVisible();
+        await setPrefs(page, { waiting: 'hidden' });
+        const chip = panel.locator('.live-panel-actions > .live-panel-waitchip');
+        await expect(chip).toHaveText('Waiting 3');
+        await expect(chip).toHaveClass(/is-important/);
+        await expect(chip).toHaveAttribute('title', 'includes a decision or permission');
+
+        // The panel folded: the chip moves to the summary, first (once).
+        await panel.locator('.live-panel-toggle').click();
+        await expect(panel).toHaveClass(/collapsed/);
+        await expect(panel.locator('.live-panel-waitchip')).toHaveCount(1);
+        await expect(panel.locator('.live-panel-summary > :first-child')).toHaveText('Waiting 3');
+        await expect(panel.locator('.live-panel-summary > :first-child')).toHaveClass(/is-important/);
+
+        // Collapsed instead of hidden: the summary still counts it; a click opens the overview as it is.
+        await setPrefs(page, { waiting: 'collapsed' });
+        await expect(panel.locator('.live-panel-summary > .live-panel-waitchip')).toHaveText('Waiting 3');
+        await panel.locator('.live-panel-summary > .live-panel-waitchip').click();
+        await expect(head(page, '#research-overview', 'Awaiting action · 3')).toHaveAttribute('aria-expanded', 'false');
+        await page.keyboard.press('Escape');
+        // Expanded: no chip (as before).
+        await setPrefs(page, { waiting: 'expanded' });
+        await expect(panel.locator('.live-panel-waitchip')).toHaveCount(0);
+    });
+
+    test('phone: the strip keeps its count (amber when important); a hidden Awaiting action shows in the sheet until it closes', async ({ page }) => {
+        await follow(page, { width: 390, height: 844 }, (b) => {
+            b.waiting = [...b.waiting, { id: 'T0013', what: 'Smí agent číst archiv?', kind: 'permission', host: 'katalog.archiv-chlumy.cz', at: new Date().toISOString() }];
+        });
+        const panel = page.locator('#live-panel');
+        await expect(panel).toHaveClass(/phone-strip/);
+        await setPrefs(page, { waiting: 'hidden' });
+        const stripChip = panel.locator('.live-panel-summary .live-panel-chip--warn');
+        await expect(stripChip).toHaveText('Awaiting action 3');
+        await expect(stripChip).toHaveClass(/is-important/);
+        await expect(panel.locator('.live-panel-waitchip')).toHaveCount(0);
+        await panel.locator('.live-panel-toggle').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov).toHaveClass(/research-overview--sheet/);
+        await expect(head(page, '#research-overview', 'Awaiting action · 3').locator('.live-section__tag')).toHaveText('hidden');
+        await ov.locator('.research-overview__close').click();
+        await expect(ov).toHaveCount(0);
+        expect((await storedPrefs(page)).s).toEqual({ waiting: 'hidden' });
+    });
+
+    test('every section hidden: the state line and a way to Customize panel; the count of what waits stays', async ({ page }) => {
+        await follow(page);
+        const panel = page.locator('#live-panel');
+        await expect(head(page, '#live-panel', 'Awaiting action · 2')).toBeVisible();
+        await setPrefs(page, { working: 'hidden', waiting: 'hidden', changes: 'hidden', queue: 'hidden' });
+        await expect(panel.locator('.live-section__head')).toHaveCount(0);
+        await expect(panel.locator('.live-panel-state')).toBeVisible();
+        await expect(panel.locator('.live-panel-allhidden')).toContainText('All sections are hidden.');
+        await expect(panel.locator('.live-panel-allhidden .link-button')).toHaveText('Customize panel');
+        await expect(panel.locator('.live-panel-waitchip')).toHaveText('Waiting 2');
+        // The overview has two more: Directions and What the research knows stay.
+        await panel.locator('.live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov.locator('.live-panel-allhidden')).toHaveCount(0);
+        await expect(head(page, '#research-overview', 'What the research knows')).toBeVisible();
+        await expect(head(page, '#research-overview', /^Now/)).toHaveCount(0);
+        await setPrefs(page, { working: 'hidden', waiting: 'hidden', changes: 'hidden', queue: 'hidden', directions: 'hidden', knows: 'hidden' });
+        await expect(ov.locator('.live-panel-allhidden')).toContainText('All sections are hidden.');
+        await expect(ov.locator('.live-section__head')).toHaveCount(0);
+    });
+
+    test('short of room: a section kept expanded is skipped by the panel\'s own folding (the panel scrolls); a section without a choice folds as before', async ({ page }) => {
+        await page.addInitScript(() => {
+            if (sessionStorage.getItem('seeded-prefs')) return;
+            sessionStorage.setItem('seeded-prefs', '1');
+            localStorage.setItem('strom-live-section-prefs', JSON.stringify({ v: 1, s: { queue: 'expanded' } }));
+        });
+        await follow(page, { width: 1440, height: 520 });
+        const panel = page.locator('#live-panel');
+        await expect(panel.locator('.live-changes li').first()).toBeAttached();
+        await expect(head(page, '#live-panel', 'Up next')).toHaveAttribute('aria-expanded', 'true');
+        await expect(head(page, '#live-panel', 'Latest changes')).toHaveAttribute('aria-expanded', 'false');
+        await expect(head(page, '#live-panel', 'Awaiting action · 2')).toHaveAttribute('aria-expanded', 'true');
+        // Folded by the panel itself: not remembered; the choice made stays the only one.
+        expect((await storedPrefs(page)).s).toEqual({ queue: 'expanded' });
+        // A click on a section the panel folded expands it for good.
+        await head(page, '#live-panel', 'Latest changes').click();
+        await expect(head(page, '#live-panel', 'Latest changes')).toHaveAttribute('aria-expanded', 'true');
+        expect((await storedPrefs(page)).s).toEqual({ queue: 'expanded', changes: 'expanded' });
+    });
+});
+
+/** A long press as a finger makes it: pointerdown, held, pointerup, then the click the release makes. */
+async function longPress(page: Page, target: Locator, ms = 650): Promise<void> {
+    // The panel redraws now and then: wait for a heading in view.
+    let box = await target.boundingBox();
+    for (let i = 0; !box && i < 20; i++) {
+        await page.waitForTimeout(50);
+        box = await target.boundingBox();
+    }
+    if (!box) throw new Error('no box to press');
+    const at = { clientX: box.x + 20, clientY: box.y + box.height / 2, pointerType: 'touch', button: 0, isPrimary: true, bubbles: true };
+    await target.dispatchEvent('pointerdown', at);
+    await page.waitForTimeout(ms);
+    await target.dispatchEvent('pointerup', at);
+    await target.dispatchEvent('click', { clientX: at.clientX, clientY: at.clientY });
+}
+
+/** Nothing scrolls sideways: the window, and each open layer of Customize panel. */
+async function noSideways(page: Page): Promise<void> {
+    const wide = await page.evaluate(() => {
+        const out: string[] = [];
+        const doc = document.documentElement;
+        if (doc.scrollWidth > doc.clientWidth + 1) out.push(`page ${doc.scrollWidth}>${doc.clientWidth}`);
+        for (const n of document.querySelectorAll<HTMLElement>('.live-sec-edit, .live-sec-edit *, .live-sec-menu, .live-sec-menu *')) {
+            if (n.scrollWidth > n.clientWidth + 1 && getComputedStyle(n).overflowX !== 'visible' && !n.matches('.live-sec-seg__opt')) out.push(`${n.className} ${n.scrollWidth}>${n.clientWidth}`);
+            const r = n.getBoundingClientRect();
+            if (r.width > 0 && (r.left < -0.5 || r.right > window.innerWidth + 0.5)) out.push(`${n.className} outside ${Math.round(r.left)}..${Math.round(r.right)}`);
+        }
+        return out;
+    });
+    expect(wide).toEqual([]);
+}
+
+/** The smallest height of what a finger can press (the visible box). */
+const minHeight = (loc: Locator) => loc.evaluateAll((els) => Math.min(...els.map(e => e.getBoundingClientRect().height)));
+
+const TALL = { width: 1440, height: 1300 };
+
+test.describe('Customize panel: ⋯, a section\'s menu, Settings (spec 044)', () => {
+    test('popover, section menu and Settings make the same choice; Hidden from the menu says so with Undo', async ({ page }) => {
+        await follow(page, TALL);
+        const panel = page.locator('#live-panel');
+        // Awaiting action: never folded by the panel itself.
+        const waiting = () => head(page, '#live-panel', 'Awaiting action');
+        await expect(waiting()).toHaveAttribute('aria-expanded', 'true');
+        // ⋯ between ⤢ and Stop following, in the group of icons.
+        const icons = panel.locator('.live-panel-icons > button');
+        await expect(icons.last()).toHaveClass(/live-panel-more/);
+        await expect(icons.nth(-2)).toHaveClass(/live-panel-expand/);
+        const more = panel.locator('.live-panel-more');
+        await expect(more).toHaveAttribute('aria-label', 'Customize panel');
+
+        // 1. The popover: all six in the sections' order, in one list (spec 057); the overview's two say so.
+        await more.click();
+        const pop = page.locator('.live-sec-edit[role="dialog"]');
+        await expect(pop).toHaveAttribute('aria-label', 'Customize panel');
+        await expect(more).toHaveAttribute('aria-expanded', 'true');
+        await expect(pop.locator('.live-sec-edit__label')).toHaveText(['At work', 'Awaiting action', 'Directions', 'Latest changes', 'Up next', 'What the research knows']);
+        await expect(pop.locator('.live-sec-edit__sep')).toHaveCount(0);
+        const row = (key: string) => pop.locator(`.live-sec-edit__row[data-key="${key}"]`);
+        await expect(row('working').locator('.live-sec-edit__note')).toHaveText('default · in the overview: Now');
+        await expect(row('knows').locator('.live-sec-edit__grip')).toHaveAttribute('aria-hidden', 'true');
+        // No choice: nothing checked, the state now dashed; Restore defaults off.
+        await expect(row('waiting').locator('[role="radio"][aria-checked="true"]')).toHaveCount(0);
+        await expect(row('waiting').locator('[role="radio"].is-current')).toHaveText('Expanded');
+        await expect(pop.locator('.live-sec-reset')).toHaveAttribute('aria-disabled', 'true');
+        // Right edges aligned, 6px under ⋯, 320 wide.
+        const [m, b] = [(await more.boundingBox())!, (await pop.boundingBox())!];
+        expect(Math.abs((m.x + m.width) - (b.x + b.width))).toBeLessThanOrEqual(1);
+        expect(Math.abs(b.y - (m.y + m.height + 6))).toBeLessThanOrEqual(1);
+        expect(Math.round(b.width)).toBe(320);
+
+        await row('waiting').locator('[role="radio"]', { hasText: 'Collapsed' }).click();
+        await expect(waiting()).toHaveAttribute('aria-expanded', 'false');
+        await expect(row('waiting').locator('[role="radio"][aria-checked="true"]')).toHaveText('Collapsed');
+        await expect(row('waiting').locator('.is-current')).toHaveCount(0);
+        await expect(row('waiting').locator('.live-sec-edit__note')).toHaveCount(0);
+        await expect(pop.locator('.live-sec-reset')).toHaveAttribute('aria-disabled', 'false');
+        expect((await storedPrefs(page)).s).toEqual({ waiting: 'collapsed' });
+        // An outside click closes it, the popover hid nothing without a word.
+        await page.mouse.click(200, 400);
+        await expect(pop).toHaveCount(0);
+        await expect(more).toHaveAttribute('aria-expanded', 'false');
+
+        // 2. A section's menu (right click): ✓ on the choice only, then Customize panel….
+        const changes = head(page, '#live-panel', 'Latest changes');
+        await changes.click({ button: 'right' });
+        const menu = page.locator('.live-sec-menu[role="menu"]');
+        await expect(menu).toHaveAttribute('aria-label', 'Options for Latest changes');
+        await expect(menu.locator('.live-sec-menu__head')).toHaveText(/^Latest changes · default/);
+        await expect(changes).toHaveClass(/is-menu-open/);
+        await expect(menu.locator('[role="menuitemradio"]')).toHaveText(['Expanded', 'Collapsed', 'Hidden']);
+        await expect(menu.locator('[role="menuitemradio"][aria-checked="true"]')).toHaveCount(0);
+        await expect(menu.locator('.live-sec-menu__edit')).toHaveText('Customize panel…');
+        await menu.locator('[role="menuitemradio"]', { hasText: 'Hidden' }).click();
+        await expect(menu).toHaveCount(0);
+        await expect(changes).toHaveCount(0);
+        const toast = page.locator('.toast[data-kind="live-sections"]');
+        await expect(toast).toContainText('Section hidden');
+        expect((await storedPrefs(page)).s).toEqual({ waiting: 'collapsed', changes: 'hidden' });
+        await toast.getByRole('button', { name: 'Undo' }).click();
+        await expect(head(page, '#live-panel', 'Latest changes')).toBeVisible();
+        expect((await storedPrefs(page)).s).toEqual({ waiting: 'collapsed' });
+        // A section's menu shows the stored choice; Customize panel… opens the popover.
+        await waiting().click({ button: 'right' });
+        await expect(menu.locator('[role="menuitemradio"][aria-checked="true"]')).toHaveText(/Collapsed/);
+        await expect(menu.locator('.live-sec-menu__head')).toHaveText('Awaiting action');
+        await menu.locator('.live-sec-menu__edit').click();
+        await expect(menu).toHaveCount(0);
+        await expect(pop).toBeVisible();
+        await page.keyboard.press('Escape');
+        await expect(pop).toHaveCount(0);
+        await expect(more).toBeFocused();
+
+        // 3. Settings: the same choices, one for all; a change there shows in the panel at once.
+        await page.evaluate(() => window.Strom.UI.showSettingsDialog());
+        const group = page.locator('#settings-group-research-follow');
+        await expect(group).toBeVisible();
+        await expect(group.locator('.settings-group-title')).toHaveText(/Following research/i);
+        await expect(group.locator('.settings-group-note')).toHaveText('On this device, for all trees. Applies to the panel and the Research overview, with or without following.');
+        const set = (key: string) => group.locator(`.live-sec-edit__row[data-key="${key}"]`);
+        await expect(set('waiting').locator('[aria-checked="true"]')).toHaveText('Collapsed');
+        await expect(set('working').locator('.live-sec-edit__note')).toHaveText('default · in the overview: Now');
+        await expect(group.locator('.is-current')).toHaveCount(0);
+        await set('waiting').locator('[role="radio"]', { hasText: 'Expanded' }).click();
+        await expect(waiting()).toHaveAttribute('aria-expanded', 'true');
+        expect((await storedPrefs(page)).s).toEqual({ waiting: 'expanded' });
+        // Hidden from Settings: no toast.
+        await set('knows').locator('[role="radio"]', { hasText: 'Hidden' }).click();
+        await expect(set('knows').locator('[aria-checked="true"]')).toHaveText('Hidden');
+        await expect(toast).toHaveCount(0);
+        await group.locator('.live-sec-reset').click();
+        await expect(page.locator('.toast[data-kind="live-sections"]')).toContainText('Defaults restored');
+        // The sections' choices are gone (the follow rows always show their choice).
+        await expect(group.locator('.live-sec-edit__row [aria-checked="true"]')).toHaveCount(0);
+        await expect(group.locator('.live-sec-reset')).toHaveAttribute('aria-disabled', 'true');
+    });
+
+    test('Restore defaults: no question, the popover closes, a toast with Undo brings the choices back', async ({ page }) => {
+        await follow(page);
+        const panel = page.locator('#live-panel');
+        await setPrefs(page, { queue: 'collapsed', changes: 'hidden', knows: 'hidden' });
+        await expect(head(page, '#live-panel', 'Latest changes')).toHaveCount(0);
+        await panel.locator('.live-panel-more').click();
+        const pop = page.locator('.live-sec-edit');
+        await pop.locator('.live-sec-reset').click();
+        await expect(pop).toHaveCount(0);
+        await expect(panel.locator('.live-panel-more')).toBeFocused();
+        await expect(head(page, '#live-panel', 'Latest changes')).toBeVisible();
+        expect((await storedPrefs(page))?.s ?? {}).toEqual({});
+        const toast = page.locator('.toast[data-kind="live-sections"]');
+        await expect(toast).toContainText('Defaults restored');
+        await toast.getByRole('button', { name: 'Undo' }).click();
+        await expect(head(page, '#live-panel', 'Latest changes')).toHaveCount(0);
+        expect((await storedPrefs(page)).s).toEqual({ queue: 'collapsed', changes: 'hidden', knows: 'hidden' });
+    });
+
+    test('keyboard: Shift+F10 and the Menu key open a heading\'s menu under it; arrows choose in the popover; Escape gives focus back', async ({ page }) => {
+        const bridge = await follow(page, TALL);
+        const panel = page.locator('#live-panel');
+        const queue = head(page, '#live-panel', 'Awaiting action');
+        // Following reads the tree twice (the research's newer head); the second load redraws the panel, which on a
+        // slow runner came in the middle of the keys below and took the focus and the menu with it.
+        await expect.poll(() => bridge.gedCalls).toBe(2);
+        await expect(queue).toHaveAttribute('aria-expanded', 'true');
+        // The locator's own press finds the heading again: a redraw of the panel (a slow runner) detaches a focused one.
+        await queue.press('Shift+F10');
+        const menu = page.locator('.live-sec-menu');
+        await expect(menu).toBeVisible();
+        // Under the heading, the first item focused; arrows walk, Escape closes back to the heading.
+        await expect(async () => {
+            const [h, mb] = [await queue.boundingBox(), await menu.boundingBox()];
+            expect(h && mb && mb.y >= h.y + h.height).toBe(true);
+        }).toPass();
+        await expect(menu.locator('[role="menuitemradio"]').first()).toBeFocused();
+        await page.keyboard.press('ArrowDown');
+        await expect(menu.locator('[role="menuitemradio"]').nth(1)).toBeFocused();
+        await page.keyboard.press('Escape');
+        await expect(menu).toHaveCount(0);
+        await expect(queue).toBeFocused();
+        await expect(queue).toHaveAttribute('aria-expanded', 'true');
+        await queue.press('ContextMenu');
+        await expect(menu).toBeVisible();
+        await page.keyboard.press('ArrowDown');
+        await page.keyboard.press('Enter');
+        await expect(menu).toHaveCount(0);
+        await expect(head(page, '#live-panel', 'Awaiting action')).toHaveAttribute('aria-expanded', 'false');
+        expect((await storedPrefs(page)).s).toEqual({ waiting: 'collapsed' });
+        // The popover: the tab stop is the choice; → moves and chooses at once.
+        await panel.locator('.live-panel-more').click();
+        const pop = page.locator('.live-sec-edit');
+        await expect(pop.locator('[data-key="working"] [tabindex="0"]')).toBeFocused();
+        const queueSeg = pop.locator('[data-key="waiting"] [role="radiogroup"]');
+        await expect(queueSeg.locator('[tabindex="0"]')).toHaveText('Collapsed');
+        await queueSeg.locator('[tabindex="0"]').focus();
+        await page.keyboard.press('ArrowRight');
+        await expect(queueSeg.locator('[aria-checked="true"]')).toHaveText('Hidden');
+        await expect(queueSeg.locator('[aria-checked="true"]')).toBeFocused();
+        await expect(head(page, '#live-panel', 'Awaiting action')).toHaveCount(0);
+        await page.keyboard.press('ArrowLeft');
+        await page.keyboard.press('ArrowLeft');
+        await expect(queueSeg.locator('[aria-checked="true"]')).toHaveText('Expanded');
+        await expect(head(page, '#live-panel', 'Awaiting action')).toHaveAttribute('aria-expanded', 'true');
+        await page.keyboard.press('Escape');
+        await expect(pop).toHaveCount(0);
+        await expect(panel.locator('.live-panel-more')).toBeFocused();
+        // The overview stays open: Escape went to the popover only.
+        await panel.locator('.live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        await ov.locator('.research-overview__more').click();
+        await expect(pop.locator('.live-sec-edit__label')).toHaveText(['Now', 'Awaiting action', 'Directions', 'Progress', 'Queue', 'What the research knows']);
+        await expect(pop.locator('.live-sec-edit__sep')).toHaveCount(0);
+        await page.keyboard.press('Escape');
+        await expect(pop).toHaveCount(0);
+        await expect(ov).toBeVisible();
+        await expect(ov.locator('.research-overview__more')).toBeFocused();
+    });
+
+    test('Settings: no group without a tree in research', async ({ page }) => {
+        await openApp(page);
+        await page.evaluate(() => window.Strom.UI.showSettingsDialog());
+        await expect(page.locator('#settings-modal')).toBeVisible();
+        await expect(page.locator('#settings-group-research-follow')).toBeHidden();
+    });
+});
+
+/** A fixed clock at the real now, kept away from midnight UTC (the bridge's own times are real ones). */
+async function fixClock(page: Page): Promise<void> {
+    const now = Date.now();
+    const h = new Date(now).getUTCHours();
+    await page.clock.setFixedTime(new Date(h >= 22 ? now - 3 * 3600_000 : h < 2 ? now + 3 * 3600_000 : now));
+}
+
+const DEFAULT_ORDER = ['working', 'waiting', 'directions', 'changes', 'queue', 'knows'];
+const storedOrder = async (page: Page): Promise<string[]> => (await storedPrefs(page))?.o ?? DEFAULT_ORDER;
+const panelTitles = async (page: Page): Promise<string[]> =>
+    (await page.locator('#live-panel .live-section__title').allTextContents()).map(t => t.trim().replace(/ · \d+$/, ''));
+
+test.describe('Customize panel: the order and the top (spec 057)', () => {
+    test('↑ ↓, Alt+arrows, a section\'s menu and a drag move a section; said to a screen reader, kept over a reload', async ({ page }) => {
+        await fixClock(page);
+        await follow(page, TALL, (b) => { b.events = false; });
+        const panel = page.locator('#live-panel');
+        await panel.locator('.live-panel-more').click();
+        const pop = page.locator('.live-sec-edit[role="dialog"]');
+        const row = (key: string) => pop.locator(`.live-sec-edit__row[data-key="${key}"]`);
+        const move = (key: string, dir: 'up' | 'down') => row(key).locator(`.live-sec-edit__move[data-value="${dir}"]`);
+        const sr = pop.locator('.live-sec-edit__sr');
+        await expect(sr).toHaveAttribute('aria-live', 'polite');
+        // The ends: no way up for the first, none down for the last; each button says which section.
+        await expect(move('working', 'up')).toHaveAttribute('aria-disabled', 'true');
+        await expect(move('working', 'down')).toHaveAttribute('aria-disabled', 'false');
+        await expect(move('knows', 'down')).toHaveAttribute('aria-disabled', 'true');
+        await expect(move('working', 'down')).toHaveAttribute('aria-label', 'Move At work down');
+        await expect(move('working', 'down')).toHaveAttribute('title', 'Move down');
+        // ↓: second of six; the focus stays on it, the panel draws the new order and marks the section a while.
+        await move('working', 'down').click();
+        await expect(pop.locator('.live-sec-edit__label')).toHaveText(['Awaiting action', 'At work', 'Directions', 'Latest changes', 'Up next', 'What the research knows']);
+        await expect(move('working', 'down')).toBeFocused();
+        await expect(sr).toHaveText('At work moved to position 2 of 6.');
+        expect(await storedOrder(page)).toEqual(['waiting', 'working', 'directions', 'changes', 'queue', 'knows']);
+        await expect.poll(() => panelTitles(page)).toEqual(['Awaiting action', 'At work', 'Latest changes', 'Up next']);
+        await expect(panel.locator('[aria-controls="live-sec-working"]')).toHaveClass(/is-moved/);
+        await expect(panel.locator('[aria-controls="live-sec-working"]')).not.toHaveClass(/is-moved/, { timeout: 4000 });
+        // ↑ back to the top: that button can no longer be used, the focus goes to ↓.
+        await move('working', 'up').click();
+        await expect(move('working', 'up')).toHaveAttribute('aria-disabled', 'true');
+        await expect(move('working', 'down')).toBeFocused();
+        await expect(sr).toHaveText('At work moved to position 1 of 6.');
+        expect(await storedOrder(page)).toEqual(DEFAULT_ORDER);
+        // Alt+↑ from the row's segment: the row moves, the focus stays in the segment.
+        const queueRadio = row('queue').locator('[role="radio"][tabindex="0"]');
+        await queueRadio.focus();
+        await page.keyboard.press('Alt+ArrowUp');
+        await expect(row('queue').locator('[role="radio"][tabindex="0"]')).toBeFocused();
+        await expect(sr).toHaveText('Up next moved to position 4 of 6.');
+        expect(await storedOrder(page)).toEqual(['working', 'waiting', 'directions', 'queue', 'changes', 'knows']);
+        await expect(row('queue').locator('[aria-checked="true"]')).toHaveCount(0);
+
+        // A drag by the grip: Up next above At work.
+        const grip = (await row('queue').locator('.live-sec-edit__grip').boundingBox())!;
+        const first = (await row('working').boundingBox())!;
+        await page.mouse.move(grip.x + grip.width / 2, grip.y + grip.height / 2);
+        await page.mouse.down();
+        await page.mouse.move(grip.x + grip.width / 2, first.y + first.height / 2 + 4, { steps: 6 });
+        await page.mouse.move(grip.x + grip.width / 2, first.y + 4, { steps: 4 });
+        await expect(row('queue')).toHaveClass(/is-dragging/);
+        await expect(row('working')).toHaveClass(/is-drop-before/);
+        await page.mouse.up();
+        await expect(pop.locator('.live-sec-edit__label').first()).toHaveText('Up next');
+        await expect(sr).toHaveText('Up next moved to position 1 of 6.');
+        expect(await storedOrder(page)).toEqual(['queue', 'working', 'waiting', 'directions', 'changes', 'knows']);
+        // A drag let go with Escape: nothing moves, the popover stays.
+        const g2 = (await row('knows').locator('.live-sec-edit__grip').boundingBox())!;
+        await page.mouse.move(g2.x + g2.width / 2, g2.y + g2.height / 2);
+        await page.mouse.down();
+        await page.mouse.move(g2.x + g2.width / 2, first.y + 4, { steps: 6 });
+        await page.keyboard.press('Escape');
+        await page.mouse.up();
+        await expect(pop).toBeVisible();
+        await expect(row('knows')).not.toHaveClass(/is-dragging/);
+        expect(await storedOrder(page)).toEqual(['queue', 'working', 'waiting', 'directions', 'changes', 'knows']);
+        await page.keyboard.press('Escape');
+        await expect(pop).toHaveCount(0);
+
+        // A section's menu: the first in the panel offers Move down only; the panel's order skips Directions.
+        await expect.poll(() => panelTitles(page)).toEqual(['Up next', 'At work', 'Awaiting action', 'Latest changes']);
+        await head(page, '#live-panel', 'Up next').click({ button: 'right' });
+        const menu = page.locator('.live-sec-menu[role="menu"]');
+        await expect(menu.locator('.live-sec-menu__move')).toHaveText(['Move down']);
+        await page.keyboard.press('Escape');
+        await expect(menu).toHaveCount(0);
+        await head(page, '#live-panel', /^Latest changes/).click({ button: 'right' });
+        await expect(menu.locator('.live-sec-menu__move')).toHaveText(['Move up']);
+        await expect(menu.locator('.live-sec-menu__edit')).toHaveText('Customize panel…');
+        await menu.locator('.live-sec-menu__move').click();
+        await expect(menu).toHaveCount(0);
+        // One place in the panel's order: it takes the place of Awaiting action (Directions, not in the panel, stays).
+        expect(await storedOrder(page)).toEqual(['queue', 'working', 'changes', 'directions', 'waiting', 'knows']);
+        await expect.poll(() => panelTitles(page)).toEqual(['Up next', 'At work', 'Latest changes', 'Awaiting action']);
+        await expect(head(page, '#live-panel', /^Latest changes/)).toBeFocused();
+
+        // Kept over a reload.
+        await page.reload();
+        await expect(page.locator('#live-panel')).toBeVisible();
+        await expect.poll(() => panelTitles(page)).toEqual(['Up next', 'At work', 'Latest changes', 'Awaiting action']);
+    });
+
+    test('hiding from the popover: the row says hidden, the section goes, no toast', async ({ page }) => {
+        await fixClock(page);
+        await follow(page, TALL, (b) => { b.events = false; });
+        await page.locator('#live-panel .live-panel-more').click();
+        const pop = page.locator('.live-sec-edit');
+        const row = pop.locator('.live-sec-edit__row[data-key="changes"]');
+        await row.locator('[role="radio"]', { hasText: 'Hidden' }).click();
+        await expect(row).toHaveClass(/is-hidden/);
+        await expect(row.locator('.live-sec-edit__tag')).toHaveText('hidden');
+        await expect(head(page, '#live-panel', /^Latest changes/)).toHaveCount(0);
+        await expect(page.locator('.toast[data-kind="live-sections"]')).toHaveCount(0);
+        await row.locator('[role="radio"]', { hasText: 'Expanded' }).click();
+        await expect(row).not.toHaveClass(/is-hidden/);
+        await expect(row.locator('.live-sec-edit__tag')).toHaveCount(0);
+        await expect(head(page, '#live-panel', /^Latest changes/)).toBeVisible();
+    });
+
+    test('At the top: switches and parts; both parts off is the tile off, on again its default parts; the cost off until switched on', async ({ page }) => {
+        await fixClock(page);
+        await follow(page, TALL, (b) => { b.events = false; });
+        await page.locator('#live-panel .live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        const cells = ov.locator('.research-overview__summary .research-overview__cell');
+        const month = cells.filter({ hasText: 'This month' });
+        await expect(cells).toHaveCount(3);
+        await ov.locator('.research-overview__more').click();
+        const pop = page.locator('.live-sec-edit');
+        const top = (key: string) => pop.locator(`.live-sec-top__row[data-key="top-${key}"]`);
+        const chip = (key: string, part: string) => top(key).locator(`.live-sec-chip[data-value="${part}"]`);
+        await expect(pop.locator('.live-sec-card__title')).toHaveText(['Sections and order', 'At the top']);
+        await expect(pop.locator('.live-sec-top__label')).toHaveText(['State', 'Last 24 h', 'This month', 'Follow in: Family / Fan / Map']);
+        await expect(top('state').locator('.live-sec-top__lock')).toHaveText('always shown');
+        await expect(top('state').locator('[role="switch"]')).toHaveCount(0);
+        // The cost: off without a choice, and said so; switched on, the amount shows and the word goes.
+        await expect(chip('month', 'month.price')).toHaveAttribute('aria-checked', 'false');
+        await expect(top('month').locator('.live-sec-top__help')).toHaveText('Cost shows only when switched on.');
+        await expect(month.locator('.research-overview__cell-value')).toHaveText(/^4 sessions/);
+        await chip('month', 'month.price').click();
+        await expect(month.locator('.research-overview__cell-value')).toHaveText('$3.20');
+        await expect(top('month').locator('.live-sec-top__help')).toHaveCount(0);
+        expect((await storedPrefs(page)).t).toEqual({ 'month.price': true });
+        // Last 24 h switched off: its parts greyed, the tile gone.
+        const daySwitch = top('day').locator('[role="switch"]');
+        await expect(daySwitch).toHaveAttribute('aria-checked', 'true');
+        await daySwitch.click();
+        await expect(daySwitch).toHaveAttribute('aria-checked', 'false');
+        await expect(chip('day', 'day.persons')).toHaveAttribute('aria-disabled', 'true');
+        await expect(chip('day', 'day.sources')).toHaveAttribute('aria-disabled', 'true');
+        await expect(cells).toHaveCount(2);
+        // On again: its default parts.
+        await daySwitch.click();
+        await expect(chip('day', 'day.persons')).toHaveAttribute('aria-checked', 'true');
+        await expect(chip('day', 'day.sources')).toHaveAttribute('aria-checked', 'true');
+        await expect(cells).toHaveCount(3);
+        // Both parts unticked one by one: the tile is off.
+        await chip('day', 'day.persons').click();
+        await expect(daySwitch).toHaveAttribute('aria-checked', 'true');
+        await chip('day', 'day.sources').click();
+        await expect(daySwitch).toHaveAttribute('aria-checked', 'false');
+        await expect(cells).toHaveCount(2);
+        // Follow in: a switch of its own, with when it shows.
+        await expect(top('followIn').locator('.live-sec-top__help')).toHaveText('Only while following live.');
+        await top('followIn').locator('[role="switch"]').click();
+        await expect(top('followIn').locator('[role="switch"]')).toHaveAttribute('aria-checked', 'false');
+        expect((await storedPrefs(page)).t).toEqual({ 'month.price': true, 'day.persons': false, 'day.sources': false, followIn: false });
+        // Kept over a reload.
+        await page.reload();
+        // The overview opens again by itself.
+        await expect(ov).toBeVisible();
+        await expect(cells).toHaveCount(2);
+        await expect(month.locator('.research-overview__cell-value')).toHaveText('$3.20');
+    });
+
+    test('Restore defaults puts back the order, the parts and the states; Undo brings all of them back', async ({ page }) => {
+        await fixClock(page);
+        await follow(page, TALL, (b) => { b.events = false; });
+        const rec = { s: { changes: 'hidden' }, o: ['queue', 'working', 'waiting', 'directions', 'changes', 'knows'], t: { 'month.price': true, followIn: false } };
+        await setRecord(page, rec);
+        await expect.poll(() => panelTitles(page)).toEqual(['Up next', 'At work', 'Awaiting action']);
+        await page.locator('#live-panel .live-panel-more').click();
+        await page.locator('.live-sec-edit .live-sec-reset').click();
+        await expect(page.locator('.live-sec-edit')).toHaveCount(0);
+        await expect.poll(() => panelTitles(page)).toEqual(['At work', 'Awaiting action', 'Latest changes', 'Up next']);
+        const after = await storedPrefs(page);
+        expect([after?.s ?? {}, after?.o, after?.t]).toEqual([{}, undefined, undefined]);
+        const toast = page.locator('.toast[data-kind="live-sections"]');
+        await expect(toast).toContainText('Defaults restored');
+        await toast.getByRole('button', { name: 'Undo' }).click();
+        await expect.poll(() => panelTitles(page)).toEqual(['Up next', 'At work', 'Awaiting action']);
+        const back = await storedPrefs(page);
+        expect({ s: back.s, o: back.o, t: back.t }).toEqual(rec);
+    });
+
+    test('Settings: the same two cards, each row on one line; a move there moves the panel; the way there from the popover', async ({ page }) => {
+        await fixClock(page);
+        await follow(page, TALL, (b) => { b.events = false; });
+        await page.locator('#live-panel .live-panel-more').click();
+        await page.locator('.live-sec-edit .live-sec-edit__all').click();
+        await expect(page.locator('.live-sec-edit')).toHaveCount(0);
+        const group = page.locator('#settings-group-research-follow');
+        await expect(group).toBeVisible();
+        await expect(group.locator('.settings-group-title')).toBeFocused();
+        await expect(group.locator('.live-sec-card__title')).toHaveText(['Sections and order', 'At the top']);
+        await expect(group.locator('.live-sec-edit__label')).toHaveText(['At work', 'Awaiting action', 'Directions', 'Latest changes', 'Up next', 'What the research knows']);
+        await expect(group.locator('[data-key="top-month"] .live-sec-top__help')).toHaveText('Cost (amount and scan readers) shows only when switched on.');
+        // One line: the name, the segment and ↑ ↓ side by side.
+        const row = group.locator('.live-sec-edit__row[data-key="changes"]');
+        const [lab, seg, mv] = [
+            (await row.locator('.live-sec-edit__label').boundingBox())!,
+            (await row.locator('[role="radiogroup"]').boundingBox())!,
+            (await row.locator('.live-sec-edit__moves').boundingBox())!,
+        ];
+        expect(seg.x).toBeGreaterThan(lab.x + lab.width);
+        expect(mv.x).toBeGreaterThan(seg.x + seg.width - 1);
+        expect(Math.abs((seg.y + seg.height / 2) - (mv.y + mv.height / 2))).toBeLessThan(4);
+        await row.locator('.live-sec-edit__move[data-value="up"]').click();
+        await expect(group.locator('.live-sec-edit__sr')).toHaveText('Latest changes moved to position 3 of 6.');
+        await expect(row.locator('.live-sec-edit__move[data-value="up"]')).toBeFocused();
+        await expect.poll(() => panelTitles(page)).toEqual(['At work', 'Awaiting action', 'Latest changes', 'Up next']);
+        await row.locator('.live-sec-edit__move[data-value="up"]').click();
+        await expect.poll(() => panelTitles(page)).toEqual(['At work', 'Latest changes', 'Awaiting action', 'Up next']);
+        // The top's parts from Settings.
+        await group.locator('[data-key="top-month"] .live-sec-chip[data-value="month.sessions"]').click();
+        expect((await storedPrefs(page)).t).toEqual({ 'month.sessions': false });
+    });
+});
+
+test.describe('Customize panel on a touch screen (spec 044)', () => {
+    test.use({ hasTouch: true, isMobile: true });
+
+    test('tablet 1024×768: a long press opens the menu and does not fold; targets of 44px; nothing sideways', async ({ page }) => {
+        await follow(page, { width: 1024, height: 768 });
+        const panel = page.locator('#live-panel');
+        // Awaiting action: never folded by the panel itself.
+        const queue = head(page, '#live-panel', 'Awaiting action');
+        await expect(queue).toHaveAttribute('aria-expanded', 'true');
+        await longPress(page, queue);
+        const menu = page.locator('.live-sec-menu');
+        await expect(menu).toBeVisible();
+        await expect(queue).toHaveAttribute('aria-expanded', 'true');
+        expect(await minHeight(menu.locator('.live-sec-menu__item'))).toBeGreaterThanOrEqual(44);
+        await noSideways(page);
+        // A short tap still folds.
+        await page.keyboard.press('Escape');
+        await expect(menu).toHaveCount(0);
+        await longPress(page, queue, 120);
+        await expect(menu).toHaveCount(0);
+        await expect(queue).toHaveAttribute('aria-expanded', 'false');
+        // The head's icons: 44px tall to a finger, from a margin around 28px buttons.
+        // The panel may redraw (a status poll) between finding a button and measuring it: each check retries on a fresh element.
+        const icons = panel.locator('.live-panel-icons > button');
+        const iconCount = await icons.count();
+        expect(iconCount).toBeGreaterThan(0);
+        for (let i = 0; i < iconCount; i++) {
+            await expect(async () => {
+                const b = icons.nth(i);
+                const r = await b.boundingBox();
+                expect(r).not.toBeNull();
+                expect(r!.width).toBeLessThan(44);
+                const hit = await page.evaluate(([x, y1, y2]) => [document.elementFromPoint(x, y1), document.elementFromPoint(x, y2)].map(n => n?.className ?? ''), [r!.x + r!.width / 2, r!.y + r!.height / 2 - 21, r!.y + r!.height / 2 + 21]);
+                const cls = await b.getAttribute('class');
+                expect(hit).toEqual([cls, cls]);
+            }).toPass({ timeout: 5000 });
+        }
+        await panel.locator('.live-panel-more').click();
+        const pop = page.locator('.live-sec-edit');
+        await expect(pop).not.toHaveClass(/live-sec-sheet/);
+        expect(await minHeight(pop.locator('[role="radio"]'))).toBeGreaterThanOrEqual(44);
+        expect(await minHeight(pop.locator('.live-sec-reset'))).toBeGreaterThanOrEqual(44);
+        await noSideways(page);
+    });
+
+    test('phone 390×844: ⋯ in the sheet opens a bottom sheet; a long press on a heading opens its sheet; Done and the backdrop close', async ({ page }) => {
+        await follow(page, { width: 390, height: 844 });
+        const panel = page.locator('#live-panel');
+        await expect(panel).toHaveClass(/phone-strip/);
+        await expect(panel.locator('.live-panel-more')).toHaveCount(0);
+        await panel.locator('.live-panel-toggle').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov).toHaveClass(/research-overview--sheet/);
+        const more = ov.locator('.research-overview__more');
+        expect(await minHeight(more)).toBeGreaterThanOrEqual(44);
+        await more.click();
+        const sheet = page.locator('.live-sec-edit.live-sec-sheet');
+        await expect(sheet).toBeVisible();
+        await expect(sheet.locator('.live-sec-sheet__title')).toHaveText('Customize panel');
+        expect(await minHeight(sheet.locator('[role="radio"]'))).toBeGreaterThanOrEqual(44);
+        expect(await minHeight(sheet.locator('.live-sec-sheet__done, .live-sec-reset, .live-sec-edit__move'))).toBeGreaterThanOrEqual(44);
+        const sb = (await sheet.boundingBox())!;
+        expect(sb.y + sb.height).toBeCloseTo(844, 0);
+        expect(sb.height).toBeLessThanOrEqual(844 * 0.86 + 1);
+        // The segment under its name, across the row.
+        const lab = (await sheet.locator('[data-key="queue"] .live-sec-edit__label').boundingBox())!;
+        const seg = (await sheet.locator('[data-key="queue"] [role="radiogroup"]').boundingBox())!;
+        expect(seg.y).toBeGreaterThan(lab.y + lab.height - 1);
+        await noSideways(page);
+        await sheet.locator('[data-key="queue"] [role="radio"]', { hasText: 'Collapsed' }).click();
+        expect((await storedPrefs(page)).s).toEqual({ queue: 'collapsed' });
+        await sheet.locator('.live-sec-sheet__done').click();
+        await expect(sheet).toHaveCount(0);
+        await expect(ov).toBeVisible();
+
+        // A long press on a heading in the sheet: its own sheet, 48px rows, ✓ on the choice.
+        const queue = head(page, '#research-overview', 'Queue');
+        const was = await queue.getAttribute('aria-expanded');
+        await longPress(page, queue);
+        const sec = page.locator('.live-sec-menu.live-sec-sheet');
+        await expect(sec).toBeVisible();
+        await expect(queue).toHaveAttribute('aria-expanded', was!);
+        await expect(sec.locator('.live-sec-sheet__title')).toHaveText('Queue');
+        await expect(sec.locator('[aria-checked="true"]')).toHaveText(/Collapsed/);
+        expect(await minHeight(sec.locator('.live-sec-menu__item'))).toBeGreaterThanOrEqual(48);
+        await noSideways(page);
+        // A tap on the backdrop closes.
+        await page.mouse.click(195, 40);
+        await expect(sec).toHaveCount(0);
+        await expect(ov).toBeVisible();
+        // Customize panel… from a heading's sheet opens the editor's sheet.
+        await longPress(page, head(page, '#research-overview', /^Now/));
+        await sec.locator('.live-sec-menu__edit').click();
+        await expect(sheet).toBeVisible();
+    });
+
+    test('phone sideways 844×390: a centered sheet 390 wide, each segment under its name', async ({ page }) => {
+        await follow(page, { width: 844, height: 390 });
+        // Sideways the small panel stays, with its ⋯; the editor is a sheet all the same.
+        await page.locator('#live-panel .live-panel-more').click();
+        const sheet = page.locator('.live-sec-edit.live-sec-sheet');
+        await expect(sheet).toBeVisible();
+        const sb = (await sheet.boundingBox())!;
+        expect(Math.round(sb.width)).toBe(390);
+        expect(Math.abs(sb.x - (844 - 390) / 2)).toBeLessThanOrEqual(1);
+        expect(sb.height).toBeLessThanOrEqual(390 - 20 + 1);
+        const lab = (await sheet.locator('[data-key="queue"] .live-sec-edit__label').boundingBox())!;
+        const seg = (await sheet.locator('[data-key="queue"] [role="radiogroup"]').boundingBox())!;
+        expect(seg.y).toBeGreaterThan(lab.y + lab.height - 1);
+        expect(await minHeight(sheet.locator('[role="radio"]'))).toBeGreaterThanOrEqual(44);
+        await noSideways(page);
+    });
+});
+
+test.describe('Customize panel on a touch screen: the order and the top (spec 057)', () => {
+    test.use({ hasTouch: true, isMobile: true });
+
+    test('tablet 1024×768: the popover with its grips, ↑ ↓, the parts and the switches 44px to a finger', async ({ page }) => {
+        await fixClock(page);
+        await follow(page, { width: 1024, height: 768 }, (b) => { b.events = false; });
+        await page.locator('#live-panel .live-panel-more').click();
+        const pop = page.locator('.live-sec-edit');
+        await expect(pop).not.toHaveClass(/live-sec-sheet/);
+        await expect(pop.locator('.live-sec-edit__grip')).toHaveCount(6);
+        expect(await minHeight(pop.locator('.live-sec-edit__move, .live-sec-chip, .live-sec-top__main'))).toBeGreaterThanOrEqual(44);
+        await noSideways(page);
+        await pop.locator('.live-sec-edit__row[data-key="working"] .live-sec-edit__move[data-value="down"]').tap();
+        expect(await storedOrder(page)).toEqual(['waiting', 'working', 'directions', 'changes', 'queue', 'knows']);
+    });
+
+    test('phone 390×844: the sheet without grips, ↑ ↓ of 44, This month greyed with why, Done closes', async ({ page }) => {
+        await fixClock(page);
+        await follow(page, { width: 390, height: 844 }, (b) => { b.events = false; });
+        await page.locator('#live-panel .live-panel-toggle').click();
+        await page.locator('#research-overview .research-overview__more').click();
+        const sheet = page.locator('.live-sec-edit.live-sec-sheet');
+        await expect(sheet).toBeVisible();
+        await expect(sheet.locator('.live-sec-edit__grip')).toHaveCount(0);
+        expect(await minHeight(sheet.locator('.live-sec-edit__move, .live-sec-chip:not([aria-disabled="true"]), .live-sec-sheet__done'))).toBeGreaterThanOrEqual(44);
+        const month = sheet.locator('.live-sec-top__row[data-key="top-month"]');
+        await expect(month).toHaveClass(/is-disabled/);
+        await expect(month.locator('.live-sec-top__help')).toHaveText('Not shown on the phone.');
+        await expect(month.locator('[role="switch"]')).toHaveAttribute('aria-disabled', 'true');
+        // aria-disabled: a tap does nothing (dispatched, the switch is not actionable to Playwright).
+        await month.locator('[role="switch"]').dispatchEvent('click');
+        expect((await storedPrefs(page))?.t ?? {}).toEqual({});
+        await noSideways(page);
+        await sheet.locator('.live-sec-edit__row[data-key="queue"] .live-sec-edit__move[data-value="up"]').tap();
+        await expect(sheet.locator('.live-sec-edit__sr')).toHaveText('Queue moved to position 4 of 6.');
+        await sheet.locator('.live-sec-sheet__done').tap();
+        await expect(sheet).toHaveCount(0);
+        await expect(page.locator('#research-overview')).toBeVisible();
+    });
+
+    test.describe('in German', () => {
+        test.use({ locale: 'de-DE' });
+
+        test('phone 390×844 Settings: a row of the sections has its name and ↑ ↓ on one line, the segment across under them, no choice cut', async ({ page }) => {
+            await fixClock(page);
+            await follow(page, { width: 390, height: 844 }, (b) => { b.events = false; });
+            await page.locator('#live-panel .live-panel-toggle').click();
+            await page.locator('#research-overview .research-overview__more').click();
+            await page.locator('.live-sec-edit .live-sec-edit__all').click();
+            const group = page.locator('#settings-group-research-follow');
+            await expect(group).toBeVisible();
+            const opts = group.locator('.live-sec-edit__row .live-sec-seg__opt');
+            await expect(opts.first()).toHaveText('Aufgeklappt');
+            const cut = await opts.evaluateAll((els) => els
+                .filter((e) => e.scrollWidth > e.clientWidth)
+                .map((e) => `${e.textContent} ${e.scrollWidth}>${e.clientWidth}`));
+            expect(cut).toEqual([]);
+            const row = group.locator('.live-sec-edit__row[data-key="changes"]');
+            const [rb, lab, seg, mv] = [
+                (await row.boundingBox())!,
+                (await row.locator('.live-sec-edit__label').boundingBox())!,
+                (await row.locator('[role="radiogroup"]').boundingBox())!,
+                (await row.locator('.live-sec-edit__moves').boundingBox())!,
+            ];
+            expect(mv.x).toBeGreaterThan(lab.x + lab.width);
+            expect(mv.y + mv.height).toBeLessThanOrEqual(seg.y + 1);
+            expect(seg.width).toBeGreaterThan(rb.width * 0.8);
+            await noSideways(page);
+        });
+    });
+});
+
+test.describe('the research history (/log)', () => {
+    test('opening the app shows what really happened, not only what came while watching', async ({ page }) => {
+        const hour = 3600_000;
+        await follow(page, { width: 1440, height: 900 }, (b) => {
+            b.events = false;
+            b.log = { entries: [
+                { head: 'h2', at: new Date(Date.now() - 4 * 60_000).toISOString(), what: ['N0007 closed: T0134: hotovo'], task: '' },
+                { head: 'h1', at: new Date(Date.now() - 5 * 60_000).toISOString(), what: ['+S0031 Sčítání lidu 1880', 'P0012 _STORY navrh'], task: 'T0134 Úmrtí Václava' },
+                { head: 'h0', at: new Date(Date.now() - 30 * hour).toISOString(), what: ['+P0099 Starý /Záznam/'], task: '' },
+            ] };
+        });
+        const panel = page.locator('#live-panel');
+        await expect(panel.locator('.live-changes li')).toHaveCount(4);
+        // Newest first; within one version its last line first (as the changes that come live).
+        await expect(panel.locator('.live-changes li')).toContainText(['N0007 closed', 'Jan Fíšek', 'Sčítání lidu 1880', 'Starý Záznam']);
+        // The history is not news: no "N new".
+        await expect(panel.locator('.live-section__sum--new')).toHaveCount(0);
+        await panel.locator('.live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov.locator('.research-overview__cell-label').nth(1)).toHaveText('Last 24 h');
+        await expect(ov.locator('.research-overview__cell-value').nth(1)).toHaveText('+0 people');
+        await expect(ov.locator('.research-overview__cell-sub').nth(1)).toHaveText('+1 source');
+        await expect(ov.locator('.research-overview__cell-sub').first()).toHaveText(/^last change 4 min/);
+        await expect(ov.locator('.research-overview__group-title').first()).toHaveText('T0134 Úmrtí Václava');
+        // A preview of the last 24 hours: the older change is left to the research.
+        // The session's closing line (no task of its own) joins the task it names.
+        await expect(ov.locator('.research-overview__group-head')).toHaveCount(1);
+        // A task nobody works on now is done: folded; a click opens it.
+        await expect(ov.locator('.research-overview__group-head')).toHaveAttribute('aria-expanded', 'false');
+        await expect(ov.locator('.research-overview__row')).toHaveCount(0);
+        await ov.locator('.research-overview__group-head').click();
+        await expect(ov.locator('.research-overview__row')).toHaveCount(3);
+        await ov.locator('.research-overview__group-head').click();
+        // A filter opens the groups: what it found is to be seen.
+        await ov.locator('.research-overview__filter[data-filter="stories"]').click();
+        await expect(ov.locator('.research-overview__row')).toHaveCount(1);
+        await ov.locator('.research-overview__filter[data-filter="all"]').click();
+        await expect(ov.locator('.research-overview__row')).toHaveCount(0);
+        await expect(ov.locator('.research-overview__older')).toContainText('Older changes are in the research');
+        // From the research's history the highlight says its window, not "while watching".
+        await ov.locator('.research-overview__show-changed').click();
+        await expect(page.locator('#evidence-pill')).toContainText('Changed people in the progress · 1');
+    });
+
+    // A busy research makes more commits in 24 hours than /log gives (500): the bridge counts them itself.
+    const RECENT = {
+        hours: 24, since: new Date(Date.now() - 24 * 3600_000).toISOString(), from: 'a0a0a0a0a0a0a0a0', head: 'b2b2b2b2b2b2b2b2',
+        at: new Date(Date.now() - 2 * 60_000).toISOString(), commits: 978,
+        persons: { added: 17, ids: ['P0102', 'P0103'] }, sources: { added: 4, ids: ['S0031'] },
+    };
+    const recentLog = () => ({ entries: [
+        { head: 'c3c3c3c3c3c3c3c3', at: new Date(Date.now() - 60_000).toISOString(), what: ['+P0006 Karel /Fíšek/'], task: '' },
+        { head: 'b2b2b2b2b2b2b2b2', at: new Date(Date.now() - 3 * 60_000).toISOString(), what: ['+S0031 Sčítání lidu 1880', '+P0005 Marie /Fíšková/'], task: '' },
+        { head: 'a1a1a1a1a1a1a1a1', at: new Date(Date.now() - 5 * 60_000).toISOString(), what: ['+P0004 Ludmila /Fíšková/'], task: '' },
+    ] });
+
+    test('last 24 hours: the bridge count, plus what came after it', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, (b) => {
+            b.events = false;
+            b.features = ['status.recent'];
+            b.recent = RECENT;
+            b.log = recentLog();
+        });
+        await page.locator('#live-panel .live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov.locator('.research-overview__cell-label').nth(1)).toHaveText('Last 24 h');
+        // 17 counted at b2…, and Karel came after it; the source of b2… is in the 4.
+        await expect(ov.locator('.research-overview__cell-value').nth(1)).toHaveText('+18 people');
+        await expect(ov.locator('.research-overview__cell-sub').nth(1)).toHaveText('+4 sources');
+    });
+
+    test('last 24 hours without the status.recent feature: counted from the history', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, (b) => {
+            b.events = false;
+            b.recent = RECENT;
+            b.log = recentLog();
+        });
+        await page.locator('#live-panel .live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov.locator('.research-overview__cell-label').nth(1)).toHaveText('Last 24 h');
+        await expect(ov.locator('.research-overview__cell-value').nth(1)).toHaveText('+3 people');
+        await expect(ov.locator('.research-overview__cell-sub').nth(1)).toHaveText('+1 source');
+    });
+
+    const READERS_SPEND = { month: '2026-10', sessions: 14, amount: 63.4, readers: 41.2, currency: 'USD' };
+
+    test('this month: the scan readers part of the cost, from a bridge that counts them', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, (b) => {
+            b.events = false;
+            b.features = ['spend.readers'];
+            b.spend = READERS_SPEND;
+        });
+        await page.locator('#live-panel .live-panel-expand').click();
+        const month = page.locator('#research-overview .research-overview__cell').filter({ hasText: 'This month' });
+        // The cost hidden by default: neither the amount nor the readers.
+        await expect(month.locator('.research-overview__cell-value')).toHaveText(/^14 sessions/);
+        await expect(month.locator('.research-overview__readers')).toHaveCount(0);
+        await setRecord(page, { t: { 'month.price': true } });
+        await expect(month.locator('.research-overview__cell-value')).toHaveText('$63.40');
+        await expect(month.locator('.research-overview__readers')).toHaveText('of it scan readers $41.20');
+    });
+
+    test('this month from an older bridge: the cost alone, no readers line', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, (b) => {
+            b.events = false;
+            b.spend = READERS_SPEND;
+        });
+        await page.locator('#live-panel .live-panel-expand').click();
+        await setRecord(page, { t: { 'month.price': true } });
+        const month = page.locator('#research-overview .research-overview__cell').filter({ hasText: 'This month' });
+        await expect(month.locator('.research-overview__cell-value')).toHaveText('$63.40');
+        await expect(month.locator('.research-overview__cell-sub')).toHaveCount(1);
+        await expect(month.locator('.research-overview__readers')).toHaveCount(0);
+    });
+
+    test('the tiles by their parts (spec 057): the count of cells, the row shared equally, no amount anywhere with the cost hidden', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, (b) => { b.events = false; });
+        await page.locator('#live-panel .live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        const strip = ov.locator('.research-overview__summary');
+        const cells = strip.locator('.research-overview__cell');
+        const month = cells.filter({ hasText: 'This month' });
+        // No amount in the text nor in any title of the strip.
+        const noAmount = async (): Promise<void> => {
+            expect(await strip.evaluate(el => el.textContent ?? '')).not.toContain('3.20');
+            expect(await strip.evaluate(el => [el, ...el.querySelectorAll('*')].map(e => e.getAttribute('title') ?? '').join('|'))).not.toContain('3.20');
+        };
+        // (a) Nothing chosen: state, 24 h, this month as its sessions (a link, its research mark), no cost.
+        await expect(cells).toHaveCount(3);
+        await expect(strip).toHaveClass(/research-overview__summary--n3/);
+        await expect(month.locator('.research-overview__cell-value')).toHaveText(/^4 sessions/);
+        await expect(month.locator('button.research-overview__cell-value')).toHaveCount(1);
+        await expect(month.locator('.research-overview__cell-sub')).toHaveCount(0);
+        await noAmount();
+        // (b) The cost on: the amount, the sessions under it.
+        await setRecord(page, { t: { 'month.price': true } });
+        await expect(month.locator('.research-overview__cell-value')).toHaveText('$3.20');
+        await expect(month.locator('.research-overview__cell-sub')).toHaveText(/^4 sessions/);
+        await expect(strip).toHaveClass(/research-overview__summary--n3/);
+        // (c) The cost alone: the amount, nothing under it.
+        await setRecord(page, { t: { 'month.price': true, 'month.sessions': false } });
+        await expect(month.locator('.research-overview__cell-value')).toHaveText('$3.20');
+        await expect(month.locator('.research-overview__cell-sub')).toHaveCount(0);
+        // (d) Sources alone, this month off: two cells, the sources the value, no line under it.
+        await setRecord(page, { t: { 'day.persons': false, 'month.sessions': false } });
+        await expect(cells).toHaveCount(2);
+        await expect(strip).toHaveClass(/research-overview__summary--n2/);
+        await expect(cells.nth(1).locator('.research-overview__cell-value')).toHaveText(/^\+\d+ sources?/);
+        await expect(cells.nth(1).locator('.research-overview__cell-sub')).toHaveCount(0);
+        await noAmount();
+        // (e) Both tiles off: the state alone over the whole row, on one line.
+        await setRecord(page, { t: { 'day.persons': false, 'day.sources': false, 'month.sessions': false } });
+        await expect(cells).toHaveCount(1);
+        await expect(strip).toHaveClass(/research-overview__summary--n1/);
+        await expect(strip).not.toHaveClass(/--n2|--n3/);
+        const box = await cells.first().evaluate((c) => {
+            const [label, value] = [c.querySelector('.research-overview__cell-label')!, c.querySelector('.research-overview__cell-value')!];
+            return { label: label.getBoundingClientRect().top, value: value.getBoundingClientRect().top, cell: c.getBoundingClientRect().width, strip: c.parentElement!.getBoundingClientRect().width };
+        });
+        expect(Math.abs(box.label - box.value)).toBeLessThan(8);
+        expect(box.cell).toBeGreaterThan(box.strip - 2);
+        await noAmount();
+    });
+
+    test('an order of its own (spec 057): the overview and the panel draw the sections in it', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, (b) => { b.events = false; });
+        const panel = page.locator('#live-panel');
+        const titles = async (root: string): Promise<string[]> =>
+            (await page.locator(`${root} .live-section__title`).allTextContents()).map(t => t.trim());
+        // The default order first.
+        await expect.poll(() => titles('#live-panel')).toEqual(['At work', 'Awaiting action · 2', 'Latest changes', 'Up next']);
+        await setRecord(page, { o: ['queue', 'knows', 'changes', 'waiting', 'directions', 'working'] });
+        await expect.poll(() => titles('#live-panel')).toEqual(['Up next', 'Latest changes', 'Awaiting action · 2', 'At work']);
+        await panel.locator('.live-panel-expand').click();
+        // The overview: the same order (the sections it draws here, in that order).
+        const order = ['Queue', 'What the research knows', 'Progress', 'Awaiting action', 'Directions', 'Now'];
+        const drawn = (await titles('#research-overview')).map(t => order.findIndex(o => t.startsWith(o))).filter(i => i >= 0);
+        expect(drawn.length).toBeGreaterThanOrEqual(4);
+        expect(drawn).toEqual([...drawn].sort((a, b) => a - b));
+        expect(drawn[0]).toBe(0);
+        expect(drawn[drawn.length - 1]).toBe(5);
+    });
+
+    test('the overview previews at most 20 steps, the rest is in the research', async ({ page }) => {
+        const min = 60_000;
+        await follow(page, { width: 1440, height: 900 }, (b) => {
+            b.events = false;
+            b.log = { entries: Array.from({ length: 25 }, (_, i) => ({
+                head: `h${i}`, at: new Date(Date.now() - (i + 1) * 20 * min).toISOString(), what: [`+S${String(100 + i).padStart(4, '0')} Zdroj ${i}`], task: `T${1000 + i} Úkol ${i}`,
+            })) };
+        });
+        await page.locator('#live-panel .live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov.locator('.research-overview__group-head')).toHaveCount(20);
+        await expect(ov.locator('.research-overview__older')).toHaveCount(1);
+    });
+});
+
+test.describe('the research says it in its language (text)', () => {
+    test('the history shows the text, hides a commit with nothing to say, links the people', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, (b) => {
+            b.events = false;
+            b.log = { entries: [
+                { head: 'h3', at: new Date(Date.now() - 2 * 60_000).toISOString(), what: ['N0010 closed: T0200 · output/tree.ged'], task: 'T0200 Křty', text: [] },
+                { head: 'h2', at: new Date(Date.now() - 3 * 60_000).toISOString(), what: ['+P0004 Ludmila /Fíšková/'], task: 'T0200 Křty', text: ['Nová osoba: Jan Fíšek (*1865) [P0012]'] },
+            ] };
+        });
+        const rows = page.locator('#live-panel .live-changes li');
+        await expect(rows).toHaveCount(1);
+        await expect(rows.first()).toContainText('Nová osoba: Jan Fíšek (*1865)');
+        await expect(rows.first()).not.toContainText('[P0012]');
+        await expect(rows.first().locator('.live-person-link')).toHaveText('Jan Fíšek');
+        await page.locator('#live-panel .live-panel-expand').click();
+        // The count comes from what the commit added ("+P…"), not from the words.
+        await expect(page.locator('#research-overview .research-overview__cell-value').nth(1)).toHaveText('+1 person');
+    });
+
+    test('a live change groups by the task of each of its commits', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, (b) => {
+            b.changeEntries = [
+                { head: 'h2', at: new Date().toISOString(), what: ['+S0031 Sčítání lidu 1880'], task: 'T0300 Sčítání', text: ['Záznam z pramene: Sčítání lidu 1880'] },
+                { head: 'h1b', at: new Date(Date.now() - 60_000).toISOString(), what: ['N0020 closed: T0299'], task: 'T0299 Matriky', text: ['Hotovo: Matriky'] },
+            ];
+        });
+        await page.locator('#live-panel .live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov.locator('.research-overview__group-title')).toHaveText(['T0300 Sčítání', 'T0299 Matriky']);
+    });
+});
+
+test.describe('back from another tree', () => {
+    test('the overview open: the small panel stays hidden', async ({ page }) => {
+        await follow(page);
+        await page.locator('#live-panel .live-panel-expand').click();
+        await expect(page.locator('#research-overview')).toBeVisible();
+        await expect(page.locator('#live-panel')).toBeHidden();
+        const research = await page.evaluate(() => window.Strom.DataManager.getCurrentTreeId());
+        await page.evaluate(() => window.Strom.DataManager.createNewTree('Jiný'));
+        await expect(page.locator('#research-overview')).toHaveCount(0);
+        await page.evaluate((id) => window.Strom.UI.switchToTree(id as string), research);
+        await expect(page.locator('#research-overview')).toBeVisible();
+        await expect(page.locator('#live-panel')).toBeHidden();
+    });
+});
+
+test.describe('the agent at work', () => {
+    test('an arc circles the avatar of whom it works on now; its queue only in the tooltip', async ({ page }) => {
+        // The arc's turning itself is checked here.
+        await page.emulateMedia({ reducedMotion: 'no-preference' });
+        // Anna (no conflict of her own, which would come first) is worked on; Josef is only queued.
+        await follow(page, { width: 1440, height: 900 }, (b) => { b.waiting = []; b.workPerson = 'P0002'; });
+        const anna = card(page, 'Anna');
+        const arc = anna.locator('.card-avatar-wrap .card-agent');
+        await expect(arc).toHaveCount(1);
+        await expect(arc).toHaveCSS('animation-name', 'agSpin');
+        await expect(anna.locator('.card-signal')).toHaveCount(0);
+        await expect(anna).toHaveAttribute('aria-label', /research is working on this person; locked$/);
+        await expect(anna.locator('.card-tooltip .tt-agent')).toHaveText('Research working: Sčítání 1921');
+        const josef = card(page, 'Josef');
+        await expect(josef.locator('.card-agent')).toHaveCount(0);
+        await expect(josef.locator('.card-tooltip .tt-agent')).toHaveText('Queued: Matriky Chlumy');
+        // Every arc turns in the same phase: the delay comes from one clock.
+        expect(await arc.evaluate(el => (el as HTMLElement).style.animationDelay)).toMatch(/^-\d+ms$/);
+    });
+
+    test('the amber badge comes first: no arc, the agent in the tooltip', async ({ page }) => {
+        // Jan has an open conflict.
+        await follow(page, { width: 1440, height: 900 }, (b) => { b.waiting = []; });
+        const jan = card(page, 'Jan');
+        await expect(jan.locator('.card-tooltip .tt-agent')).toHaveText('Research working: Sčítání 1921');
+        await expect(jan.locator('.card-signal')).toHaveText('≠');
+        await expect(jan.locator('.card-agent')).toHaveCount(0);
+    });
+
+    test('reduced motion: the arc stands still but stays', async ({ page }) => {
+        await page.emulateMedia({ reducedMotion: 'reduce' });
+        await follow(page, { width: 1440, height: 900 }, (b) => { b.waiting = []; b.workPerson = 'P0002'; });
+        const arc = card(page, 'Anna').locator('.card-agent');
+        await expect(arc).toBeVisible();
+        await expect(arc).toHaveCSS('animation-name', 'none');
+    });
+
+    test('done: a check for a few seconds, then gone; none after a reload', async ({ page }) => {
+        // The check's few seconds (AGENT_DONE_MS + its fade) are run forward on Playwright's clock.
+        await page.clock.install();
+        await fastReconnect(page);
+        const bridge = await follow(page, { width: 1440, height: 900 }, (b) => { b.waiting = []; b.workPerson = 'P0002'; });
+        const anna = card(page, 'Anna');
+        await expect(anna.locator('.card-agent')).toHaveCount(1);
+        bridge.workDone = true;
+        const check = anna.locator('.card-signal.card-done');
+        await expect(check).toHaveText('✓', { timeout: 6000 });
+        await expect(anna.locator('.card-agent')).toHaveCount(0);
+        await page.clock.fastForward(4400);
+        await expect(check).toHaveCount(0);
+        await page.reload();
+        await expect(page.locator('#live-panel')).toBeVisible();
+        await expect(card(page, 'Anna')).toBeVisible();
+        // A status read after the reload: still no check.
+        await nextStatus(bridge);
+        await expect(page.locator('.card-done')).toHaveCount(0);
+    });
+
+    test('done with a question for the user: straight to the amber badge', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, (b) => { b.waiting = []; b.workPerson = 'P0002'; });
+        const anna = card(page, 'Anna');
+        await expect(anna.locator('.card-agent')).toHaveCount(1);
+        bridge.waiting = [{ id: 'T0009', what: 'Potvrďte Annin rok narození', person: 'P0002', at: new Date().toISOString() }];
+        bridge.workDone = true;
+        await expect(anna.locator('.card-signal')).toHaveText('!', { timeout: 6000 });
+        await expect(anna.locator('.card-done')).toHaveCount(0);
+    });
+
+    test('compact and far zoom: a ring on the card corner, at least 8px on screen', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, (b) => { b.waiting = []; b.workPerson = 'P0002'; });
+        await page.evaluate(() => window.Strom.UI.setCardDensity('compact'));
+        const ring = card(page, 'Anna').locator('.card-agent-dot');
+        await expect(ring).toBeVisible();
+        // (Its own box: the turning ring's bounding box grows with the rotation.)
+        const onScreen = () => ring.evaluate(el => (el as HTMLElement).offsetWidth * window.Strom.ZoomPan.getScale());
+        // (Polled: a redraw may swap the card between two reads.)
+        await expect.poll(() => ring.evaluate(el => (el as HTMLElement).offsetWidth)).toBe(12);
+        await page.evaluate(() => window.Strom.UI.setCardDensity('normal'));
+        await expect.poll(async () => {
+            await page.evaluate(() => window.Strom.ZoomPan.zoomOut());
+            await page.waitForTimeout(260);
+            return page.evaluate(() => window.Strom.ZoomPan.getScale());
+        }, { timeout: 10000 }).toBeLessThan(0.55);
+        await expect(card(page, 'Anna').locator('.card-agent')).toBeHidden();
+        await expect(ring).toBeVisible();
+        await expect.poll(onScreen).toBeGreaterThanOrEqual(7.9);
+    });
+});
+
+test.describe('a run waiting for its gate', () => {
+    test('is paused, not working: when it goes on, and no agent arc (a queued person gets none either)', async ({ page }) => {
+        const until = new Date(Date.now() + 90 * 60_000);
+        await follow(page, { width: 1440, height: 900 }, (b) => {
+            b.waiting = [];
+            b.paused = { until: until.toISOString(), reason: 'Claude usage 92 %' };
+        });
+        const panel = page.locator('#live-panel');
+        await expect(panel.locator('.live-paused')).toContainText('Paused · Claude usage 92 % · resumes at');
+        await panel.locator('.live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov.locator('.research-overview__cell').first()).toHaveClass(/is-paused/);
+        await expect(ov.locator('.research-overview__cell-value').first()).toHaveText('Paused');
+        await expect(ov.locator('.research-overview__cell-sub').first()).toHaveText(/^resumes at /);
+        await expect(page.locator('.person-card .card-agent')).toHaveCount(0);
+        await expect(page.locator('.person-card .card-done')).toHaveCount(0);
+    });
+});
+
+test.describe('Research overview', () => {
+    test('desktop: beside a narrower tree; summary, waiting, progress, filters, hover, changed, Escape', async ({ page }) => {
+        await follow(page);
+        const panel = page.locator('#live-panel');
+        await expect(panel.locator('.live-changes li')).toHaveCount(5);
+        const before = await page.locator('#tree-container').evaluate(el => el.getBoundingClientRect().width);
+        const midBefore = await page.evaluate(() => {
+            const { width, height } = window.Strom.ZoomPan.getViewportSize();
+            const t = window.Strom.ZoomPan.getTransform();
+            return [(width / 2 - t.tx) / t.scale, (height / 2 - t.ty) / t.scale];
+        });
+
+        await panel.locator('.live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov).toBeVisible();
+        await expect(ov).toHaveAttribute('role', 'complementary');
+        await expect(panel).toBeHidden();
+        const after = await page.locator('#tree-container').evaluate(el => el.getBoundingClientRect().width);
+        expect(after).toBeLessThan(before - 400);
+        // The point in the middle of the view stays in the middle.
+        const midAfter = await page.evaluate(() => {
+            const { width, height } = window.Strom.ZoomPan.getViewportSize();
+            const t = window.Strom.ZoomPan.getTransform();
+            return [(width / 2 - t.tx) / t.scale, (height / 2 - t.ty) / t.scale];
+        });
+        expect(Math.abs(midAfter[0] - midBefore[0])).toBeLessThan(2);
+        expect(Math.abs(midAfter[1] - midBefore[1])).toBeLessThan(2);
+
+        // The cost hidden by default: this month's value is its sessions (spec 057).
+        await expect(ov.locator('.research-overview__cell-value')).toHaveText(['Working', '+3 people', /^4 sessions/]);
+        // Who works now comes first, what waits right below it.
+        await expect(ov.locator('.live-section__title').nth(0)).toHaveText(/^Now/);
+        await expect(ov.locator('.live-section__title').nth(1)).toHaveText(/^Awaiting action/);
+        // The state says when the research last changed; its version only on hover.
+        const stateSub = ov.locator('.research-overview__cell-sub').first();
+        await expect(stateSub).toHaveText(/^last change (just now|\d+ min)/);
+        await expect(stateSub).toHaveAttribute('title', /· Research version h2$/);
+        await expect(ov.locator('.research-overview__cell-sub').nth(1)).toHaveText(/^\+1 source · since \d{1,2}:\d{2}/);
+        // An older research (no waiting.groups): compact rows in its order, no chips or phases.
+        const rows = ov.locator('.research-overview__waiting-item');
+        await expect(rows).toHaveCount(2);
+        await expect(rows.nth(0).locator('.research-overview__waiting-who')).toHaveText('Jan Fíšek');
+        await expect(rows.nth(1)).toContainText('whole research');
+        await expect(ov.locator('.research-overview__waiting-filters')).toHaveCount(0);
+        await expect(ov.locator('.research-overview__phase-head')).toHaveCount(0);
+        await expect(ov.locator('.research-overview__waiting-detail')).toHaveCount(0);
+        await rows.nth(0).locator('.research-overview__waiting-row').click();
+        await expect(rows.nth(0).locator('.research-overview__waiting-detail .live-person-link')).toHaveText('Jan Fíšek');
+        // Without actions from the research: only "Answer", as before; no hint.
+        await expect(rows.nth(0).locator('.research-overview__waiting-action')).toHaveText(['Answer, opens in the research']);
+        await expect(rows.nth(0).locator('.research-overview__waiting-hint')).toHaveCount(0);
+        await expect(ov.locator('.research-overview__now-row')).toContainText('agent-matriky — Sčítání 1921');
+        await expect(ov.locator('.research-overview__now-row .link-button')).toHaveText('Show in tree');
+
+        // Progress: one group (the task), every change; the filters count and filter.
+        await expect(ov.locator('.research-overview__group-head')).toHaveCount(1);
+        await expect(ov.locator('.research-overview__group-title')).toHaveText('Sčítání 1921');
+        // The task the agent works on now stays open.
+        await expect(ov.locator('.research-overview__group-head')).toHaveAttribute('aria-expanded', 'true');
+        await expect(ov.locator('.research-overview__row')).toHaveCount(6);
+        await expect(ov.locator('.research-overview__filter')).toHaveText(['All 6', 'People 4', 'Sources 1', 'Stories 1']);
+        await ov.locator('.research-overview__filter[data-filter="sources"]').click();
+        await expect(ov.locator('.research-overview__row')).toHaveCount(1);
+        await expect(ov.locator('.research-overview__filter[data-filter="sources"]')).toHaveAttribute('aria-checked', 'true');
+        await ov.locator('.research-overview__filter[data-filter="all"]').click();
+
+        // Hovering a row lights its card up.
+        await ov.locator('.research-overview__row.has-person', { hasText: 'Ludmila' }).hover();
+        await expect(card(page, 'Ludmila')).toHaveClass(/overview-hover/);
+        await ov.locator('.research-overview__head').hover();
+        await expect(page.locator('.person-card.overview-hover')).toHaveCount(0);
+
+        // Queue and What the research knows start folded.
+        await expect(head(page, '#research-overview', 'Queue')).toHaveAttribute('aria-expanded', 'false');
+        await expect(head(page, '#research-overview', 'What the research knows').locator('.live-section__sum')).toHaveText('1 conflict');
+
+        await ov.locator('.research-overview__show-changed').click();
+        await expect(page.locator('#evidence-pill')).toContainText('Changed people in the progress · 4');
+        await expect(card(page, 'Ludmila')).toHaveClass(/evidence-hit/);
+        await expect(card(page, 'Josef')).toHaveClass(/evidence-dim/);
+        // A filter narrows the people shown in the tree (Stories: whose story changed).
+        await ov.locator('.research-overview__filter[data-filter="stories"]').click();
+        await expect(page.locator('#evidence-pill')).toContainText('Changed people in the progress · Stories · 1');
+        await expect(card(page, 'Ludmila')).toHaveClass(/evidence-dim/);
+        await ov.locator('.research-overview__filter[data-filter="all"]').click();
+        await expect(page.locator('#evidence-pill')).toContainText('Changed people in the progress · 4');
+        await expect(ov).toBeVisible();
+        await page.keyboard.press('Escape');
+        await expect(page.locator('#evidence-pill')).toHaveCount(0);
+        await expect(ov).toBeVisible();
+        await page.keyboard.press('Escape');
+        await expect(ov).toHaveCount(0);
+        await expect(panel).toBeVisible();
+        await expect(panel).not.toHaveClass(/ended/);
+        expect(await page.locator('#tree-container').evaluate(el => el.getBoundingClientRect().width)).toBeCloseTo(before, 0);
+    });
+
+    test('the overview opens again with the next following; the Research menu has it', async ({ page }) => {
+        await follow(page);
+        await page.locator('#live-panel .live-panel-expand').click();
+        await expect(page.locator('#research-overview')).toBeVisible();
+        await page.reload();
+        await expect(page.locator('#research-overview')).toBeVisible();
+        await page.locator('#research-overview .research-overview__close').click();
+        await expect(page.locator('#research-overview')).toHaveCount(0);
+        await page.evaluate(() => window.Strom.UI.openResearchMenu());
+        await page.evaluate(() => window.Strom.UI.refreshResearchMenu());
+        await page.evaluate(() => window.Strom.UI.researchActionOverview());
+        await expect(page.locator('#research-overview')).toBeVisible();
+        await expect(page.locator('#research-item-overview')).toHaveCount(1);
+        // Already following: no "Follow live".
+        await expect(page.locator('#research-item-live')).toHaveCount(0);
+    });
+
+    test('Missing evidence in the foot opens the tree overview at Data quality', async ({ page }) => {
+        await follow(page);
+        await page.locator('#live-panel .live-panel-expand').click();
+        const link = page.locator('#research-overview .research-overview__foot .link-button', { hasText: /^Missing evidence: \d+ (person|people) ›$/ });
+        await link.click();
+        const quality = page.locator('#tree-overview-modal .tov-sec[data-section="quality"]');
+        await expect(quality.locator('.tov-sec-head')).toHaveAttribute('aria-expanded', 'true');
+        await expect(quality.locator('[data-block="evidence"]')).toBeVisible();
+    });
+
+    test('switching the language redraws the panel and the overview', async ({ page }) => {
+        await follow(page);
+        await expect(page.locator('#live-panel .live-changes li')).toHaveCount(5);
+        await page.evaluate(() => window.Strom.UI.setLanguage('cs'));
+        await expect(page.locator('#live-panel .live-section__title').first()).toHaveText('Pracuje se');
+        await page.locator('#live-panel .live-panel-expand').click();
+        await expect(page.locator('#research-overview .research-overview__title')).toHaveText('Přehled výzkumu');
+        await page.evaluate(() => window.Strom.UI.setLanguage('de'));
+        await expect(page.locator('#research-overview .research-overview__title')).toHaveText('Forschungsübersicht');
+        await expect(page.locator('#research-overview .research-overview__filter').first()).toHaveText('Alle 6');
+    });
+
+    test('tablet: over the tree, the tree keeps its width', async ({ page }) => {
+        await follow(page, { width: 1024, height: 768 });
+        const before = await page.locator('#tree-container').evaluate(el => el.getBoundingClientRect().width);
+        await page.locator('#live-panel .live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov).toHaveClass(/research-overview--overlay/);
+        expect(await page.locator('#tree-container').evaluate(el => el.getBoundingClientRect().width)).toBe(before);
+        expect((await ov.boundingBox())!.width).toBe(400);
+    });
+
+    test('phone: a strip; a tap opens the sheet; a person closes it', async ({ page }) => {
+        await follow(page, { width: 360, height: 780 });
+        const panel = page.locator('#live-panel');
+        await expect(panel).toHaveClass(/phone-strip/);
+        await expect(panel.locator('.live-panel-summary')).toContainText('Working');
+        await expect(panel.locator('.live-panel-summary')).toContainText('Awaiting action 2');
+        await expect(panel.locator('.live-panel-expand')).toHaveCount(0);
+        await panel.locator('.live-panel-toggle').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov).toHaveClass(/research-overview--sheet/);
+        await expect(ov).toHaveAttribute('aria-modal', 'true');
+        await expect(ov.locator('.live-section__title').nth(0)).toHaveText(/^Now/);
+        await expect(ov.locator('.live-section__title').nth(1)).toHaveText(/^Awaiting action/);
+        await ov.locator('.research-overview__waiting-row').first().click();
+        await expect(ov.locator('.live-waiting-answer')).toHaveCount(0);
+        await expect(ov.locator('.research-overview__waiting-detail')).toContainText('answered in the research on the computer');
+        await ov.locator('.research-overview__row .live-person-link', { hasText: 'Karel Fíšek' }).first().click();
+        await expect(ov).toHaveCount(0);
+        await expect(card(page, 'Karel')).toBeVisible();
+    });
+});
+
+/**
+ * A research with `waiting.groups` (Strom Research 1.13.2-beta.13): 35 items
+ * in four places, to do and sent, in the research's order. Invented archives,
+ * offices and webs.
+ */
+function groupedWaiting(): Record<string, unknown>[] {
+    const day = (d: number) => new Date(Date.now() - d * 86_400_000).toISOString();
+    const out: Record<string, unknown>[] = [];
+    const web = { key: 'host:rodokmen.example', name: 'rodokmen.example', kind: 'web' };
+    const archive = { key: 'repo:R0001', name: 'Archiv Vzorov', kind: 'archive' };
+    const office = { key: 'to:MěÚ Vzorov', name: 'MěÚ Vzorov', kind: 'office' };
+    const family = { key: 'family', name: 'Rodina', kind: 'family' };
+    const push = (item: Record<string, unknown>) => out.push({ order: out.length, at: day(20 - out.length / 2), ...item });
+    let n = 1;
+    const id = () => `T${String(n++).padStart(4, '0')}`;
+    push({ id: id(), what: 'Ověřit, zda badatelna funguje', kind: 'check', section: 'decide', group: web, url: 'https://rodokmen.example/badatelna', actions: ['answer'] });
+    for (let i = 0; i < 6; i++) {
+        push({ id: id(), what: `Dohledat sňatek ${i + 1} na https://rodokmen.example/hledat?q=${i + 1}.`, kind: 'web', section: 'web', group: web,
+            url: `https://rodokmen.example/zaznam/${i + 1}`, actions: ['answer', 'chat'] });
+    }
+    for (let i = 0; i < 10; i++) {
+        push({ id: id(), what: `Uložit snímky matriky Vzorov ${i + 1}`, kind: 'images', section: 'images', group: archive, person: i === 0 ? 'P0012' : undefined,
+            inbox: { dir: `inbox/T${i}`, have: 3, want: 10 }, actions: ['folder', 'chat'] });
+    }
+    for (let i = 0; i < 6; i++) {
+        push({ id: id(), what: `Napsat matrice o zápis ${i + 1}`, kind: 'letter', section: 'letter', group: office, to: 'MěÚ Vzorov',
+            note: `notes/T${i}-dotaz.md`, actions: ['answer', 'file', 'note', 'sent', 'chat'] });
+    }
+    for (let i = 0; i < 7; i++) {
+        push({ id: id(), what: `Zeptat se rodiny na fotografii ${i + 1}`, kind: 'family', section: 'family', group: family, actions: ['answer', 'file'] });
+    }
+    for (let i = 0; i < 3; i++) {
+        push({ id: id(), what: `Odeslaný dopis ${i + 1}`, kind: 'letter', section: 'letter', group: office, phase: 'sent', sentAt: day(9),
+            actions: ['answer', 'file', 'chat'] });
+    }
+    for (let i = 0; i < 2; i++) {
+        push({ id: id(), what: `Odeslaný dotaz rodině ${i + 1}`, kind: 'family', section: 'family', group: family, phase: 'sent', sentAt: day(4),
+            actions: ['answer', 'file'] });
+    }
+    return out;
+}
+
+const grouped = (b: Bridge) => { b.features = ['waiting.groups']; b.waiting = groupedWaiting(); };
+
+async function recordLaunches(page: Page): Promise<void> {
+    await page.evaluate(() => {
+        const launched: string[] = [];
+        (window as unknown as { __launched: string[] }).__launched = launched;
+        window.Strom.UI.handOverResearchLink = (url: string) => { launched.push(url); };
+    });
+}
+const launched = (page: Page) => page.evaluate(() => (window as unknown as { __launched: string[] }).__launched);
+
+test.describe('Awaiting action from a research with waiting.groups', () => {
+    // The kind chips wrap onto further lines: none is cut at the panel's edge, German being the longest (1105).
+    for (const size of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+        test(`the kind chips wrap inside the overview at ${size.width}, no chip cut`, async ({ page }) => {
+            await follow(page, size, grouped);
+            if (size.width > 640) await page.locator('#live-panel .live-panel-expand').click();
+            else await page.locator('#live-panel .live-panel-toggle').click();
+            const ov = page.locator('#research-overview');
+            await expect(ov).toBeVisible();
+            for (const lang of ['de', 'cs', 'en']) {
+                await page.evaluate((l) => window.Strom.UI.setLanguage(l as never), lang);
+                const bar = ov.locator('.research-overview__waiting-filters');
+                await expect(bar.locator('.research-overview__filter')).toHaveCount(6);
+                const m = await bar.evaluate(row => {
+                    const r = row.getBoundingClientRect();
+                    const panel = row.closest('#research-overview')!.getBoundingClientRect();
+                    const chips = [...row.querySelectorAll('.research-overview__filter')].map(c => c.getBoundingClientRect());
+                    return {
+                        overflow: row.scrollWidth - row.clientWidth,
+                        outside: chips.filter(c => c.left < r.left - 0.5 || c.right > r.right + 0.5
+                            || c.left < panel.left - 0.5 || c.right > panel.right + 0.5).length,
+                        lines: new Set(chips.map(c => Math.round(c.top))).size,
+                    };
+                });
+                expect(m.overflow, lang).toBeLessThanOrEqual(0);
+                expect(m.outside, lang).toBe(0);
+                if (lang === 'de') expect(m.lines, lang).toBeGreaterThan(1);
+            }
+        });
+    }
+
+    test('the small panel: the first five to do with their kind, the rest in the overview', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, grouped);
+        const panel = page.locator('#live-panel');
+        const waiting = head(page, '#live-panel', 'Awaiting action · 30');
+        await expect(waiting).toBeVisible();
+        await expect(waiting.locator('.live-section__sum')).toHaveText('awaiting a reply 5');
+        const rows = panel.locator('.live-waiting-row');
+        await expect(rows).toHaveCount(5);
+        await expect(rows.first().locator('.live-kind')).toHaveText('Decision');
+        await expect(rows.nth(1).locator('.live-kind')).toHaveText('Web');
+        await expect(rows.first()).toContainText('Ověřit, zda badatelna funguje');
+        const more = panel.locator('.live-waiting-more');
+        await expect(more).toHaveText('25 more in the overview ⤢');
+        await more.click();
+        await expect(page.locator('#research-overview')).toBeVisible();
+        // The menu counts what is to do.
+        await page.keyboard.press('Escape');
+        await panel.locator('.live-panel-toggle').click();
+        await expect(page.locator('#research-menu-signal')).toHaveText('30');
+    });
+
+    test('overview: chips, phases, groups by place, one detail with its actions', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, grouped);
+        await page.locator('#live-panel .live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov).toBeVisible();
+        await recordLaunches(page);
+        const section = head(page, '#research-overview', 'Awaiting action · 30');
+        await expect(section.locator('.live-section__sum')).toHaveText('awaiting a reply 5');
+        await expect(ov.locator('.research-overview__waiting-filters .research-overview__filter'))
+            .toHaveText(['All 35', 'Decisions 1', 'Images 10', 'Archives and offices 9', 'Family 9', 'Web 6']);
+
+        // To do open, Awaiting a reply folded; the places folded with their counts, in the research's order.
+        const todo = ov.locator('.research-overview__phase-head[data-phase="todo"]');
+        const sent = ov.locator('.research-overview__phase-head[data-phase="sent"]');
+        await expect(todo).toHaveText(/To do · 30/);
+        await expect(todo).toHaveAttribute('aria-expanded', 'true');
+        await expect(sent).toHaveText(/Awaiting a reply · 5/);
+        await expect(sent).toHaveAttribute('aria-expanded', 'false');
+        const groups = ov.locator('.research-overview__phase[data-phase="todo"] .research-overview__waiting-group');
+        await expect(groups.locator('.research-overview__group-title')).toHaveText(['rodokmen.example', 'Archiv Vzorov', 'MěÚ Vzorov', 'Rodina']);
+        await expect(groups.locator('.research-overview__group-span')).toHaveText(['7', '10', '6', '7']);
+        await expect(groups.locator('.research-overview__group-kind')).toHaveText(['Web', 'Archive', 'Office', 'Family']);
+        await expect(groups.first()).toHaveAttribute('aria-expanded', 'false');
+        await expect(ov.locator('.research-overview__waiting-item')).toHaveCount(0);
+
+        // A place's own "Chat", folded or not: the first item in order that offers a chat
+        // (the check before it does not); none where no item offers one (the family).
+        const heads = ov.locator('.research-overview__phase[data-phase="todo"] .research-overview__waiting-grouphead');
+        const groupChat = heads.locator('.research-overview__waiting-groupchat');
+        await expect(groupChat).toHaveCount(3);
+        await expect(heads.nth(0).locator('.research-overview__waiting-groupchat')).toHaveAttribute('data-task', 'T0002');
+        await expect(heads.nth(1).locator('.research-overview__waiting-groupchat')).toHaveAttribute('data-task', 'T0008');
+        await expect(heads.nth(2).locator('.research-overview__waiting-groupchat')).toHaveAttribute('data-task', 'T0018');
+        await expect(heads.nth(3).locator('.research-overview__waiting-groupchat')).toHaveCount(0);
+        // A bridge without waiting.sent / waiting.note: no place's Sent, no queries' text.
+        await expect(ov.locator('.research-overview__waiting-groupwrite')).toHaveCount(0);
+        await heads.nth(0).locator('.research-overview__waiting-groupchat').click();
+        await expect(groups.first()).toHaveAttribute('aria-expanded', 'false');
+        expect(await launched(page)).toEqual([`strom-research://task?tree=${UUID}&task=T0002&do=chat`]);
+        await page.evaluate(() => { (window as unknown as { __launched: string[] }).__launched.length = 0; });
+
+        // A place unfolds to its items: compact rows with the kind.
+        await groups.nth(1).click();
+        const items = ov.locator('.research-overview__waiting-item');
+        await expect(items).toHaveCount(10);
+        await expect(items.first().locator('.live-kind')).toHaveText('Images');
+        await expect(items.first().locator('.research-overview__waiting-who')).toHaveText('Jan Fíšek');
+        await items.first().locator('.research-overview__waiting-row').click();
+        await expect(items.first().locator('.research-overview__waiting-row')).toHaveAttribute('aria-expanded', 'true');
+        const detail = items.first().locator('.research-overview__waiting-detail');
+        // The images' state as a sentence (an older bridge: no book's frame); the row says how many.
+        await expect(items.first().locator('.waiting-images__text')).toHaveText('3 of 10 images');
+        await expect(detail.locator('.wait-book__state')).toHaveText('3 of 10 images saved.');
+        await expect(detail.locator('.wait-book')).toHaveCount(0);
+        await expect(detail.locator('.research-overview__waiting-inbox')).toHaveCount(0);
+        // Images are saved by hand (no images through this bridge): Discuss leads, as the detail's main button; no hint.
+        await expect(detail.locator('[data-action="images"]')).toHaveCount(0);
+        await expect(detail.locator('.research-overview__waiting-action')).toHaveText(['Discuss with the agent, AI, opens in the researchAI', 'Open folder, opens in the research']);
+        const imagesChat = detail.locator('.research-overview__waiting-action[data-action="chat"]');
+        await expect(imagesChat).toBeVisible();
+        await expect(imagesChat).toHaveClass(/waiting-action--primary/);
+        await expect(detail.locator('.research-overview__waiting-hint')).toHaveCount(0);
+        await imagesChat.click();
+        expect(await launched(page)).toEqual([`strom-research://task?tree=${UUID}&task=T0008&do=chat`]);
+        await page.evaluate(() => { (window as unknown as { __launched: string[] }).__launched.length = 0; });
+
+        // Another place: a letter; one detail at a time; Chat right next to Answer.
+        await groups.nth(2).click();
+        const letter = ov.locator('.research-overview__waiting-item', { hasText: 'Napsat matrice o zápis 1' });
+        await letter.locator('.research-overview__waiting-row').click();
+        await expect(ov.locator('.research-overview__waiting-detail')).toHaveCount(1);
+        const actions = letter.locator('.research-overview__waiting-action');
+        await expect(actions).toHaveText(['Answer, opens in the research', 'Chat, AI, opens in the researchAI', 'Add a file, opens in the research', 'Query text, opens in the research', 'Sent, opens in the research']);
+        await expect(actions.nth(1)).toBeVisible();
+        await expect(actions.nth(1)).not.toHaveClass(/is-primary/);
+        await expect(letter.locator('.research-overview__waiting-hint')).toHaveText('The answer is saved with the task; the agent takes it up in its next work.');
+        await expect(letter.locator('.research-overview__waiting-on')).toContainText('to: MěÚ Vzorov');
+        const task = await letter.getAttribute('data-id');
+        await actions.nth(0).click();
+        await actions.nth(1).click();
+        await actions.nth(3).click();
+        await actions.nth(4).click();
+        expect(await launched(page)).toEqual([
+            `strom-research://task?tree=${UUID}&task=${task}`,
+            `strom-research://task?tree=${UUID}&task=${task}&do=chat`,
+            `strom-research://task?tree=${UUID}&task=${task}&do=note`,
+            `strom-research://task?tree=${UUID}&task=${task}&do=sent`,
+        ]);
+
+        // A web item: its address opens in a new tab; addresses in the text are links.
+        await groups.nth(0).click();
+        const webItem = ov.locator('.research-overview__waiting-item', { hasText: 'Dohledat sňatek 1' });
+        await webItem.locator('.research-overview__waiting-row').click();
+        const web = webItem.locator('a.research-overview__waiting-web');
+        await expect(web).toHaveText('Open website ↗');
+        await expect(web).toHaveAttribute('href', 'https://rodokmen.example/zaznam/1');
+        await expect(web).toHaveAttribute('target', '_blank');
+        await expect(web).toHaveAttribute('rel', 'noopener noreferrer');
+        const inText = webItem.locator('.research-overview__waiting-text a.live-text-link');
+        await expect(inText).toHaveText('https://rodokmen.example/hledat?q=1');
+        await expect(inText).toHaveAttribute('href', 'https://rodokmen.example/hledat?q=1');
+        await expect(inText).toHaveAttribute('rel', 'noopener noreferrer');
+        // The row itself holds no link (the text is clamped there).
+        await expect(webItem.locator('.research-overview__waiting-row a')).toHaveCount(0);
+
+        // Awaiting a reply: unfolds to its places; the rows say when they were sent.
+        await sent.click();
+        await expect(sent).toHaveAttribute('aria-expanded', 'true');
+        const sentGroups = ov.locator('.research-overview__phase[data-phase="sent"] .research-overview__waiting-group');
+        await expect(sentGroups.locator('.research-overview__group-title')).toHaveText(['MěÚ Vzorov', 'Rodina']);
+        await sentGroups.first().click();
+        const sentRows = ov.locator('.research-overview__phase[data-phase="sent"] .research-overview__waiting-item');
+        await expect(sentRows).toHaveCount(3);
+        await expect(sentRows.first().locator('.research-overview__waiting-sent')).toHaveText(/^sent \d{1,2}\/\d{1,2}$/);
+        await expect(sentRows.first().locator('.research-overview__waiting-age')).toHaveText('9 days ago');
+        await sentRows.first().locator('.research-overview__waiting-row').click();
+        // What was sent is not marked sent again.
+        await expect(sentRows.first().locator('.research-overview__waiting-action')).toHaveText(['Answer, opens in the research', 'Chat, AI, opens in the researchAI', 'Add a file, opens in the research']);
+    });
+
+    test('a chip filters and unfolds every place; the choice stays; a new item hidden by it dots its chip', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, grouped);
+        await page.locator('#live-panel .live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        const chip = (f: string) => ov.locator(`.research-overview__waiting-filters .research-overview__filter[data-filter="${f}"]`);
+        await chip('family').click();
+        await expect(chip('family')).toHaveAttribute('aria-checked', 'true');
+        // One place, unfolded; what was sent stays folded.
+        await expect(ov.locator('.research-overview__phase[data-phase="todo"] .research-overview__waiting-group')).toHaveText(/Rodina/);
+        await expect(ov.locator('.research-overview__phase[data-phase="todo"] .research-overview__waiting-group')).toHaveAttribute('aria-expanded', 'true');
+        await expect(ov.locator('.research-overview__waiting-item')).toHaveCount(7);
+        await expect(ov.locator('.research-overview__phase-head[data-phase="sent"]')).toHaveText(/Awaiting a reply · 2/);
+        expect(await page.evaluate(() => localStorage.getItem('strom-live-overview-waiting-filter'))).toBe('family');
+
+        // A new image task: the Images chip gets a dot while Family hides it.
+        await expect(chip('images')).not.toHaveClass(/has-new/);
+        bridge.waiting = [...bridge.waiting, {
+            id: 'T0099', what: 'Uložit nový snímek', kind: 'images', section: 'images', order: 99,
+            group: { key: 'repo:R0001', name: 'Archiv Vzorov', kind: 'archive' }, at: new Date().toISOString(),
+        }];
+        await expect(chip('images')).toHaveClass(/has-new/, { timeout: 15000 });
+        await expect(chip('images')).toHaveText('Images 11');
+        await expect(chip('family')).not.toHaveClass(/has-new/);
+        // Shown: the dot goes, and its place is open.
+        await chip('images').click();
+        await expect(chip('images')).not.toHaveClass(/has-new/);
+        await expect(ov.locator('.research-overview__waiting-item.is-fresh')).toHaveText(/Uložit nový snímek/);
+        await chip('all').click();
+        await expect(ov.locator('.research-overview__waiting-group', { hasText: 'Archiv Vzorov' })).toHaveAttribute('aria-expanded', 'true');
+        await expect(ov.locator('.research-overview__waiting-group', { hasText: 'Rodina' }).first()).toHaveAttribute('aria-expanded', 'false');
+
+        // A filter whose last item went falls back to All.
+        await chip('decide').click();
+        bridge.waiting = bridge.waiting.filter(w => w.kind !== 'check');
+        await expect(chip('decide')).toHaveCount(0, { timeout: 15000 });
+        await expect(chip('all')).toHaveAttribute('aria-checked', 'true');
+    });
+
+    test('a lone task of its place has its own heading, open, not a row under the place above (1105)', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, (b) => {
+            grouped(b);
+            // Right after Archiv Vzorov's ten items: a browser-only archive's only task; and one task without a place.
+            const list = [...b.waiting];
+            list.splice(17, 0, { id: 'T0090', what: 'Zápis Tomáše Vrby na webu (ročník 1898)', kind: 'web', section: 'web',
+                group: { key: 'repo:R0002', name: 'Oblastní archiv Vzorov', kind: 'archive' }, url: 'https://archiv-vzorov.example/kmenove-listy', actions: ['answer'] });
+            list.push({ id: 'T0091', what: 'Rozmyslet další postup', kind: 'other', section: 'other' });
+            b.waiting = list.map((w, i) => ({ ...w, order: i }));
+        });
+        await page.locator('#live-panel .live-panel-expand').click();
+        const ov = page.locator('#research-overview');
+        const todo = '.research-overview__phase[data-phase="todo"]';
+        const groups = ov.locator(`${todo} .research-overview__waiting-group`);
+        await expect(groups.locator('.research-overview__group-title'))
+            .toHaveText(['rodokmen.example', 'Archiv Vzorov', 'Oblastní archiv Vzorov', 'MěÚ Vzorov', 'Rodina', 'Other']);
+        await expect(groups.locator('.research-overview__group-span')).toHaveText(['7', '10', '1', '6', '7', '1']);
+        // A lone item's place is open (nothing hidden behind a click); the larger places stay folded.
+        await expect(groups.nth(2)).toHaveAttribute('aria-expanded', 'true');
+        await expect(groups.nth(5)).toHaveAttribute('aria-expanded', 'true');
+        await expect(groups.nth(1)).toHaveAttribute('aria-expanded', 'false');
+        const items = ov.locator(`${todo} .research-overview__waiting-item`);
+        await expect(items).toHaveCount(2);
+        // Each lone item stands right under its own place's heading, never bare under the place before it.
+        const headOf = (what: string) => ov.locator(`${todo} .research-overview__waiting-item`, { hasText: what }).evaluate(li =>
+            li.closest('ul')?.previousElementSibling?.querySelector('.research-overview__group-title')?.textContent ?? null);
+        expect(await headOf('Zápis Tomáše Vrby na webu')).toBe('Oblastní archiv Vzorov');
+        expect(await headOf('Rozmyslet další postup')).toBe('Other');
+
+        // Unfolding the place above keeps the lone task under its own heading.
+        await groups.nth(1).click();
+        await expect(items).toHaveCount(12);
+        expect(await headOf('Zápis Tomáše Vrby na webu')).toBe('Oblastní archiv Vzorov');
+        expect(await headOf('Uložit snímky matriky Vzorov 10')).toBe('Archiv Vzorov');
+        // Folded by hand, it stays folded.
+        await groups.nth(2).click();
+        await expect(groups.nth(2)).toHaveAttribute('aria-expanded', 'false');
+        await expect(ov.locator(`${todo} .research-overview__waiting-item`, { hasText: 'Zápis Tomáše Vrby na webu' })).toHaveCount(0);
+    });
+
+    test('phone: the sheet has no ways into the research on the computer, only the website', async ({ page }) => {
+        await follow(page, { width: 360, height: 780 }, grouped);
+        const panel = page.locator('#live-panel');
+        await expect(panel.locator('.live-panel-summary')).toContainText('Awaiting action 30');
+        await panel.locator('.live-panel-toggle').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov).toHaveClass(/research-overview--sheet/);
+        const filters = ov.locator('.research-overview__waiting-filters');
+        await expect(filters).toHaveCSS('flex-wrap', 'wrap');
+        await ov.locator('.research-overview__waiting-group').first().click();
+        await ov.locator('.research-overview__waiting-item', { hasText: 'Dohledat sňatek 1' }).locator('.research-overview__waiting-row').click();
+        const detail = ov.locator('.research-overview__waiting-detail');
+        await expect(detail.locator('.research-overview__waiting-action')).toHaveCount(0);
+        await expect(detail.locator('.research-overview__waiting-hint')).toHaveCount(0);
+        await expect(ov.locator('.research-overview__waiting-groupchat')).toHaveCount(0);
+        await expect(detail.locator('a.research-overview__waiting-web')).toHaveText('Open website ↗');
+        await expect(detail).toContainText('Answers are given in the research on a computer.');
+    });
+});
+
+/**
+ * Written through the bridge (variant B): Sent for an item (Undo, Back to To
+ * do), Sent for a place, the queries' text with Copy, a file for a task; a
+ * refused write puts the row back. Only what the bridge announces.
+ */
+const writable = (features: string[], accepts?: Record<string, unknown>) => (b: Bridge) => {
+    grouped(b);
+    b.features = ['waiting.groups', ...features];
+    if (accepts) b.accepts = accepts;
+    b.note = {
+        text: 'Vážený úřade,\nprosím o výpisy z matriky Vzorov:\n\n1. sňatek 1885\n2. narození 1890',
+        notes: ['notes/T0-dotaz.md', 'notes/T1-dotaz.md'], tasks: ['T0018', 'T0019', 'T0020', 'T0021', 'T0022', 'T0023'],
+    };
+};
+
+/**
+ * The bridge's next status, read by the app: two asks of the reconnect chain
+ * after now (the first answers with what the bridge has now, the second is
+ * asked only after the app read it).
+ */
+async function nextStatus(bridge: Bridge): Promise<void> {
+    const n = bridge.chain;
+    await expect.poll(() => bridge.chain, { timeout: 10000 }).toBeGreaterThanOrEqual(n + 2);
+}
+
+/**
+ * The waits between reconnects to the bridge shortened for a test that waits
+ * for its next status (2 s in use: reconnectMs in src/ui/research-ui.ts).
+ */
+async function fastReconnect(page: Page): Promise<void> {
+    await page.addInitScript(() => { (globalThis as { __LIVE_RECONNECT_MS?: number }).__LIVE_RECONNECT_MS = 250; });
+}
+
+async function openOverview(page: Page) {
+    await page.locator('#live-panel .live-panel-expand').click();
+    const ov = page.locator('#research-overview');
+    await expect(ov).toBeVisible();
+    await recordLaunches(page);
+    return ov;
+}
+
+const todoHead = (page: Page) => page.locator('#research-overview .research-overview__phase-head[data-phase="todo"]');
+const sentHead = (page: Page) => page.locator('#research-overview .research-overview__phase-head[data-phase="sent"]');
+const placeHead = (page: Page, phase: string, name: string) => page.locator(`#research-overview .research-overview__phase[data-phase="${phase}"] .research-overview__waiting-grouphead`)
+    .filter({ has: page.locator('.research-overview__group-title', { hasText: name }) });
+
+async function openLetter(page: Page, text = 'Napsat matrice o zápis 1') {
+    const ov = page.locator('#research-overview');
+    await placeHead(page, 'todo', 'MěÚ Vzorov').locator('.research-overview__waiting-group').click();
+    const item = ov.locator('.research-overview__waiting-item', { hasText: text });
+    await item.locator('.research-overview__waiting-row').click();
+    return item;
+}
+
+test.describe('Awaiting action written through the bridge', () => {
+    test('Sent at an item: one write, the row in Awaiting a reply at once, Undo; Back to To do at a sent one', async ({ page }) => {
+        await fastReconnect(page);
+        const bridge = await follow(page, { width: 1440, height: 900 }, writable(['waiting.sent']));
+        const ov = await openOverview(page);
+        const letter = await openLetter(page);
+        // Sent goes through the bridge (no); the file still by the link (no accepts.media.task).
+        const actions = letter.locator('.research-overview__waiting-action');
+        await expect(actions).toHaveText(['Answer, opens in the research', 'Chat, AI, opens in the researchAI', 'Add a file, opens in the research', 'Query text, opens in the research', 'Sent']);
+        const sent = letter.locator('.research-overview__waiting-action[data-action="sent"]');
+        await expect(sent).toHaveAttribute('data-write', 'bridge');
+        // A double click writes once.
+        await sent.evaluate((b: HTMLButtonElement) => { b.click(); b.click(); });
+        await expect(todoHead(page)).toHaveText(/To do · 29/);
+        await expect(sentHead(page)).toHaveText(/Awaiting a reply · 6/);
+        await expect(head(page, '#research-overview', 'Awaiting action · 29')).toBeVisible();
+        const toast = page.locator('.toast[data-kind="waiting-sent"]');
+        await expect(toast).toContainText(/^Recorded as sent on \d{1,2}\/\d{1,2}/);
+        expect(bridge.writes.map(w => [w.method, w.path, w.body])).toEqual([['POST', 'waiting/T0018', '{"do":"sent"}']]);
+        expect(bridge.writes[0].headers['content-type']).toMatch(/^text\/plain/);
+        expect(await launched(page)).toEqual([]);
+        // The menu counts what is left to do.
+        await expect(page.locator('#research-menu-signal')).toHaveText('29');
+
+        // Undo: back to do.
+        await toast.locator('.toast-action', { hasText: 'Undo' }).click();
+        await expect(todoHead(page)).toHaveText(/To do · 30/);
+        await expect(page.locator('.toast[data-kind="waiting-unsent"]')).toHaveText('Back in To do');
+        expect(bridge.writes.map(w => [w.path, w.body])).toEqual([['waiting/T0018', '{"do":"sent"}'], ['waiting/T0018', '{"do":"unsent"}']]);
+
+        // A sent item offers Back to To do (and is not marked sent again).
+        await sentHead(page).click();
+        await placeHead(page, 'sent', 'MěÚ Vzorov').locator('.research-overview__waiting-group').click();
+        const sentItem = ov.locator('.research-overview__phase[data-phase="sent"] .research-overview__waiting-item', { hasText: 'Odeslaný dopis 1' });
+        await sentItem.locator('.research-overview__waiting-row').click();
+        await expect(sentItem.locator('.research-overview__waiting-action')).toHaveText(['Answer, opens in the research', 'Chat, AI, opens in the researchAI', 'Add a file, opens in the research', 'Back to To do']);
+        await sentItem.locator('.research-overview__waiting-action[data-action="unsent"]').click();
+        await expect(todoHead(page)).toHaveText(/To do · 31/);
+        // The row moves at once; the write goes once the research's head right before it is asked.
+        await expect.poll(() => bridge.writes.length).toBe(3);
+        expect(bridge.writes.at(-1)).toMatchObject({ path: 'waiting/T0031', body: '{"do":"unsent"}' });
+        // The bridge's next status agrees: the row stays where it went.
+        await nextStatus(bridge);
+        await expect(todoHead(page)).toHaveText(/To do · 31/);
+    });
+
+    test('a place: Sent for its items to do and the text of all its queries with Copy, folded, the fold untouched', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, writable(['waiting.sent', 'waiting.note']));
+        const ov = await openOverview(page);
+        const office = placeHead(page, 'todo', 'MěÚ Vzorov');
+        // Only where items offer them: the office (letters with sent and a query text); not the family, web or archive.
+        await expect(office.locator('.research-overview__waiting-groupwrite')).toHaveText(['Sent', 'All queries\' text']);
+        await expect(office.locator('.research-overview__waiting-groupchat')).toHaveText('ChatAI');
+        for (const name of ['Rodina', 'rodokmen.example', 'Archiv Vzorov']) {
+            await expect(placeHead(page, 'todo', name).locator('.research-overview__waiting-groupwrite')).toHaveCount(0);
+        }
+        await page.evaluate(() => {
+            const copied: string[] = [];
+            (window as unknown as { __copied: string[] }).__copied = copied;
+            Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (t: string) => { copied.push(t); } } });
+        });
+
+        // The queries' text: a small window over the overview, the text as text with its lines.
+        await office.locator('.research-overview__waiting-groupnote').click();
+        const dialog = page.locator('#waiting-note-modal');
+        await expect(dialog).toBeVisible();
+        await expect(dialog.locator('#waiting-note-title')).toHaveText('All queries\' text');
+        await expect(dialog.locator('.audit-log-subtitle')).toHaveText('MěÚ Vzorov · 6 queries');
+        const text = dialog.locator('.waiting-note-text');
+        await expect(text).toHaveCSS('white-space', 'pre-wrap');
+        expect(await text.evaluate(n => n.textContent)).toBe(bridge.note!.text);
+        expect(await text.evaluate(n => n.children.length)).toBe(0);
+        await dialog.locator('.waiting-note-copy').click();
+        expect(await page.evaluate(() => (window as unknown as { __copied: string[] }).__copied)).toEqual([bridge.note!.text]);
+        await expect(page.locator('.toast[data-kind="waiting-copied"]')).toHaveText('Copied');
+        expect(bridge.writes.map(w => [w.method, w.path])).toEqual([['GET', `group/${encodeURIComponent('to:MěÚ Vzorov')}/note`]]);
+        // Escape closes the window alone.
+        await page.keyboard.press('Escape');
+        await expect(dialog).toHaveCount(0);
+        await expect(ov).toBeVisible();
+        await expect(office.locator('.research-overview__waiting-group')).toHaveAttribute('aria-expanded', 'false');
+
+        // Sent for the place: its six letters move at once; the fold never toggled.
+        await office.locator('.research-overview__waiting-groupwrite[data-action="group-sent"]').click();
+        await expect(todoHead(page)).toHaveText(/To do · 24/);
+        await expect(sentHead(page)).toHaveText(/Awaiting a reply · 11/);
+        await expect(page.locator('.toast[data-kind="waiting-sent"]')).toContainText(/^6 items recorded as sent on/);
+        expect(bridge.writes.at(-1)).toMatchObject({ method: 'POST', path: `group/${encodeURIComponent('to:MěÚ Vzorov')}`, body: '{"do":"sent"}' });
+        await expect(placeHead(page, 'todo', 'MěÚ Vzorov')).toHaveCount(0);
+        await expect(ov.locator('.research-overview__phase[data-phase="todo"] .research-overview__waiting-item')).toHaveCount(0);
+        expect(await launched(page)).toEqual([]);
+    });
+
+    test('a place\'s Sent offers Undo: exactly the tasks it marked go back to To do', async ({ page }) => {
+        await fastReconnect(page);
+        const bridge = await follow(page, { width: 1440, height: 900 }, writable(['waiting.sent']));
+        await openOverview(page);
+        await placeHead(page, 'todo', 'MěÚ Vzorov').locator('.research-overview__waiting-groupwrite[data-action="group-sent"]').click();
+        await expect(todoHead(page)).toHaveText(/To do · 24/);
+        await expect(sentHead(page)).toHaveText(/Awaiting a reply · 11/);
+        const toast = page.locator('.toast[data-kind="waiting-sent"]');
+        // A double click on Undo writes once.
+        await toast.locator('.toast-action', { hasText: 'Undo' }).evaluate((b: HTMLButtonElement) => { b.click(); b.click(); });
+        await expect(todoHead(page)).toHaveText(/To do · 30/);
+        await expect(sentHead(page)).toHaveText(/Awaiting a reply · 5/);
+        await expect(page.locator('.toast[data-kind="waiting-unsent"]')).toHaveText('Back in To do');
+        const key = encodeURIComponent('to:MěÚ Vzorov');
+        expect(bridge.writes.map(w => [w.method, w.path, w.body])).toEqual([
+            ['POST', `group/${key}`, '{"do":"sent"}'],
+            ['POST', `group/${key}`, '{"do":"unsent","tasks":["T0018","T0019","T0020","T0021","T0022","T0023"]}'],
+        ]);
+        await expect(placeHead(page, 'todo', 'MěÚ Vzorov').locator('.research-overview__group-span')).toHaveText('6');
+        // No lasting place-level Undo among the replies awaited.
+        await expect(page.locator('#research-overview .research-overview__phase[data-phase="sent"] .research-overview__waiting-groupwrite')).toHaveCount(0);
+        // The bridge's next status agrees: the rows stay in To do.
+        await nextStatus(bridge);
+        await expect(todoHead(page)).toHaveText(/To do · 30/);
+    });
+
+    test('Undo of a place\'s Sent leaves a letter sent earlier in the same place in Awaiting a reply', async ({ page }) => {
+        await fastReconnect(page);
+        const bridge = await follow(page, { width: 1440, height: 900 }, writable(['waiting.sent']));
+        const ov = await openOverview(page);
+        await placeHead(page, 'todo', 'MěÚ Vzorov').locator('.research-overview__waiting-groupwrite[data-action="group-sent"]').click();
+        await expect(sentHead(page)).toHaveText(/Awaiting a reply · 11/);
+        await page.locator('.toast[data-kind="waiting-sent"] .toast-action').click();
+        await expect(todoHead(page)).toHaveText(/To do · 30/);
+        await expect.poll(() => bridge.writes.length).toBe(2);
+        // The tasks named are those the Sent marked, never the older letters of the place (T0031–T0033).
+        const tasks = (JSON.parse(bridge.writes.at(-1)!.body) as { tasks: string[] }).tasks;
+        expect(tasks).not.toContain('T0031');
+        expect(tasks).toHaveLength(6);
+        await sentHead(page).click();
+        await placeHead(page, 'sent', 'MěÚ Vzorov').locator('.research-overview__waiting-group').click();
+        const sentRows = ov.locator('.research-overview__phase[data-phase="sent"] .research-overview__waiting-item');
+        for (const n of [1, 2, 3]) await expect(sentRows.filter({ hasText: `Odeslaný dopis ${n}` })).toHaveCount(1);
+        await expect(placeHead(page, 'sent', 'MěÚ Vzorov').locator('.research-overview__group-span')).toHaveText('3');
+        await nextStatus(bridge);
+        await expect(sentRows.filter({ hasText: 'Odeslaný dopis 1' })).toHaveCount(1);
+    });
+
+    test('a refused Undo of a place\'s Sent (400 waiting.bad-body) keeps its letters in Awaiting a reply and says so', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, writable(['waiting.sent']));
+        await openOverview(page);
+        await placeHead(page, 'todo', 'MěÚ Vzorov').locator('.research-overview__waiting-groupwrite[data-action="group-sent"]').click();
+        await expect(todoHead(page)).toHaveText(/To do · 24/);
+        // The Sent itself is written (after the research's head is asked), only then the bridge refuses.
+        await expect.poll(() => bridge.writes.length).toBe(1);
+        bridge.refuse = { status: 400, code: 'waiting.bad-body' };
+        await page.locator('.toast[data-kind="waiting-sent"] .toast-action').click();
+        await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveText('Not recorded: the research did not take the request.');
+        await expect(todoHead(page)).toHaveText(/To do · 24/);
+        await expect(sentHead(page)).toHaveText(/Awaiting a reply · 11/);
+        expect(bridge.writes.at(-1)).toMatchObject({ method: 'POST', body: expect.stringContaining('"do":"unsent"') });
+    });
+
+    test('a place gone meanwhile (404 group.none): its Sent and its queries\' text go quietly, no error', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, writable(['waiting.sent', 'waiting.note']));
+        bridge.refuse = { status: 404, code: 'group.none' };
+        const ov = await openOverview(page);
+        const office = placeHead(page, 'todo', 'MěÚ Vzorov');
+        // The queries' text: no window, no toast.
+        await office.locator('.research-overview__waiting-groupnote').click();
+        await expect.poll(() => bridge.writes.length).toBe(1);
+        await page.waitForTimeout(300);
+        await expect(page.locator('#waiting-note-modal')).toHaveCount(0);
+        await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveCount(0);
+        // Sent: the place's rows go (not back to To do, not to Awaiting a reply), no error toast.
+        await office.locator('.research-overview__waiting-groupwrite[data-action="group-sent"]').click();
+        await expect.poll(() => bridge.writes.length).toBe(2);
+        await expect(todoHead(page)).toHaveText(/To do · 24/);
+        await expect(sentHead(page)).toHaveText(/Awaiting a reply · 5/);
+        await expect(placeHead(page, 'todo', 'MěÚ Vzorov')).toHaveCount(0);
+        await page.waitForTimeout(300);
+        await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveCount(0);
+        await expect(ov).toBeVisible();
+    });
+
+    test('a place\'s Sent whose answer names no task offers no Undo', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, writable(['waiting.sent']));
+        bridge.groupSentSilent = true;
+        await openOverview(page);
+        await placeHead(page, 'todo', 'MěÚ Vzorov').locator('.research-overview__waiting-groupwrite[data-action="group-sent"]').click();
+        await expect(todoHead(page)).toHaveText(/To do · 24/);
+        const toast = page.locator('.toast[data-kind="waiting-sent"]');
+        await expect(toast).toContainText(/^6 items recorded as sent on/);
+        await expect(toast.locator('.toast-action')).toHaveCount(0);
+    });
+
+    test('Add a file at a task: the originals\' path with X-Strom-Task, then "Sent to the research"', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, writable([], { media: { task: true } }));
+        await openOverview(page);
+        const letter = await openLetter(page);
+        await expect(letter.locator('.research-overview__waiting-action')).toHaveText(['Answer, opens in the research', 'Chat, AI, opens in the researchAI', 'Add a file', 'Query text, opens in the research', 'Sent, opens in the research']);
+        const chooser = page.waitForEvent('filechooser');
+        await letter.locator('.research-overview__waiting-action[data-action="file"]').click();
+        await (await chooser).setFiles({ name: 'odpoved-uradu.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 vymyšlená odpověď') });
+        await expect(page.locator('.toast[data-kind="waiting-file-sent"]')).toHaveText('Sent to the research');
+        const put = bridge.writes.find(w => w.method === 'PUT');
+        expect(put?.path).toMatch(/^media\/[0-9a-f]{64}$/);
+        expect(put?.headers['x-strom-task']).toBe('T0018');
+        expect(put?.headers['x-strom-name']).toBe('odpoved-uradu.pdf');
+        expect(put?.headers['content-type']).toBe('application/pdf');
+        expect(await launched(page)).toEqual([]);
+    });
+
+    test('Sent at an item the research already has sent (sent: [], phase sent): it stays in Awaiting a reply, no error', async ({ page }) => {
+        await fastReconnect(page);
+        const bridge = await follow(page, { width: 1440, height: 900 }, writable(['waiting.sent']));
+        await openOverview(page);
+        const letter = await openLetter(page);
+        // The research marked it sent meanwhile, after the status the app last read: the bridge has it
+        // sent from the write on (changed before the click, the fast reconnect could move the row first).
+        bridge.itemReply = { sent: [], phase: 'sent' };
+        await letter.locator('.research-overview__waiting-action[data-action="sent"]').click();
+        await expect(todoHead(page)).toHaveText(/To do · 29/);
+        await expect(sentHead(page)).toHaveText(/Awaiting a reply · 6/);
+        await nextStatus(bridge);
+        await expect(sentHead(page)).toHaveText(/Awaiting a reply · 6/);
+        await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveCount(0);
+        expect(bridge.writes.map(w => [w.path, w.body])).toEqual([['waiting/T0018', '{"do":"sent"}']]);
+    });
+
+    test('Sent at an item the research keeps to do (sent: [], phase todo): the row follows it back, no error', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, writable(['waiting.sent']));
+        await openOverview(page);
+        const letter = await openLetter(page);
+        bridge.itemReply = { sent: [], phase: 'todo' };
+        await letter.locator('.research-overview__waiting-action[data-action="sent"]').click();
+        await expect.poll(() => bridge.writes.length).toBe(1);
+        await expect(todoHead(page)).toHaveText(/To do · 30/, { timeout: 2000 });
+        await expect(sentHead(page)).toHaveText(/Awaiting a reply · 5/);
+        await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveCount(0);
+        await expect(page.locator('.toast[data-kind="waiting-sent"]')).toHaveCount(0);
+    });
+
+    // The research commits a write of "Awaiting action" (its answer's head): the tree, unchanged by it,
+    // takes that head as its version by the rule of the family's material; a commit of its agent meanwhile is loaded.
+    const H1 = 'aaaa111', H2 = 'bbbb222', H3 = 'cccc333';
+    const linkHead = (page: Page) => page.evaluate(() => window.Strom.TreeManager.getActiveTreeMetadata()?.research?.head ?? '');
+    for (const c of [
+        { name: 'its parent the tree\'s head', reply: { head: H3, parent: H2 }, taken: true },
+        { name: 'no parent said, no commit of the agent since the last one following heard of', reply: { head: H3 }, taken: true },
+        { name: 'its parent a commit of the agent after the tree\'s head', reply: { head: H3, parent: 'dddd444' }, taken: false },
+    ]) {
+        test(`Sent committed by the research (${c.name}): ${c.taken ? 'the head is taken, nothing loaded again' : 'not taken, the newer tree is loaded'}`, async ({ page }) => {
+            await fastReconnect(page);
+            const bridge = await follow(page, { width: 1440, height: 900 }, (b) => { writable(['waiting.sent'])(b); b.heads = [H1, H2]; });
+            await expect.poll(() => linkHead(page)).toBe(H2);
+            expect(bridge.gedCalls).toBe(2);
+            await openOverview(page);
+            const letter = await openLetter(page);
+            bridge.writeHead = c.reply;
+            await letter.locator('.research-overview__waiting-action[data-action="sent"]').click();
+            await expect.poll(() => bridge.writes.length).toBe(1);
+            await expect(page.locator('.toast[data-kind="waiting-sent"]')).toBeVisible();
+            if (c.taken) {
+                await expect.poll(() => linkHead(page)).toBe(H3);
+                // The research says the new head in its next statuses: following loads nothing for it.
+                await nextStatus(bridge);
+                await nextStatus(bridge);
+                expect(bridge.gedCalls).toBe(2);
+            } else {
+                await expect.poll(() => bridge.gedCalls).toBe(3);
+                await expect.poll(() => linkHead(page)).toBe(H3);
+            }
+            await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveCount(0);
+        });
+    }
+
+    // No parent said and its agent committed after the last status following read (the stream has not told it yet):
+    // the head right before the write is asked fresh, so the research's new head is not taken as the tree's own.
+    test('Sent committed by the research (no parent said, a commit of the agent after the last status): not taken, the newer tree is loaded', async ({ page }) => {
+        await fastReconnect(page);
+        const bridge = await follow(page, { width: 1440, height: 900 }, (b) => { writable(['waiting.sent'])(b); b.heads = [H1, H2]; });
+        await expect.poll(() => linkHead(page)).toBe(H2);
+        expect(bridge.gedCalls).toBe(2);
+        await openOverview(page);
+        const letter = await openLetter(page);
+        // The stream goes quiet (its next /events never answers): following hears nothing more by itself.
+        bridge.events = false;
+        await expect.poll(() => bridge.eventsHeld ?? 0, { timeout: 10000 }).toBe(1);
+        const chain = bridge.chain;
+        // The agent commits H2 → Hx; only a status asked now says it.
+        bridge.committed = 'eeee555';
+        bridge.writeHead = { head: H3 };
+        const asked = bridge.statusCalls ?? 0;
+        await letter.locator('.research-overview__waiting-action[data-action="sent"]').click();
+        await expect.poll(() => bridge.writes.length).toBe(1);
+        await expect(page.locator('.toast[data-kind="waiting-sent"]')).toBeVisible();
+        expect(bridge.statusCalls ?? 0).toBeGreaterThan(asked);
+        // Not taken: the research's new version (with the agent's commit) is loaded.
+        await expect.poll(() => bridge.gedCalls).toBe(3);
+        await expect.poll(() => linkHead(page)).toBe(H3);
+        expect(bridge.chain).toBe(chain);
+        await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveCount(0);
+    });
+
+    test('a check with file in its actions: no Add a file through the bridge, the task link stays', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, (b) => {
+            writable([], { media: { task: true } })(b);
+            const check = b.waiting.find(w => w.kind === 'check')!;
+            check.actions = ['answer', 'file'];
+        });
+        const ov = await openOverview(page);
+        await placeHead(page, 'todo', 'rodokmen.example').locator('.research-overview__waiting-group').click();
+        const check = ov.locator('.research-overview__waiting-item', { hasText: 'Ověřit, zda badatelna funguje' });
+        await check.locator('.research-overview__waiting-row').click();
+        await expect(check.locator('.research-overview__waiting-action')).toHaveText(['Answer, opens in the research', 'Add a file, opens in the research']);
+        await expect(check.locator('[data-write="bridge"]')).toHaveCount(0);
+        // A letter still adds its file through the bridge.
+        const letter = await openLetter(page);
+        await expect(letter.locator('.research-overview__waiting-action[data-action="file"]')).toHaveAttribute('data-write', 'bridge');
+        expect(bridge.writes).toHaveLength(0);
+    });
+
+    test('a refused or unanswered write puts the row back and says so', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, writable(['waiting.sent']));
+        bridge.refuse = { status: 423, code: 'locked' };
+        await openOverview(page);
+        let letter = await openLetter(page);
+        await letter.locator('.research-overview__waiting-action[data-action="sent"]').click();
+        await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveText('Not recorded: another session holds the tree in the research.');
+        await expect(todoHead(page)).toHaveText(/To do · 30/);
+        await expect(letter).toBeVisible();
+        bridge.refuse = 'abort';
+        letter = page.locator('#research-overview .research-overview__waiting-item', { hasText: 'Napsat matrice o zápis 1' });
+        await letter.locator('.research-overview__waiting-action[data-action="sent"]').click();
+        await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveText('Not recorded: the research did not answer.');
+        await expect(todoHead(page)).toHaveText(/To do · 30/);
+        expect(bridge.writes).toHaveLength(2);
+    });
+
+    test('phone: the sheet writes through the bridge (Sent, a file, the queries\' text), no way into the research', async ({ page }) => {
+        const bridge = await follow(page, { width: 360, height: 780 }, writable(['waiting.sent', 'waiting.note'], { media: { task: true } }));
+        await page.locator('#live-panel .live-panel-toggle').click();
+        const ov = page.locator('#research-overview');
+        await expect(ov).toHaveClass(/research-overview--sheet/);
+        await recordLaunches(page);
+        const office = placeHead(page, 'todo', 'MěÚ Vzorov');
+        await expect(office.locator('.research-overview__waiting-groupwrite')).toHaveText(['Sent', 'All queries\' text']);
+        await expect(ov.locator('.research-overview__waiting-groupchat')).toHaveCount(0);
+        const box = await office.locator('.research-overview__waiting-groupwrite').first().boundingBox();
+        expect(box!.height).toBeGreaterThanOrEqual(44);
+
+        const letter = await openLetter(page);
+        await expect(letter.locator('.research-overview__waiting-action')).toHaveText(['Add a file', 'Sent']);
+        await expect(letter.locator('.research-overview__waiting-detail')).toContainText('answered in the research on the computer');
+        // The queries' text opens over the sheet; × closes it, the sheet stays.
+        await office.locator('.research-overview__waiting-groupnote').click();
+        const dialog = page.locator('#waiting-note-modal');
+        await expect(dialog.locator('.waiting-note-text')).toContainText('prosím o výpisy z matriky Vzorov');
+        await expect(dialog.locator('.waiting-note-copy')).toBeVisible();
+        await dialog.locator('.close-btn').click();
+        await expect(dialog).toHaveCount(0);
+        await expect(ov).toBeVisible();
+        await letter.locator('.research-overview__waiting-action[data-action="sent"]').click();
+        await expect(todoHead(page)).toHaveText(/To do · 29/);
+        await expect.poll(() => bridge.writes.map(w => [w.method, w.path])).toEqual([
+            ['GET', `group/${encodeURIComponent('to:MěÚ Vzorov')}/note`], ['POST', 'waiting/T0018'],
+        ]);
+        expect(await launched(page)).toEqual([]);
+    });
+});

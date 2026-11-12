@@ -5,7 +5,7 @@
  * without loading the whole parser.
  */
 
-import { normalizeDateInput } from './dates.js';
+import { normalizeDateInput, readWrittenDate } from './dates.js';
 import { readDateWords } from './date-words.js';
 
 const MONTHS: Record<string, string> = {
@@ -39,11 +39,22 @@ export function gedcomDatePhrase(dateStr: string): string | null {
     return dateStr.replace(/@#D[^@]*@\s*/gi, '').trim() || null;
 }
 
+/**
+ * A GEDCOM date read whole into a flex date ("25 SEP 1857" → "1857-09-25",
+ * "BET 1888 AND 1892" → "1888..1892"), or null when the value is not one date
+ * alone (a phrase, a date read only in part, other words after it).
+ */
+export function gedcomDateWhole(dateStr: string): string | null {
+    const read = readGedcomDate(dateStr);
+    return read.date && !read.lossy && !read.phrase ? read.date : null;
+}
+
 const YEAR_RE = /^\d{3,4}$/;
 
 /**
  * A date with no words around it, for readDateWords: a GEDCOM one read whole
- * ("3 MAR 1919", "1919") or a dotted day-first one ("12. 3. 1919").
+ * ("3 MAR 1919", "1919", a month and year "07/1987") or a dotted day-first
+ * one ("12. 3. 1919").
  */
 function bareDate(s: string): string | null {
     const read = readGedcomDate(s);
@@ -101,6 +112,13 @@ function readGedcomDate(dateStr: string): { date: string; lossy: boolean; phrase
     const local = readDateWords(dateStr, bareDate);
     if (local) return { date: local, lossy: false, phrase };
 
+    // A date written the way people write it ("12/5/1850", "Cca 2/3/1850",
+    // "Mezi 1850-1852", "Cca 1850-1852"): read as the date field reads it.
+    // When the reading took a choice the text does not make (day and month
+    // that could swap, "cca" left out of a range), the text stays as written.
+    const written = readWrittenDate(dateStr);
+    if (written) return { date: written.date, lossy: written.assumed, phrase };
+
     // Qualifier prefixes map to flex-date qualifiers instead of being dropped.
     // INT (interpreted) is an approximation of what the phrase says.
     let qualifier = '';
@@ -123,6 +141,16 @@ function readGedcomDate(dateStr: string): { date: string; lossy: boolean; phrase
     // both notations name the same moment. The flex-date model has no dual-year
     // form, so the year AS WRITTEN in the record (the first one) is kept — the
     // least lossy single value, and the one a reader finds in the source.
+    // A month and year in figures ("07/1987", "7/1987", "07.1987"), the way
+    // some programs write a date without a day: read as the month of that
+    // year. Only a month 1–12 counts ("13/1987" stays unknown); a dual year
+    // ("1699/00") has the year first and a day-first date ("12.03.1919") has
+    // two separators, so neither is taken for one.
+    const numericMonth = /^(\d{1,2})[./](\d{3,4})$/.exec(cleaned.trim());
+    if (numericMonth && +numericMonth[1] >= 1 && +numericMonth[1] <= 12) {
+        return { date: `${qualifier}${numericMonth[2]}-${numericMonth[1].padStart(2, '0')}`, lossy: false, phrase };
+    }
+
     const parts = cleaned.split(/\s+/).filter(Boolean).map(p => p.replace(/^(\d{3,4})\/\d{1,2}$/, '$1'));
     const monthOf = (p: string | undefined): string | undefined => p ? MONTHS[p.toUpperCase()] : undefined;
     const lastIsYear = parts.length > 0 && YEAR_RE.test(parts[parts.length - 1]);

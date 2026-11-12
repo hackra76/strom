@@ -66,6 +66,8 @@ class MergerUIClass {
     private escapeHandler: ((e: KeyboardEvent) => void) | null = null;
     private autoSaveTimeout: ReturnType<typeof setTimeout> | null = null;
     private incomingFileName?: string;
+    /** A merge of a GEDCOM file: its import record in the incoming data (spec 066). */
+    private gedcomImport?: { gedcom: true; importId?: string };
 
     // Track if opened from tree manager (for returning to it)
     private openedFromTreeManager: boolean = false;
@@ -80,8 +82,12 @@ class MergerUIClass {
      * @param sourceTreeIdOrFileName Either a TreeId (for tree-to-tree merge) or a filename (for file import)
      * @param fromTreeManager Whether this merge was opened from the tree manager
      */
-    startMerge(incomingData: StromData, sourceTreeIdOrFileName?: string | TreeId, fromTreeManager: boolean = false): void {
+    startMerge(
+        incomingData: StromData, sourceTreeIdOrFileName?: string | TreeId, fromTreeManager: boolean = false,
+        gedcomImport?: { gedcom: true; importId?: string },
+    ): void {
         const existingData = DataManager.getData();
+        this.gedcomImport = gedcomImport;
 
         // Create merge state
         this.mergeState = createMergeState(existingData, incomingData);
@@ -117,6 +123,7 @@ class MergerUIClass {
      */
     resumeMerge(state: MergeState, fileName?: string, targetTreeName?: string, sourceTreeName?: string): void {
         this.mergeState = state;
+        this.gedcomImport = undefined;
         this.currentFilter = 'all';
         this.selectedMatchIndex = -1;
         this.hasUnsavedChanges = false;
@@ -720,12 +727,13 @@ class MergerUIClass {
         const decision = this.mergeState?.decisions.get(match.incomingId);
 
         // Determine status: confirmed, rejected, skipped, or pending (needs review)
-        // Score >= 50 is pre-confirmed, score < 50 requires explicit user action.
+        // Score >= AUTO_CONFIRM_SCORE is pre-confirmed, anything below it is
+        // only offered and requires explicit user action.
         // Skip is independent: the incoming person is neither merged nor added.
         const isSkipped = decision?.type === 'skip';
-        const isConfirmed = decision?.type === 'confirm' || (!decision && match.score >= 50);
+        const isConfirmed = decision?.type === 'confirm' || (!decision && match.score >= AUTO_CONFIRM_SCORE);
         const isRejected = decision?.type === 'reject';
-        const isPending = !decision && match.score < 50; // Needs user review
+        const isPending = !decision && match.score < AUTO_CONFIRM_SCORE; // Needs user review
 
         const confidenceClass = match.confidence;
         const confidenceLabel = strings.merge[`${match.confidence}Confidence`] || match.confidence;
@@ -787,7 +795,7 @@ class MergerUIClass {
                         ${strings.merge.changeMatch}
                     </button>
                     ${resolveBtn}
-                    <button class="merge-btn-preview" data-action="compare" title="${strings.treePreview.comparePersons}">
+                    <button class="merge-btn-preview" data-action="compare" title="${strings.treePreview.comparePersons}" aria-label="${strings.treePreview.comparePersons}">
                         👁
                     </button>
                 </div>
@@ -825,7 +833,7 @@ class MergerUIClass {
                     <button class="merge-btn-skip ${isSkipped ? 'active' : ''}" data-action="skip" title="${this.escapeHtml(strings.merge.skipTooltip)}">
                         ${isSkipped ? strings.merge.unskip : strings.merge.skip}
                     </button>
-                    <button class="merge-btn-preview" data-action="preview" title="${strings.treePreview.preview}">
+                    <button class="merge-btn-preview" data-action="preview" title="${strings.treePreview.preview}" aria-label="${strings.treePreview.preview}">
                         👁
                     </button>
                 </div>
@@ -1470,6 +1478,17 @@ class MergerUIClass {
             this.clearAutoSave();
             void clearCurrentMerge();
 
+            // What the import brought, for the steps after it.
+            const gedcomImport = this.gedcomImport;
+            this.gedcomImport = undefined;
+            if (gedcomImport) {
+                const importId = gedcomImport.importId ? result.importMap?.get(gedcomImport.importId) : undefined;
+                void UI.afterImport(newTreeId, {
+                    gedcom: true, path: 'merge', ...(importId ? { importId } : {}),
+                    added: result.stats.added, updated: result.stats.merged,
+                });
+            }
+
             // Reset state
             this.mergeState = null;
             this.selectedMatchIndex = -1;
@@ -1513,7 +1532,8 @@ class MergerUIClass {
 
             // If the merge introduced new issues, offer to open validation on
             // the merged tree so the user can review (and fix) them right away.
-            if (newIssueCount > 0) {
+            // A file from another program: its "What next" card carries the data check.
+            if (newIssueCount > 0 && !UI.importNextPendingFor(newTreeId)) {
                 const openValidation = await UI.showConfirm(
                     strings.merge.newIssues(newIssueCount),
                     strings.merge.newIssuesTitle

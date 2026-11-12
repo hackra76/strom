@@ -9,7 +9,7 @@
 
 import { DataManager } from '../data.js';
 import {
-    LifeEvent, LifeEventType, EventParticipant, ParticipantRole, PersonId, PartnershipId, FactStatus,
+    LifeEvent, LifeEventType, EventParticipant, ParticipantRole, PersonId, PartnershipId,
     generateParticipantId,
 } from '../types.js';
 import { PersonPicker } from '../person-picker.js';
@@ -20,7 +20,6 @@ import { SELECTABLE_EVENT_TYPES, orderLifeList, eventTakesParticipants, eventVal
 import { formatFlexDate, normalizeDateInput, formatDateForInput } from '../dates.js';
 import { chainLinkSvg, iconSvg } from '../icons.js';
 import { uiModule } from './module.js';
-import { factStatusHtml } from './fact-status.js';
 import { autoGrowAll } from './autogrow.js';
 import { DETAIL_KEYS, offeredDetails, refreshDetailGroup, resetDetailGroup, renderAgeCheck, ageBirthDate, eventDetailLine } from './event-details-ui.js';
 import { shownNameOrEmpty, fitNameHtml } from '../person-name.js';
@@ -87,6 +86,12 @@ export const personEventsMethods = uiModule({
 
         const locked = DataManager.isPersonLocked(this.currentId);
         const rows: string[] = [];
+        // One reliability mark per fact (none at the facts when the origin row stands for them all).
+        const marks = this.personReliabilityView(person);
+        // "Originally from the family tree" and the research's proposal under a fact (src/ui/fact-origin-ui.ts).
+        const originBridge = this.researchOriginBridge();
+        const proposals = this.originProposalsOf(person);
+        const origin = (fact: string): string => this.factOriginHtml(person, fact, originBridge, proposals);
 
         // Birth and death rows are read-only (never editable as events); all
         // rows stand in the order of the life (T31: a burial after the death).
@@ -100,17 +105,17 @@ export const personEventsMethods = uiModule({
             if (entry.kind === 'birth') {
                 rows.push(this.eventRowHtml(strings.events.types.birth,
                     eventMeta(person.birthDate, person.birthPlace), null, '',
-                    eventDetailLine({ address: person.birthAddress }), person.birthStatus));
+                    eventDetailLine({ address: person.birthAddress }), this.personFactMarkHtml(marks, 'birth'), origin('birth')));
             } else if (entry.kind === 'death') {
                 rows.push(this.eventRowHtml(strings.events.types.death,
                     eventMeta(person.deathDate, person.deathPlace), null, '',
-                    eventDetailLine({ cause: person.deathCause, age: person.deathAge, address: person.deathAddress }), person.deathStatus));
+                    eventDetailLine({ cause: person.deathCause, age: person.deathAge, address: person.deathAddress }), this.personFactMarkHtml(marks, 'death'), origin('death')));
             } else {
                 const event = entry.event;
                 rows.push(this.eventRowHtml(eventTypeLabel(event),
                     eventMeta(event.date, event.place, eventOwnSubject(event)),
                     locked ? null : event.id,
-                    this.participantsSummary(event), eventDetailLine(event), event.status));
+                    this.participantsSummary(event), eventDetailLine(event), this.personFactMarkHtml(marks, `event:${event.id}`), origin(`event:${event.id}`)));
             }
         }
 
@@ -151,8 +156,8 @@ export const personEventsMethods = uiModule({
         }).join('  ·  ');
     },
 
-    /** `participantsHtml`: participantsSummary's HTML (escaped already). */
-    eventRowHtml(typeLabel: string, meta: string, eventId: string | null, participantsHtml = '', details = '', status?: FactStatus): string {
+    /** `participantsHtml`: participantsSummary's HTML (escaped already); `belowHtml`: the fact's origin rows (HTML, escaped already). */
+    eventRowHtml(typeLabel: string, meta: string, eventId: string | null, participantsHtml = '', details = '', markHtml = '', belowHtml = ''): string {
         const actions = eventId === null ? '' : `
             <div class="event-actions">
                 <button type="button" class="event-edit-btn" title="${esc(strings.events.edit)}" aria-label="${esc(strings.events.edit)}"
@@ -168,7 +173,8 @@ export const personEventsMethods = uiModule({
         return `
             <div class="event-row${eventId === null ? ' readonly' : ''}">
                 <div class="event-main">
-                    <div><span class="event-type">${esc(typeLabel)}</span>${metaHtml}${factStatusHtml(status)}</div>
+                    <div><span class="event-type">${esc(typeLabel)}</span>${metaHtml}${markHtml}</div>
+                    ${belowHtml}
                     ${detailsHtml}
                     ${peopleHtml}
                 </div>

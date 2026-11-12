@@ -64,6 +64,14 @@ export interface FanViewHost {
     addParentLabel(): string;
     /** The family line chosen in the tree view (its legend row marked). */
     selectedRod?(): string | null;
+    /** The centre pinned while following the research agent (its label replaces the origin pill). */
+    pinnedCenter?(): PersonId | null;
+    /** Extra items of a person's menu (pin / release the centre while following), after re-centring. */
+    menuExtra?(id: PersonId, isCentre: boolean): Array<{ id: FanMenuItemId; label: string; run: () => void }>;
+    /** "Release" on the pinned centre's label. */
+    unpinCenter?(): void;
+    /** A sector's menu (or its sheet) closed. */
+    menuClosed?(): void;
     /** After every redraw of the SVG (the evidence highlight is put back). */
     afterDraw(): void;
     /** The person's detail (the same dialog as elsewhere; read-only where the tree is). */
@@ -84,10 +92,13 @@ export interface FanMenuSpec {
     items: Array<{ id: FanMenuItemId; label: string; kbd?: string; run: () => void }>;
 }
 
-export type FanMenuItemId = 'recenter' | 'detail' | 'page' | 'first' | 'add';
+export type FanMenuItemId = 'recenter' | 'pin' | 'unpin' | 'detail' | 'page' | 'first' | 'add';
 
-/** §5.5: the re-centring swap. */
-const SWAP_MS = 320;
+/**
+ * The re-centring swap: a short cross-fade without any change of size, the
+ * same both ways (a sector, Back, the original person, pin and release).
+ */
+const SWAP_MS = 150;
 const FADE_MS = 200;
 const FLASH_MS = 1800;
 
@@ -102,8 +113,6 @@ function coarsePointer(): boolean {
 /** The pending swap: the old drawing (a copy over the stage) waits for the new focus. */
 interface Swap {
     layer: HTMLElement;
-    kind: 'zoom' | 'fade';
-    point: FanZoomPoint;
     timer: ReturnType<typeof setTimeout>;
 }
 
@@ -139,6 +148,10 @@ export class FanViewController {
     private shown: PersonId | null = null;
     /** How the coming focus change was asked for here (null: from elsewhere — search, ↩). */
     private pendingNav: 'back' | 'origin' | null = null;
+    /** The coming focus becomes the origin (a centre pinned or released while following). */
+    private originNext: PersonId | null = null;
+    /** "Centre: Name · Release" while the pinned centre is shown. */
+    private centrePin: HTMLElement | null = null;
     private swap: Swap | null = null;
     private swapAnims: Animation[] = [];
     private pill: HTMLButtonElement | null = null;
@@ -302,8 +315,8 @@ export class FanViewController {
     }
 
     /** A sector of a person: re-centre on them. */
-    protected onSectorTap(person: PersonId, _sector: Element, point: FanZoomPoint): void {
-        this.recenter(person, point);
+    protected onSectorTap(person: PersonId, _sector: Element, _point: FanZoomPoint): void {
+        this.recenter(person);
     }
 
     /** The focus disc: a step back when there is one. */
@@ -329,6 +342,13 @@ export class FanViewController {
         if (focus === this.shown) return false;
         const nav = this.pendingNav;
         this.pendingNav = null;
+        if (this.originNext === focus) {
+            this.originNext = null;
+            this.origin = focus;
+            this.history = [];
+            this.shown = focus;
+            return true;
+        }
         if (nav === 'origin') this.history = [];
         else if (nav !== 'back') {
             if (this.history[this.history.length - 1] === focus) this.history.pop();
@@ -375,13 +395,51 @@ export class FanViewController {
         return this.origin;
     }
 
+    /**
+     * Re-centre on a person who becomes the origin (the way back starts
+     * anew): a centre pinned or released while following the agent.
+     */
+    recenterAsOrigin(id: PersonId): void {
+        if (!this.host.active()) return;
+        if (id === this.host.focusId()) {
+            this.origin = id;
+            this.history = [];
+            this.updatePill();
+            if (this.model && this.chart) this.draw();
+            return;
+        }
+        if (this.busy()) return;
+        this.originNext = id;
+        this.beginSwap();
+        this.host.setFocus(id);
+    }
+
+    /** A sector's menu is open. */
+    menuOpen(): boolean {
+        return !!this.menuKey;
+    }
+
+    /** The pill or the pinned centre's label again (the pin changed without a new focus). */
+    refreshPill(): void {
+        this.updatePill();
+    }
+
+    /** The middle of a person's first sector in stage px (null: not drawn). */
+    pointOfPerson(id: PersonId): FanZoomPoint | null {
+        const m = this.model;
+        if (!m) return null;
+        if (m.focus.id === id) return this.sectorPoint('f');
+        const s = m.sectors.find(x => x.person?.id === id && !x.repeatOf) ?? m.desc.find(x => x.person?.id === id && !x.repeatOfKey);
+        return s ? this.sectorPoint(s.key) : null;
+    }
+
     private busy(): boolean {
         return !!this.swap || this.swapAnims.length > 0;
     }
 
-    private recenter(id: PersonId, point?: FanZoomPoint): void {
+    private recenter(id: PersonId): void {
         if (this.busy() || id === this.host.focusId()) return;
-        this.beginSwap('zoom', point);
+        this.beginSwap();
         this.host.setFocus(id);
     }
 
@@ -390,7 +448,7 @@ export class FanViewController {
         if (!prev || this.busy()) return;
         this.history.pop();
         this.pendingNav = 'back';
-        this.beginSwap('fade');
+        this.beginSwap();
         this.host.setFocus(prev);
     }
 
@@ -398,7 +456,7 @@ export class FanViewController {
         const origin = this.origin;
         if (!origin || origin === this.host.focusId() || this.busy()) return;
         this.pendingNav = 'origin';
-        this.beginSwap('fade');
+        this.beginSwap();
         this.host.setFocus(origin);
     }
 
@@ -407,7 +465,7 @@ export class FanViewController {
      * (reduced motion: none — the fans swap at once). The copy carries no
      * sector attributes, classes or ids of the live drawing.
      */
-    private beginSwap(kind: Swap['kind'], point?: FanZoomPoint): void {
+    private beginSwap(): void {
         this.endSwap();
         const chart = this.chart;
         const svg = chart?.querySelector('svg.fan-svg');
@@ -417,10 +475,9 @@ export class FanViewController {
         layer.setAttribute('aria-hidden', 'true');
         layer.appendChild(this.ghostOf(svg as SVGSVGElement));
         chart.after(layer);
-        const { W, H } = this.zoom?.size() ?? { W: chart.clientWidth, H: chart.clientHeight };
         // Taps wait for the swap; a focus that never comes (refused) lets them go again.
         const timer = setTimeout(() => this.endSwap(), 1500);
-        this.swap = { layer, kind, point: point ?? { x: W / 2, y: H / 2 }, timer };
+        this.swap = { layer, timer };
     }
 
     /** A copy of the drawing for the swap: nothing in it answers to the live fan's selectors. */
@@ -451,19 +508,8 @@ export class FanViewController {
         this.swap = null;
         const { layer } = swap;
         const done = () => { layer.remove(); this.swapAnims = []; };
-        let out: Animation, inn: Animation;
-        if (swap.kind === 'zoom') {
-            const vb = this.zoom!.viewBox();
-            layer.style.transformOrigin = `${swap.point.x}px ${swap.point.y}px`;
-            chart.style.transformOrigin = `${(0 - vb.x) * vb.ppu}px ${(0 - vb.y) * vb.ppu}px`;
-            out = layer.animate([{ opacity: 1, transform: 'scale(1)' }, { opacity: 0, transform: 'scale(1.5)' }],
-                { duration: SWAP_MS, easing: 'cubic-bezier(.4,0,.6,1)', fill: 'forwards' });
-            inn = chart.animate([{ opacity: 0, transform: 'scale(0.85)' }, { opacity: 1, transform: 'scale(1)' }],
-                { duration: SWAP_MS, easing: 'cubic-bezier(.2,.7,.3,1)' });
-        } else {
-            out = layer.animate([{ opacity: 1 }, { opacity: 0 }], { duration: FADE_MS, easing: 'ease', fill: 'forwards' });
-            inn = chart.animate([{ opacity: 0 }, { opacity: 1 }], { duration: FADE_MS, easing: 'ease' });
-        }
+        const out = layer.animate([{ opacity: 1 }, { opacity: 0 }], { duration: SWAP_MS, easing: 'ease', fill: 'forwards' });
+        const inn = chart.animate([{ opacity: 0 }, { opacity: 1 }], { duration: SWAP_MS, easing: 'ease' });
         this.swapAnims = [out, inn];
         out.onfinish = done;
         out.oncancel = done;
@@ -495,7 +541,9 @@ export class FanViewController {
         const focus = this.host.focusId();
         const show = !!origin && !!focus && origin !== focus && this.host.active();
         if (this.pillTimer) { clearTimeout(this.pillTimer); this.pillTimer = null; }
-        if (show) {
+        const pinned = this.host.pinnedCenter?.() ?? null;
+        this.updateCentrePin(!!pinned && pinned === focus && this.host.active() ? pinned : null);
+        if (show && !(pinned && pinned === focus)) {
             const p = this.host.data().persons[origin!];
             const name = p ? shownNameFull(p) : '';
             const nameEl = pill.querySelector<HTMLElement>('.fan-origin-name');
@@ -515,6 +563,39 @@ export class FanViewController {
             pill.hidden = true;
             pill.classList.remove('is-leaving');
         }, FADE_MS);
+    }
+
+    /** "Centre: Name · Release" at the top left while the pinned centre is shown (null: none). */
+    private updateCentrePin(id: PersonId | null): void {
+        const stage = this.stage();
+        if (!id || !stage) {
+            if (this.centrePin) this.centrePin.hidden = true;
+            return;
+        }
+        if (!this.centrePin || !stage.contains(this.centrePin)) {
+            const box = document.createElement('div');
+            box.className = 'fan-center-pin';
+            box.id = 'fan-center-pin';
+            box.setAttribute('role', 'status');
+            const label = document.createElement('span');
+            label.className = 'fan-center-pin-label';
+            const name = document.createElement('b');
+            name.className = 'fan-center-pin-name';
+            const release = document.createElement('button');
+            release.type = 'button';
+            release.className = 'fan-center-pin-release';
+            release.addEventListener('click', () => this.host.unpinCenter?.());
+            box.append(label, name, release);
+            stage.appendChild(box);
+            this.centrePin = box;
+        }
+        const box = this.centrePin;
+        const p = this.host.data().persons[id];
+        box.querySelector('.fan-center-pin-label')!.textContent = strings.fan.centerLabel;
+        box.querySelector('.fan-center-pin-name')!.textContent = p ? shownNameFull(p) : '';
+        box.querySelector('.fan-center-pin-release')!.textContent = strings.fan.release;
+        box.hidden = false;
+        this.placePill(box);
     }
 
     /**
@@ -538,8 +619,8 @@ export class FanViewController {
      * followed research's card and of the legend chip when they stand at the
      * top of the stage: narrower when one is to its right, otherwise below it.
      */
-    private placePill(): void {
-        const pill = this.pill, stage = this.stage();
+    private placePill(el?: HTMLElement): void {
+        const pill = el ?? this.pill, stage = this.stage();
         if (!pill || pill.hidden || !stage) return;
         pill.style.top = '';
         pill.style.maxWidth = '';
@@ -570,7 +651,11 @@ export class FanViewController {
         const pill = this.pill;
         if (!pill) return;
         pill.addEventListener('click', () => this.goOrigin());
-        const replace = () => { this.placeChip(); if (!pill.hidden) this.placePill(); };
+        const replace = () => {
+            this.placeChip();
+            if (!pill.hidden) this.placePill();
+            if (this.centrePin && !this.centrePin.hidden) this.placePill(this.centrePin);
+        };
         if (typeof MutationObserver === 'function') new MutationObserver(replace).observe(document.body, { childList: true });
         if (typeof ResizeObserver === 'function') {
             const stage = this.stage();
@@ -602,7 +687,8 @@ export class FanViewController {
             const p = this.host.data().persons[pid];
             if (!p) return null;
             const items: FanMenuSpec['items'] = [];
-            if (kind !== 'focus') items.push({ id: 'recenter', label: S.recenter, kbd: 'Enter', run: () => this.recenter(pid, this.sectorPoint(key) ?? undefined) });
+            if (kind !== 'focus') items.push({ id: 'recenter', label: S.recenter, kbd: 'Enter', run: () => this.recenter(pid) });
+            items.push(...(this.host.menuExtra?.(pid, kind === 'focus') ?? []));
             items.push({ id: 'detail', label: S.personDetail, run: () => this.host.personDetail(pid) });
             items.push({ id: 'page', label: S.personPage, run: () => this.host.personPage(pid) });
             const first = el.getAttribute('data-fan-repeat-of');
@@ -642,6 +728,7 @@ export class FanViewController {
                 if (this.menuKey !== key) return;
                 this.menuKey = null;
                 this.hideRing();
+                this.host.menuClosed?.();
                 this.ignoreTapUntil = performance.now() + 400;
                 requestAnimationFrame(() => {
                     const a = document.activeElement;
@@ -733,6 +820,7 @@ export class FanViewController {
             this.host.hideMenuSheet();
         }
         if (refocus) this.focusKey(key);
+        this.host.menuClosed?.();
     }
 
     private showRing(p: FanZoomPoint): void {
@@ -763,7 +851,7 @@ export class FanViewController {
     }
 
     /** A sector's middle in stage px (null: no such sector). */
-    private sectorPoint(key: string): FanZoomPoint | null {
+    sectorPoint(key: string): FanZoomPoint | null {
         const zoom = this.zoom;
         if (!zoom) return null;
         const vb = zoom.viewBox();
@@ -904,7 +992,7 @@ export class FanViewController {
             if (this.busy()) return;
             const pid = el.getAttribute('data-fan-person') as PersonId | null;
             if (el.getAttribute('data-fan-kind') === 'focus') { this.goBack(); return; }
-            if (pid) { this.recenter(pid, this.sectorPoint(key) ?? undefined); return; }
+            if (pid) { this.recenter(pid); return; }
             if (el.getAttribute('data-fan-add')) this.openMenu(el, this.sectorPoint(key) ?? { x: 0, y: 0 }, coarsePointer() || isMobile() ? 'sheet' : 'context');
         }
     }

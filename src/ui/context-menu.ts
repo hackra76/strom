@@ -16,6 +16,7 @@ import { isTabletOrMobile } from '../breakpoints.js';
 import { fitFlyout, FLYOUT_MARGIN } from './flyout.js';
 import { shownName, shownNameFull, nameHtml } from '../person-name.js';
 import { displayYear } from '../dates.js';
+import { inBirthOrder } from '../marriage-order.js';
 import { menuOffersLineJumps } from '../card-tap.js';
 import { personStoryChapterCount } from '../story-text.js';
 import { LineageIndex, RodId, realRodMembers, rodOf, spouseRodsOf } from '../lineage.js';
@@ -64,6 +65,10 @@ export interface PersonMenuAction {
     caption?: boolean;
     /** The row's label in a stronger weight (a ghost's "Unlink"). */
     strong?: boolean;
+    /** Greyed and not run, still read out (`aria-disabled`): "Edit" while following a research. */
+    disabled?: boolean;
+    /** Looks like a link (the "Stop following" under a greyed "Edit"). */
+    link?: boolean;
     /** Above everything else, also above the bottom sheet's tiles (a ghost's own block). */
     lead?: boolean;
     /** In the bottom sheet right under the tiles (where "Focus" is), not with the rows below "Add". */
@@ -77,6 +82,12 @@ export interface PersonMenuAction {
      * stays empty).
      */
     kind?: 'place' | 'placeOpen' | 'focus' | 'jump';
+    /**
+     * A research direction the person is in (spec 038 §5.1): its kind's
+     * glyph before the name, the name drawn as a link ('' = the "and {n}
+     * more" row: the glyph's column empty).
+     */
+    glyph?: string;
 }
 
 /** The person menu with the rows of the view links: a ghost's block on top, the rest right after "Focus". */
@@ -98,7 +109,8 @@ function withViewLinkRows(items: PersonMenuAction[], vl: { head: PersonMenuActio
  */
 export function submenuRow(action: string, label: string, items: PersonMenuAction[]): PersonMenuAction[] {
     if (items.length === 0) return [];
-    if (items.length === 1) return [{ ...items[0], divider: false, header: undefined }];
+    // One row alone comes up a level, unless it needs its heading ("In direction").
+    if (items.length === 1 && items[0].glyph === undefined) return [{ ...items[0], divider: false, header: undefined }];
     const tag = items.find(i => i.action === 'research-knows')?.tag;
     return [{ action, label, submenu: items, tag, ariaLabel: tag ? `${label}, ${tag}` : undefined }];
 }
@@ -154,6 +166,10 @@ export function menuItemBody(a: PersonMenuAction): string {
     const label = a.note ? `${e(a.label)}<span class="menu-item-note">${e(a.note)}</span>` : e(a.label);
     // The kind column (§2): an empty span, its mark drawn by the style (index.html .menu-item-kind)
     const kind = a.kind ? `<span class="menu-item-kind" data-kind="${a.kind}" aria-hidden="true"></span>` : '';
+    if (a.glyph !== undefined) {
+        const cls = a.glyph ? 'menu-item-label menu-item-line' : 'menu-item-label menu-item-line-more';
+        return `<span class="menu-item-glyph" aria-hidden="true">${e(a.glyph)}</span><span class="${cls}">${label}</span>${tail}`;
+    }
     return tail || a.note || kind ? `${kind}<span class="menu-item-label">${label}</span>${tail}` : label;
 }
 
@@ -218,7 +234,9 @@ export const contextMenuMethods = uiModule({
 
         // "Research ›": what the research knows, then its actions — on every
         // variant of the menu (nothing there changes the app).
-        const knows = this.personResearchKnows(personId);
+        // The person's signals above already lead there with the conflicts and the question (signal-knows).
+        const signals = TreeRenderer.cardSignalsFor(personId);
+        const knows = signals && (signals.conflicts > 0 || signals.question) ? null : this.personResearchKnows(personId);
         const researchActions = this.personResearchActions(personId);
         // Files about the person, to the research (right after what it knows).
         // In an archive whose materials are shown: "Add material…" (it is kept, not sent to an agent).
@@ -230,9 +248,15 @@ export const contextMenuMethods = uiModule({
             material.push({ action: 'research-read', label: strings.read.menuPerson, note: strings.read.menuSub, badge: 'ai' });
         }
         const head = [...(knows ? [knows] : []), ...material];
-        const research = submenuRow('research', strings.research.personSection, [
+        // The directions the person is in, first, a line under them (spec 038 §5.1 a).
+        const inLine = this.personInLineItems(personId);
+        const rest = [
             ...head,
             ...researchActions.map((a, i) => (i === 0 && head.length ? { ...a, divider: true } : a)),
+        ];
+        const research = submenuRow('research', strings.research.personSection, [
+            ...inLine,
+            ...rest.map((a, i) => (i === 0 && inLine.length ? { ...a, divider: true } : a)),
         ]);
 
         // Linked in the view only: never a change of the data, so offered in every variant.
@@ -272,6 +296,11 @@ export const contextMenuMethods = uiModule({
                 ...children,
                 // Read-only look at the record (the edit form in its locked mode).
                 { action: 'view', label: c.view },
+                // Following a research: "Edit" greyed with why, and the way out (063 U3 A5).
+                ...(DataManager.isLiveFollowing() ? [
+                    { action: 'edit-following', label: c.edit, note: c.editFollowing, disabled: true, sheetTop: true },
+                    { action: 'live-stop', label: strings.research.stop, link: true, sheetTop: true },
+                ] : []),
                 ...readItems(false),
                 ...rodRows,
                 ...group([
@@ -392,14 +421,15 @@ export const contextMenuMethods = uiModule({
     /**
      * Under the rows in place: the person's siblings (with the siblings tab)
      * and children (with the children tab) the view draws elsewhere in the
-     * tree, in the tabs' order, each once ("Already in the tree elsewhere"),
-     * a row each that moves the view to the card (also right under the
-     * bottom sheet's tiles).
+     * tree, in the tabs' order (each by birth), each once ("Already in the
+     * tree elsewhere"), a row each that moves the view to the card (also
+     * right under the bottom sheet's tiles).
      */
     elsewhereRows(personId: PersonId): PersonMenuAction[] {
+        const data = DataManager.getData();
         const ids = [
-            ...(TreeRenderer.canToggleSiblings(personId) ? TreeRenderer.siblingsElsewhereOf(personId) : []),
-            ...(TreeRenderer.canToggleChildren(personId) ? TreeRenderer.childrenElsewhereOf(personId) : []),
+            ...(TreeRenderer.canToggleSiblings(personId) ? inBirthOrder(data, TreeRenderer.siblingsElsewhereOf(personId)) : []),
+            ...(TreeRenderer.canToggleChildren(personId) ? inBirthOrder(data, TreeRenderer.childrenElsewhereOf(personId)) : []),
         ];
         return [...new Set(ids)]
             .map(id => DataManager.getPerson(id))
@@ -420,6 +450,10 @@ export const contextMenuMethods = uiModule({
     runPersonMenuAction(personId: PersonId, action: string): void {
         if (action.startsWith('view-link-')) {
             this.runViewLinkMenuAction(personId, action);
+            return;
+        }
+        if (action.startsWith('research-in-line')) {
+            this.runPersonInLine(action);
             return;
         }
         if (action === LINE_JUMP_PARENTS_ACTION || action === LINE_JUMP_CHILDREN_ACTION) {
@@ -451,6 +485,10 @@ export const contextMenuMethods = uiModule({
                 break;
             case 'page':
                 this.showPersonPage(personId);
+                break;
+            // "Stop following" under the greyed "Edit" (063 U3 A5): the same stop as the live panel's.
+            case 'live-stop':
+                this.stopLiveFollow();
                 break;
             case 'focus':
                 // "Focus" always returns to the family view so the user is not
@@ -527,6 +565,31 @@ export const contextMenuMethods = uiModule({
             case 'signal-agent':
                 this.openCardSignal(personId, action.slice('signal-'.length));
                 break;
+            case 'signal-waiting-list':
+                // Touch: the person's items in Waiting for you, lit (each answered from its row).
+                this.hideContextMenu();
+                this.showPersonWaiting(this.personWaitingItems(personId));
+                break;
+            case 'signal-story-compare':
+                if (!this.openWaitingStoryCompare(personId)) this.showResearchWaiting();
+                break;
+            case 'signal-knows':
+                this.clearDialogStack();
+                this.openPersonResearchKnows(personId);
+                break;
+            case 'signal-verify':
+                this.showVerifyPersonDialog(personId);
+                break;
+            case 'signal-verify-first':
+                this.showVerifyPersonDialog(personId, { prioritize: true });
+                break;
+            case 'signal-verify-pending':
+                this.clearDialogStack();
+                this.showPersonResearchDialog(personId);
+                break;
+            case 'cross-tree':
+                this.openCrossTreeOf(personId);
+                break;
             case 'research-knows':
                 this.clearDialogStack();
                 this.showPersonResearchDialog(personId);
@@ -572,7 +635,10 @@ export const contextMenuMethods = uiModule({
             // NB: keep the class value out of the attribute as a whole variable —
             // interpolating a `${... ? ... : ...}` directly inside class="context-menu…"
             // confuses the self-export HTML cleaner's regex once minified.
-            const cls = a.danger ? 'context-menu-item danger' : a.strong ? 'context-menu-item is-strong' : 'context-menu-item';
+            const cls = a.danger ? 'context-menu-item danger' : a.strong ? 'context-menu-item is-strong'
+                : a.disabled ? 'context-menu-item is-disabled' : a.link ? 'context-menu-item is-link' : 'context-menu-item';
+            // Greyed: reached by the arrows and read out, nothing to run (no data-action).
+            if (a.disabled) return `${divider}${header}<div class="${cls}" role="menuitem" tabindex="-1" aria-disabled="true"${menuItemAria(a)}>${menuItemBody(a)}</div>`;
             return `${divider}${header}<div class="${cls}" role="menuitem" tabindex="-1" data-action="${a.action}"${menuItemAria(a)}>${menuItemBody(a)}</div>`;
         }).join('');
     },

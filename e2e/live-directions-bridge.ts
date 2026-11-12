@@ -1,0 +1,364 @@
+import { expect, Page } from '@playwright/test';
+
+/**
+ * A research bridge that manages its directions (Strom Research 1.26,
+ * spec 038): `/status` with `caps` and the directions in their order of
+ * work, and the writes (`POST /directions`, `/directions/<G>`,
+ * `/directions/<G>/state`, `/directions/order`, `GET /directions/people`)
+ * kept in `writes` and answered by default as the research would, or by
+ * the answers queued in `replies`. Followed live through `?live=`.
+ * Invented data only (the Fíškovi of Smrkov).
+ */
+
+export const UUID = '3f2c9a10-7b1e-4c55-9d2a-0e8f6b4a1c77';
+export const BRIDGE = 'http://127.0.0.1:5996/0123456789abcdef0123456789abcdef';
+const cors = { 'access-control-allow-origin': '*' };
+export const ALL_LINKS = ['send', 'excerpt', 'app', 'open', 'chat', 'task', 'review', 'research',
+    'new', 'update', 'sessions', 'conflict', 'story', 'sync-undo', 'setup', 'live', 'direction', 'finish'];
+
+export const GED = [
+    '0 HEAD', '1 SOUR STROM_RESEARCH', '1 DATE 30 SEP 2026', `1 _STROM_TREE ${UUID}`, '1 CHAR UTF-8', '1 NOTE Fíškovi',
+    '0 @P0001@ INDI', '1 NAME Josef /Fíšek/', '1 SEX M', '1 BIRT', '2 DATE 1840', '1 REFN P0001', '1 FAMS @F0001@',
+    '0 @P0002@ INDI', '1 NAME Anna /Svobodová/', '1 SEX F', '1 REFN P0002', '1 FAMS @F0001@',
+    '0 @P0012@ INDI', '1 NAME Jan /Fíšek/', '1 SEX M', '1 BIRT', '2 DATE 1865', '1 REFN P0012', '1 FAMC @F0001@',
+    '0 @P0050@ INDI', '1 NAME Marie /Fíšková/', '1 SEX F', '1 BIRT', '2 DATE 1871', '1 REFN P0050',
+    '0 @F0001@ FAM', '1 HUSB @P0001@', '1 WIFE @P0002@', '1 CHIL @P0012@',
+    '0 TRLR',
+].join('\n');
+
+export const ago = (min: number): string => new Date(Date.now() - min * 60_000).toISOString();
+
+/** Caps of a research that manages its directions (weighted order). */
+export const CAPS = {
+    directionsWrite: true, directionsOrder: true, orderMode: 'weight',
+    directionKinds: ['ancestors', 'descendants', 'question'], duplicateDirections: false, offLineBranches: false,
+};
+
+/** Four directions in the order of work: one worked on, one paused in its place, one new, one ended. */
+export const MANAGED_DIRECTIONS: Record<string, unknown>[] = [
+    { id: 'G0001', name: 'Předci: Jan Fíšek', state: 'active', direction: 'ancestors', focus: 'P0012', order: 1, tasks: 2, waiting: 1,
+        working: true, since: ago(6000), limits: { generations: 8 }, generations: [2, 1, 0], last: { at: ago(120), text: 'sňatek rodičů nalezen' },
+        found: { days: 7, sessions: 3, persons: 1, sources: 9, people: ['P0050'] } },
+    { id: 'G0004', name: 'Předci: Anna Svobodová', state: 'paused', direction: 'ancestors', focus: 'P0002', order: 2,
+        reason: 'matriky ještě nejsou online', since: ago(1440) },
+    { id: 'G0002', name: 'Potomci: Josef Fíšek', state: 'active', direction: 'descendants', focus: 'P0001', order: 3, tasks: 0, waiting: 0,
+        working: false, since: ago(30), limits: { before: 1750 } },
+    { id: 'G0005', name: 'Kdo byl kmotr?', state: 'done', direction: 'question', since: ago(2880), question: 'Kdo byl kmotr Jana?' },
+];
+
+/** The run on G0001. */
+export const MANAGED_AGENT = { who: 'agent-matriky', since: ago(16), task: 'křest Marie Fíškové, Smrkov 1871', person: 'P0012', research: 'G0001', session: 'N0132' };
+
+export interface BridgeReply { status: number; body: unknown; headers?: Record<string, string> }
+
+export interface ManagedBridge {
+    researches: Record<string, unknown>[];
+    /** `/status.caps` (null: an older research, none sent). */
+    caps: Record<string, unknown> | null;
+    working: Record<string, unknown>[];
+    /** Every write, in the order it came (method, path after the token, body). */
+    writes: { method: string; path: string; body: unknown }[];
+    /** Answers for the next writes, first first (empty: the research's own answer). */
+    replies: BridgeReply[];
+    statusAsks: number;
+    /** The bridge does not answer (every request refused). */
+    down: boolean;
+    /** `/status.offLine` (null: none sent); its branches change with the writes. */
+    offLine: Record<string, unknown> | null;
+    /** `/status.queue` and `/status.waiting` (writes change them). */
+    queue: Record<string, unknown>[];
+    waiting: Record<string, unknown>[];
+    /** Who else is in which direction (`GET /directions/people`, added to each direction's person; absent: its person only). */
+    people?: Record<string, string[]>;
+    /**
+     * The whole queue read by pages (`queue.page`): `queue` is all of it, the status sends its window (14 up next,
+     * 6 set aside, each with `pos`) and `queueCounts`; `rev` changes with every change of the queue's order.
+     */
+    paged?: { rev: number };
+    /** Each `GET /queue` asked (its query, without `app`). */
+    queueReads: string[];
+}
+
+/** The status's window of a queue read by pages: 14 tasks up next, then up to 6 set aside. */
+const QUEUE_WINDOW = 14;
+
+/** The tasks up next numbered by their place in the whole queue (`pos`); set-aside ones last, by id, without one. */
+function queueWithPlaces(b: ManagedBridge): Record<string, unknown>[] {
+    let pos = 0;
+    const next = b.queue.filter(q => q.state === 'next').map(({ whyBefore: _w, ...q }) => ({ ...q, pos: ++pos }));
+    const parked = b.queue.filter(q => q.state === 'parked').map(({ whyBefore: _w, ...q }) => q)
+        .sort((x, y) => String(x.id).localeCompare(String(y.id)));
+    return [...next, ...parked];
+}
+
+const queueRev = (b: ManagedBridge): string => (b.paged?.rev ?? 0).toString(16).padStart(16, '0');
+
+/** `/status.queueCounts` of a queue read by pages. */
+function queueCounts(b: ManagedBridge): Record<string, unknown> {
+    const research: Record<string, number> = {};
+    const branch: Record<string, number> = {};
+    let next = 0;
+    let parked = 0;
+    for (const q of b.queue) {
+        if (q.state !== 'next') { parked++; continue; }
+        next++;
+        if (typeof q.research === 'string') research[q.research] = (research[q.research] ?? 0) + 1;
+        if (typeof q.branch === 'string') branch[q.branch] = (branch[q.branch] ?? 0) + 1;
+    }
+    return { research, branch, next, parked, rev: queueRev(b) };
+}
+
+/** `GET /queue?from&count&branch&research&state`, as the research answers it. */
+function queuePage(b: ManagedBridge, query: URLSearchParams): BridgeReply {
+    const from = Number(query.get('from') ?? 0);
+    const count = Math.min(100, Number(query.get('count') ?? 50));
+    const rows = queueWithPlaces(b)
+        .filter(q => !query.get('branch') || q.branch === query.get('branch'))
+        .filter(q => !query.get('research') || q.research === query.get('research'))
+        .filter(q => !query.get('state') || q.state === query.get('state'));
+    const items = rows.slice(from, from + count);
+    const next = from + count < rows.length ? from + count : undefined;
+    return { status: 200, body: { items, total: rows.length, from, ...(next !== undefined ? { next } : {}), rev: queueRev(b), head: 'h1' } };
+}
+
+const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
+    ({ status, headers: { ...cors, 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
+
+/** What the research answers to a write by itself (and what it changes). */
+function answer(b: ManagedBridge, method: string, path: string, body: Record<string, unknown>): BridgeReply {
+    const find = (id: string) => b.researches.find(d => d.id === id);
+    if (method === 'GET' && path === 'directions/people') {
+        const people: Record<string, string[]> = {};
+        for (const d of b.researches) {
+            if (d.state === 'done' || typeof d.focus !== 'string') continue;
+            (people[d.focus] ??= []).push(d.id as string);
+        }
+        for (const [p, ids] of Object.entries(b.people ?? {})) people[p] = [...new Set([...(people[p] ?? []), ...ids])];
+        return { status: 200, body: { people } };
+    }
+    const branches = (b.offLine?.branches ?? []) as Record<string, unknown>[];
+    const branchGet = /^offline\/(B-P\d+)$/.exec(path);
+    if (method === 'GET' && branchGet) {
+        const br = branches.find(x => x.id === branchGet[1]);
+        if (!br) return { status: 404, body: { error: 'offline.none' } };
+        return { status: 200, body: { branch: br, tasks: b.queue.filter(q => q.branch === br.id).map(q => ({ id: q.id, text: q.text })) } };
+    }
+    if (method !== 'POST') return { status: 404, body: { error: 'not.found' } };
+    // Work outside the directions (spec 038 K7): a branch's choice, the tree's, a task's own place, a growing branch's answer.
+    const setBranch = (br: Record<string, unknown>, mode: string, line?: string): void => {
+        if (mode === 'default') {
+            br.mode = (b.offLine!.mode as string) ?? 'occasional';
+            br.own = false;
+            delete br.line;
+        } else {
+            br.mode = mode;
+            br.own = true;
+            if (mode === 'line') br.line = line ?? br.nearest;
+            else delete br.line;
+        }
+    };
+    if (branchGet) {
+        const br = branches.find(x => x.id === branchGet[1]);
+        if (!br) return { status: 404, body: { error: 'offline.none' } };
+        if (body.mode === 'line' && !find(body.line as string)) return { status: 404, body: { error: 'directions.none' } };
+        setBranch(br, body.mode as string, body.line as string | undefined);
+        return { status: 200, body: { branch: br, head: 'h1', parent: 'h1' } };
+    }
+    if (path === 'offline') {
+        if (typeof body.mode === 'string') b.offLine!.mode = body.mode === 'default' ? 'occasional' : body.mode;
+        if (typeof body.suggest === 'boolean') b.offLine!.suggest = body.suggest;
+        const { branches: _drop, ...rest } = b.offLine!;
+        return { status: 200, body: { offLine: rest, head: 'h1', parent: 'h1' } };
+    }
+    const task = /^queue\/(T\d+)$/.exec(path);
+    if (task) {
+        const q = b.queue.find(x => x.id === task[1]);
+        if (!q) return { status: 404, body: { error: 'queue.none' } };
+        // A queue read by pages: Do next puts the task first, To the end last; the order's print changes.
+        if (b.paged && (body.do === 'next' || body.do === 'last')) {
+            b.queue = body.do === 'next' ? [q, ...b.queue.filter(x => x !== q)] : [...b.queue.filter(x => x !== q), q];
+            b.paged.rev++;
+        }
+        if (body.do === 'default') {
+            delete q.own;
+            if ((q.why as { kind?: string } | undefined)?.kind === 'own') q.why = q.whyBefore ?? undefined;
+        } else {
+            if ((q.why as { kind?: string } | undefined)?.kind !== 'own') q.whyBefore = q.why;
+            q.own = body.do;
+            q.why = { kind: 'own', do: body.do };
+        }
+        // The count of tasks with a manual place follows.
+        if (b.offLine) b.offLine.ownTasks = b.queue.filter(x => x.own).length;
+        const { whyBefore: _w, ...sent } = q;
+        return { status: 200, body: { task: sent, head: 'h1', parent: 'h1' } };
+    }
+    const wait = /^waiting\/(W-B-P\d+)$/.exec(path);
+    if (wait) {
+        const w = b.waiting.find(x => x.id === wait[1]);
+        if (!w) return { status: 404, body: { error: 'waiting.none', id: wait[1] } };
+        b.waiting = b.waiting.filter(x => x !== w);
+        const br = branches.find(x => x.id === w.branch);
+        if (br && body.do === 'line') setBranch(br, 'line', (body.line as string | undefined) ?? (w.research as string));
+        if (br && body.do === 'never') setBranch(br, 'never');
+        return { status: 200, body: { branch: br, answer: body.do, head: 'h1', parent: 'h1' } };
+    }
+    if (path === 'directions/order') {
+        const order = (body.order as string[]).filter(id => find(id));
+        const ignored = (body.order as string[]).filter(id => !find(id));
+        order.forEach((id, i) => { find(id)!.order = i + 1; });
+        return { status: 200, body: { order, ignored } };
+    }
+    const state = /^directions\/(G\d+)\/state$/.exec(path);
+    if (state) {
+        const d = find(state[1]);
+        if (!d) return { status: 404, body: { error: 'directions.none' } };
+        d.state = body.do === 'pause' ? 'paused' : body.do === 'done' ? 'done' : 'active';
+        d.since = new Date().toISOString();
+        if (typeof body.reason === 'string') d.reason = body.reason;
+        else delete d.reason;
+        return { status: 200, body: { direction: d } };
+    }
+    const edit = /^directions\/(G\d+)$/.exec(path);
+    if (edit) {
+        const d = find(edit[1]);
+        if (!d) return { status: 404, body: { error: 'directions.none' } };
+        for (const k of ['name', 'question', 'reason'] as const) if (typeof body[k] === 'string') d[k] = body[k];
+        const limits = body.limits as Record<string, number | null> | undefined;
+        if (limits) {
+            const now = { ...(d.limits as Record<string, number> | undefined) };
+            for (const [k, v] of Object.entries(limits)) {
+                if (v === null) delete now[k];
+                else now[k] = v;
+            }
+            d.limits = now;
+        }
+        return { status: 200, body: { direction: d } };
+    }
+    if (path === 'directions') {
+        const id = `G${String(b.researches.length + 10).padStart(4, '0')}`;
+        const d = { id, name: (body.name as string) || `Předci: ${body.person}`, state: 'active', direction: body.direction, focus: body.person,
+            order: b.researches.filter(x => x.state !== 'done').length + 1, tasks: 0, waiting: 0, working: false, since: new Date().toISOString(),
+            ...(body.limits ? { limits: body.limits } : {}), ...(typeof body.question === 'string' ? { question: body.question } : {}) };
+        b.researches.push(d);
+        return { status: 200, body: { direction: d } };
+    }
+    return { status: 404, body: { error: 'not.found' } };
+}
+
+/**
+ * Follow a research live with the bridge above (`caps: null`: an older
+ * research). Research links are recorded in `window.__launched` instead of
+ * being opened.
+ */
+export async function followManaged(page: Page, opts: {
+    researches?: Record<string, unknown>[];
+    caps?: Record<string, unknown> | null;
+    working?: Record<string, unknown>[];
+    size?: { width: number; height: number };
+    /** Reconnect every 250 ms (a test of the bridge going away). */
+    fastReconnect?: boolean;
+    /** `/status.features` (absent: none sent). */
+    features?: string[];
+    /** `/status.offLine` (absent: none sent). */
+    offLine?: Record<string, unknown>;
+    /** `/status.queue` (absent: one task of G0001). */
+    queue?: Record<string, unknown>[];
+    /** `/status.waiting` (absent: none). */
+    waiting?: Record<string, unknown>[];
+    /** The research's tree (absent: `GED`). */
+    ged?: string;
+    /** Who else is in which direction (absent: each direction's person only). */
+    people?: Record<string, string[]>;
+    /** `queue` is the whole queue, read by pages (`queue.page` should be in `features`). */
+    paged?: boolean;
+} = {}): Promise<ManagedBridge> {
+    await page.setViewportSize(opts.size ?? { width: 1440, height: 900 });
+    if (opts.fastReconnect) {
+        await page.addInitScript(() => { (globalThis as { __LIVE_RECONNECT_MS?: number }).__LIVE_RECONNECT_MS = 250; });
+    }
+    await page.addInitScript((links) => {
+        if (sessionStorage.getItem('seeded')) return;
+        sessionStorage.setItem('seeded', '1');
+        localStorage.setItem('strom-research-links', JSON.stringify({ actions: links, at: new Date().toISOString() }));
+    }, ALL_LINKS);
+    const b: ManagedBridge = {
+        researches: structuredClone(opts.researches ?? MANAGED_DIRECTIONS),
+        caps: opts.caps === undefined ? CAPS : opts.caps,
+        working: opts.working ?? [MANAGED_AGENT],
+        writes: [], replies: [], statusAsks: 0, down: false,
+        offLine: opts.offLine ? structuredClone(opts.offLine) : null,
+        queue: structuredClone(opts.queue ?? [{ id: 'T0101', text: 'Matriky Smrkov', state: 'next', research: 'G0001' }]),
+        waiting: structuredClone(opts.waiting ?? []),
+        ...(opts.people ? { people: structuredClone(opts.people) } : {}),
+        ...(opts.paged ? { paged: { rev: 1 } } : {}),
+        queueReads: [],
+    };
+    const pagedFeature = !!opts.features?.includes('queue.page');
+    const windowOf = (): Record<string, unknown>[] => {
+        const all = queueWithPlaces(b);
+        return [...all.filter(q => q.state === 'next').slice(0, QUEUE_WINDOW), ...all.filter(q => q.state === 'parked').slice(0, 6)];
+    };
+    const status = () => ({
+        tree: { id: UUID, name: 'Fíškovi' }, head: 'h1', persons: 4,
+        working: b.working,
+        waiting: b.waiting,
+        // An older research cuts the queue to the same window, without places and counts.
+        ...(b.paged ? {
+            queue: windowOf().map(({ pos, ...q }) => (pagedFeature ? { ...q, ...(pos ? { pos } : {}) } : q)),
+            queueMore: Math.max(0, b.queue.filter(q => q.state === 'next').length - QUEUE_WINDOW),
+            ...(pagedFeature ? { queueCounts: queueCounts(b) } : {}),
+        } : { queue: b.queue.map(({ whyBefore: _w, ...q }) => q) }),
+        links: ALL_LINKS,
+        researches: b.researches,
+        ...(b.caps ? { caps: b.caps } : {}),
+        ...(b.offLine ? { offLine: b.offLine } : {}),
+        ...(opts.features ? { features: opts.features } : {}),
+    });
+    await page.route(`${BRIDGE}/**`, async (route) => {
+        if (b.down) return route.abort('connectionrefused');
+        const req = route.request();
+        const path = new URL(req.url()).pathname.replace(/^\/[0-9a-f]+\//, '');
+        if (path === 'status') {
+            b.statusAsks++;
+            return route.fulfill(json(status()));
+        }
+        if (path === 'tree.ged') return route.fulfill({ status: 200, headers: { ...cors, 'content-type': 'text/plain; charset=utf-8' }, body: opts.ged ?? GED });
+        if (path === 'events') {
+            return route.fulfill({ status: 200, headers: { ...cors, 'content-type': 'text/event-stream' }, body: `event: hello\ndata: ${JSON.stringify(status())}\n\n` });
+        }
+        if (path === 'queue' && req.method() === 'GET') {
+            const query = new URL(req.url()).searchParams;
+            query.delete('app');
+            b.queueReads.push(query.toString());
+            return route.fulfill(json(queuePage(b, query).body));
+        }
+        if (/^(directions|offline|queue\/|waiting\/)/.test(path)) {
+            const raw = req.postData();
+            const body = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+            b.writes.push({ method: req.method(), path, body });
+            const r = b.replies.shift() ?? answer(b, req.method(), path, body);
+            return route.fulfill(json(r.body, r.status, r.headers));
+        }
+        return route.fulfill({ status: 404, headers: cors, body: '' });
+    });
+    await page.goto(`/strom.html?live=${encodeURIComponent(BRIDGE)}`);
+    await expect(page.locator('#live-panel')).toBeVisible();
+    await page.evaluate(() => {
+        const launched: string[] = [];
+        (window as unknown as { __launched: string[] }).__launched = launched;
+        window.Strom.UI.handOverResearchLink = (url: string) => { launched.push(url); };
+    });
+    return b;
+}
+
+export const launchedLinks = (page: Page) => page.evaluate(() => (window as unknown as { __launched: string[] }).__launched);
+
+export async function openOverview(page: Page): Promise<void> {
+    await page.locator('#live-panel .live-panel-expand').click();
+    await expect(page.locator('#research-overview')).toBeVisible();
+}
+
+export const overview = (page: Page) => page.locator('#research-overview');
+export const directionRow = (page: Page, id: string) => overview(page).locator(`.research-direction[data-direction="${id}"]`);
+/** The writes of the directions (no `GET /directions/people`). */
+export const directionWrites = (b: ManagedBridge) => b.writes.filter(w => w.method === 'POST');

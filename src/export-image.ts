@@ -12,15 +12,21 @@ import { displayYear } from './dates.js';
 import { personInitials } from './initials.js';
 import { parentRelKind, parentRelDash, connectionDash } from './parent-rel-style.js';
 import type { CardLine, CardLineStyle, CardValueLines } from './card-fields.js';
+import type { CardStatusClass } from './reliability.js';
+import type { StoryMark } from './card-signals.js';
 import {
     CARD_MARK_WIDTH, CARD_COLUMN_GAP, CUSTOM_CARD_PAD_X, CARD_ROW_HEIGHT, CARD_DETAIL_GAP, CARD_LABEL_GAP,
     CARD_VALUE_DATE_GAP, CARD_NAME_ROW_HEIGHT, CARD_YEARS_ROW_HEIGHT, CARD_BIRTH_ROW_HEIGHT, CARD_AVATAR_WIDTH, CARD_HEAD_GAP,
-    MeasureTexts, CardRow, cardPlaceOffset, cardLinesTop, customCardRows, cardHeadBlock,
+    MeasureTexts, CardRow, cardPlaceOffset, cardLinesTop, customCardRows, cardHeadBlock, CARD_STATUS_MARK_ROOM,
+    CARD_NAME_MAX_ROWS, normalCardNameRows, NORMAL_CARD_NAME_ROW_HEIGHT,
 } from './card-width.js';
 import { shownName, shownNameParts, birthNoteText } from './person-name.js';
 import { strings } from './strings.js';
+import { unionOrderGlyphLift } from './union-order-measure.js';
+import { isClusterBoundary } from './ged-exporter.js';
 import {
-    unionOrderBadges, UnionOrderBadge, PillMetrics, estimatePillMetrics, placeUnionOrderPill, viewLineSegments,
+    unionOrderBadges, UnionOrderBadge, PillMetrics, estimatePillMetrics, estimateShortPillMetrics, placeUnionOrderPill, viewLineSegments,
+    shortPillLabelForm, shortPillNumber, PILL_HEIGHT,
     segmentsNearCard, EDGE_INSET, PillLabel, pillLabelForms, pillLabelWidths, PillSegment, EDGE_GAP, lineLinksOf, lineLinkTabs, LineLinkTab,
 } from './marriage-order.js';
 
@@ -46,6 +52,8 @@ const COLORS = {
     textLight: '#5c5546',
     textFaint: '#746c5c',
     accent: '#b0703c',      // the ∞ of the marriage-order pill (--accent)
+    markBg: '#f6f2ea',      // the status mark's fill (--surface-2)
+    storyFold: '#a39880',   // the story's folded corner (--story-fold = --text-ghost)
     printBorder: '#b8ad98',
     footer: '#8a8272',
     background: '#ffffff',
@@ -53,7 +61,13 @@ const COLORS = {
 
 const FONT = "'Strom Serif', Georgia, 'Times New Roman', serif";
 const PADDING = 40;
+/** The footer strip of one row; each further row adds FOOTER_ROW_GAP. */
 export const FOOTER_HEIGHT = 44;
+/** Between the middles of two footer rows. */
+const FOOTER_ROW_GAP = 20;
+/** The footer takes at most this many rows; the last ends in "…" when the text goes on. */
+const FOOTER_MAX_ROWS = 2;
+const FOOTER_SEPARATOR = '  ·  ';
 
 /** Poster geometry/style shared with other poster builders (e.g. the fan). */
 export const POSTER_PADDING = PADDING;
@@ -76,6 +90,63 @@ export function branchStripePath(x: number, y: number, h: number, r: number, w: 
     const dy = w < r ? r - Math.sqrt(r * r - (r - w) * (r - w)) : 0;
     return `M${f(x + w)} ${f(y + dy)}A${r} ${r} 0 0 0 ${f(x)} ${f(y + r)}`
         + `L${f(x)} ${f(y + h - r)}A${r} ${r} 0 0 0 ${f(x + w)} ${f(y + h - dy)}Z`;
+}
+
+/** The status mark's place (index.html .card-status-mark): 4px above the bottom, 15px in beside a fold, 5px without. */
+const STATUS_MARK_H = 12;
+const STATUS_MARK_BOTTOM = 4;
+
+/** The status mark's width: two dots (or ✓) inside a 3px padding and the 1px frame, at least 18px. */
+function statusMarkWidth(cls: CardStatusClass): number {
+    const content = cls === 'cs-p2' || cls === 'cs-p1' || cls === 'cs-import' ? 12 : cls === 'cs-res' ? 5 : cls === 'cs-human' ? 6 : 0;
+    return Math.max(18, content + 8);
+}
+
+/**
+ * The card's status mark (spec 066 P4 §1, §7) as the screen draws it: a 12px
+ * pill in the card's bottom-right corner, its frame and glyphs from the
+ * screen's light colours — ✓ in a firm frame, two dots full or half, one
+ * hollow dot, two hollow dots in a dashed frame (from the family tree), an
+ * empty dotted frame (no source). `right`/`bottom`: the card's outer edges.
+ */
+export function statusMarkSvg(cls: CardStatusClass, right: number, bottom: number, hasFold: boolean): string {
+    const w = statusMarkWidth(cls);
+    // Inside the card's 1px border, as the absolute mark of the screen.
+    const x = right - 1 - (hasFold ? 15 : 5) - w;
+    const y = bottom - 1 - STATUS_MARK_BOTTOM - STATUS_MARK_H;
+    const frame = cls === 'cs-human' || cls === 'cs-import' ? COLORS.textLight : cls === 'cs-none' ? COLORS.line : COLORS.cardBorder;
+    const dash = cls === 'cs-import' ? ' stroke-dasharray="3,2"' : cls === 'cs-none' ? ' stroke-dasharray="1,1.5"' : '';
+    const fill = cls === 'cs-none' ? 'none' : COLORS.markBg;
+    const ink = cls === 'cs-human' ? COLORS.text : cls === 'cs-none' ? COLORS.textFaint : COLORS.textLight;
+    const out = [`<g class="card-status-mark" data-status="${cls}">`,
+        `<rect x="${(x + 0.5).toFixed(1)}" y="${(y + 0.5).toFixed(1)}" width="${w - 1}" height="${STATUS_MARK_H - 1}" rx="5.5" fill="${fill}" stroke="${frame}" stroke-width="1"${dash}/>`];
+    const cx = x + w / 2;
+    const cy = y + STATUS_MARK_H / 2;
+    const dot = (dx: number, on: boolean): string =>
+        `<circle cx="${(cx + dx).toFixed(1)}" cy="${cy.toFixed(1)}" r="2" fill="${on ? ink : 'none'}" stroke="${ink}" stroke-width="1"/>`;
+    if (cls === 'cs-human') out.push(`<text x="${cx.toFixed(1)}" y="${(cy + 3).toFixed(1)}" text-anchor="middle" font-size="9" font-weight="700" fill="${ink}">✓</text>`);
+    else if (cls === 'cs-p2') out.push(dot(-3.5, true), dot(3.5, true));
+    else if (cls === 'cs-p1') out.push(dot(-3.5, true), dot(3.5, false));
+    else if (cls === 'cs-res') out.push(dot(0, false));
+    else if (cls === 'cs-import') out.push(dot(-3.5, false), dot(3.5, false));
+    out.push('</g>');
+    return out.join('');
+}
+
+/**
+ * The story's folded corner (spec 066 P4 §6, §7): the card's bottom-right
+ * 14px folded over, full for the person's own approved story, a band along
+ * the fold for a couple's story alone or a draft. `right`/`bottom`: the
+ * card's outer edges; the fold follows the card's 8px corner.
+ */
+export function storyFoldSvg(story: StoryMark, right: number, bottom: number): string {
+    const r = (n: number) => n.toFixed(1);
+    if (story.final && story.kind === 'own') {
+        return `<g class="card-story"><path d="M${r(right - 14)},${r(bottom)} L${r(right)},${r(bottom - 14)} L${r(right)},${r(bottom - 8)} A8,8 0 0 1 ${r(right - 8)},${r(bottom)} Z" fill="${COLORS.storyFold}"/>`
+            + `<line x1="${r(right - 14)}" y1="${r(bottom - 7)}" x2="${r(right - 7)}" y2="${r(bottom - 14)}" stroke="${COLORS.textFaint}" stroke-width="0.6"/></g>`;
+    }
+    // Hollow: the band between the fold line and a parallel line 4.5px towards the corner.
+    return `<g class="card-story hollow"><path d="M${r(right - 14)},${r(bottom)} L${r(right)},${r(bottom - 14)} L${r(right)},${r(bottom - 9.5)} L${r(right - 9.5)},${r(bottom)} Z" fill="${COLORS.storyFold}"/></g>`;
 }
 
 /** Spouse-line dash per partnership status (mirror of the renderer). */
@@ -122,6 +193,42 @@ function fittedText(
 }
 
 /**
+ * How far a Compact card's name may be narrowed (textLength) before it is
+ * shortened with "…" instead: a name only a little too wide stays whole,
+ * a long one is never squeezed unreadable (1110).
+ */
+export const COMPACT_NAME_MIN_SQUEEZE = 0.9;
+
+/** The Compact card's name as drawn: its text, font size and the width it is drawn at. */
+export interface CompactName { text: string; size: number; width: number; squeezed: boolean }
+
+/**
+ * The Compact card's name as the screen fits it (renderer.ts fitCardNames):
+ * 13px, then 12.5px, then shortened with "…" (the card's ellipsis). A name
+ * at most 1/COMPACT_NAME_MIN_SQUEEZE times the room is drawn whole, narrowed
+ * to the room. `widths` measures texts at 600 12.5px in the card's serif.
+ */
+export function fitCompactName(name: string, maxW: number, widths: (texts: string[]) => Map<string, number>): CompactName {
+    const w = widths([name]).get(name) ?? 0;
+    if (w * 13 / 12.5 <= maxW) return { text: name, size: 13, width: w * 13 / 12.5, squeezed: false };
+    if (w <= maxW) return { text: name, size: 12.5, width: w, squeezed: false };
+    if (w * COMPACT_NAME_MIN_SQUEEZE <= maxW) return { text: name, size: 12.5, width: maxW, squeezed: true };
+    const chars = [...name];
+    const cuts: string[] = [];
+    for (let n = chars.length - 1; n >= 1; n--) {
+        const head = chars.slice(0, n).join('').trimEnd();
+        if (head) cuts.push(`${head}…`);
+    }
+    const cutWidths = widths(cuts);
+    for (const text of cuts) {
+        const cw = cutWidths.get(text) ?? 0;
+        if (cw <= maxW) return { text, size: 12.5, width: cw, squeezed: false };
+    }
+    const last = cuts[cuts.length - 1] ?? '…';
+    return { text: last, size: 12.5, width: maxW, squeezed: (cutWidths.get(last) ?? 0) > maxW };
+}
+
+/**
  * The birth surname's row ("roz. Dvořáková") as it fits `maxW`: whole, or
  * shortened with "…" (never squeezed with textLength), or '' when fewer than
  * 4 letters of the surname would show — the screen's rule (fitCardBirths).
@@ -143,10 +250,12 @@ export function fitBirthRow(birth: string, maxW: number, width: (text: string) =
  * "1. ∞ 1866" in an 18px pill — the screen's .union-order-pill (its parts
  * where the screen's measure puts them, a 1px hairline), without its shadow;
  * with the shorter `label` the screen shows where the whole does not fit in
- * its half of the card ("2nd ∞", "2nd").
+ * its half of the card ("2nd ∞", "2nd"), or the dense spacing's short
+ * one ("∞ 2", its parts placed by `m` in the order of its text).
  */
 export function unionOrderPillSvg(b: UnionOrderBadge, m: PillMetrics, x: number, y: number, dimmed = false, label: PillLabel = 'full'): string {
-    const num = strings.focus.unionOrdinal(b.number);
+    // The dense spacing's short pill ("∞ 2"): its number, the ∞ drawn as the glyph.
+    const num = label === 'short' ? shortPillNumber(strings.marriageOrder.short(b.number)) : strings.focus.unionOrdinal(b.number);
     const base = (y + 12.5).toFixed(1);
     const font = `${LINE_FONT} font-size="10" font-weight="600" fill="${COLORS.textLight}"`;
     const parts = [
@@ -154,7 +263,9 @@ export function unionOrderPillSvg(b: UnionOrderBadge, m: PillMetrics, x: number,
         `<text x="${(x + m.numX).toFixed(2)}" y="${base}" ${font}>${escapeXml(num)}</text>`,
     ];
     if (label !== 'ordinal') {
-        parts.push(`<text x="${(x + m.glyphX).toFixed(2)}" y="${base}" text-anchor="middle" ${LINE_FONT} font-size="11" font-weight="600" fill="${COLORS.accent}">∞</text>`);
+        // The ∞ lifted level with the digits, as on the screen (T47).
+        const glyphBase = (y + 12.5 - unionOrderGlyphLift().ink).toFixed(2);
+        parts.push(`<text x="${(x + m.glyphX).toFixed(2)}" y="${glyphBase}" text-anchor="middle" ${LINE_FONT} font-size="11" font-weight="600" fill="${COLORS.accent}">∞</text>`);
     }
     if (b.year && label === 'full') parts.push(`<text x="${(x + m.yearX).toFixed(2)}" y="${base}" ${font}>${escapeXml(b.year)}</text>`);
     return `<g class="union-order-pill" data-union-order="${b.number}" data-person="${escapeXml(b.personId)}" data-toward="${escapeXml(b.towardId)}"${dimmed ? ' opacity="0.5"' : ''}${label !== 'full' ? ` data-label="${label}"` : ''}>${parts.join('')}</g>`;
@@ -201,7 +312,7 @@ export interface SvgBounds {
     height: number;
 }
 
-export interface PosterOptions {
+export interface PosterOptions extends PosterFooterMeta {
     /** Footer title (tree name). */
     treeName?: string;
     /** Footer date/subtitle. */
@@ -239,13 +350,23 @@ export interface PosterOptions {
      * rows are the screen's (src/card-width.ts customCardRows).
      */
     cardValueLines?: CardValueLines;
+    /**
+     * Rows a custom card's name may take when details may wrap
+     * (src/card-width.ts cardNameMaxRows): 2 (default, the Register and
+     * Custom cards, the last ends in "…"), 0 the whole name (the Detailed
+     * card, T40).
+     */
+    cardNameMaxRows?: CardValueLines;
     /** The custom card's line style: marks (default) or labels (the event's word before the value). */
     cardStyle?: CardLineStyle;
     /** Labels style: the label column (the view's longest label, src/card-width.ts). */
     cardLabelColumn?: number;
     /** The years under the name per person (the option "Years under the name"; src/card-fields.ts cardYears). */
     cardYears?: Map<string, string>;
-    /** Text widths in the card's fonts (the screen measures them); estimated when absent. */
+    /**
+     * Text widths in the card's fonts (the screen measures them); estimated
+     * when absent. The Normal card wraps its name on rows by them (T40).
+     */
     measureCardTexts?: MeasureTexts;
     /**
      * @font-face rules of the app's fonts (src/poster-fonts.ts), embedded so
@@ -262,9 +383,23 @@ export interface PosterOptions {
     focusId?: string | null;
     /**
      * The pill measured as the screen draws it (src/union-order-measure.ts);
-     * estimated when absent. `glyph` false: the ordinal alone.
+     * estimated when absent. `glyph` false: the ordinal alone; `short`: the
+     * dense spacing's short pill ("∞ 2", its whole text in `ordinal`).
      */
-    measureUnionOrderPill?: (ordinal: string, year: string, glyph?: boolean) => PillMetrics;
+    measureUnionOrderPill?: (ordinal: string, year: string, glyph?: boolean, short?: boolean) => PillMetrics;
+    /**
+     * The card marks the image carries (spec 066 P4 §7), per person as the
+     * screen shows them: the status mark of sources and reliability and the
+     * story's folded corner, each only when its switch in Settings → Show on
+     * card is on. Absent: none (the family book's tree page).
+     */
+    cardMarks?: Map<string, PosterCardMarks>;
+}
+
+/** What a card's bottom-right corner carries in the image. */
+export interface PosterCardMarks {
+    status?: CardStatusClass;
+    story?: StoryMark;
 }
 
 /** What the poster needs of a custom card line. */
@@ -277,7 +412,9 @@ const LINE_FONT = `font-family="'Instrument Sans', -apple-system, 'Segoe UI', sa
 const estimateCardTexts: MeasureTexts = (kind, texts) => {
     const out = new Map<string, number>();
     for (const t of texts) {
-        out.set(t, kind === 'name' ? estWidth(t, 15, true) : kind === 'label' || kind === 'more' ? estWidth(t, 12, true)
+        out.set(t, kind === 'name' ? estWidth(t, 15, true) : kind === 'nameSmall' ? estWidth(t, 12.5, true)
+            : kind === 'posterTitle' ? estWidth(t, 16, true)
+            : kind === 'label' || kind === 'more' ? estWidth(t, 12, true)
             : kind === 'years' ? estWidth(t, 11, false) : estWidth(t, 12, false));
     }
     return out;
@@ -288,10 +425,14 @@ interface CustomCardLook {
     dateColumn: number;
     labelColumn: number;
     valueLines: CardValueLines;
+    /** Rows the name may take when details may wrap (0: the whole name). */
+    nameMaxRows: CardValueLines;
     style: CardLineStyle;
     measure: MeasureTexts;
     /** Widths measured by the screen: texts are drawn at them. */
     exact: boolean;
+    /** The card carries the status mark: its last line keeps clear of it, as on screen (CARD_STATUS_MARK_ROOM). */
+    statusRoom?: boolean;
 }
 
 /**
@@ -306,7 +447,8 @@ interface CustomCardLook {
  * the place; every row at the value's start). The rows are the screen's (the
  * same wrapping, src/card-width.ts customCardRows), one text a row, 3px
  * between details that may wrap. When details may wrap a long name takes the
- * screen's two rows; with one row a detail it shrinks to 13px and only then
+ * screen's rows (two at most, or the whole name on the Detailed card, T40);
+ * with one row a detail it shrinks to 13px and only then
  * shortens, as on screen. With `exact` (widths measured by the screen) texts
  * are drawn at their measured widths, so the geometry holds in whatever font
  * a viewer sets them.
@@ -315,7 +457,7 @@ function customCardSvg(
     person: StromData['persons'][keyof StromData['persons']], pos: { x: number; y: number }, cw: number,
     lines: PosterCardLine[], ring: string, clipId: string, years: string, look: CustomCardLook,
 ): string {
-    const { dateColumn, labelColumn, valueLines, style, measure, exact } = look;
+    const { dateColumn, labelColumn, valueLines, nameMaxRows, style, measure, exact, statusRoom } = look;
     const out: string[] = [];
     const left = pos.x + CUSTOM_CARD_PAD_X;
     const right = pos.x + cw - CUSTOM_CARD_PAD_X;
@@ -323,8 +465,15 @@ function customCardSvg(
     const birth = shownNameParts(person, '?').birthNote;
     const birthRow = birthNoteText(birth);
     const metrics = { cardWidth: cw, dateColumn, ...(style === 'labels' ? { labelColumn } : {}) };
-    const { rows, heads } = customCardRows([{ name, avatar: !person.isPlaceholder, lines, ...(years ? { years } : {}),
-        ...(birthRow ? { birth: birthRow } : {}) }], metrics, measure, valueLines, style);
+    const entry = { name, avatar: !person.isPlaceholder, lines, ...(years ? { years } : {}), ...(birthRow ? { birth: birthRow } : {}) };
+    let { rows, heads } = customCardRows([entry], metrics, measure, valueLines, style, nameMaxRows);
+    // The last line clear of the status mark, as the screen wraps it, unless that
+    // takes a row more than the card was laid out with (then it stays as it was).
+    if (statusRoom && lines.length > 0) {
+        const kept = customCardRows([{ ...entry, lastLineReserve: CARD_STATUS_MARK_ROOM }], metrics, measure, valueLines, style, nameMaxRows);
+        const count = (r: typeof rows) => lines.reduce((n, l) => n + Math.max(1, r.get(l)?.rows.length ?? 0), 0);
+        if (count(kept.rows) === count(rows)) ({ rows, heads } = kept);
+    }
     const head = heads[0];
     let textX = left;
     if (!person.isPlaceholder) {
@@ -361,7 +510,7 @@ function customCardSvg(
             : nameAt15 * fs / 15 > nameRoom ? ` textLength="${nameRoom.toFixed(0)}" lengthAdjust="spacingAndGlyphs"` : '';
         out.push(`<text x="${textX.toFixed(1)}" y="${(blockTop + 14.5).toFixed(1)}" font-size="${fs}" font-weight="600" fill="${COLORS.text}"${clamp}>${escapeXml(name)}</text>`);
     } else {
-        // The rows the screen draws (two at most), each at its measured width.
+        // The rows the screen draws (two at most, or all of the Detailed card's), each at its measured width.
         const widths = measure('name', head.name);
         head.name.forEach((row, i) => {
             const w = Math.min(widths.get(row) ?? 0, nameRoom);
@@ -452,26 +601,145 @@ export interface PosterFooterMeta {
     treeName?: string;
     viewLabel?: string;
     dateLabel?: string;
+    /**
+     * Widths of the footer's texts in the image's fonts ('posterTitle' the
+     * tree name, 'posterNote' the rest; the screen measures them); estimated
+     * when absent.
+     */
+    measureFooterTexts?: MeasureTexts;
+}
+
+/** The footer as drawn: its text, its rows and its height. */
+export interface PosterFooterLayout {
+    /** The tree name, then the view label and the date, each after "  ·  ". */
+    text: string;
+    /** Where the tree name ends in `text` (it is drawn larger and bold). */
+    titleEnd: number;
+    /** The rows as [start, end) in `text`: one after another, all of it unless `cut`. */
+    rows: Array<[number, number]>;
+    /** The text did not fit the rows: the last one ends in "…". */
+    cut: boolean;
+    /** The footer strip's height (0: no footer). */
+    height: number;
+}
+
+const FOOTER_SPACE = /\s/;
+const FOOTER_BREAK_AFTER = /[-–]/;
+/** Scripts written without spaces: a row may break between any two of their characters. */
+const FOOTER_NO_SPACES = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
+
+/**
+ * The footer's rows in an image `width` px wide: one row when the whole text
+ * fits between the paddings (as before); otherwise the text wraps onto a
+ * second row, after a space, "-" or "–" (between characters where no such
+ * break fits, never inside a character: an accent, an emoji or a flag stays
+ * whole; between any two CJK characters), and when two rows do not take it,
+ * the second ends in "…". Widths come from `meta.measureFooterTexts`.
+ */
+export function posterFooterLayout(meta: PosterFooterMeta, width: number): PosterFooterLayout {
+    const title = meta.treeName ?? '';
+    let text = title;
+    for (const note of [meta.viewLabel, meta.dateLabel]) if (note) text += (text ? FOOTER_SEPARATOR : '') + note;
+    const titleEnd = title.length;
+    if (!text) return { text, titleEnd, rows: [], cut: false, height: 0 };
+    const measure = meta.measureFooterTexts ?? estimateCardTexts;
+    const room = width - 2 * PADDING;
+    const len = text.length;
+
+    // The widths of the rows from `a` to each end, `tail` after the row.
+    const widths = (a: number, ends: readonly number[], tail = ''): number[] => {
+        const parts = ends.map(b => footerRowParts(text, titleEnd, a, b, tail));
+        const t = measure('posterTitle', parts.map(p => p[0]).filter(Boolean));
+        const n = measure('posterNote', parts.map(p => p[1]).filter(Boolean));
+        return parts.map(([x, y]) => (x ? t.get(x) ?? 0 : 0) + (y ? n.get(y) ?? 0 : 0));
+    };
+    const longestFitting = (a: number, ends: readonly number[], tail = ''): number | undefined => {
+        const w = widths(a, ends, tail);
+        let best: number | undefined;
+        ends.forEach((b, k) => { if (w[k] <= room + 0.01) best = b; });
+        return best;
+    };
+    // Where a row may end: between two characters (never inside one) ...
+    const charBreaks = (a: number): number[] => {
+        const out: number[] = [];
+        for (let i = a + 1; i < len; i++) if (isClusterBoundary(text, i)) out.push(i);
+        return out;
+    };
+    // ... and preferably after a space, "-" or "–", or beside a CJK character.
+    const wordBreaks = (a: number): number[] => charBreaks(a).filter(i =>
+        (FOOTER_SPACE.test(text[i - 1]) || FOOTER_BREAK_AFTER.test(text[i - 1])) && !FOOTER_SPACE.test(text[i])
+        || FOOTER_NO_SPACES.test(text.slice(i - 2, i)) || FOOTER_NO_SPACES.test(text.slice(i, i + 2)));
+
+    const rows: Array<[number, number]> = [];
+    let cut = false;
+    let a = 0;
+    while (a < len) {
+        if (widths(a, [len])[0] <= room + 0.01) {
+            rows.push([a, len]);
+            break;
+        }
+        if (rows.length === FOOTER_MAX_ROWS - 1) {
+            // The last row: as much as fits with "…" after it.
+            rows.push([a, longestFitting(a, charBreaks(a), '…') ?? a]);
+            cut = true;
+            break;
+        }
+        const chars = charBreaks(a);
+        const end = longestFitting(a, wordBreaks(a)) ?? longestFitting(a, chars) ?? chars[0] ?? len;
+        rows.push([a, end]);
+        a = end;
+    }
+    const height = FOOTER_HEIGHT + Math.max(0, rows.length - 1) * FOOTER_ROW_GAP;
+    return { text, titleEnd, rows, cut, height };
+}
+
+/** The footer strip's height in an image `width` px wide (0: no footer). */
+export function posterFooterHeight(meta: PosterFooterMeta, width: number): number {
+    return posterFooterLayout(meta, width).height;
+}
+
+/**
+ * A footer row's text in its two fonts: the tree name's part and the rest's,
+ * without the spaces at the row's ends, `tail` after the last part.
+ */
+function footerRowParts(text: string, titleEnd: number, a: number, b: number, tail = ''): [string, string] {
+    const row = text.slice(a, b);
+    const start = a + (row.length - row.trimStart().length);
+    const end = start + row.trim().length;
+    const t = text.slice(start, Math.max(start, Math.min(end, titleEnd)));
+    const n = text.slice(Math.max(start, titleEnd), Math.max(end, titleEnd));
+    return end > titleEnd ? [t, n + tail] : [t + tail, n];
 }
 
 /**
  * Shared poster footer: "<tree name>  ·  <view label>  ·  <date>" on the
  * bottom-left. Title, view label and date sit TOGETHER on the left — a lone
  * date in the far-right corner used to force a nearly-empty last print sheet.
+ * Within the image's `width` it wraps onto a second row (posterFooterLayout).
  * Returns '' when there is nothing to show. Positioned against `totalHeight`
  * (the poster's full pixel height, footer strip included).
  */
-export function posterFooterSvg(meta: PosterFooterMeta, totalHeight: number): string {
-    const title = meta.treeName ? escapeXml(meta.treeName) : '';
-    const view = meta.viewLabel ? escapeXml(meta.viewLabel) : '';
-    const date = meta.dateLabel ? escapeXml(meta.dateLabel) : '';
-    if (!title && !view && !date) return '';
-    const fy = totalHeight - FOOTER_HEIGHT / 2;
-    const parts: string[] = [];
-    if (title) parts.push(`<tspan font-size="16" font-weight="600" fill="${COLORS.text}">${title}</tspan>`);
-    if (view) parts.push(`<tspan font-size="12" fill="${COLORS.footer}">${parts.length ? '  ·  ' : ''}${view}</tspan>`);
-    if (date) parts.push(`<tspan font-size="12" fill="${COLORS.footer}">${parts.length ? '  ·  ' : ''}${date}</tspan>`);
-    return `<text x="${PADDING}" y="${fy.toFixed(1)}" dominant-baseline="middle">${parts.join('')}</text>`;
+export function posterFooterSvg(meta: PosterFooterMeta, totalHeight: number, width: number): string {
+    const layout = posterFooterLayout(meta, width);
+    if (layout.rows.length === 0) return '';
+    const titleTspan = (t: string): string => `<tspan font-size="16" font-weight="600" fill="${COLORS.text}">${escapeXml(t)}</tspan>`;
+    const noteTspan = (t: string): string => `<tspan font-size="12" fill="${COLORS.footer}">${escapeXml(t)}</tspan>`;
+    if (layout.rows.length === 1 && !layout.cut) {
+        // One row: the parts as they have always been drawn.
+        const fy = totalHeight - FOOTER_HEIGHT / 2;
+        const parts: string[] = [];
+        if (meta.treeName) parts.push(titleTspan(meta.treeName));
+        if (meta.viewLabel) parts.push(noteTspan(`${parts.length ? FOOTER_SEPARATOR : ''}${meta.viewLabel}`));
+        if (meta.dateLabel) parts.push(noteTspan(`${parts.length ? FOOTER_SEPARATOR : ''}${meta.dateLabel}`));
+        return `<text x="${PADDING}" y="${fy.toFixed(1)}" dominant-baseline="middle">${parts.join('')}</text>`;
+    }
+    const top = totalHeight - layout.height + FOOTER_HEIGHT / 2;
+    return layout.rows.map(([a, b], k) => {
+        const tail = layout.cut && k === layout.rows.length - 1 ? '…' : '';
+        const [t, n] = footerRowParts(layout.text, layout.titleEnd, a, b, tail);
+        const y = top + k * FOOTER_ROW_GAP;
+        return `<text x="${PADDING}" y="${y.toFixed(1)}" dominant-baseline="middle">${t ? titleTspan(t) : ''}${n ? noteTspan(n) : ''}</text>`;
+    }).join('');
 }
 
 /**
@@ -517,9 +785,9 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
     const heightOf = (id: string): number => personCardHeight(config, id as keyof StromData['persons']);
     const bounds = computeBounds(result, config);
 
-    const hasFooter = !!(options.treeName || options.dateLabel || options.viewLabel);
-    const footer = hasFooter ? FOOTER_HEIGHT : 0;
     const width = bounds.width + PADDING * 2;
+    const footer = posterFooterHeight(options, width);
+    const hasFooter = footer > 0;
     const height = bounds.height + PADDING * 2 + footer;
     const ox = -bounds.minX + PADDING;
     const oy = -bounds.minY + PADDING;
@@ -614,6 +882,11 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
         // to 50%, matching the on-screen `indirect` de-emphasis (draw parity).
         const dimmed = !!options.dimmedIds?.has(personId);
         if (dimmed) out.push('<g opacity="0.5">');
+        // The card's corner (spec 066 P4 §7): the status mark and the story's fold, as the screen shows them.
+        const marks = person && !isPlaceholder ? options.cardMarks?.get(personId) : undefined;
+        const markCls = marks?.status;
+        // Text that could reach the mark ends before it, as on screen (index.html: compact padding-right 36px, a last row 28px).
+        const markRoom = markCls ? 28 : 0;
 
         // "Letopis" card: neutral surface, hairline border (dashed for placeholders).
         // Custom cards are made to be printed: a firmer border on paper.
@@ -633,14 +906,21 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
             out.push(customCardSvg(person, pos, cw, options.cardLines.get(personId) ?? [], ring, `av${clipCounter++}`,
                 options.cardYears?.get(personId) ?? '', {
                     dateColumn: options.cardDateColumn ?? 0, labelColumn: options.cardLabelColumn ?? 0,
-                    valueLines: options.cardValueLines ?? 1, style: options.cardStyle ?? 'marks',
+                    valueLines: options.cardValueLines ?? 1, nameMaxRows: options.cardNameMaxRows ?? CARD_NAME_MAX_ROWS,
+                    style: options.cardStyle ?? 'marks',
                     measure: options.measureCardTexts ?? estimateCardTexts, exact: !!options.measureCardTexts,
+                    statusRoom: !!markCls,
                 }));
         } else if (person && !isPlaceholder && options.cardDensity === 'compact') {
             // Compact: the name only (no avatar, no meta), centred in the whole
             // box at 13px — the screen's 10px side padding inside the border.
-            out.push(fittedText(shownName(person, '?'), pos.x + cw / 2, pos.y + ch / 2 + 4.5, cw - 22,
-                [13, 12.5], true, COLORS.text));
+            // Beside the mark the name keeps 36px on the right (the screen's padding).
+            // A long name is shortened with "…" as on the screen, never squeezed unreadable (1110).
+            const nameShift = markCls ? 13 : 0;
+            const measure = options.measureCardTexts ?? estimateCardTexts;
+            const fit = fitCompactName(shownName(person, '?'), cw - 22 - 2 * nameShift, texts => measure('nameSmall', texts));
+            const clamp = fit.squeezed ? ` textLength="${fit.width.toFixed(1)}" lengthAdjust="spacingAndGlyphs"` : '';
+            out.push(`<text x="${(pos.x + cw / 2 - nameShift).toFixed(1)}" y="${(pos.y + ch / 2 + 4.5).toFixed(1)}" text-anchor="middle" font-size="${fit.size}" font-weight="600" fill="${COLORS.text}"${clamp}>${escapeXml(fit.text)}</text>`);
         } else if (person && !isPlaceholder) {
             // Avatar: gender-ring circle with a photo or initials (like on
             // screen), 34px (r=17) centred on the card's height; 10px left
@@ -679,34 +959,52 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
             const meta = [metaYears, metaPlace].filter(Boolean).join(' · ');
             const parts = shownNameParts(person, '?');
             const birthText = parts.birthNote ? fitBirthRow(parts.birthNote, contentW, t => estWidth(t, 11, false)) : '';
-            if (!birthText) {
+            // The name on the screen's rows (renderer.ts fitCardNames, src/card-width.ts
+            // normalCardNameRows): given names, then the surname, each wrapped at 12.5px,
+            // never shortened. More than two rows: the card was laid out taller for them
+            // (T40, config.personHeights).
+            const measure = options.measureCardTexts ?? estimateCardTexts;
+            const split = normalCardNameRows([{ given: parts.given, surname: parts.surname, avatar: true }], measure)[0];
+            const nameRows = [...split.given, ...split.surname];
+            const wrapped = nameRows.length > 2;
+            // With the birth surname's row the name stays on one line 15 → 14 → 13px, else goes on rows.
+            const oneLine = wrapped || !birthText ? undefined : [15, 14, 13].find(fs => estWidth(fullName, fs, true) <= contentW);
+            if (!wrapped && !birthText) {
                 out.push(fittedText(fullName, cx, pos.y + 28, contentW, [15, 13, 11], true, COLORS.text));
                 if (meta) {
-                    out.push(fittedText(meta, cx, pos.y + 45, contentW, [11, 10, 9], false, COLORS.textLight));
+                    out.push(fittedText(meta, cx - markRoom / 2, pos.y + 45, contentW - markRoom, [11, 10, 9], false, COLORS.textLight));
                 }
+            } else if (oneLine) {
+                out.push(`<text x="${cx.toFixed(1)}" y="${(pos.y + 24).toFixed(1)}" text-anchor="middle" font-size="${oneLine}" font-weight="600" fill="${COLORS.text}">${escapeXml(fullName)}</text>`);
+                out.push(`<text class="card-birth" x="${cx.toFixed(1)}" y="${(pos.y + 38.5).toFixed(1)}" text-anchor="middle" font-size="11" fill="${COLORS.textFaint}">${escapeXml(birthText)}</text>`);
+                if (meta) out.push(fittedText(meta, cx - markRoom / 2, pos.y + 52.5, contentW - markRoom, [11, 10, 9], false, COLORS.textLight));
             } else {
-                // With the birth surname's row: the screen's rows (fitCardNames) — the
-                // name on one line 15 → 14 → 13px, else given name / surname at
-                // 12.5px; then "roz. …" at 11px, then the meta (years only after a
-                // split name). The birth row shortens, never squeezes.
-                const oneLine = [15, 14, 13].find(fs => estWidth(fullName, fs, true) <= contentW);
-                const nameText = (t: string, y: number, fs: number) => {
-                    let shown = t;
-                    for (let n = t.length - 1; n > 0 && estWidth(shown, fs, true) > contentW; n--) shown = `${t.slice(0, n).trimEnd()}…`;
-                    return `<text x="${cx.toFixed(1)}" y="${y.toFixed(1)}" text-anchor="middle" font-size="${fs}" font-weight="600" fill="${COLORS.text}">${escapeXml(shown)}</text>`;
-                };
-                if (oneLine) {
-                    out.push(nameText(fullName, pos.y + 24, oneLine));
-                    out.push(`<text class="card-birth" x="${cx.toFixed(1)}" y="${(pos.y + 38.5).toFixed(1)}" text-anchor="middle" font-size="11" fill="${COLORS.textFaint}">${escapeXml(birthText)}</text>`);
-                    if (meta) out.push(fittedText(meta, cx, pos.y + 52.5, contentW, [11, 10, 9], false, COLORS.textLight));
-                } else {
-                    out.push(nameText(parts.given, pos.y + 15, 12.5));
-                    out.push(nameText(parts.surname, pos.y + 29.5, 12.5));
-                    out.push(`<text class="card-birth" x="${cx.toFixed(1)}" y="${(pos.y + 43).toFixed(1)}" text-anchor="middle" font-size="11" fill="${COLORS.textFaint}">${escapeXml(birthText)}</text>`);
-                    if (metaYears) out.push(fittedText(metaYears, cx, pos.y + 56.5, contentW, [10.5], false, COLORS.textLight));
+                // The rows (12.5px, 14.375px a row), then "roz. …" at 11px, then the
+                // years only, in 13.5px rows: one block in the middle of the card.
+                const smallRow = 13.5;
+                const top = pos.y + (ch - nameRows.length * NORMAL_CARD_NAME_ROW_HEIGHT
+                    - (birthText ? smallRow : 0) - (meta ? smallRow : 0)) / 2;
+                const widths = measure('nameSmall', nameRows);
+                nameRows.forEach((row, i) => {
+                    const w = widths.get(row) ?? 0;
+                    // Measured by the screen: drawn at that width (inside the column in any font).
+                    const clamp = options.measureCardTexts && w > 0
+                        ? ` textLength="${Math.min(w, contentW).toFixed(1)}" lengthAdjust="spacingAndGlyphs"`
+                        : w > contentW ? ` textLength="${contentW.toFixed(0)}" lengthAdjust="spacingAndGlyphs"` : '';
+                    const y = top + NORMAL_CARD_NAME_ROW_HEIGHT * i + 10.9;
+                    out.push(`<text class="card-name-row" x="${cx.toFixed(1)}" y="${y.toFixed(1)}" text-anchor="middle" font-size="12.5" font-weight="600" fill="${COLORS.text}"${clamp}>${escapeXml(row)}</text>`);
+                });
+                let y = top + NORMAL_CARD_NAME_ROW_HEIGHT * nameRows.length + 10;
+                if (birthText) {
+                    out.push(`<text class="card-birth" x="${cx.toFixed(1)}" y="${y.toFixed(1)}" text-anchor="middle" font-size="11" fill="${COLORS.textFaint}">${escapeXml(birthText)}</text>`);
+                    y += smallRow;
                 }
+                if (metaYears) out.push(fittedText(metaYears, cx - markRoom / 2, y, contentW - markRoom, [10.5], false, COLORS.textLight));
             }
         }
+
+        if (marks?.story) out.push(storyFoldSvg(marks.story, pos.x + cw + 0.5, pos.y + ch + 0.5));
+        if (markCls) out.push(statusMarkSvg(markCls, pos.x + cw + 0.5, pos.y + ch + 0.5, !!marks?.story));
 
         if (dimmed) out.push('</g>');
     }
@@ -714,23 +1012,30 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
 
     // --- Marriage-order pills (T13): always whole, the screen's size,
     //     colours and place (placeUnionOrderPill; the image draws no tabs),
-    //     no shadow; above the cards they straddle ---
+    //     no shadow; above the cards they straddle. The dense spacing (D1,
+    //     spec 069 §4): as on its screen, the short "∞ 2" on the card's edge
+    //     only, never in the row above it, which would reach the bus ---
     const badges = unionOrderBadges(data, result, options.orderData ?? data, (options.focusId ?? null) as PersonId | null);
     if (badges.size > 0) {
-        const measure = options.measureUnionOrderPill ?? estimatePillMetrics;
+        const dense = !!config.dense;
+        const measure = (ordinal: string, year: string, glyph: boolean, short: boolean): PillMetrics =>
+            options.measureUnionOrderPill ? options.measureUnionOrderPill(ordinal, year, glyph, short)
+                : short ? estimateShortPillMetrics(ordinal) : estimatePillMetrics(ordinal, year, glyph);
         const segments = viewLineSegments(result);
         out.push('<g class="union-order-pills">');
         for (const [personId, b] of [...badges.entries()].sort((a, b) => String(a[0]).localeCompare(String(b[0])))) {
             const pos = result.positions.get(personId);
             if (!pos) continue;
             // Each label measured: the shorter one where the whole does not fit in its half.
-            const forms = pillLabelForms(strings.focus.unionOrdinal(b.number), b.year);
-            const metrics = forms.map(f => measure(f.ordinal, f.year, f.glyph));
+            const forms = dense ? [shortPillLabelForm(strings.marriageOrder.short(b.number))]
+                : pillLabelForms(strings.focus.unionOrdinal(b.number), b.year);
+            const metrics = forms.map(f => measure(f.ordinal, f.year, f.glyph, !!f.short));
             // The card's 1px border: the screen's corner groups stand 12px inside it.
             const slot = placeUnionOrderPill({
                 cardWidth: cw, side: b.side, ...pillLabelWidths(forms, metrics.map(m => m.width)), leftTabs: 0, rightTabs: 0,
                 leftInset: 1 + EDGE_INSET, rightInset: 1 + EDGE_INSET,
                 segments: segmentsNearCard(segments, pos.x, pos.y, cw),
+                edgeOnly: dense,
             });
             if (!slot) continue;
             const m = metrics[forms.findIndex(f => f.label === slot.label)];
@@ -756,11 +1061,19 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
             const texts = kinds.map(k => lineLinkLabel(k, (k === 'linkParents' ? link.parentIds : link.childIds).map(nameOf), budget - 16));
             const widths = texts.map(t => estWidth(t, 10, true) + 16);
             const rowW = widths.reduce((a, w) => a + w, 0) + EDGE_GAP * (kinds.length - 1);
-            const y = pos.y + heightOf(personId) + 3;
+            const below = pos.y + heightOf(personId) + 3;
             // Left, centred or right under the card: the first clear of the lines
             const starts = [pos.x + inset, pos.x + (cw - rowW) / 2, pos.x + cw - inset - rowW];
-            const x0 = starts.find(x => !pillHitsLine(x, y, rowW, 18, segments)) ?? starts[0];
-            let x = x0;
+            // The dense spacing's bus may run 16px under the card (a lane toward
+            // it): with no place clear there, the row sits on the card's bottom
+            // edge, as the screen's tabs do, before it would cross the line.
+            const rows = config.dense ? [below, pos.y + heightOf(personId) - PILL_HEIGHT / 2] : [below];
+            let x = starts[0], y = below;
+            found: for (const ry of rows) {
+                for (const sx of starts) {
+                    if (!pillHitsLine(sx, ry, rowW, 18, segments)) { x = sx; y = ry; break found; }
+                }
+            }
             texts.forEach((t, i) => {
                 out.push(lineLinkPillSvg(t, personId, x, y, !!options.dimmedIds?.has(personId)).svg);
                 x += widths[i] + EDGE_GAP;
@@ -773,7 +1086,7 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
 
     // --- Footer (tree name · view label · date) ---
     if (hasFooter) {
-        out.push(posterFooterSvg(options, height));
+        out.push(posterFooterSvg(options, height, width));
     }
 
     out.push('</svg>');

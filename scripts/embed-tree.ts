@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
+import { deflateRawSync } from 'zlib';
 import { buildSync } from 'esbuild';
 import { parseGedcom, convertToStrom } from '../src/ged-parser.js';
 import { jsonForScript } from '../src/export.js';
@@ -24,6 +25,50 @@ for (const lang of CHANGELOG_LANGUAGES) {
 }
 const releaseNotes = { version: pkgVersion, sections };
 
+// "How Strom works" embedded help data
+async function buildHelpData() {
+    const pin = JSON.parse(readFileSync('package.json', 'utf-8')).stromDoc;
+    const dir = 'vendor/strom-doc';
+    const vendored = existsSync(`${dir}/PIN`) ? readFileSync(`${dir}/PIN`, 'utf-8').trim() : '';
+    if (!pin || vendored !== pin) {
+        throw new Error(`help: vendor/strom-doc is at "${vendored}", package.json "stromDoc" is "${pin}" (npm run help:pin)`);
+    }
+    const files: Record<string, string> = {};
+    const walk = (path: string, rel: string) => {
+        for (const name of readdirSync(path).sort()) {
+            const full = `${path}/${name}`;
+            const key = rel ? `${rel}/${name}` : name;
+            if (statSync(full).isDirectory()) walk(full, key);
+            else if (name.endsWith('.md')) files[key] = readFileSync(full, 'utf-8');
+        }
+    };
+    walk(dir, '');
+    const helper = buildSync({
+        entryPoints: ['src/help/help-convert.ts'],
+        bundle: true,
+        format: 'esm',
+        platform: 'neutral',
+        write: false,
+    });
+    const skHelper = buildSync({
+        entryPoints: ['src/help/help-sk.ts'],
+        bundle: true,
+        format: 'esm',
+        platform: 'neutral',
+        write: false,
+    });
+    const { convertHelp, embedHelp } = await import(
+        'data:text/javascript;base64,' + Buffer.from(helper.outputFiles[0].text).toString('base64')
+    );
+    const { translateHelpToSlovak } = await import(
+        'data:text/javascript;base64,' + Buffer.from(skHelper.outputFiles[0].text).toString('base64')
+    );
+    const bundle = convertHelp(files, pin);
+    bundle.langs.cs = translateHelpToSlovak(bundle.langs.cs);
+    return embedHelp(bundle, (data: Buffer) => deflateRawSync(data, { level: 9 }));
+}
+const helpData = await buildHelpData();
+
 buildSync({
     entryPoints: ['src/main.ts'],
     bundle: true,
@@ -32,6 +77,7 @@ buildSync({
     define: {
         __APP_VERSION__: JSON.stringify(pkgVersion),
         __RELEASE_NOTES__: JSON.stringify(releaseNotes),
+        __HELP_DATA__: JSON.stringify(helpData),
     },
     logLevel: 'warning',
 });

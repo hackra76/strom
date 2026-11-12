@@ -1,5 +1,5 @@
 import type { StringsType } from '../strings.js';
-import { nPl, plPl, HIT_KIND_PL } from './helpers.js';
+import { familyGenitivePl, nPl, plPl, HIT_KIND_PL } from './helpers.js';
 
 /** "5 miejsc": the place count shared by the map strings (the pack cannot read `strings` at load time). */
 const placeCountPl = (count: number): string => `${count} ${plPl(count, 'miejsce', 'miejsca', 'miejsc')}`;
@@ -35,8 +35,6 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         titleBefore: 'Tytuł przed imieniem',
         titleAfter: 'Tytuł po nazwisku',
         marriedSurname: 'Nazwisko po ślubie',
-        showHint: 'Pokaż pomoc do pola',
-        nameVariantsHint: 'Jak zapisują je księgi metrykalne (Brzuska, Brzoska), alias albo przydomek od gospodarstwa. Kilka form oddziela się przecinkami. Wyszukiwanie i scalanie znajdą wtedy osobę pod każdą z nich. Dotyczy tylko tej osoby – formy nazwiska wspólne dla całej rodziny należą do Akcje → Drzewo → Formy nazwiska.',
         firstName: 'Imię',
         lastName: 'Nazwisko',
         gender: 'Płeć',
@@ -82,8 +80,6 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         moreChildrenCount: (n: number) => nPl(n, 'kolejne dziecko', 'kolejnych dzieci', 'kolejnych dzieci'),
         // After the first three unions on the hover card (T37).
         moreUnions: (n: number) => `i ${n} ${plPl(n, 'kolejny', 'kolejne', 'kolejnych')}`,
-        // Footer of the hover card: the real desktop gesture (click opens the menu).
-        gestureHint: 'Kliknięcie otwiera menu',
     },
 
     // Placeholders
@@ -93,7 +89,7 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         titleAfter: 'np. mł., Ph.D.',
         firstName: 'Imię',
         lastName: 'Nazwisko',
-        maidenName: 'Nazwisko rodowe',
+        maidenName: 'Nazwisko z urodzenia',
         refn: 'np. karton archiwalny 12 lub id z innego programu',
         question: 'np. czy ktoś wie, kiedy się urodziła?',
         flexDateShort: 'np. 1880',
@@ -125,6 +121,7 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
     // Context menu
     contextMenu: {
         edit: 'Edytuj',
+        editFollowing: 'Podczas śledzenia badania tylko do odczytu.',
         view: 'Wyświetl',
         focus: 'Ustaw w centrum',
         showDescendants: 'Pokaż potomków',
@@ -158,6 +155,7 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         timeline: 'Oś czasu',
         fan: 'Wachlarz',
         map: 'Mapa',
+        table: 'Tabela',
         toggle: 'Widok rodzina / potomkowie',
         back: 'Powrót do widoku rodziny',
         badgeLabel: 'Potomkowie:',
@@ -207,6 +205,7 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         onMap: {
             notFound: (shown: number, missing: number) => `${placeCountPl(shown)} na mapie · mapa nie znalazła ${missing}`,
             lookResearch: (n: number) => `Odszukaj w badaniu (${n})`,
+            lookResearchShort: 'W badaniu',
             lookResearchTitle: 'Otwiera Miejsca z miejscami bez położenia i podglądem wyszukiwania w badaniu.',
             confirm: (n: number) => `${n} do potwierdzenia ›`,
             confirmTitle: 'Otwiera zakładkę Czeka w panelu badania.',
@@ -252,7 +251,7 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
             oldResearch: 'Ta wersja badania jeszcze nie wyszukuje miejsc.',
         },
         waiting: {
-            title: 'Czeka na decyzję · Miejsca',
+            title: 'Czeka na załatwienie · Miejsca',
             group: 'Miejsca',
             questions: (n: number) => nPl(n, 'pytanie', 'pytania', 'pytań'),
             answer: 'Odpowiedz',
@@ -287,6 +286,9 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
             now: (name: string) => `Teraz: ${name}`,
             nowMap: (date: string) => date ? `Według mapy · ${date}` : 'Według mapy',
             nowHand: 'Umieszczone ręcznie',
+            nowFar: (km: string) => `${km} km od propozycji`,
+            nowNear: 'Mniej niż 1 km od propozycji',
+            nowAt: (lat: string, lon: string) => `${lat}, ${lon}`,
             nowResearch: 'Według badania',
             nowOther: 'Z innego źródła',
             suggested: (name: string) => `Propozycja: ${name}`,
@@ -317,7 +319,7 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
             tSkipped: (n: number) => `Pominięto: ${n} (zmiany w międzyczasie).`,
             undo: 'Cofnij',
             undone: 'Cofnięto.',
-            errChanged: 'Pytanie zmieniło się w międzyczasie; „Czeka na decyzję” odświeżono.',
+            errChanged: 'Pytanie zmieniło się w międzyczasie; „Czeka na załatwienie” odświeżono.',
             errBusy: 'Nie można teraz odpowiedzieć: badanie jest zajęte. Za chwilę będzie to możliwe.',
             errLocked: 'Nie można teraz odpowiedzieć: badanie jest zajęte przez inną sesję.',
             errFailed: 'Nie udało się wysłać odpowiedzi.',
@@ -378,9 +380,10 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
             dDecide: 'Co by rozstrzygnęło',
             dCheck: 'Do sprawdzenia',
             dSource: 'Źródło',
+            dSourceOpen: 'Otwórz źródło',
             whoHand: 'Ręcznego położenia badanie nie zmienia; pyta tylko w zakładce Czeka, gdy znajdzie sprzeczność.',
             checkFar: (km: number, family: string, a: number, b: number) =>
-                `Leży ${km} km od innych miejsc rodziny ${family} ${a === b ? `w ${a} r.` : `w latach ${a}–${b}`}.`,
+                `Leży ${km} km od innych miejsc rodziny ${familyGenitivePl(family)} ${a === b ? `w ${a} r.` : `w latach ${a}–${b}`}.`,
             checkDistrict: (expected: string, actual: string, parish: boolean, titled = false) => parish
                 ? `Zapisy podają parafię ${expected}, położenie jest w powiecie ${actual}.`
                 : titled
@@ -389,7 +392,9 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
             checkStreet: 'Mapa znalazła ulicę, nie miejscowość.',
             checkArea: 'Mapa znalazła obszar, nie miejscowość.',
             checkOtherTown: 'Etykieta położenia podaje inną miejscowość.',
-            checkMulti: 'Mapa znalazła dwie miejscowości o tej nazwie i wybrała tę najbliższą innym miejscom drzewa.',
+            checkMulti: (n: number) => `Mapa znalazła ${n} miejscowości o tej nazwie i wybrała tę najbliższą innym miejscom drzewa.`,
+            checkSameName: 'Możliwe, że to inne miejsce o tej samej nazwie.',
+            checkMapLabel: 'Położenie na mapie',
             selected: (n: number) => `Wybrano ${n}`,
             lookSelected: (n: number) => `Odszukaj wybrane (${n})`,
             checkSelected: (n: number) => `Sprawdź wybrane (${n})`,
@@ -424,6 +429,11 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
             rStreet: 'ulica',
             miniLegend: 'inne miejsca drzewa',
             miniLabel: 'Wyniki na mapie',
+            legendPlain: 'bez ostrzeżenia',
+            legendNear: 'bez ostrzeżenia, blisko innych miejsc',
+            legendWarn: 'z ostrzeżeniem, powód jest przy wyniku',
+            miniAway: 'odległe wyniki: tylko kierunek na brzegu mapy',
+            awayMore: (n: number) => `Pozostałe odległe (${n})`,
             showOnMap: 'Pokaż na mapie',
             hideMap: 'Ukryj mapę',
             noneFits: 'Żaden nie pasuje? Umieść ręcznie na mapie',
@@ -454,6 +464,15 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         },
     },
     map: {
+        workHead: 'W toku',
+        workRecord: 'miejsce wpisu',
+        workRecordSrc: 'miejsce wpisu (z badań)',
+        workPerson: (event: string) => `miejsce osoby · ${event}`,
+        workEvents: { birth: 'urodzenie', residence: 'zamieszkanie', wedding: 'ślub', death: 'zgon' },
+        outScope: 'na razie bez osoby na mapie',
+        noCoords: (place: string) => `${place} – bez położenia na mapie`,
+        noPlace: (name: string) => `${name} – bez miejsca`,
+        locate: 'Wyszukać położenie',
         fit: 'Pokaż wszystkie miejsca',
         zoomIn: 'Przybliż',
         zoomOut: 'Oddal',
@@ -514,6 +533,7 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         settingHint: 'Pozwala mapie wysyłać nazwy miejsc do usługi geokodowania. Odszukane już współrzędne zostają w drzewie.',
         tilesNotice: 'Podkład mapy wczytuje się z openstreetmap.org – wczytanie zdradza temu serwerowi tylko to, jaki obszar jest oglądany, nic więcej. Dane rodziny zostają w aplikacji.',
         tilesNoticeOk: 'Pokaż mapę',
+        tilesBlocked: 'Podkład mapy jest niedostępny: serwer kafelków OpenStreetMap go odrzucił. Miejsca są nadal widoczne.',
         timeMode: 'Migracje w czasie',
         timeModeEmpty: 'Po uzupełnieniu dat (urodzenia, zgonu, wydarzeń) widać przemieszczanie się rodu w czasie.',
         timePlay: 'Odtwórz',
@@ -631,6 +651,19 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         legendRepeats: '↻ powtarza się (implex)',
         originPerson: 'Osoba wyjściowa',
         originAria: (name: string) => `Osoba wyjściowa: ${name}`,
+        pin: 'Przypiąć jako środek',
+        unpin: 'Odpiąć środek',
+        centerLabel: 'Środek:',
+        release: 'Odpiąć',
+        workingTitle: (task: string) => `W toku: ${task}`,
+        workOn: 'Trwa praca nad:',
+        workOutside: 'Praca poza wachlarzem:',
+        genN: (n: number) => `${n}. pokolenie`,
+        // The app cannot decline a name: "prababka osoby Franciszek Vlk".
+        genSub: (rel: string, name: string, g: number) => `${rel} osoby ${name} · wachlarz pokazuje ${g}`,
+        nPeople: (n: number) => `Trwa praca nad ${n} osobami`,
+        noRelation: (name: string) => `bez związku z osobą ${name}`,
+        edgeGo: (name: string) => `Przesunąć do: ${name}`,
         backRow: '↶ wstecz',
         backTo: (name: string) => `Wstecz: ${name}`,
         recenter: 'Wyśrodkuj ponownie',

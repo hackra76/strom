@@ -305,10 +305,12 @@ export const treeManagementMethods = uiModule({
      */
     refreshActionMenuBadges(): void {
         const count = this.anniversaryBadgeCount();
+        // The dot goes out once the anniversaries were opened, until their list changes or a new day (T51).
+        const annDot = count > 0 && this.anniversaryDotLit();
         // The Research button and menu (its own signal); the ⋯ dot is the anniversaries' only.
         const researchSignal = this.refreshResearchMenu();
         const dot = document.getElementById('actions-menu-dot');
-        if (dot) dot.style.display = count > 0 ? 'block' : 'none';
+        if (dot) dot.style.display = annDot ? 'block' : 'none';
         // The "More" tab carries both: there the research group sits in its sheet (a narrow window with a mouse).
         // Changes waiting for a research that is not running: their number on the tab, in place of the dot (audit 017 a-D6).
         const resting = this.researchRestingWaitingCount();
@@ -320,7 +322,7 @@ export const treeManagementMethods = uiModule({
             else moreCount.removeAttribute('title');
         }
         const moreDot = document.getElementById('bottom-bar-more-dot');
-        if (moreDot) moreDot.style.display = resting === 0 && (count > 0 || researchSignal !== '') ? 'block' : 'none';
+        if (moreDot) moreDot.style.display = resting === 0 && (annDot || researchSignal !== '') ? 'block' : 'none';
         this.renderActionsExportReminder();
         // Count badge on the Anniversaries row; its tooltip and the row's
         // spoken name say what the number counts (the next days, T33).
@@ -475,7 +477,7 @@ export const treeManagementMethods = uiModule({
         const rowItem = (row: TreeActionRow): HTMLElement => {
             const item = document.createElement('div');
             item.className = 'tree-switcher-action actions-tree-action'
-                + (row.quiet ? ' is-quiet' : '') + (row.danger ? ' danger' : '') + (row.editOnly ? ' edit-only' : '');
+                + (row.danger ? ' danger' : '') + (row.editOnly ? ' edit-only' : '');
             item.setAttribute('role', row.checked !== undefined ? 'menuitemcheckbox' : 'menuitem');
             item.tabIndex = 0;
             item.dataset.action = row.key;
@@ -948,6 +950,7 @@ export const treeManagementMethods = uiModule({
                         ${s.persons(tree.personCount)} • ${s.families(familyCount)}
                         ${defaultPersonDisplay ? ` • ${this.escapeHtml(defaultPersonDisplay)}` : ''}
                     </div>
+                    ${tree.research?.id && !tree.research.copy ? this.researchLiveSlotHtml(tree.id) : ''}
                     <div class="tree-manager-item-actions">
                         <button class="tree-open-btn" onclick="window.Strom.UI.openTreeFromManager('${tree.id}')">${s.open}</button>
                         ${isActive ? `<span class="tree-opened-label">${s.opened}</span>` : ''}
@@ -1007,6 +1010,9 @@ export const treeManagementMethods = uiModule({
         }
 
         list.innerHTML = html || `<p class="tree-manager-empty">${strings.merge.noItems}</p>`;
+        // "Research on" (spec 064): each research tree's switch, as its bridge last answered; asked again now.
+        list.querySelectorAll<HTMLElement>('[data-research-live]').forEach(slot => this.fillResearchLiveSlot(slot));
+        this.kickOtherResearch();
         // Merge names come from file/tree names: no inline JS (a quote in the
         // name would break out of the handler string).
         list.querySelectorAll<HTMLElement>('.pending-merge-rename').forEach(btn => {
@@ -1064,7 +1070,6 @@ export const treeManagementMethods = uiModule({
             item.className = 'tree-row-menu-item';
             item.dataset.action = row.key;
             if (row.danger) item.classList.add('danger');
-            if (row.quiet) item.classList.add('is-quiet');
             if (row.editOnly) item.classList.add('edit-only');
             if (row.hint) item.title = row.hint;
             const label = document.createElement('span');

@@ -15,14 +15,15 @@ import { TreeRenderer } from '../renderer.js';
 import { SettingsManager, CardSignals } from '../settings.js';
 import { strings } from '../strings.js';
 import { CARD_SIZE, CardDensity, Person, PersonId, Partnership, PartnershipId, StromData } from '../types.js';
-import { ActionSignal, ACTION_GLYPH, stateStripesHtml } from '../card-signals.js';
+import { ActionSignal, ACTION_GLYPH, storyFoldHtml } from '../card-signals.js';
+import { statusMarkHtml } from './fact-status.js';
 import {
     CardFieldKey, CardFieldSettings, CardHeightMode, CardLineStyle, CardValueLines, CardWidthCap, CARD_FIELD_KEYS,
     CARD_HEIGHT_MODES, CARD_LINE_STYLES, CARD_MARKS, CARD_VALUE_LINES, CARD_WIDTH_CAPS, PLACE_KEYS, cardLines,
     cardLineHtml, cardYears, cardDateReferences, isFieldCardDensity, CARD_DENSITIES, CardPresetKey, cardTypeForKey,
     customCardSize, matchCardPreset, presetAsCustom,
 } from '../card-fields.js';
-import { CardHead, customCardMetrics, customCardRows, measureCardTexts } from '../card-width.js';
+import { CardHead, cardNameMaxRows, customCardMetrics, customCardRows, measureCardTexts } from '../card-width.js';
 import { uiModule } from './module.js';
 
 const esc = (text: string): string => text.replace(/[&<>"']/g, c =>
@@ -105,7 +106,7 @@ function samplePreview(density: CardPresetKey | 'custom', viewWidth: number | un
     const own = customCardMetrics([entry], measureCardTexts, fields.widthCap, fields.lines, fields.style,
         cardDateReferences(fields.fullDate));
     const metrics = { ...own, cardWidth: viewWidth ?? own.cardWidth };
-    const { rows, heights, heads } = customCardRows([entry], metrics, measureCardTexts, fields.lines, fields.style);
+    const { rows, heights, heads } = customCardRows([entry], metrics, measureCardTexts, fields.lines, fields.style, cardNameMaxRows(density));
     const wrapped = fields.lines !== 1;
     const html = `<div class="card-lines${wrapped ? ' card-lines--rows' : ''}">${lines.map(l =>
         cardLineHtml(l, esc, false, wrapped ? rows.get(l) : undefined, fields.style, !!rows.get(l)?.longDate)).join('')}</div>`;
@@ -160,7 +161,9 @@ function watchCardPreview(host: HTMLElement): void {
 }
 
 /** No signals: the tiles' small cards (unreadable at a quarter of the size). */
-const NO_SIGNALS: CardSignals = { evidence: false, story: false, waiting: false, conflict: false, question: false, agent: false };
+const NO_SIGNALS: CardSignals = {
+    status: false, story: false, waiting: false, conflict: false, question: false, agent: false, crossTree: false,
+};
 
 /** The scale of the small cards in the row of types (one for every type). */
 const THUMB_SCALE = 0.25;
@@ -201,7 +204,9 @@ export function forgetCardTypeCopy(): void {
  * for `viewWidth`, the drawn view's card width, when given).
  */
 function sampleCard(density: CardDensity, on: CardSignals, viewWidth: number | undefined): { html: string; width: number; height: number } {
-    const stripes = stateStripesHtml(on.evidence ? 'partial' : null, on.story ? { kind: 'own', final: false } : null);
+    // The status mark of a person with only some citations (●○) and a story's fold.
+    const stripes = (on.status ? statusMarkHtml({ cls: 'cs-p1', source: 'evidence', facts: [] }) : '')
+        + storyFoldHtml(on.story ? { kind: 'own', final: false } : null);
     const action: ActionSignal | null = on.waiting ? 'waiting' : on.conflict ? 'conflict' : on.question ? 'question' : null;
     const badge = action ? `<span class="card-signal signal-${action}">${ACTION_GLYPH[action]}</span>` : '';
     const dot = action ? `<span class="card-signal-dot signal-${action}"></span>` : '';
@@ -292,6 +297,8 @@ export const cardFieldsUiMethods = uiModule({
             <span class="settings-name" id="card-type-label">${esc(d.settingLabel)}</span>
             <div class="card-type-row" id="card-type-row" role="radiogroup" aria-labelledby="card-type-label"${current === 'custom' ? '' : ' aria-describedby="card-type-desc"'}>${tiles}</div>
             ${below}`;
+        // The hint under Spacing about the Compact card follows the type (spec 069 §5).
+        this.syncTreeSpacingSetting();
 
         const choose = (density: CardDensity): void => {
             if (density !== SettingsManager.getCardDensity()) this.setCardDensity(density);

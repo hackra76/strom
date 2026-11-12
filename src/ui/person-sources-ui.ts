@@ -11,12 +11,13 @@ import { DataManager } from '../data.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { PartnershipId, PersonId, Source, Story } from '../types.js';
 import { yearOf } from '../dates.js';
-import { personSourceRows as personSourceRowsOf, PersonSourceRow } from '../person-sources.js';
+import { personSourceRows as personSourceRowsOf, PersonSourceRow, rowQuality } from '../person-sources.js';
 import { storyProseHtml, coupleStories, coupleStoryYears, coupleChipNames } from '../story-text.js';
 import { personInitials } from '../initials.js';
 import { uiModule } from './module.js';
 import { normalizeModal } from './modal-skeleton.js';
 import { storyWithDraft, draftDate } from './story-compare-ui.js';
+import { sourceCodeNamer, storyBasisDetailsHtml, storyBasisShown, storyBasisWords, storyFactText } from '../story-sources.js';
 import { CitationContext, qualityLabel, sourceThumbHtml, hydrateThumbs } from './sources.js';
 import { shownName } from '../person-name.js';
 
@@ -117,12 +118,14 @@ export const personSourcesMethods = uiModule({
 
     // ==================== SOURCES ====================
 
-    showPersonSourcesDialog(personId: PersonId): void {
+    /** `focusSourceIds`: the sources of one fact (a status tip's "and N more"), marked in the list, the first scrolled into view. */
+    showPersonSourcesDialog(personId: PersonId, focusSourceIds: string[] = []): void {
         // Replace an open one; the stack entry (pushed by the caller) stays.
         document.getElementById(SOURCES_ID)?.remove();
         if (!DataManager.getPerson(personId)) return;
         this.personSourcesId = personId;
         this.personSourcesShown = null;
+        this.personSourcesFocus = focusSourceIds.length > 0 ? new Set(focusSourceIds) : null;
 
         const overlay = document.createElement('div');
         overlay.className = 'modal-overlay active';
@@ -159,6 +162,7 @@ export const personSourcesMethods = uiModule({
         const box = overlay.querySelector('.modal') as HTMLElement;
         box.setAttribute('tabindex', '-1');
         box.focus({ preventScroll: true });
+        overlay.querySelector('.person-source-row.is-focus')?.scrollIntoView?.({ block: 'nearest' });
     },
 
     closePersonSourcesDialog(): void {
@@ -166,6 +170,7 @@ export const personSourcesMethods = uiModule({
         this.dialogStack = this.dialogStack.filter(d => d !== SOURCES_ID);
         this.personSourcesId = null;
         this.personSourcesShown = null;
+        this.personSourcesFocus = null;
     },
 
     /** (Re)draw the list — also after a citation made from the dialog. */
@@ -198,12 +203,23 @@ export const personSourcesMethods = uiModule({
         // An archive has no reading results to give: no link to one.
         const readings = !this.activeResearchAgentless();
         list.innerHTML = rows.map((r, i) => {
-            const q = qualityLabel(r.source.quality);
-            const labels = r.cites.map(c => c.title
-                ? `<span title="${esc(c.title)}">${esc(c.label)}</span>` : esc(c.label)).join(' · ');
-            const cls = before !== null && !before.has(key(r)) ? 'person-source-row is-new' : 'person-source-row';
+            // One reliability for the row, or each citation its own where they differ (spec 077).
+            const whole = rowQuality(r);
+            const q = whole === null ? '' : qualityLabel(whole);
+            const tag = (quality: number | undefined): string => {
+                const label = qualityLabel(quality);
+                return label ? ` <span class="source-quality-tag">${esc(label)}</span>` : '';
+            };
+            const labels = r.cites.map(c => {
+                const label = c.title ? `<span title="${esc(c.title)}">${esc(c.label)}</span>` : esc(c.label);
+                const own = whole === null && !c.story ? tag(c.quality) : '';
+                // A fact and its own reliability wrap as one, never apart on a narrow screen.
+                return own ? `<span class="person-source-cite">${label}${own}</span>` : label;
+            }).join(' · ');
+            const focus = this.personSourcesFocus?.has(r.source.id) ?? false;
+            const cls = `person-source-row${before !== null && !before.has(key(r)) ? ' is-new' : ''}${focus ? ' is-focus' : ''}`;
             const row = `
-                <button type="button" class="${cls}" data-row="${i}">
+                <button type="button" class="${cls}" data-row="${i}"${focus ? ' aria-current="true"' : ''}>
                     ${sourceThumbHtml(r.source, 'picker')}
                     <span class="person-source-text">
                         <span class="person-source-title">${esc(r.source.title)}</span>
@@ -254,15 +270,14 @@ export const personSourcesMethods = uiModule({
         const waiting = own ? storyWithDraft({ personId }) : null;
         const nvBanner = (story: Story, attrs: string): string =>
             `<div class="story-nv-banner"><span>${esc(s.nvReader(draftDate(story)))}</span><button type="button" class="story-nv-compare" ${attrs}>${esc(s.compare)}</button></div>`;
-        const extraHtml = (story: Story): string => {
-            const facts = (story.facts ?? []).filter(f => f.trim());
-            if (!facts.length && !story.note) return '';
-            return `<div class="story-reader-extra">
-                ${facts.length > 0 ? `<div class="menu-section-header">${esc(s.facts)}</div>
-                    <ul class="story-reader-facts">${facts.map(f => `<li>${esc(f)}</li>`).join('')}</ul>` : ''}
-                ${story.note ? `<p class="story-reader-note">${esc(story.note)}</p>` : ''}
-            </div>`;
-        };
+        // The research's bare source codes ("[S0164]") read as the sources' titles.
+        const catalog = DataManager.getData().sources;
+        const named = sourceCodeNamer(catalog);
+        // What the text is based on: one section folded under each story (the sources once, the facts readable, the caveat).
+        const lang = getCurrentLanguage();
+        const basisWords = storyBasisWords(strings);
+        const extraHtml = (story: Story): string => storyBasisDetailsHtml(
+            storyBasisShown(catalog, story, f => storyFactText(f, strings, lang)), basisWords, { cls: 'story-basis' });
         const stateTag = (story: Story, nv: boolean): string => nv
             ? ` <span class="story-nv-tag">${esc(s.nvBadge)}</span>`
             : story.status === 'draft' ? ` <span class="story-draft-tag">${esc(s.statusDraft)}</span>` : '';
@@ -284,7 +299,7 @@ export const personSourcesMethods = uiModule({
             ownHtml = `<section class="story-reader-own story-reader-ch" id="person-story-ch-own">
                     ${headText || actions ? `<div class="story-ch-head"><div class="story-ch-headtext">${headText}</div>${actions ? `<div class="story-ch-actions">${actions}</div>` : ''}</div>` : ''}
                     ${waiting ? nvBanner(waiting, 'id="person-story-compare"') : ''}
-                    <div class="story-reader-text">${storyProseHtml(own.text, { title: own.title })}</div>
+                    <div class="story-reader-text">${storyProseHtml(named(own.text), { title: own.title })}</div>
                     ${extraHtml(own)}
                 </section>`;
         }
@@ -317,7 +332,7 @@ export const personSourcesMethods = uiModule({
                         ${coupleApprove ? `<div class="story-ch-actions">${approveBtn(`data-approve-partnership="${esc(u.id)}"`)}</div>` : ''}
                     </div>
                     ${nv ? nvBanner(nv, `data-partnership-id="${esc(u.id)}"`) : ''}
-                    <div class="story-reader-text">${storyProseHtml(st.text, { title: st.title })}</div>
+                    <div class="story-reader-text">${storyProseHtml(named(st.text), { title: st.title })}</div>
                     ${extraHtml(st)}
                 </section>`;
         }).join('');

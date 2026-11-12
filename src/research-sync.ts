@@ -8,6 +8,7 @@
 import { ResearchLink, ResearchSend, ResearchSendMode, Source, StromData, Person, PersonId, ResearchConflict, ResearchWriteHeld } from './types.js';
 import { ResearchInbox, LiveIntake, ResearchSendRecord } from './research-link.js';
 import { ResearchHeldConflicts, trimHeldConflicts } from './research-device.js';
+import { hasEntryFields } from './source-location.js';
 
 /**
  * A send the research wrote vouches for its version (that version holds
@@ -334,9 +335,12 @@ function fnv(text: string): string {
     return (h >>> 0).toString(36);
 }
 
-/** What a reading of the entry consists of: its wording and its page. */
+/** What a reading of the entry consists of: its wording and its page (with its folio and image when it has them, spec 075). */
 export function sourceReadingHash(src: Source): string {
-    return fnv(`${(src.transcript ?? '').trim()}\u0000${(src.reference ?? '').trim()}`);
+    const page = hasEntryFields(src)
+        ? [src.folio, src.image, src.reference].map(v => (v ?? '').trim()).join('\u0000')
+        : (src.reference ?? '').trim();
+    return fnv(`${(src.transcript ?? '').trim()}\u0000${page}`);
 }
 
 /** Every source with a transcript, by id → reading hash (what a send carries). */
@@ -390,7 +394,7 @@ export function unverifiedOlderSources(data: StromData, link: ResearchLink | und
 }
 
 /** The user's values a conflict can be about: the name (the surname after marriage and the one the person goes by too), sex, birth and death. */
-const CONFLICT_FIELDS: (keyof Person)[] = ['firstName', 'lastName', 'marriedSurname', 'primaryName', 'gender', 'birthDate', 'birthPlace', 'deathDate', 'deathPlace'];
+const CONFLICT_FIELDS: (keyof Person)[] = ['firstName', 'lastName', 'marriedSurname', 'marriedFirstName', 'primaryName', 'gender', 'birthDate', 'birthPlace', 'deathDate', 'deathPlace'];
 
 /**
  * People whose value in the app the research's version would replace while a

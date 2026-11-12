@@ -12,7 +12,7 @@ import type { Gender, LifeEvent, LifeEventType, Person, PersonId, StromData, Par
 import type { ReadEntry, ReadEvent, ReadPerson, ReadVariant } from './research-read.js';
 import { researchPersonRef } from './research-link.js';
 import { gedcomTagEventType, parseGedcomDate } from './ged-parser.js';
-import { quickMatch, QuickMatchReason, normalizeName, stringSimilarity, compareEventDates } from './merge/matching.js';
+import { quickMatch, QuickMatchReason, normalizeName, stringSimilarity, compareEventDates, inMatchPass } from './merge/matching.js';
 import { parseFlexDate } from './dates.js';
 import { sameSurname } from './surnames.js';
 import { sameGivenName } from './given-names.js';
@@ -42,6 +42,8 @@ export interface ProposeCandidate {
     why: string;
     /** Found through relatives by the surname alone (no given name, no date): a candidate on Link, not the default. */
     tentative?: boolean;
+    /** A person written from this very entry before (cites its source): not a guess by the name. */
+    fromEntry?: boolean;
 }
 
 /** One person's choice in the suggestion. */
@@ -229,18 +231,21 @@ function appCandidate(entry: ReadEntry, p: ReadPerson, data: StromData, draft: S
     const same = prior.filter(o => !taken.has(o.id) && name(o) === name(me));
     if (same.length === 1) {
         const q = quickMatch(me, same[0], draft, data);
-        return { id: same[0].id, byResearch: false, score: Math.max(q.score, MATCH_THRESHOLD), reasons: q.reasons, why: '' };
+        return { id: same[0].id, byResearch: false, score: Math.max(q.score, MATCH_THRESHOLD), reasons: q.reasons, why: '', fromEntry: true };
     }
     const alive = aliveDates(entry, p.ref);
     let best: ProposeCandidate | null = null;
     let tie = false;
-    for (const other of Object.values(data.persons)) {
-        if (other.isPlaceholder || taken.has(other.id) || diedBefore(other, alive)) continue;
-        const q = quickMatch(me, other, draft, data);
-        if (q.score < MATCH_THRESHOLD) continue;
-        if (!best || q.score > best.score) { best = { id: other.id, byResearch: false, score: q.score, reasons: q.reasons, why: '' }; tie = false; }
-        else if (q.score === best.score) tie = true;
-    }
+    // One matching pass over both: the surname rules of each are worked out once, not per person.
+    inMatchPass([draft, data], () => {
+        for (const other of Object.values(data.persons)) {
+            if (other.isPlaceholder || taken.has(other.id) || diedBefore(other, alive)) continue;
+            const q = quickMatch(me, other, draft, data);
+            if (q.score < MATCH_THRESHOLD) continue;
+            if (!best || q.score > best.score) { best = { id: other.id, byResearch: false, score: q.score, reasons: q.reasons, why: '' }; tie = false; }
+            else if (q.score === best.score) tie = true;
+        }
+    });
     // Two tree persons fit equally: the choice is the user's.
     if (tie) return null;
     return best ?? givenOnlyCandidate(me, alive, data, draft, taken);
@@ -425,10 +430,25 @@ function relativeCandidate(entry: ReadEntry, p: ReadPerson, data: StromData, dra
     return hit.sure ? c : { ...c, tentative: true };
 }
 
+/** The name fields of a read person a match by name rests on. */
+const NAME_FIELDS: readonly string[] = ['given', 'surname'];
+
+/**
+ * Whether a candidate rests on a field read uncertainly: it fits by the name
+ * alone (the research's match, a quick match by name only) and the given name
+ * or the surname was read uncertainly. A date, parents, a partner or a child
+ * that fit as well carry the match, so does a person written from this entry before.
+ */
+export function matchRestsOnUncertain(p: Pick<ReadPerson, 'uncertain'>, candidate: Pick<ProposeCandidate, 'reasons' | 'fromEntry'>): boolean {
+    if (candidate.fromEntry || !candidate.reasons.includes('name') || !candidate.reasons.every(r => r === 'name')) return false;
+    return p.uncertain.some(f => NAME_FIELDS.includes(f));
+}
+
 /**
  * The suggestion as it opens: a candidate links, no candidate is new, a
  * godparent or witness is not written unless the research says who it is
- * (an app's guess is kept for Link). The family picks first; relatives of
+ * (an app's guess is kept for Link); a candidate by a name read uncertainly
+ * is kept for Link, the default is No. The family picks first; relatives of
  * persons already matched follow them, round by round.
  */
 export function initialPropose(readId: string, entry: ReadEntry, data: StromData): ProposeState {
@@ -488,7 +508,9 @@ export function initialPropose(readId: string, entry: ReadEntry, data: StromData
     }
     for (const p of entry.persons) {
         const candidate = found.get(p.ref) ?? null;
-        const choice: ProposeChoice = !family.has(p.ref) && !candidate?.byResearch ? 'skip' : candidate && !candidate.tentative ? 'link' : 'new';
+        // A match that rests on a name read uncertainly is offered on Link, the default is No (1109).
+        const choice: ProposeChoice = candidate && matchRestsOnUncertain(p, candidate) ? 'skip'
+            : !family.has(p.ref) && !candidate?.byResearch ? 'skip' : candidate && !candidate.tentative ? 'link' : 'new';
         persons[p.ref] = {
             ref: p.ref,
             choice,

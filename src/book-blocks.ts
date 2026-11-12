@@ -12,13 +12,15 @@
 import { Partnership, PartnershipId, Person, PersonId, Source, StromData, Story, personSourceIds } from './types.js';
 import { PrivacyMode } from './privacy.js';
 import { getStringsForLang } from './strings.js';
+import { sourceEntryText, sourcePlaceParts } from './source-location.js';
 import { formatFlexDate, parseFlexDate, yearOf } from './dates.js';
 import { sortCoupleEvents } from './events.js';
 import { shownNameOrEmpty } from './person-name.js';
-import { feminineForm, czechRulesApply, isGapOnlyName } from './surnames.js';
+import { feminineFormIn, isGapOnlyName } from './surnames.js';
 import { INDEX_UNCERTAIN, TRANSCRIPTION_GAP, indexLetter, orderIndexKeys } from './family-pages.js';
 import { safeHttpUrl } from './validation.js';
 import { proseHtml, coupleStoryYears } from './story-text.js';
+import { nameSourceCodes, storyBasisSourceIds } from './story-sources.js';
 import { marriedInto, placeSpans, Rod, RodId, rodGenerations, rodNameForms, rodPlaceSpans, sortByBirth } from './lineage.js';
 import { placeKey } from './places.js';
 import {
@@ -361,12 +363,11 @@ export function rodOverviewHtml(rod: Rod, ctx: BookCtx, page: { title?: string }
     if (rodShown(ctx, rod.founderId)) {
         const forms = rod.forms.length ? rod.forms : [rod.surname];
         let text = esc(forms.join(', '));
-        if (czechRulesApply(ctx.model.index.data)) {
-            // A female form some member carries is named once, among the female forms.
-            const fem = [...new Set(forms.map(f => feminineForm(f)).filter((f): f is string => !!f))];
-            const own = forms.filter(f => !fem.includes(f));
-            if (fem.length && own.length) text = `${esc(own.join(', '))}; ${esc(B.femaleForms(fem.join(', ')))}`;
-        }
+        // A female form some member carries is named once, among the female forms (where the rules apply, genderRulesApply).
+        const data = ctx.model.index.data;
+        const fem = [...new Set(forms.map(f => feminineFormIn(f, data)).filter((f): f is string => !!f))];
+        const own = forms.filter(f => !fem.includes(f));
+        if (fem.length && own.length) text = `${esc(own.join(', '))}; ${esc(B.femaleForms(fem.join(', ')))}`;
         rows.push([B.nameForms, text]);
     }
     rows.push([B.inRod, esc(B.inRodValue(rod.realMemberCount, rod.realSpouseCount, rod.generations, rod.familyIds.length))]);
@@ -466,6 +467,14 @@ const CONFLICT_FACTS: Record<'birth' | 'baptism' | 'death' | 'burial', string[]>
     birth: ['BIRT'], baptism: ['CHR', 'BAPM'], death: ['DEAT'], burial: ['BURI', 'CREM'],
 };
 
+/**
+ * A dot of the evidence mark, drawn (full, half, empty) at one size: the glyph ◐ comes from a fallback font
+ * larger than ● and ○.
+ */
+function bookDot(kind: 'full' | 'half' | 'empty'): string {
+    return `<span class="book-dot book-dot-${kind}" aria-hidden="true"></span>`;
+}
+
 /** The evidence mark after a fact (§5.8): ● documented / ◐ conflict: {value} in P{n} / ○ not documented. */
 function evidenceMark(ctx: BookCtx, p: Person, fact: keyof typeof CONFLICT_FACTS, status: string | undefined, sourceIds: readonly string[] | undefined, shown: string): string {
     if (!ctx.research) return '';
@@ -476,12 +485,12 @@ function evidenceMark(ctx: BookCtx, p: Person, fact: keyof typeof CONFLICT_FACTS
         const sid = (other?.sourceIds ?? []).find(id => !!ctx.sources.source(id));
         const marker = sid ? ctx.sources.cite(sid).replace(/<[^>]*>/g, '') : '';
         const value = other ? stripResearchIds(other.value).text.trim() : '';
-        return `<span class="book-mark">◐ ${esc(B.evidence.conflict(value, marker || '?'))}</span>`;
+        return `<span class="book-mark">${bookDot('half')}${esc(B.evidence.conflict(value, marker || '?'))}</span>`;
     }
     const sourced = (sourceIds ?? []).some(id => !!ctx.sources.source(id));
     return status === 'proven' || sourced
-        ? `<span class="book-mark">● ${esc(B.evidence.proven)}</span>`
-        : `<span class="book-mark">○ ${esc(B.evidence.unproven)}</span>`;
+        ? `<span class="book-mark">${bookDot('full')}${esc(B.evidence.proven)}</span>`
+        : `<span class="book-mark">${bookDot('empty')}${esc(B.evidence.unproven)}</span>`;
 }
 
 function factsHtml(ctx: BookCtx, p: Person): string {
@@ -592,8 +601,12 @@ export function personBookHtml(id: PersonId, ctx: BookCtx, opts: { chapter: numb
 // ─── A family (§5.4) ────────────────────────────────────────────────────────
 
 function storyBlock(ctx: BookCtx, story: Story, who: string, owner: { person: Person } | { couple: Partnership }): string {
-    const body = proseHtml(story.text, { title: story.title, headingLevel: 5, softBreak: 'space', dropStrayMarks: true });
+    // A bare source code ("[S0164]") reads as the source's title.
+    const body = proseHtml(nameSourceCodes(story.text, ctx.tree.sources), { title: story.title, headingLevel: 5, softBreak: 'space', dropStrayMarks: true });
     if (!body) return '';
+    // The sources the story rests on go into the book's numbered list (only with the Sources part);
+    // nothing under the text, no new reference numbers in it (spec 1104).
+    if (ctx.parts.sources) for (const id of storyBasisSourceIds(ctx.tree.sources, story)) ctx.sources.cite(id);
     const banner = ctx.extras?.banner?.(story, owner) ?? '';
     const title = story.title ? ` <span class="book-story-title">${esc(story.title)}</span>` : '';
     const approve = story.status === 'draft' && 'person' in owner ? ctx.extras?.approve?.(owner.person) ?? '' : '';
@@ -677,7 +690,8 @@ function chapterSourcesHtml(ctx: BookCtx, n: number): string {
     if (!ids.length) return '';
     const rows = ids.map(id => {
         const s = ctx.sources.source(id)!;
-        const short = [s.title, s.reference].filter(x => !!x?.trim()).map(x => esc(x!.trim())).join(', ');
+        // The entry's place without the book (an older source: its location as it is).
+        const short = [s.title, sourceEntryText(s, ', ', ctx.lang)].filter(x => !!x?.trim()).map(x => esc(x!.trim())).join(', ');
         return `<p><span class="book-pn">P${ctx.sources.no.get(id)}</span>${short}</p>`;
     }).join('');
     return `<div class="book-section book-chapter-sources"><h3 class="book-sub">${esc(B.chapterSources)}</h3>${rows}<p class="book-muted">${esc(B.chapterSourcesNote)}</p></div>`;
@@ -777,7 +791,9 @@ export function sourcesHtml(ctx: BookCtx): string {
     if (!ids.length) return '';
     const rows = ids.map(id => {
         const s = ctx.sources.source(id)!;
-        const full = [s.title, s.repository, s.reference].filter(x => !!x?.trim()).map(x => esc(x!.trim())).join(', ');
+        // Title, archive, call number, folio, image, the rest (an older source: title, archive, location).
+        const place = sourcePlaceParts(s, ctx.lang);
+        const full = [s.title, ...place.book, ...(place.whole ? [place.whole] : place.entry)].filter(x => !!x?.trim()).map(x => esc(x!.trim())).join(', ');
         const href = safeHttpUrl(s.url);
         const scan = href ? `<span class="book-source-scan">${esc(B.scan)} <a href="${esc(href)}" data-print="${esc(printedUrl(href))}"><span>${esc(href)}</span></a></span>` : '';
         const back = ctx.sources.chapters.get(id) ?? [];

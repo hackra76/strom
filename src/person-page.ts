@@ -27,6 +27,7 @@ import { parseFlexDate, formatFlexDate, yearOf, ageBetween, toCanonical } from '
 import { nameHtml, shownName, shownNameOrEmpty } from './person-name.js';
 import { asciiSlug, safeFileName } from './filenames.js';
 import { isSafeExcerptDataUrl, safeHttpUrl, isOriginalOnlyAttachment } from './validation.js';
+import { nameSourceCodes, storyBasisBodyHtml, storyBasisEmpty, storyBasisHead, storyBasisShown, storyBasisWords, storyFactText } from './story-sources.js';
 import { storyProseHtml, coupleStories, coupleStoryYears, splitProseLead, partnershipsInOrder, partnershipSortKey } from './story-text.js';
 import { excerptImageUrl } from './excerpts.js';
 import { personSourceRows, lifeEventLabel, coupleEventLabelIn, PersonSourceRow } from './person-sources.js';
@@ -44,6 +45,8 @@ import { fanScreenSizes } from './fan-labels.js';
 import { fanZoomInlineScript } from './fan-zoom.js';
 import { websiteUrl } from './about-links.js';
 import type { ImageRegistry } from './image-registry.js';
+import { sourceTranslation } from './source-translation.js';
+import { sourcePlaceLine } from './source-location.js';
 
 // ─── Interface (ZADANI §2.6) ────────────────────────────────────────────────
 
@@ -444,7 +447,7 @@ function relativeView(p: Person, withEvents: boolean): Person {
         id: p.id, firstName: p.firstName, lastName: p.lastName, gender: p.gender, isPlaceholder: p.isPlaceholder,
         partnerships: [...p.partnerships], parentIds: [...p.parentIds], childIds: [...p.childIds],
     };
-    for (const k of ['titleBefore', 'titleAfter', 'marriedSurname', 'primaryName', 'birthDate', 'birthPlace',
+    for (const k of ['titleBefore', 'titleAfter', 'marriedSurname', 'marriedFirstName', 'primaryName', 'birthDate', 'birthPlace',
         'deathDate', 'deathPlace', 'isDeceased'] as const) {
         if (p[k] !== undefined) (keep as unknown as Record<string, unknown>)[k] = p[k];
     }
@@ -538,8 +541,9 @@ export function preparePersonPageData(data: StromData, opts: PersonPageOptions, 
         }
     }
 
-    // The sources the person, the person's events and marriages cite.
-    const rows = personSourceRows({ ...full, persons: { ...full.persons, [id]: person } }, id, S);
+    // The sources the person, the person's events and marriages cite, and those the
+    // person's and the couples' stories rest on (a chronicle no event cites).
+    const rows = personSourceRows({ ...full, persons: { ...full.persons, [id]: person } }, id, S, { stories: true });
     if (groups.sources || groups.excerpts || groups.research) {
         for (const row of rows) {
             const s: Source = structuredClone(row.source);
@@ -610,7 +614,7 @@ function ancestorView(p: Person, known: (id: PersonId) => boolean): Person {
         id: p.id, firstName: p.firstName, lastName: p.lastName, gender: p.gender, isPlaceholder: p.isPlaceholder,
         partnerships: [], parentIds, childIds: [],
     };
-    for (const k of ['titleBefore', 'titleAfter', 'marriedSurname', 'primaryName', 'birthDate', 'deathDate', 'isDeceased'] as const) {
+    for (const k of ['titleBefore', 'titleAfter', 'marriedSurname', 'marriedFirstName', 'primaryName', 'birthDate', 'deathDate', 'isDeceased'] as const) {
         if (p[k] !== undefined) (keep as unknown as Record<string, unknown>)[k] = p[k];
     }
     const rel = parentIds.filter(pid => p.parentRelTypes?.[pid] && p.parentRelTypes[pid] !== 'biological');
@@ -1055,7 +1059,8 @@ function personFacts(page: PersonPageData, S: S): PersonFact[] {
         const other = u.person1Id === person.id ? u.person2Id : u.person1Id;
         if (protect && page.living.has(other)) continue;
         if (u.startDate || u.startPlace) add(S.personSources.citeUnion(yearOf(u.startDate)), u.startStatus, cited(u.sourceIds));
-        if (u.endDate || u.endPlace) add(withYear(S.fields.divorceRow, u.endDate), u.endStatus, cited(u.sourceIds));
+        // The divorce by its own record, else by the couple's as before.
+        if (u.endDate || u.endPlace) add(withYear(S.fields.divorceRow, u.endDate), u.endStatus, cited(u.divorceSourceIds?.length ? u.divorceSourceIds : u.sourceIds));
         for (const ev of u.events ?? []) {
             if (!ev.date && !ev.place) continue;
             add(withYear(coupleEventLabelIn(ev, S), ev.date), ev.status, cited(ev.sourceIds));
@@ -1724,22 +1729,27 @@ function draftTag(c: Ctx, st: Story): string {
     return st.status === 'draft' ? ` <span class="pp-draft-tag">${esc(c.S.story.statusDraft)}</span>` : '';
 }
 
-/** What the story rests on (facts, the author's note), folded under the prose. */
+/**
+ * What the story's text is based on, one section folded under the prose (spec
+ * 1104): the sources it rests on (its pointers and the codes its facts cite,
+ * each once; only with the page's Sources group, as every other source of the
+ * page), its facts readable, the author's caveat. The window folds it with a
+ * button, the file with <details>; print leaves it out (the sources are in the
+ * page's Sources section, the facts in the life).
+ */
 function storyBasisHtml(c: Ctx, st: Story, key: string, id: string): string {
-    const { P, page } = c;
-    const facts = (st.facts ?? []).map(f => stripResearchIds(f)).filter(f => f.text.trim());
-    const note = st.note?.trim() ? stripResearchIds(st.note).text : '';
-    if (!facts.length && !note) return '';
-    const showIds = page.groups.research;
-    const items = facts.map(f => {
-        f.ids.forEach(rid => c.ids.add(rid));
-        return `<li>${esc(f.text.trim())}${showIds ? f.ids.map(rid => `<span class="pp-id">${esc(rid)}</span>`).join('') : ''}</li>`;
-    }).join('');
+    if (c.opts.mode === 'print') return '';
+    const { page, S } = c;
+    // The researchers' section still lists the research ids the facts carry.
+    for (const f of st.facts ?? []) stripResearchIds(f).ids.forEach(rid => c.ids.add(rid));
+    const b = storyBasisShown(page.groups.sources ? c.tree.sources : undefined, st,
+        f => stripResearchIds(storyFactText(f, S, page.lang)).text, t => stripResearchIds(t).text);
+    if (storyBasisEmpty(b)) return '';
+    const L = storyBasisWords(S);
     return fold(c, {
         key, id, cls: 'pp-basis',
-        head: `<span class="pp-disc--inline">${esc(P.storyBasis)} ${foldState('▸', '▾')}</span>`,
-        body: `<div class="pp-basis-body">${items ? `<ul>${items}</ul>` : ''}`
-            + (note ? `<p class="pp-basis-note">${esc(P.authorNote)}: ${esc(note)}</p>` : '') + `</div>`,
+        head: `<span class="pp-disc--inline">${esc(storyBasisHead(b, L))} ${foldState('▸', '▾')}</span>`,
+        body: `<div class="pp-basis-body">${storyBasisBodyHtml(b, L, { cls: 'pp-basis' })}</div>`,
     });
 }
 
@@ -1823,7 +1833,8 @@ export function coupleChapterData(tree: StromData, person: Person, u: Partnershi
     const pid = u.person1Id === person.id ? u.person2Id : u.person1Id;
     const partner = pid ? tree.persons[pid] : undefined;
     const real = partner && !partner.isPlaceholder ? partner : undefined;
-    const stripped = stripResearchIds(st.text);
+    // A bare source code reads as the source's title; the researchers' section still gets the code.
+    const stripped = { text: stripResearchIds(nameSourceCodes(st.text, tree.sources)).text, ids: stripResearchIds(st.text).ids };
     const title = st.title?.trim() ? stripResearchIds(st.title).text.trim() : '';
     const short = (p: Person) => p.firstName?.trim() || shownNameOrEmpty(p);
     return {
@@ -1918,8 +1929,9 @@ function storyHtml(c: Ctx): string {
     let head = `<h2 class="pp-kicker pp-story-kicker">${esc(P.sec.story)}</h2>`;
     let body = '';
     if (own) {
-        const stripped = stripResearchIds(own.text);
-        stripped.ids.forEach(id => c.ids.add(id));
+        stripResearchIds(own.text).ids.forEach(id => c.ids.add(id));
+        // A bare source code reads as the source's title.
+        const stripped = stripResearchIds(nameSourceCodes(own.text, c.tree.sources));
         const title = own.title?.trim() ? stripResearchIds(own.title).text : '';
         const tag = draftTag(c, own);
         head = title
@@ -2371,7 +2383,7 @@ export function personBookClipsHtml(page: PersonPageData, opts: PersonPageOption
     if (!c || shielded(c, c.person.id) || !c.page.groups.excerpts) return '';
     const { P } = c;
     const figs: string[] = [];
-    for (const row of personSourceRows(page.tree, page.personId, c.S)) {
+    for (const row of personSourceRows(page.tree, page.personId, c.S, { stories: true })) {
         const s = page.tree.sources?.[row.source.id];
         if (!s?.excerpts?.length) continue;
         const ev = excerptEvent(c, s.id);
@@ -2561,6 +2573,7 @@ function excerptEvent(c: Ctx, sid: string): { event: PersonPageCaptionEvent | nu
     for (const uid of p.partnerships) {
         const u = c.tree.partnerships[uid];
         if (u?.sourceIds?.includes(sid)) return { event: 'marriage', label: '', year: yearOf(u.startDate), place: u.startPlace?.trim() ?? '' };
+        if (u?.divorceSourceIds?.includes(sid)) return { event: null, label: c.S.fields.divorceRow, year: yearOf(u.endDate), place: u.endPlace?.trim() ?? '' };
     }
     const ev = p.events?.find(e => e.sourceIds?.includes(sid));
     if (ev) return { event: null, label: lifeEventLabel(ev, c.S), year: yearOf(ev.date), place: ev.place?.trim() ?? '' };
@@ -2906,7 +2919,8 @@ function sourcesHtml(c: Ctx, rows: PersonSourceRow[]): string {
         const s = row.source;
         const title = stripResearchIds(s.title || '?').text;
         const sup = row.cites.length ? `${P.sources.supports}: ${row.cites.map(x => x.label).join(' · ')}` : '';
-        const ref = [s.repository, s.reference].map(x => x?.trim()).filter(Boolean).join(' · ');
+        // Archive · call number · folio · image · the rest (an older source: archive · location), spec 075 §4.
+        const ref = sourcePlaceLine(s, 'long', c.opts.lang);
         const body: string[] = [];
         const main = c.mainEx.get(s.id);
         // Each excerpt shown here links its own scan; the card's link below is another page, or none.
@@ -2924,6 +2938,11 @@ function sourcesHtml(c: Ctx, rows: PersonSourceRow[]): string {
         }
         if (s.transcript?.trim()) {
             body.push(`<div><p class="pp-kicker">${esc(P.sources.transcript)}</p><p class="pp-transcript">${esc(stripResearchIds(s.transcript).text)}</p></div>`);
+        }
+        // The research's translation of the transcript (a section of the source's note): folded under it.
+        const translation = sourceTranslation(s.note);
+        if (translation) {
+            body.push(`<details class="pp-translation"><summary class="pp-kicker">${esc(P.sources.translation)}</summary><p class="pp-transcript pp-translation-text">${esc(stripResearchIds(translation).text)}</p></details>`);
         }
         const pageUrl = [s.url, ...(s.excerpts ?? []).map(e => e.pageUrl)].map(safeHttpUrl).find(u => u && !linked.has(u));
         const page = extLink(pageUrl ?? undefined, P.sources.archivePage);
@@ -3097,7 +3116,7 @@ export function prefixPageIds(html: string, prefix: string, keep: ReadonlySet<st
 function personPageBodyHtml(page: PersonPageData, opts: PersonPageOptions): string {
     const c = makeCtx(page, opts);
     if (!c) return '<article class="pp"></article>';
-    const rows = personSourceRows(page.tree, page.personId, c.S).filter(r => page.tree.sources?.[r.source.id]);
+    const rows = personSourceRows(page.tree, page.personId, c.S, { stories: true }).filter(r => page.tree.sources?.[r.source.id]);
     const items = researchItems(page, page.lang, c);
     const differs = page.groups.research ? { birth: items.differsBirth, death: items.differsDeath } : null;
     const footer = footerHtml(c);

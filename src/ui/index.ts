@@ -26,7 +26,7 @@ import {
     Source
 } from '../types.js';
 import { strings } from '../strings.js';
-import { parseGedcom, convertToStrom, GedcomConversionResult } from '../ged-parser.js';
+import { parseGedcom, convertToStrom, GedcomConversionResult, GedcomDecoding } from '../ged-parser.js';
 import {
     validateJsonImport,
     ValidationResult,
@@ -60,7 +60,7 @@ import { relationModalMethods } from './relation-modal.js';
 import { dialogsMethods } from './dialogs.js';
 import { relationshipsPanelMethods } from './relationships-panel.js';
 import { searchMethods } from './search.js';
-import { importExportMethods } from './import-export.js';
+import { importExportMethods, type AfterImportOptions } from './import-export.js';
 import { mergeUiMethods } from './merge-ui.js';
 import { encryptionUiMethods } from './encryption-ui.js';
 import { treeStatsMethods } from './tree-stats.js';
@@ -77,6 +77,8 @@ import { storyCompareMethods } from './story-compare-ui.js';
 import { cardFieldsUiMethods } from './card-fields-ui.js';
 import { personResearchMethods } from './person-research-ui.js';
 import { conflictDecideMethods } from './conflict-decide-ui.js';
+import { hypothesisWaitMethods } from './hypothesis-wait-ui.js';
+import { hypothesisWaitingMethods } from './hypothesis-waiting-ui.js';
 import { conflictPanelMethods } from './conflict-panel-ui.js';
 import { researchAdoptMethods } from './research-adopt-ui.js';
 import { researchInstallMethods } from './research-install-ui.js';
@@ -92,16 +94,26 @@ import { phoneMethods } from './phone-ui.js';
 import { readDocumentMethods } from './read-document-ui.js';
 import { readProposeMethods } from './read-propose-ui.js';
 import { researchImagesMethods } from './research-images-ui.js';
+import { sourceConfirmMethods } from './source-confirm-ui.js';
+import { readSourceMethods } from './read-source-ui.js';
 import { readHistoryMethods } from './read-history-ui.js';
 import { evidenceUiMethods } from './evidence-ui.js';
 import { rodViewMethods } from './rod-view.js';
 import { treeOverviewMethods } from './tree-overview.js';
 import { cardSignalsUiMethods } from './card-signals-ui.js';
 import { researchOverviewMethods } from './research-overview-ui.js';
+import { liveSectionEditMethods } from './live-section-edit-ui.js';
 import { researchWaitingWriteMethods } from './research-waiting-write-ui.js';
+import { waitingTaskMethods } from './waiting-task-ui.js';
+import { researchBrowserMethods } from './research-browser-ui.js';
 import { researchRemovedMethods } from './research-removed-ui.js';
 import { researchDirectionsMethods } from './research-directions-ui.js';
+import { directionFormMethods } from './direction-form-ui.js';
+import { researchOffLineMethods } from './research-offline-ui.js';
 import { liveFollowMethods } from './live-follow-ui.js';
+import { fanFollowMethods } from './fan-follow-ui.js';
+import { mapFollowMethods } from './map-follow-ui.js';
+import { followLegendMethods } from './follow-legend-ui.js';
 import { researchEdgeUiMethods } from './research-edge-ui.js';
 import { viewLinksUiMethods } from './view-links-ui.js';
 import { viewLinksListMethods } from './view-links-list-ui.js';
@@ -116,6 +128,8 @@ import { genLabelsMethods } from './gen-labels.js';
 import { anniversariesUiMethods } from './anniversaries-ui.js';
 import { slideshowMethods } from './slideshow.js';
 import { mapMethods, MapScope } from './map-ui.js';
+import { tableMethods } from './table-view/table-ui.js';
+import { tableResearchMethods } from './table-view/table-research-ui.js';
 import { placesManagerMethods } from './places-manager-ui.js';
 import { placesResearchMethods } from './places-research-ui.js';
 import { placesIdentifyMethods } from './places-identify-ui.js';
@@ -130,6 +144,11 @@ import { surnamesMethods } from './surnames-ui.js';
 import { surnameSuggestMethods } from './surname-suggest-ui.js';
 import { shareUiMethods } from './share-ui.js';
 import { researchPromoMethods } from './research-promo-ui.js';
+import { importNextMethods } from './import-next-ui.js';
+import { personReliabilityMethods } from './person-reliability-ui.js';
+import { verifyUiMethods } from './verify-ui.js';
+import { factOriginMethods } from './fact-origin-ui.js';
+import { exportGedcomMethods } from './export-gedcom-ui.js';
 import { familyWizardMethods } from './family-wizard.js';
 import { pwaUiMethods } from './pwa-ui.js';
 import { fileAccessMethods } from './file-access-ui.js';
@@ -139,8 +158,10 @@ import { researchSyncMethods } from './research-sync-ui.js';
 import { historyMethods } from './history-ui.js';
 import { historyKindsMethods } from './history-kinds-ui.js';
 import { historyAlignMethods } from './history-align-ui.js';
+import { sourceSplitMethods } from './source-split-ui.js';
 import { qualityMethods } from './quality-ui.js';
 import { researchFixesMethods } from './research-fixes-ui.js';
+import { verifyPersonMethods } from './verify-person-ui.js';
 import { duplicateVerdictsMethods } from './duplicate-verdicts-ui.js';
 import { historyManageMethods } from './history-manage-ui.js';
 import { historyDetailMethods } from './history-detail-ui.js';
@@ -149,12 +170,14 @@ import { historyPlaceMethods } from './history-place-ui.js';
 import { historyCardMethods } from './history-card-ui.js';
 import { timelineHistoryMethods } from './timeline-history-ui.js';
 import { researchOthersMethods } from './research-others-ui.js';
+import { researchLiveMethods } from './research-live-ui.js';
 import { researchFollowMethods } from './research-follow-ui.js';
 import { originalsMethods } from './originals-ui.js';
 import { researchTreeSettingsMethods } from './research-tree-settings-ui.js';
 import { researchLoadMethods } from './research-load-ui.js';
 import { tourMethods, TourStepDef } from './tour.js';
 import { releaseNotesMethods } from './release-notes-ui.js';
+import { helpMethods } from './help-ui.js';
 
 export class UIClass {
     currentId: PersonId | null = null;
@@ -174,6 +197,16 @@ export class UIClass {
     gedcomResult: GedcomConversionResult | null = null;
     /** This GEDCOM import brings images (null until the result dialog decides). */
     gedcomImportImages: boolean | null = null;
+    /** Raw bytes of the GEDCOM file in the result dialog (another encoding re-reads them). */
+    gedcomRawBuffer: ArrayBuffer | null = null;
+    /** How the GEDCOM file in the result dialog was decoded. */
+    gedcomDecoding: GedcomDecoding | null = null;
+    /** The GEDCOM file of the result dialog as picked: its name, sha256 and the day it was loaded (spec 066). */
+    gedcomFileInfo: { name: string; sha: string; at: string } | null = null;
+    /** A new tree from a GEDCOM file waits for the import dialog's OK: the file's import record. */
+    pendingGedcomImport: { importId?: string } | null = null;
+    /** What the last import brought (the import summary reads it). */
+    lastImport: ({ treeId: TreeId } & AfterImportOptions) | null = null;
     /** State of the optional checkbox of the last showChoice() dialog. */
     choiceCheckboxChecked = false;
     /** The source catalog's filter ("Transcription not verified" from Research for this tree). */
@@ -321,6 +354,12 @@ export class UIClass {
     sourceEditorOriginal: Partial<Source> | null = null;
     /** The research read this source and the user changed its transcript or page: the note stays until close. */
     sourceUserReadingShown = false;
+    /** "Use" on the editor's proposal: the folio, image and location before it, and the location it came from (for Undo). */
+    sourceLocationTaken: { folio: string; image: string; reference: string } | null = null;
+    /** The pending re-check of the editor's location line after typing in Other location. */
+    sourceLocationTimer: ReturnType<typeof setTimeout> | null = null;
+    /** The image field's help: pinned by a tap, shown on hover or on keyboard focus. */
+    sourceImageHelp = { pinned: false, hover: false, focus: false };
     /** Where the open source editor was reached from (for page crops and citing). */
     sourceEditorContext: CitationContext | null = null;
     /** The source shown in the viewer, and the citation chip it was opened from. */
@@ -335,6 +374,8 @@ export class UIClass {
     /** The person whose "Sources" dialog is open, and the person-level rows it last drew. */
     personSourcesId: PersonId | null = null;
     personSourcesShown: Set<string> | null = null;
+    /** The sources the open person-sources dialog marks (a status tip's way to all of a fact's sources). */
+    personSourcesFocus: Set<string> | null = null;
     /** Ends the open "Hand the tree to the research?" dialog as "Don't hand over". */
     researchAdoptResolve: (() => void) | null = null;
     /** Cancel of the open "Load the research version?" (research-load-ui.ts). */
@@ -603,6 +644,13 @@ type ConflictDecideMethods = typeof conflictDecideMethods;
 export interface UIClass extends ConflictDecideMethods {}
 Object.assign(UIClass.prototype, conflictDecideMethods);
 
+type HypothesisWaitMethods = typeof hypothesisWaitMethods;
+export interface UIClass extends HypothesisWaitMethods {}
+Object.assign(UIClass.prototype, hypothesisWaitMethods);
+type HypothesisWaitingMethods = typeof hypothesisWaitingMethods;
+export interface UIClass extends HypothesisWaitingMethods {}
+Object.assign(UIClass.prototype, hypothesisWaitingMethods);
+
 type ConflictPanelMethods = typeof conflictPanelMethods;
 export interface UIClass extends ConflictPanelMethods {}
 Object.assign(UIClass.prototype, conflictPanelMethods);
@@ -659,6 +707,14 @@ type ResearchImagesMethods = typeof researchImagesMethods;
 export interface UIClass extends ResearchImagesMethods {}
 Object.assign(UIClass.prototype, researchImagesMethods);
 
+type SourceConfirmMethods = typeof sourceConfirmMethods;
+export interface UIClass extends SourceConfirmMethods {}
+Object.assign(UIClass.prototype, sourceConfirmMethods);
+
+type ReadSourceMethods = typeof readSourceMethods;
+export interface UIClass extends ReadSourceMethods {}
+Object.assign(UIClass.prototype, readSourceMethods);
+
 type ReadProposeMethods = typeof readProposeMethods;
 export interface UIClass extends ReadProposeMethods {}
 Object.assign(UIClass.prototype, readProposeMethods);
@@ -672,12 +728,18 @@ Object.assign(UIClass.prototype, historyKindsMethods);
 type HistoryAlignMethods = typeof historyAlignMethods;
 export interface UIClass extends HistoryAlignMethods {}
 Object.assign(UIClass.prototype, historyAlignMethods);
+type SourceSplitMethods = typeof sourceSplitMethods;
+export interface UIClass extends SourceSplitMethods {}
+Object.assign(UIClass.prototype, sourceSplitMethods);
 type QualityMethods = typeof qualityMethods;
 export interface UIClass extends QualityMethods {}
 Object.assign(UIClass.prototype, qualityMethods);
 type ResearchFixesMethods = typeof researchFixesMethods;
 export interface UIClass extends ResearchFixesMethods {}
 Object.assign(UIClass.prototype, researchFixesMethods);
+type VerifyPersonMethods = typeof verifyPersonMethods;
+export interface UIClass extends VerifyPersonMethods {}
+Object.assign(UIClass.prototype, verifyPersonMethods);
 type DuplicateVerdictsMethods = typeof duplicateVerdictsMethods;
 export interface UIClass extends DuplicateVerdictsMethods {}
 Object.assign(UIClass.prototype, duplicateVerdictsMethods);
@@ -728,9 +790,21 @@ type ResearchOverviewMethods = typeof researchOverviewMethods;
 export interface UIClass extends ResearchOverviewMethods {}
 Object.assign(UIClass.prototype, researchOverviewMethods);
 
+type LiveSectionEditMethods = typeof liveSectionEditMethods;
+export interface UIClass extends LiveSectionEditMethods {}
+Object.assign(UIClass.prototype, liveSectionEditMethods);
+
 type ResearchWaitingWriteMethods = typeof researchWaitingWriteMethods;
 export interface UIClass extends ResearchWaitingWriteMethods {}
 Object.assign(UIClass.prototype, researchWaitingWriteMethods);
+
+type WaitingTaskMethods = typeof waitingTaskMethods;
+export interface UIClass extends WaitingTaskMethods {}
+Object.assign(UIClass.prototype, waitingTaskMethods);
+
+type ResearchBrowserMethods = typeof researchBrowserMethods;
+export interface UIClass extends ResearchBrowserMethods {}
+Object.assign(UIClass.prototype, researchBrowserMethods);
 
 type ResearchRemovedMethods = typeof researchRemovedMethods;
 export interface UIClass extends ResearchRemovedMethods {}
@@ -740,9 +814,29 @@ type ResearchDirectionsMethods = typeof researchDirectionsMethods;
 export interface UIClass extends ResearchDirectionsMethods {}
 Object.assign(UIClass.prototype, researchDirectionsMethods);
 
+type DirectionFormMethods = typeof directionFormMethods;
+export interface UIClass extends DirectionFormMethods {}
+Object.assign(UIClass.prototype, directionFormMethods);
+
+type ResearchOffLineMethods = typeof researchOffLineMethods;
+export interface UIClass extends ResearchOffLineMethods {}
+Object.assign(UIClass.prototype, researchOffLineMethods);
+
 type LiveFollowMethods = typeof liveFollowMethods;
 export interface UIClass extends LiveFollowMethods {}
 Object.assign(UIClass.prototype, liveFollowMethods);
+
+type FanFollowMethods = typeof fanFollowMethods;
+export interface UIClass extends FanFollowMethods {}
+Object.assign(UIClass.prototype, fanFollowMethods);
+
+type MapFollowMethods = typeof mapFollowMethods;
+export interface UIClass extends MapFollowMethods {}
+Object.assign(UIClass.prototype, mapFollowMethods);
+
+type FollowLegendMethods = typeof followLegendMethods;
+export interface UIClass extends FollowLegendMethods {}
+Object.assign(UIClass.prototype, followLegendMethods);
 
 type ResearchEdgeUiMethods = typeof researchEdgeUiMethods;
 export interface UIClass extends ResearchEdgeUiMethods {}
@@ -799,6 +893,14 @@ Object.assign(UIClass.prototype, slideshowMethods);
 type MapMethods = typeof mapMethods;
 export interface UIClass extends MapMethods {}
 Object.assign(UIClass.prototype, mapMethods);
+
+type TableMethods = typeof tableMethods;
+export interface UIClass extends TableMethods {}
+Object.assign(UIClass.prototype, tableMethods);
+
+type TableResearchMethods = typeof tableResearchMethods;
+export interface UIClass extends TableResearchMethods {}
+Object.assign(UIClass.prototype, tableResearchMethods);
 
 type PlacesManagerMethods = typeof placesManagerMethods;
 export interface UIClass extends PlacesManagerMethods {}
@@ -870,6 +972,10 @@ Object.assign(UIClass.prototype, researchSyncMethods);
 type ResearchOthersMethods = typeof researchOthersMethods;
 export interface UIClass extends ResearchOthersMethods {}
 Object.assign(UIClass.prototype, researchOthersMethods);
+
+type ResearchLiveMethods = typeof researchLiveMethods;
+export interface UIClass extends ResearchLiveMethods {}
+Object.assign(UIClass.prototype, researchLiveMethods);
 type ResearchFollowMethods = typeof researchFollowMethods;
 export interface UIClass extends ResearchFollowMethods {}
 Object.assign(UIClass.prototype, researchFollowMethods);
@@ -890,6 +996,26 @@ type ResearchPromoMethods = typeof researchPromoMethods;
 export interface UIClass extends ResearchPromoMethods {}
 Object.assign(UIClass.prototype, researchPromoMethods);
 
+type ImportNextMethods = typeof importNextMethods;
+export interface UIClass extends ImportNextMethods {}
+Object.assign(UIClass.prototype, importNextMethods);
+
+type PersonReliabilityMethods = typeof personReliabilityMethods;
+export interface UIClass extends PersonReliabilityMethods {}
+Object.assign(UIClass.prototype, personReliabilityMethods);
+
+type VerifyUiMethods = typeof verifyUiMethods;
+export interface UIClass extends VerifyUiMethods {}
+Object.assign(UIClass.prototype, verifyUiMethods);
+
+type FactOriginMethods = typeof factOriginMethods;
+export interface UIClass extends FactOriginMethods {}
+Object.assign(UIClass.prototype, factOriginMethods);
+
+type ExportGedcomMethods = typeof exportGedcomMethods;
+export interface UIClass extends ExportGedcomMethods {}
+Object.assign(UIClass.prototype, exportGedcomMethods);
+
 type TourMethods = typeof tourMethods;
 export interface UIClass extends TourMethods {}
 Object.assign(UIClass.prototype, tourMethods);
@@ -897,5 +1023,9 @@ Object.assign(UIClass.prototype, tourMethods);
 type ReleaseNotesMethods = typeof releaseNotesMethods;
 export interface UIClass extends ReleaseNotesMethods {}
 Object.assign(UIClass.prototype, releaseNotesMethods);
+
+type HelpMethods = typeof helpMethods;
+export interface UIClass extends HelpMethods {}
+Object.assign(UIClass.prototype, helpMethods);
 
 export const UI = new UIClass();

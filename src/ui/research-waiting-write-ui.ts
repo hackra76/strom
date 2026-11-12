@@ -15,13 +15,16 @@ import { researchMarkFlags } from './research-open-mark.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { LiveWaiting, researchTaskRef } from '../research-link.js';
 import {
-    WaitingWrites, WaitingPending, WaitingSentResult, WaitingFileResult, WaitingWriteRefused, GroupNoteDone, NO_WAITING_WRITES, WAITING_SETTLE_MS, WAITING_FILE_ACCEPT,
+    WaitingWrites, WaitingPending, WaitingSentResult, WaitingFileResult, WaitingAnswerResult, WaitingWriteRefused, GroupNoteDone, NO_WAITING_WRITES, WAITING_SETTLE_MS, WAITING_FILE_ACCEPT,
     waitingWrites, waitingGroupSendable, waitingTaskIds, waitingFileWritable, waitingWrittenPhase, applyWaitingPending, settleWaitingPending, waitingSentDay, waitingFileTaken,
-    postWaitingSent, postGroupSent, postGroupUnsent, getGroupNote, putWaitingFile,
+    postWaitingSent, postGroupSent, postGroupUnsent, getGroupNote, putWaitingFile, answerWaiting, TaskImageResult, uploadTaskImage,
 } from '../research-waiting-write.js';
-import { WaitingPhase, waitingPhase } from '../research-waiting.js';
+import type { WaitingAnswerOutcome } from './waiting-answer-form.js';
+import { WaitingPhase, imagesState, waitingPhase } from '../research-waiting.js';
+import type { UploadOutcome } from './waiting-images-upload.js';
+import { imagesSentence, itemKey, takeOwnImages } from './waiting-images-ui.js';
 import { uiModule } from './module.js';
-import { el, liveSession, LiveSession } from './research-ui.js';
+import { el, LiveSession, researchSession } from './research-ui.js';
 import { normalizeModal } from './modal-skeleton.js';
 import { TreeManager } from '../tree-manager.js';
 
@@ -47,9 +50,12 @@ function writeState(s: LiveSession): WriteState {
     return st;
 }
 
-/** The session the write was made in still runs (following ended or went elsewhere: nothing to show). */
+/**
+ * The session the write was made in still runs: followed, or viewed through its bridge in the
+ * overview (following ended, went elsewhere or the overview closed: nothing to show).
+ */
 function stillFollowing(s: LiveSession): boolean {
-    return liveSession() === s && !s.ended;
+    return researchSession() === s && !s.ended;
 }
 
 /** What a refused write says (none: nothing, the row just goes). */
@@ -87,7 +93,7 @@ export const researchWaitingWriteMethods = uiModule({
      * again for it. A commit of its agent meanwhile: nothing taken, the newer
      * version comes as ever.
      */
-    takeWaitingWriteHead(s: LiveSession, before: string, result: WaitingSentResult | WaitingFileResult): void {
+    takeWaitingWriteHead(s: LiveSession, before: string, result: WaitingSentResult | WaitingFileResult | WaitingAnswerResult | TaskImageResult): void {
         if (!result.ok || !result.head) return;
         this.researchTakeOwnWriteHead(s.researchId, before, result.head, result.parent);
         if (!s.ended && TreeManager.getTreeMetadata(s.treeId)?.research?.head === result.head) s.head = result.head;
@@ -104,8 +110,8 @@ export const researchWaitingWriteMethods = uiModule({
         return this.researchHeadBeforeWrite(s.researchId, { ask: true, base: s.bridge.base });
     },
 
-    /** What the followed research's bridge takes from "Awaiting action". */
-    liveWaitingWrites(s: LiveSession | null = liveSession()): WaitingWrites {
+    /** What the followed (or viewed) research's bridge takes from "Awaiting action". */
+    liveWaitingWrites(s: LiveSession | null = researchSession()): WaitingWrites {
         if (!s || s.ended) return NO_WAITING_WRITES;
         return waitingWrites({ features: s.features, accepts: s.accepts });
     },
@@ -367,6 +373,89 @@ export const researchWaitingWriteMethods = uiModule({
         let copied = false;
         try { copied = document.execCommand('copy'); } catch { /* by hand */ }
         this.showToast(copied ? W.noteCopied : W.noteCopyFailed, copied ? 3000 : 6000, { kind: copied ? 'waiting-copied' : 'waiting-failed' });
+    },
+
+    /**
+     * The person's answer to an item (spec 048 §2), through the bridge
+     * (`waiting.answer`): taken, the row leaves To do at once and the toast
+     * says so; gone already (404): the row goes silently; the task waits for
+     * something else now (409 changed): the status is asked again and the
+     * next try expects what it says (`expect`); answered in the terminal
+     * (409 no-answer): the item is read again. The form says the rest.
+     */
+    async sendWaitingAnswer(s: LiveSession, w: LiveWaiting, text: string, expect?: string): Promise<WaitingAnswerOutcome> {
+        const task = researchTaskRef(w.id);
+        if (!task || !this.liveWaitingWrites(s).answer) return 'fail';
+        const st = writeState(s);
+        if (st.pending.get(w.id)?.until === Infinity) return 'skipped';
+        const back = st.pending.get(w.id);
+        st.pending.set(w.id, { phase: waitingPhase(w), until: Infinity });
+        let result: WaitingAnswerResult;
+        try {
+            const before = await this.waitingHeadBeforeWrite(s);
+            result = await answerWaiting(s.bridge.base, task, { text, expect: expect ?? w.at });
+            this.takeWaitingWriteHead(s, before, result);
+        } finally {
+            if (back) st.pending.set(w.id, back);
+            else st.pending.delete(w.id);
+        }
+        const taken = result.ok || result.code === 'none';
+        if (taken) st.pending.set(w.id, { phase: waitingPhase(w), gone: true, until: Date.now() + WAITING_SETTLE_MS });
+        if (!stillFollowing(s)) return taken ? (result.ok ? 'saved' : 'gone') : 'fail';
+        if (taken) this.reshowLiveWaiting(s);
+        this.liveStatusSoon(s);
+        if (result.ok) {
+            this.showToast(strings.live.waitingTask.answerSaved, 6000, { kind: 'waiting-answered' });
+            return 'saved';
+        }
+        switch (result.code) {
+            case 'none': return 'gone';
+            case 'changed': return 'changed';
+            case 'no-answer': return 'no-answer';
+            case 'busy': case 'locked': return 'busy';
+            // Held by the research (sealed elsewhere …): its own sentence and way, the form says it was not saved.
+            case 'held': this.showWaitingRefused(result); return 'fail';
+            default: return 'fail';
+        }
+    },
+
+    /**
+     * One image of "Add images" (spec 048 §3) through the bridge, its number,
+     * Replace and progress; the research's new head taken as the tree's own.
+     */
+    async uploadWaitingImage(s: LiveSession, task: string, file: File,
+        opts: { image: number | null; replace: boolean; onProgress: (sent: number, total: number) => void }): Promise<TaskImageResult> {
+        const before = await this.waitingHeadBeforeWrite(s);
+        const result = await uploadTaskImage(s.bridge.base, task, file, { ...opts, maxBytes: s.accepts?.mediaMaxBytes });
+        this.takeWaitingWriteHead(s, before, result);
+        return result;
+    },
+
+    /**
+     * "Add images" finished: the task woke with its last image (the row goes
+     * at once, the toast says so) or is gone (the row goes silently);
+     * otherwise the images saved are taken as seen here (not lit as arrived)
+     * and the sentence of how it stands comes back ("✓ 1 of 2 images saved –
+     * image 58 missing. The task keeps waiting."); null: nothing to say.
+     */
+    settleWaitingImages(s: LiveSession, w: LiveWaiting, outcome: UploadOutcome): string | null {
+        const following = stillFollowing(s);
+        if (outcome.woken || outcome.gone) {
+            writeState(s).pending.set(w.id, { phase: waitingPhase(w), gone: true, until: Date.now() + WAITING_SETTLE_MS });
+            if (following) {
+                this.reshowLiveWaiting(s);
+                this.liveStatusSoon(s);
+            }
+            if (outcome.woken) this.showToast(strings.live.waitingTask.imagesAll, 6000, { kind: 'waiting-images' });
+            return null;
+        }
+        if (following) this.liveStatusSoon(s);
+        // Files not added (the same as an image taken already) are said after how it stands.
+        const notes = outcome.notes.slice(0, 5).join(' ') + (outcome.notes.length > 5 ? ' …' : '');
+        if (outcome.saved === 0) return notes || null;
+        const now = outcome.inbox ? imagesState({ ...w, inbox: outcome.inbox }) : null;
+        takeOwnImages(itemKey(s, w.id), now);
+        return `✓ ${now ? `${imagesSentence(now)} ` : ''}${strings.live.waitingTask.stillWaits}${notes ? ` ${notes}` : ''}`;
     },
 
     /** "Add a file" at a task: an image or PDF picked here goes to the research with the task's id. */

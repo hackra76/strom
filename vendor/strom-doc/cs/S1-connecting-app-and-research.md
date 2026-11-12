@@ -1,0 +1,237 @@
+<a id="S1"></a>
+# S1 Propojení aplikace a výzkumu
+
+Jak se aplikace Strom spojí s výzkumem na stejném počítači, jaké druhy stromů z toho vzniknou a co se děje, když
+spojení nejde. Popisuje aplikaci Strom 3.21.2 (a výzkum 1.25.2). Změny z novější verze mají u sebe její číslo. Co se
+s úpravami děje po spojení, popisuje [S2](S2-edits-from-the-app.md), telefon [S5](S5-phone.md).
+
+<a id="S1.1"></a>
+## S1.1 Most výzkumu běží jen na tomto počítači
+
+Aplikace mluví s výzkumem přes most: malý server, který výzkum spustí na tomto počítači. Most poslouchá jen na
+adrese `127.0.0.1`, na náhodném portu, a každá jeho adresa nese tajný klíč. Data stromu přes most nikam jinam
+nejdou.
+
+- **Hranice:**
+  - Most přijme dotaz jen ze stránky aplikace Strom na stromapp.info nebo z místní adresy. Přijde-li jeho
+    klíč z cizí stránky, výzkum klíč hned vymění a ten dotaz nedostane odpověď.
+  - Most běží, dokud ho člověk nevypne (`strom live stop`, v aplikaci přepínač **Výzkum zapnutý**, [S1.9](#S1.9)),
+    nebo do vypnutí počítače. Sám skončí jen tehdy, když to člověk zvolil (`live.idleMinutes`, v aplikaci **Po
+    2 hodinách nečinnosti**): když se ho ta doba nikdo na nic nezeptá a ve stromu přitom nikdo nepracuje.
+    Pravidelný dotaz aplikace na stav most při životě nedrží.
+  - Most skončí sám také tehdy, když jeho výzkum ze složky zmizí a chybí i při další kontrole aspoň o 10 s později.
+    Disk nedostupný jen na chvíli most neukončí. Most téhož výzkumu spuštěný navíc vedle běžícího hned skončí.
+  - Když se most spustí znovu sám (aktualizace, nečinnost, pád), drží si adresu: stejný port, je-li volný, a stejný
+    klíč. Aplikace se pak spojí bez nového odkazu.
+  - `strom live stop` klíč zahodí: aplikaci pak znovu spojí až `strom app`. Je-li port obsazený jiným programem,
+    most vezme jiný port a aplikace potřebuje nový odkaz.
+  - Zápis most odmítne, když je strom zapečetěný na jiném počítači, když soubory stromu ve složce v cloudu ještě
+    nejsou stažené a když je plný disk. Úpravy pak čekají v aplikaci ([S2](S2-edits-from-the-app.md)).
+- **Ovládání:** terminál: `strom live` (běží most?), `strom live start`, `strom live stop` (`--forget` zapomene
+  i port), `strom config set live.idleMinutes <minuty>` (0: nikdy sám, výchozí). Záznam běhu je ve složce výzkumu
+  v `.strom/live.log`.
+- **Platí od:** výzkum 1.0.0. Stejná adresa po novém spuštění od 1.8.0, `live.idleMinutes` od 1.25.0.
+- **Od výzkumu 1.29.0:** most sám po nečinnosti nekončí (výchozí `live.idleMinutes` 0); dřív skončil sám po dvou
+  hodinách. Hodnota, kterou si člověk uložil, zůstává.
+- **Od výzkumu 1.30.0:** most, jehož výzkum zmizel, skončí až po druhé kontrole aspoň o 10 s později (dřív hned);
+  druhý most téhož výzkumu hned skončí.
+- **Od výzkumu 1.31.0:** i po aktualizaci zůstane u výzkumu jeden most. Most, který běží vedle mostu výzkumu (toho,
+  kterého jmenuje `.strom/live.json`), skončí sám při nejbližší kontrole (každých 10 s). Most, kterému aktualizace
+  smazala strom, ze kterého běží, skončí také a zapíše to do `.strom/live.log`. Nový most, který skončí, protože
+  výzkum drží jiný most, ukončí i most, který ho spustil k předání, pokud to není most výzkumu. Předání mostu
+  novějšímu stromu je rychlejší: starý most odpovídá, zatímco se nový strom ověřuje.
+
+<!-- zdroj: research:src/core/live.ts (v1.25.2) header :1-80, token crypto.randomBytes :1702, leaked :1809, :1995, LIVE_IDLE_MS / live.idleMinutes :1705, config.ts DEFAULT_LIVE_IDLE_MINUTES = 0 (od 1.29.0), live-last.json :518, seal.foreign / tree.not-downloaded / disk.full · src/commands/start.ts live · src/core/config.ts live.idleMinutes · research:94d75934 src/core/live.ts GONE_MS 10_000 (researchGone: dvě kontroly aspoň 10 s od sebe), otherBridge (most téhož stromu už běží → konec) · CHANGELOG.cs.md 1.30.0 · research:0c6f2205 src/core/live.ts OWNER_MS 10_000 (most mimo live.json skončí), kód stromu smazaný aktualizací (dvě kontroly GONE_MS, live.log), EXIT.locked → konec mostu, který spustil předání (STROM_LIVE_REPLACES), kromě mostu z live.json · 0239e6c3 předání: starý most odpovídá během ověření nového · CHANGELOG.cs.md 1.31.0 -->
+
+<a id="S1.2"></a>
+## S1.2 Výzkum se otevře v aplikaci odkazem z terminálu
+
+Výzkum se v aplikaci otevře příkazem `strom app`. Výzkum spustí most a otevře v prohlížeči aplikaci s odkazem na
+svůj strom. Poprvé vznikne v aplikaci nový strom, příště se aktualizuje tentýž.
+
+- **Hranice:**
+  - Pracuje-li ve stromu agent (nebo s volbou `--live`), aplikace strom rovnou sleduje živě ([S1.4](#S1.4)).
+    Jinak si strom jednou načte.
+  - Aplikace vezme jen odkaz na `127.0.0.1` nebo `localhost`. Jiný odkaz ignoruje s hlášením „Odkaz mířil na
+    soubor, který není na tomto počítači, proto byl ignorován.“
+  - Strom z výzkumu už v aplikaci je a od posledního načtení se v aplikaci nezměnil: aktualizuje se. Změnil se:
+    aplikace se zeptá, zda ho **Aktualizovat**, nebo **Otevřít jako kopii**. Před aktualizací se uloží záloha.
+  - Safari webové stránce spojení s programem na tomto počítači nedovolí. `strom app` proto Safari nikdy neotevře.
+    Bez vhodného prohlížeče soubor převezme nainstalovaná aplikace, nebo jde do okna aplikace přetáhnout soubor
+    `output/tree-strom.ged` ze složky výzkumu.
+  - Chrome a Edge se poprvé zeptají na povolení přístupu k zařízením v místní síti. Bez něj se aplikace k výzkumu
+    nedostane ([S1.5](#S1.5)).
+- **Ovládání:** terminál: `strom app`, `strom app --live`. Aplikace: **Výzkum → Další → Výzkum u tohoto
+  stromu…**
+- **Platí od:** aplikace 3.0.0, výzkum 1.0.0
+- **Od výzkumu 1.30.0:** na macOS předá výzkum adresu aplikaci nainstalované z prohlížeče na Chromiu (Chrome, Edge…)
+  prohlížeči, který už běží, stejně jako by ji předalo jeho druhé spuštění. Žádný další program se nespustí a v Docku
+  nepřibude ikona prohlížeče. Když prohlížeč neběží nebo do 5 s neodpoví, výzkum ho spustí jako dřív.
+
+<!-- zdroj: research:a4a2f6c0 src/core/chromium.ts openWebApp (darwin: handToRunning SingletonSocket, jinak launch), handToRunning (ACK, timeout 5000), singletonMessage · dirigent:prace/1109-vyzkum-dock-chrome/karta.md Výsledek (živě Chrome, Edge, Canary) · research:src/commands/start.ts (v1.25.2) app, liveAppUrl / importAppUrl, Safari · app:src/research-link.ts:584 parseLoopbackUrl, :747 decideResearchOpen · src/ui/research-ui.ts:1088 initExternalOpen, :1350 importResearchFromUrl · src/local-network.ts · strings.ts research.notLocal, research.editedMessage, research.safariBlocked -->
+
+<a id="S1.2.1"></a>
+### S1.2.1 Odkazy, které aplikace přijme
+
+| Odkaz | Co aplikace udělá |
+|---|---|
+| `?live=` | otevře strom a sleduje ho živě |
+| `?import-url=` | strom jednou načte z mostu |
+| `?send=` | pošle úpravy na adresu, kterou dal výzkum spuštěný z aplikace k poslání |
+| `?research=install` | otevře instalaci výzkumu (odkaz poslaný z telefonu) |
+| `?tree=…&research=…&person=…` | otevře strom výzkumu na zadané osobě |
+
+Parametry aplikace po zpracování z adresy odebere. Po obnovení stránky během sledování se sledování tiše obnoví.
+
+<!-- zdroj: app:src/ui/research-ui.ts initExternalOpen :1088, rememberedLiveBridge · src/deep-link.ts · src/research-install.ts -->
+
+<a id="S1.3"></a>
+## S1.3 Druhy stromů v aplikaci
+
+Strom v aplikaci je buď vlastní, nebo patří k výzkumu na tomto počítači. Strom z výzkumu nese v souboru číslo
+výzkumu a verzi, ze které vznikl. Podle toho aplikace ví, kam ho poslat zpět.
+
+| Druh | V přepínači stromů | Co to je |
+|---|---|---|
+| Vlastní strom | bez značky | strom jen v aplikaci, bez výzkumu |
+| Výzkum | **Výzkum** | strom, ve kterém pracuje agent výzkumu |
+| Archiv Stromu | **Archiv** | strom, který výzkum drží s prameny na disku, bez agenta |
+| Výzkum čeká na agenta | **Archiv** | výzkum, který zatím nemá agenta; aplikace s ním zachází jako s archivem |
+| Kopie | bez značky | starší kopie stromu z výzkumu (**Otevřít jako kopii**, duplikát, druhý import); z výzkumu se už neaktualizuje |
+
+- **Hranice:** zda je strom výzkum, nebo archiv, rozhoduje výzkum, ne aplikace. Přepnout jde jen ve výzkumu.
+- **Ovládání:** aplikace: přepínač stromů. Terminál: menu výzkumu.
+- **Platí od:** aplikace 3.12.0 (název Archiv Stromu), značky v přepínači od 3.16.0
+
+<!-- zdroj: app:src/research-link.ts _STROM_TREE, _STROM_HEAD · src/types.ts:1695 ResearchLink (copy, mode) · src/research-others.ts researchAgentless · src/ui/research-sync-ui.ts researchKindOf :654, researchAgentAway · strings.ts treeSwitcher.kindArchive, kindResearch · spec 002 · CHANGELOG.cs.md 3.12.0, 3.16.0 -->
+
+<a id="S1.4"></a>
+## S1.4 Sledování živě
+
+Při sledování živě přicházejí změny z výzkumu do aplikace samy. Sledovaný strom je mezitím jen pro čtení, aby se
+úprava v aplikaci nepotkala s prací agenta.
+
+- **Hranice:**
+  - Živě se sleduje vždy jen jeden strom. Sledování jiného stromu to předchozí ukončí.
+  - Přepnutí na strom, kde pracuje agent, ho začne sledovat bez dotazu. Neodeslané úpravy otevřeného stromu se
+    předtím pošlou.
+  - Sledování skončí, když agent přestane pracovat nebo když se z výzkumu stane archiv. Strom jde pak zase upravovat.
+  - Když se automatické sledování nepodaří, aplikace mlčí a strom zůstane, jak byl.
+- **Ovládání:** aplikace: **Sledovat živě** · terminál: `strom app --live`
+- **Platí od:** aplikace 3.0.0; přepnutí na strom s agentem od 3.13.1
+- **Od aplikace 3.26.0 s výzkumem 1.30.0:**
+  - výzkum má strom pro aplikaci sestavený pro každý stav a drží ho i po novém spuštění mostu;
+  - aplikace ukáže strom hned v poslední sestavené podobě. Když výzkum mezitím pokročil, panel výzkumu ukáže
+    „Připravuje se novější verze…“ a novější verze strom sama nahradí, jakmile je hotová;
+  - když se výzkum od posledního načtení nezměnil a strom v aplikaci je stále přesně ten načtený, aplikace ho znovu
+    nestahuje ani nenačítá;
+  - během sledování výzkum změnu ohlásí, až je její strom připravený.
+
+<!-- zdroj: app:src/ui/research-ui.ts startLiveFollow :2376 (opts.auto), researchReconnectOnly · strings.ts live.followLive, live.followingTree, live.followStarted, live.followMoved, live.liveEndedArchive, live.liveEndedNoAgent · CHANGELOG.cs.md 3.13.1 · spec 011 · app:669c08f0 src/research-tree-file.ts (ged.stale → tree.ged?stale=1, treeFileState preparing; ged.etag → If-None-Match jen u stromu přesně z toho souboru, 304 = strom zůstává), src/ui/research-ui.ts livePreparing, strings.ts research.newerPreparing · research:94d75934 src/core/liveged.ts (strom pro aplikaci jednou pro stav a variantu, na disku i po restartu mostu), src/core/live.ts (change až s hotovým stromem; ETag u tree.ged) · CHANGELOG.cs.md 1.30.0 -->
+
+<a id="S1.5"></a>
+## S1.5 Když výzkum neběží nebo spojení nejde
+
+Když aplikace výzkum nezastihne, strom v aplikaci se nemění a úpravy v něm počkají. Co přesně se stalo, ukáže
+aplikace v okně **Výzkum se nepodařilo spojit**.
+
+| Příčina | Co aplikace ukáže | Co pomůže |
+|---|---|---|
+| prohlížeč nepouští stránku k zařízením v místní síti | **… blokuje spojení** (název prohlížeče) | povolit **Aplikace na zařízení** (Brave: **Přístup k localhostu**) v nastavení webu |
+| prohlížeč se teprve ptá | **Prohlížeč čeká na povolení** | odpovědět na dotaz prohlížeče |
+| most neběží | **Výzkum neodpovídá** | spustit výzkum; na nové adrese ho spojí `strom app --live` |
+| na adrese odpovídá jiný most (změněný klíč, jiný strom) | **Výzkum odmítl spojení** | `strom app --live` |
+| Safari | **Safari výzkum nepustí** | otevřít odkaz v Chrome nebo Edge (**Zkopírovat odkaz**) |
+
+- **Hranice:**
+  - Okno vždy řekne, že se nic nezměnilo a strom zůstává, jak byl. **Zkusit znovu** zkusí spojení znovu.
+  - Strom z výzkumu jde upravovat i tehdy, když výzkum neběží. Úpravy se pošlou, až se výzkum znovu spojí.
+  - Most běží, ale neodpovídá: pomůže `strom live stop` a nové spuštění.
+- **Ovládání:** aplikace: **Zkusit znovu**, **Zavřít**, **Jak povolit** · terminál: `strom app --live`,
+  `strom live stop`
+- **Platí od:** aplikace 3.9.0
+
+<!-- zdroj: app:src/ui/research-ui.ts:1406 showResearchConnectFailed (denied, prompt, down, refused, safari) · src/local-network.ts · strings.ts sync.stateBlocked, sync.blockedSub, sync.settingApps, sync.settingBrave, sync.bridgeDownSub, sync.notRespondingSub, sync.addressRefusedSub, researchOthers.offPanel -->
+
+<a id="S1.6"></a>
+## S1.6 Starší a novější verze
+
+Aplikace a výzkum se vydávají zvlášť. Výzkum aplikaci ve stavu řekne, co umí, a aplikace podle toho zapne jen to,
+co výzkum přijme. Výzkum zase podle verze aplikace volí, co jí pošle.
+
+- **Hranice:**
+  - **Starší výzkum** (bez automatického posílání, nebo bez titulů): aplikace ukáže **Výzkum má starší verzi (v)**
+    s nabídkou **Aktualizovat výzkum**. Úpravy se pak posílají jen ručně: aplikace výzkum spustí v terminálu a ten
+    si je vezme. Tituly do aktualizace zůstanou jen v aplikaci.
+  - **Nová verze výzkumu k dispozici:** aplikace ukáže **Nová verze Strom Research …** s tlačítkem
+    **Aktualizovat**. Co právě běží, doběhne na současné verzi.
+  - **Výzkum, který zapsala novější verze programu `strom`:** starší program ho neotevře ani do něj nezapíše.
+  - **Strom uložený novější verzí aplikace:** v aplikaci je jen ke čtení, dokud se aplikace neaktualizuje.
+- **Ovládání:** aplikace: **Aktualizovat výzkum**, **Zkontrolovat znovu** · terminál: `strom update`
+- **Platí od:** aplikace 3.9.0 (výzkum 1.12.0); strom jen ke čtení od aplikace 3.19.0
+- **Od aplikace 3.22.0:** linie z aplikace a panel bez spojení se zapnou jen s výzkumem 1.26.0
+  ([S4](S4-research-from-the-app.md)).
+
+<!-- zdroj: app:src/ui/research-update-ui.ts · strings.ts researchUpdate.line, researchUpdate.titlesLine, research.updateAvailable, research.updateBusyHint, storage.newerReadOnly · research:src/core/live.ts (v1.25.2) status locked :1516, :2810, appVersionOf :1492 · CHANGELOG.cs.md 3.19.0 -->
+
+<a id="S1.7"></a>
+## S1.7 Více výzkumů na jednom počítači
+
+Každý strom z výzkumu má vlastní most. Aplikace se ptá i mostů stromů, které právě nejsou otevřené, a jejich stav
+ukáže v přepínači stromů.
+
+- **Hranice:**
+  - Značky u stromu v přepínači: **živě** (sleduje se), **běží** nebo **N linie** (agent pracuje), **čeká N**
+    (věci k vyřízení), **neběží**.
+  - Ptá se vždy jen jednoho mostu naráz a jen tehdy, když je stránka vidět: poprvé po 3 sekundách, pak každou
+    minutu. Na odpověď čeká nejvýš 1,5 sekundy.
+  - Neběžící výzkum se znovu spojí otevřením stromu z výzkumu (`strom app`).
+- **Ovládání:** aplikace: přepínač stromů; panel výzkumu, řádek **Jinde**
+- **Platí od:** aplikace 3.13.1
+
+<!-- zdroj: app:src/research-others.ts ResearchTreeKind, OTHER_BRIDGES_TIMINGS · src/ui/research-others-ui.ts · strings.ts researchOthers.otherTreeLabel, researchOthers.offReconnect · CHANGELOG.cs.md 3.13.1 -->
+
+<a id="S1.8"></a>
+## S1.8 Data zůstávají na počítači
+
+Aplikace drží stromy v úložišti prohlížeče na tomto zařízení. Výzkum drží svůj strom ve své složce na disku. Mezi
+nimi jde strom jen přes most na tomto počítači ([S1.1](#S1.1)).
+
+- **Hranice:**
+  - Každý prohlížeč má vlastní úložiště. Strom otevřený v Chrome v Edge není.
+  - Strom v aplikaci a strom ve výzkumu jsou dvě kopie. Hlavní je strom v aplikaci, výzkum má vlastní kopii, a co
+    výzkum nezapíše, je v aplikaci vždy vidět ([S2](S2-edits-from-the-app.md)).
+- **Platí od:** aplikace 3.0.0
+
+<!-- zdroj: app:src/storage.ts strom-db, strom-originals · strings.ts treeSettings.principles · research:src/core/live.ts 127.0.0.1 -->
+
+<a id="S1.9"></a>
+## S1.9 Výzkum zapnutý: přepínač mostu u stromu
+
+Každý strom z výzkumu na tomto počítači má v aplikaci přepínač **Výzkum zapnutý**. Ukazuje skutečný stav mostu:
+zapnutý, když most odpovídá, jinak vypnutý. Zapnutý most běží do vypnutí přepínačem nebo `strom live stop`, do vypnutí
+počítače, nebo podle nastavení **Vypnout výzkum po nečinnosti**.
+
+- **Hranice:**
+  - Vypnutí ukončí most jako `strom live stop`, jen si most nechá adresu (port a klíč). Vypnutý most zůstane vypnutý:
+    nová práce ve stromu ho sama nevrátí. Strom v aplikaci zůstává a jde dál upravovat
+    ([S1.5](#S1.5)). Pod přepínačem stojí „Vypnutý. Zůstane vypnutý, dokud se znovu nezapne.“
+  - Most vypnutý nečinností se vrátí sám s novou prací ve stromu, na téže adrese. Pod přepínačem stojí „Vypnul se po
+    nečinnosti. S novou prací ve stromu se zase zapne sám.“
+  - Zapnutí pošle výzkumu odkaz, který spustí jen most na jeho poslední adrese, bez okna. Když se nic nestane, nebo
+    výzkum zapnutí z aplikace neumí, aplikace ukáže příkaz `strom live start` (spustit v terminálu ve složce stromu)
+    s tlačítkem **Kopírovat**. Starší výzkum, který vypnutí z aplikace neumí, ukáže stejně příkaz `strom live stop`.
+  - Po vypnutí nebo restartu počítače most neběží a sám se nespustí. Zapne ho člověk: v panelu výzkumu **Zapnout**,
+    nebo `strom live start`.
+  - **Vypnout výzkum po nečinnosti** má dvě volby: **Do vypnutí počítače** (výchozí) a **Po 2 hodinách nečinnosti**.
+    Platí pro všechny stromy na tomto počítači a drží ji výzkum (`live.idleMinutes` 0 nebo 120). Běžící mosty ji
+    převezmou do minuty. Hodnota nastavená v terminálu se ukáže jako **Vlastní hodnota (N min)**. Neběží-li výzkum,
+    který volbu umí, aplikace místo voleb ukáže příkazy do terminálu.
+  - Na telefonu a tabletu přepínač není (výzkum běží na počítači). Kopie stromu z výzkumu přepínač nemá.
+- **Ovládání:** aplikace: přepínač **Výzkum zapnutý** v panelu výzkumu (strom bez sledování živě a po skončení
+  sledování) a ve **Správě stromů** u řádku stromu; panel výzkumu, když výzkum neběží: **Zapnout**; **Nastavení** →
+  **Výzkum na tomto počítači** → **Vypnout výzkum po nečinnosti**. Terminál: `strom live start`, `strom live stop`,
+  `strom config set live.idleMinutes 0` (do vypnutí počítače) nebo `120` (po 2 hodinách nečinnosti).
+- **Platí od:** aplikace 3.25.0, výzkum 1.29.0
+
+<!-- zdroj: research:src/core/live.ts liveWrite (POST <token>/live {idleMinutes 0…10080} → strom config set live.idleMinutes; {do: stop} → konec stopped, adresa zůstává), liveState (/status live idleMinutes, idleChoices), IDLE_READ_MS 60 s, reviveLive + endedIdle (zpět s prací jen konec idle; bez slova: zpět s menu, prací, aktualizací), stop SIGTERM → signal · src/core/config.ts DEFAULT_LIVE_IDLE_MINUTES 0, LIVE_IDLE_AFTER_MINUTES 120, LIVE_IDLE_CHOICES, LIVE_IDLE_MAX_MINUTES · src/core/links.ts LINK_LIVE_DOS start · src/commands/links.ts startBridge (bez okna) · app:src/ui/research-live-ui.ts researchLiveState (onComputer, link.copy, features live.stop / live.start), fillResearchLiveSlot, fillResearchLiveStart, renderResearchLiveSettings (LIVE_IDLE_FOREVER, LIVE_IDLE_TWO_HOURS, idleCustom), COMMAND_START / COMMAND_STOP · src/ui/research-ui.ts researchLiveSlot (panel po skončení sledování, idle, start) · src/ui/tree-management.ts researchLiveSlotHtml · strings.ts researchLive.* · index.html settings-group-research-live · spec 064 K1.1–K2.3 -->

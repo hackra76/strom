@@ -50,6 +50,7 @@ import { placesView, resetPlacesView } from './places-identify-ui.js';
 import { uiModule } from './module.js';
 import { normalizeModal } from './modal-skeleton.js';
 import type { MapScope } from './map-ui.js';
+import { helpMark } from './help-mark.js';
 
 /** A row of the dialog: a place with its location, when it has one. */
 interface ManagerPlace {
@@ -224,6 +225,7 @@ export const placesManagerMethods = uiModule({
                     <button type="button" class="secondary" id="places-close" data-dismiss>${strings.buttons.close}</button>
                 </div>
             </div>`;
+        overlay.querySelector('#places-close-x')?.before(helpMark('placesManager'));
         document.body.appendChild(overlay);
         // Wrap the body into its scroll container now, not in the skeleton's
         // observer later: moving the rows there afterwards would drop the
@@ -674,20 +676,29 @@ export const placesManagerMethods = uiModule({
         if (id.state === 'running') line = `<p class="place-pin-text">${this.escapeHtml(strings.places.state.runningTitle)}</p>`;
         else if (id.state === 'undet' && id.why) line = `<p class="place-pin-text">${this.escapeHtml(id.why)}</p>`;
         else if (id.state === 'check') {
-            const text = id.checks?.[0] ? checkFindingText(id.checks[0], lang) : id.checkWhy ?? '';
-            if (text) line = `<p class="place-pin-text" data-tone="warn">${this.escapeHtml(text)}</p>`;
+            const f = id.checks?.[0];
+            const text = f ? checkFindingText(f, lang) : id.checkWhy ?? '';
+            // Far from the family, or in another district than the records name: the map may have found a namesake.
+            const same = f && (f.kind === 'far' || f.kind === 'district') ? ` ${strings.places.dialog.checkSameName}` : '';
+            if (text) line = `<p class="place-pin-text" data-tone="warn">${this.escapeHtml(text + same)}</p>`;
         } else if (town && (geo?.townChoices ?? 0) > 1) line = `<span class="place-nearest">${this.escapeHtml(m.nearestTown)}</span>`;
         else if (id.state === 'placed' || id.state === 'verified') {
             const former = placeFormerLine(id, p.usage.display, lang);
             if (former) line = `<p class="place-pin-text place-former">${this.escapeHtml(former)}</p>`;
         }
         const actions = placeRowActions(id, { canResearch: managerCanResearch, hasGeo: !!geo, byTown: !!geo?.byTown });
+        // Check: the location as it stands, on the small map among the tree's places, before Keep or Change.
+        const checkMap = id.state === 'check' && !!geo;
+        const mapOpen = checkMap && placesView.checkMap.has(p.key);
+        const acts = actions.map(a => this.placeActionHtml(a, id, p.key));
+        if (checkMap) acts.push(this.placeCheckMapToggleHtml(mapOpen));
         return `
             <div class="place-pin${id.state === 'none' ? ' place-pin-none' : ''}" data-state="${id.state}">
                 <div class="place-pin-state">${badge}</div>
                 ${label ? `<span class="place-pin-label"><span class="place-pin-mark" aria-hidden="true">⌖</span> ${this.escapeHtml(label)}</span>` : ''}
                 ${line}
-                ${actions.length ? `<span class="place-pin-acts">${actions.map(a => this.placeActionHtml(a, id, p.key)).join('')}</span>` : ''}
+                ${acts.length ? `<span class="place-pin-acts">${acts.join('')}</span>` : ''}
+                ${mapOpen ? this.placeCheckMapHtml(label || p.usage.display) : ''}
             </div>`;
     },
 
@@ -793,6 +804,9 @@ export const placesManagerMethods = uiModule({
         };
         for (const b of own<HTMLButtonElement>('.place-keep')) b.onclick = () => this.keepPlaceLocation(key);
         for (const b of own<HTMLButtonElement>('.place-why-toggle')) b.onclick = () => this.togglePlaceWhy(row, key);
+        for (const b of own<HTMLButtonElement>('.place-checkmap-toggle')) b.onclick = () => this.togglePlaceCheckMap(row, key);
+        const checkMap = own<HTMLElement>('.place-check-map .place-mini-map')[0];
+        if (checkMap) this.drawPlaceCheckMap(checkMap, key);
         const rename = row.querySelector<HTMLButtonElement>('.place-rename-open');
         if (rename) rename.onclick = () => this.openPlaceRename(row, key);
         const split = row.querySelector('.place-split-one') as HTMLButtonElement | null;

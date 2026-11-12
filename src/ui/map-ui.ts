@@ -22,6 +22,7 @@ import { strings, getCurrentLanguage } from '../strings.js';
 import { placeOriginBadge, type PlaceIdentity } from '../place-identity.js';
 import { checkFindingText, placeFormerLine, placeLocationLabel } from '../places-dialog.js';
 import { mapBarState, mapBubbleResearch, type MapBarAction } from '../place-actions.js';
+import { researchBridgeAgentLabel } from './research-open-mark.js';
 import { placeGeoHash } from '../place-records.js';
 import { PersonId, PlaceGeo } from '../types.js';
 import {
@@ -39,6 +40,7 @@ import {
 } from '../map.js';
 import { GEOCODER_NAME, geocodePlaces, placesCentroid } from '../geocode.js';
 import { uiModule } from './module.js';
+import { loadMapTile, mapTilesBlocked, onMapTilesChange, releaseMapTile } from './map-tiles.js';
 
 import { iconSvg } from '../icons.js';
 import { shownName } from '../person-name.js';
@@ -60,6 +62,8 @@ let openPoint: string | null = null;
 /** The open town bubble's house search, and the houses (houseKey, NO_HOUSE) shown with all their people. */
 let townQuery = '';
 let townExpanded = new Set<string>();
+/** openPoint of a bubble of the research's work alone (no map point of its own). */
+const WORK_BUBBLE = '\u0001work:';
 /** The "no house number" group in townExpanded. */
 const NO_HOUSE = '\u0000';
 /** Above this many houses a town bubble gets its search and shortens each house's people. */
@@ -69,6 +73,8 @@ let kindsMenuOpen = false;
 let kindTipTimer: number | null = null;
 /** Escape and the click outside the menu of kinds are listened to once, for every map canvas. */
 let mapKeysBound = false;
+/** The map listens once for the tile server's refusal (its note), for every map canvas. */
+let mapTilesBound = false;
 
 /** Per tree: the places the map's own lookup asked for and did not find (this page's life). */
 const geocodeMissed = new Map<string, Set<string>>();
@@ -183,7 +189,7 @@ export const mapMethods = uiModule({
                             aria-label="${strings.map.zoomIn}" title="${strings.map.zoomIn}">+</button>
                     <button type="button" class="map-zoom-out" onclick="window.Strom.UI.zoomMap(-1)"
                             aria-label="${strings.map.zoomOut}" title="${strings.map.zoomOut}">−</button>
-                    <button type="button" class="map-fit" onclick="window.Strom.UI.fitMapToPlaces()"
+                    <button type="button" class="map-fit" onclick="window.Strom.UI.fitMapToPlaces(true)"
                             aria-label="${strings.map.fit}" title="${strings.map.fit}">⤢</button>
                     <button type="button" class="map-time-toggle" onclick="window.Strom.UI.toggleMapTime()"
                             aria-pressed="false" aria-label="${strings.map.timeMode}" title="${strings.map.timeMode}">${iconSvg('timer')}</button>
@@ -233,6 +239,8 @@ export const mapMethods = uiModule({
         this.drawMapTiles(container);
         this.drawMapMarkers(container, places);
         this.renderMapStatus(places);
+        // Following the research: where it works now and its trail, over the markers.
+        this.applyMapFollowMarks();
         // The states the research knows (check marks, to confirm) come with its places.
         void this.refreshPlacesLive(LIVE_MAX_AGE_MS);
     },
@@ -246,6 +254,11 @@ export const mapMethods = uiModule({
     mapBarAction(action: MapBarAction): void {
         if (action === 'geocode') { void this.startGeocoding(); return; }
         if (action === 'confirm') { this.openWaitingPlaces(); return; }
+        if (action === 'research') {
+            // Where its steps do not go here (another computer, a phone, an older research): say where they go.
+            const note = this.placesResearchNote(this.placesResearchContext().access);
+            if (note) { this.showToast(note, 8000); return; }
+        }
         this.showPlacesManager(undefined, undefined, undefined, { unplaced: action === 'research' });
         if (action === 'research' && document.getElementById('places-modal')) this.openPlacesBulk('look');
     },
@@ -278,7 +291,11 @@ export const mapMethods = uiModule({
         const ro = new ResizeObserver(update);
         bars.forEach(el => ro.observe(el));
         // The canvas can be rebuilt: one window listener, pointing at the latest.
-        if (!mapFloorUpdate) window.addEventListener('resize', () => mapFloorUpdate?.());
+        if (!mapFloorUpdate) {
+            window.addEventListener('resize', () => mapFloorUpdate?.());
+            // The phone's research strip moves the status bar without resizing it.
+            window.addEventListener('strom:live-strip', () => mapFloorUpdate?.());
+        }
         mapFloorUpdate = update;
     },
 
@@ -523,12 +540,15 @@ export const mapMethods = uiModule({
         const research = this.placesResearchContext();
         const input = {
             shown: places.length, missing: missing.length, missingTried: missing.filter(p => missed.has(p.key)).length,
-            access: research.access, confirm: 0,
+            access: research.access, confirm: 0, look: 0,
         };
-        // "N to confirm" counts only after the lookup, with a research.
-        if (input.missing > 0 && input.missingTried >= input.missing && research.access !== 'none') {
-            const ids = this.placeIdentitiesNow([...places.map(p => p.key), ...missing.map(p => p.key)]);
-            input.confirm = [...ids.values()].filter(id => id.state === 'confirm').length;
+        // With a research: what it could look up (as Places' preview: no location or not identified,
+        // nothing queued twice, spec 058); "N to confirm" counts only after the lookup.
+        if (input.missing > 0 && research.access !== 'none') {
+            const after = input.missingTried >= input.missing;
+            const ids = this.placeIdentitiesNow([...(after ? places.map(p => p.key) : []), ...missing.map(p => p.key)]);
+            input.look = missing.filter(p => { const st = ids.get(p.key)?.state; return st === 'none' || st === 'undet'; }).length;
+            if (after) input.confirm = [...ids.values()].filter(id => id.state === 'confirm').length;
         }
         const bar = mapBarState(input);
         const confirm = input.confirm;
@@ -540,7 +560,8 @@ export const mapMethods = uiModule({
             const go = `onclick="window.Strom.UI.mapBarAction('${a}')"`;
             switch (a) {
                 case 'geocode': return `<button type="button" ${go}>${strings.map.lookUp(missing.length)}</button>`;
-                case 'research': return `<button type="button" class="map-status-research" ${go} title="${this.escapeHtml(om.lookResearchTitle)}">${this.escapeHtml(om.lookResearch(missing.length))}</button>`;
+                // An agent's work asked through the bridge (queued, nothing runs yet): the AI badge alone.
+                case 'research': return `<button type="button" class="map-status-research" ${go} title="${this.escapeHtml(om.lookResearchTitle)}">${researchBridgeAgentLabel(bar.after ? om.lookResearch(input.look) : om.lookResearchShort)}</button>`;
                 case 'confirm': return `<button type="button" class="secondary map-status-confirm" ${go} title="${this.escapeHtml(om.confirmTitle)}"><span aria-hidden="true">?</span> ${this.escapeHtml(om.confirm(confirm))}</button>`;
                 case 'places': return `<button type="button" class="secondary" ${go}>${strings.map.managePlaces}</button>`;
             }
@@ -574,7 +595,7 @@ export const mapMethods = uiModule({
                 img.className = 'map-tile';
                 img.alt = '';
                 img.draggable = false;
-                img.src = tileUrl(t);
+                loadMapTile(img, tileUrl(t));
                 layer.appendChild(img);
                 live.set(key, img);
             }
@@ -583,10 +604,36 @@ export const mapMethods = uiModule({
         }
         for (const [key, img] of live) {
             if (!seen.has(key)) {
+                releaseMapTile(img);
                 img.remove();
                 live.delete(key);
             }
         }
+        this.renderMapTilesBlocked(container);
+        if (!mapTilesBound) {
+            mapTilesBound = true;
+            onMapTilesChange(() => {
+                const open = document.getElementById('map-container');
+                if (open?.querySelector('.map-canvas')) this.renderMapTilesBlocked(open);
+            });
+        }
+    },
+
+    /**
+     * The tile server refused the background: one plain note on the map
+     * instead of a grid of "Access blocked" pictures. The points, the bar and
+     * the attribution stay; the note lets clicks through to the map.
+     */
+    renderMapTilesBlocked(container: HTMLElement): void {
+        const note = container.querySelector('.map-tiles-blocked');
+        if (!mapTilesBlocked()) { note?.remove(); return; }
+        if (note) return;
+        const el = document.createElement('div');
+        el.className = 'map-tiles-blocked';
+        el.setAttribute('role', 'status');
+        el.textContent = strings.map.tilesBlocked;
+        // Right above the tiles: the points, lines and bubble are drawn over it.
+        container.querySelector('.map-tiles')?.after(el);
     },
 
     drawMapMarkers(container: HTMLElement, places: MappedPlace[]): void {
@@ -595,7 +642,11 @@ export const mapMethods = uiModule({
 
         // Time mode draws its own markers (cumulative, year-aware) plus the
         // migration lines; the ordinary marker set is ignored while it is on.
-        if (this.mapTimeOn) { this.drawMapTimeLayer(container); return; }
+        if (this.mapTimeOn) {
+            this.drawMapTimeLayer(container);
+            this.positionMapFollow(container);
+            return;
+        }
         const lines = container.querySelector('.map-lines') as SVGElement | null;
         if (lines) lines.innerHTML = '';
 
@@ -612,6 +663,7 @@ export const mapMethods = uiModule({
             return this.mapMarkerHtml(info, persons, false, width, height, check);
         }).join('');
         declutterMapLabels(layer);
+        this.positionMapFollow(container);
     },
 
     /**
@@ -945,6 +997,7 @@ export const mapMethods = uiModule({
             townExpanded = new Set();
         }
         openPoint = point.key;
+        popup.classList.remove('map-work-bubble');
 
         const m = strings.map;
         const on = this.mapKinds();
@@ -995,6 +1048,8 @@ export const mapMethods = uiModule({
             <div class="map-popup-foot">
                 <button type="button" class="map-popup-fix" data-key="${this.escapeHtml(point.type === 'town' ? point.ownKey ?? point.key : point.key)}">${m.wrongSpot}</button>
             </div>`;
+        // Following the research: the runs at work here, right under the place's head.
+        this.mapPopupWork(popup, point.key);
         if (point.type === 'town') {
             this.renderMapTownList(point);
             const input = popup.querySelector('.map-popup-search input') as HTMLInputElement | null;
@@ -1009,6 +1064,24 @@ export const mapMethods = uiModule({
         popup.classList.toggle('map-popup--sheet', sheet);
         document.getElementById('map-container')?.classList.toggle('map-sheet-open', sheet);
         if (sheet && opts.pan !== false) this.panMapAboveSheet(geo);
+    },
+
+    /**
+     * A bubble of the research's work alone (spec 043 §5.4): a place worked on
+     * that is not one of the map's points now. Closes like any bubble.
+     */
+    showMapWorkBubble(html: string, geo: PlaceGeo | { lat: number; lon: number }, session: number): void {
+        const popup = document.querySelector('.map-popup') as HTMLElement | null;
+        if (!popup) return;
+        openPoint = `${WORK_BUBBLE}${session}`;
+        popup.innerHTML = html;
+        popup.classList.add('map-work-bubble');
+        this.fillMapWorkTimes(popup);
+        popup.style.display = 'flex';
+        const sheet = window.matchMedia(MQ_MOBILE).matches;
+        popup.classList.toggle('map-popup--sheet', sheet);
+        document.getElementById('map-container')?.classList.toggle('map-sheet-open', sheet);
+        if (sheet) this.panMapAboveSheet({ lat: geo.lat, lon: geo.lon });
     },
 
     /**
@@ -1187,6 +1260,14 @@ export const mapMethods = uiModule({
             if (target.closest('.map-popup-close')) { this.closeMapPopup(); return; }
             const person = target.closest('.map-popup-person') as HTMLElement | null;
             if (person?.dataset.personId) { this.focusFromMap(person.dataset.personId); return; }
+            // The person a run works on: the family view, as following goes there (spec 043 §1.2).
+            const worked = target.closest('.map-work-person') as HTMLElement | null;
+            if (worked?.dataset.personId) {
+                this.closeMapPopup();
+                if (this.liveFollowView()) this.followToPerson(worked.dataset.personId as PersonId);
+                else this.focusFromMap(worked.dataset.personId);
+                return;
+            }
             const more = target.closest('.map-popup-more') as HTMLElement | null;
             if (more && openPoint) {
                 townExpanded.add(more.dataset.group ?? '');
@@ -1218,7 +1299,7 @@ export const mapMethods = uiModule({
             // A button the bubble re-rendered under the click ("+ N more") is
             // no longer in the page: that click was inside the bubble.
             if (!(e.target as Node).isConnected) return;
-            if ((e.target as HTMLElement).closest('.map-marker, .map-popup, .map-controls, .map-topleft, .map-status, .map-timebar, .map-tiles-notice, .map-attribution')) return;
+            if ((e.target as HTMLElement).closest('.map-marker, .map-marker-work, .map-follow-notices, .follow-legend-host, .map-popup, .map-controls, .map-topleft, .map-status, .map-timebar, .map-tiles-notice, .map-attribution')) return;
             if (downAt && Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) > 6) return;
             this.closeMapPopup();
         });
@@ -1228,7 +1309,10 @@ export const mapMethods = uiModule({
         openPoint = null;
         document.getElementById('map-container')?.classList.remove('map-sheet-open');
         const popup = document.querySelector('.map-popup') as HTMLElement | null;
-        if (popup) popup.style.display = 'none';
+        if (popup) {
+            popup.style.display = 'none';
+            popup.classList.remove('map-work-bubble');
+        }
     },
 
     /** Clicking a person on the map takes you to them in the family view. */
@@ -1246,9 +1330,11 @@ export const mapMethods = uiModule({
         TreeRenderer.render();
     },
 
-    fitMapToPlaces(): void {
+    /** Frame every place; `byUser`: the Fit button (following there then stops panning the map). */
+    fitMapToPlaces(byUser = false): void {
         const container = document.getElementById('map-container');
         if (!container) return;
+        if (byUser) this.noteMapMovedByUser();
         const places = this.mapPlaces();
         if (places.length === 0) return;
         const { width, height } = this.mapViewportSize(container);
@@ -1259,9 +1345,11 @@ export const mapMethods = uiModule({
         this.drawMapMarkers(container, places);
     },
 
+    /** The + / − buttons. */
     zoomMap(delta: number): void {
         const container = document.getElementById('map-container');
         if (!container || !this.mapCenter) return;
+        this.noteMapMovedByUser();
         const { width, height } = this.mapViewportSize(container);
         const next = zoomAround(
             this.mapCenter, this.mapZoom, this.mapZoom + delta,
@@ -1285,6 +1373,8 @@ export const mapMethods = uiModule({
         let lastY = 0;
         let pinching = false;
         let pinchBaseline = 0;   // finger spread measured at the last zoom step
+        // Where a drag started: past a few px it moves the map by hand (following there pauses its panning).
+        let dragFrom: { x: number; y: number } | null = null;
 
         // Redraws re-position tiles/markers, so during a gesture they are
         // coalesced to one per frame instead of one per pointer event.
@@ -1305,8 +1395,9 @@ export const mapMethods = uiModule({
         };
 
         container.addEventListener('pointerdown', (e: PointerEvent) => {
-            if ((e.target as HTMLElement).closest('.map-marker, .map-popup, .map-controls, .map-topleft, .map-status, .map-timebar, .map-tiles-notice')) return;
+            if ((e.target as HTMLElement).closest('.map-marker, .map-marker-work, .map-follow-notices, .follow-legend-host, .map-popup, .map-controls, .map-topleft, .map-status, .map-timebar, .map-tiles-notice')) return;
             pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+            if (pointers.size === 1) dragFrom = { x: e.clientX, y: e.clientY };
             try { container.setPointerCapture(e.pointerId); } catch { /* not capturable */ }
             if (pointers.size === 1) {
                 dragging = true;
@@ -1331,6 +1422,7 @@ export const mapMethods = uiModule({
                 const { step, baseline } = pinchZoomStep(spread(), pinchBaseline);
                 pinchBaseline = baseline;
                 if (step !== 0) {
+                    this.noteMapMovedByUser();
                     const [a, b] = [...pointers.values()];
                     const rect = container.getBoundingClientRect();
                     const next = zoomAround(
@@ -1346,6 +1438,10 @@ export const mapMethods = uiModule({
             }
 
             if (dragging && this.mapCenter) {
+                if (dragFrom && Math.hypot(e.clientX - dragFrom.x, e.clientY - dragFrom.y) > 4) {
+                    dragFrom = null;
+                    this.noteMapMovedByUser();
+                }
                 this.mapCenter = panCenter(this.mapCenter, this.mapZoom, e.clientX - lastX, e.clientY - lastY);
                 lastX = e.clientX;
                 lastY = e.clientY;
@@ -1376,6 +1472,7 @@ export const mapMethods = uiModule({
         container.addEventListener('wheel', (e: WheelEvent) => {
             if (!this.mapCenter) return;
             e.preventDefault();
+            this.noteMapMovedByUser();
             const rect = container.getBoundingClientRect();
             const next = zoomAround(
                 this.mapCenter, this.mapZoom, this.mapZoom + (e.deltaY < 0 ? 1 : -1),
@@ -1435,6 +1532,8 @@ export const mapMethods = uiModule({
             signal: controller.signal,
             // A place with a house the geocoder does not know is looked up by its town (§4).
             townFallback: { centroid: placesCentroid(data.places), known: knownStreets(data) },
+            // Of several towns of a place's name, the one nearest the tree's other places (A6.5.1).
+            treePlaces: data.places,
             onProgress: (done, total) => {
                 this.mapGeocoding = { done, total, place: names[Math.min(done, total - 1)] };
                 this.renderMapStatus(this.mapPlaces());

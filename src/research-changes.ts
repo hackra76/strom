@@ -5,9 +5,13 @@
  * Pure: no DOM, no storage.
  */
 
-import { StromData, Person, Partnership, Source, EventParticipant, PersonId, LifeEvent, Attachment, PlaceGeo, isPrimaryName } from './types.js';
+import { StromData, Person, Partnership, Source, EventParticipant, PersonId, LifeEvent, Attachment, PlaceGeo, isPrimaryName, personSourceIds } from './types.js';
 import { isPurePlaceholder } from './single-parent.js';
 import { collectPlaces } from './places.js';
+import { factValueSignature, handedConfirmations } from './verify.js';
+import type { FactHolder } from './import-origin.js';
+import { getStringsForLang, SUPPORTED_LANGUAGES } from './strings.js';
+import { sourcePlaceDiffers, sourcePlaceKey } from './source-location.js';
 
 export type ChangeKind =
     | 'added' | 'deleted' | 'name' | 'gender' | 'birth' | 'death' | 'marriage' | 'event'
@@ -27,13 +31,14 @@ export interface PersonChange {
     refn?: string;
 }
 
-const NAME_FIELDS: (keyof Person)[] = ['firstName', 'lastName', 'titleBefore', 'titleAfter', 'marriedSurname', 'primaryName', 'nameVariants'];
-const BIRTH_FIELDS: (keyof Person)[] = ['birthDate', 'birthPlace', 'birthAddress'];
+const NAME_FIELDS: (keyof Person)[] = ['firstName', 'lastName', 'titleBefore', 'titleAfter', 'marriedSurname', 'marriedFirstName', 'primaryName', 'nameVariants'];
+const BIRTH_FIELDS: (keyof Person)[] = ['birthDate', 'birthPlace', 'birthAddress', 'birthAge'];
 const DEATH_FIELDS: (keyof Person)[] = ['deathDate', 'deathPlace', 'deathCause', 'deathAge', 'deathAddress', 'isDeceased'];
 const CITATION_FIELDS: (keyof Person)[] = ['sourceIds', 'birthSourceIds', 'deathSourceIds'];
 /** Not the user's: the research's own knowledge and statuses, and what the app keeps for itself. */
-const IGNORED_FIELDS = new Set<string>(['research', 'birthStatus', 'deathStatus', 'photoOriginalName', 'partnerships', 'childIds', 'isLocked',
-    'dismissedMarriedSuggestion']);
+const IGNORED_FIELDS = new Set<string>(['research', 'birthStatus', 'deathStatus', 'photoOriginalName', 'photoDate', 'partnerships', 'childIds', 'isLocked',
+    'dismissedMarriedSuggestion', 'importId', 'importedValues', 'importedParents', 'researchOrigins', 'originalIds', 'gedcomExtra', 'alsoChildOf',
+    'confirmed', 'researchVerify']);
 const MARRIAGE_FIELDS: (keyof Partnership)[] = ['status', 'startDate', 'startPlace', 'endDate', 'endPlace', 'address', 'ages', 'note'];
 
 /** JSON with sorted keys and images reduced to their length (two copies of one tree compare equal). */
@@ -48,6 +53,18 @@ export function stable(value: unknown): string {
 }
 
 const differs = (a: unknown, b: unknown): boolean => stable(a) !== stable(b);
+
+/**
+ * A fact confirmed or a confirmation taken back between the two (what goes
+ * to the research as `_STROM_CONFIRMED`): a confirmation ended by a change
+ * of the fact's value is that change, told as it.
+ */
+function confirmationsDiffer(before: FactHolder, after: FactHolder): boolean {
+    const a = handedConfirmations(before);
+    const b = handedConfirmations(after);
+    return [...new Set([...Object.keys(a), ...Object.keys(b)])]
+        .some(fact => a[fact] !== b[fact] && !(b[fact] === undefined && factValueSignature(before, fact) !== factValueSignature(after, fact)));
+}
 const fullName = (p: Person): string => `${p.firstName} ${p.lastName}`.trim() || '?';
 /** The name with its titles ("Ing. Josef Novák st."): a title the load takes away is a value it overwrites (B18-1). */
 const titledName = (p: Person): string => [p.titleBefore, p.firstName, p.lastName, p.titleAfter].map(v => v?.trim() ?? '').filter(Boolean).join(' ');
@@ -113,8 +130,9 @@ function personKinds(before: Person, after: Person): Set<ChangeKind> {
         const a = evBefore.get(id);
         const b = evAfter.get(id);
         if (!a || !b) { kinds.add(b?.type === 'birth' || a?.type === 'birth' ? 'birth' : 'event'); if (b?.participants?.length) participantKinds([], b.participants).forEach(k => kinds.add(k)); continue; }
-        const { participants: pa, sourceIds: sa, status: _st1, ...restA } = a;
-        const { participants: pb, sourceIds: sb, status: _st2, ...restB } = b;
+        // gedcomEmails: what the loaded file wrote as EMAIL, kept for "Back to {prog}" only.
+        const { participants: pa, sourceIds: sa, status: _st1, gedcomEmails: _em1, gedcomValue: _gv1, gedcomAddress: _ga1, ...restA } = a;
+        const { participants: pb, sourceIds: sb, status: _st2, gedcomEmails: _em2, gedcomValue: _gv2, gedcomAddress: _ga2, ...restB } = b;
         if (differs(restA, restB)) kinds.add('event');
         participantKinds(pa, pb).forEach(k => kinds.add(k));
         if (differs(sa ?? [], sb ?? [])) kinds.add('citation');
@@ -136,6 +154,8 @@ function personKinds(before: Person, after: Person): Set<ChangeKind> {
         return o;
     };
     if (differs(rest(before), rest(after))) kinds.add('other');
+    // A fact confirmed, or a confirmation taken back, goes to the research (`_STROM_CONFIRMED`).
+    if (confirmationsDiffer(before, after)) kinds.add('other');
     if (differs(ownAtts(before).map(a => ({ ...a, dataUrl: undefined })), ownAtts(after).map(a => ({ ...a, dataUrl: undefined })))
         && !kinds.has('attachment') && !kinds.has('attachmentRemoved')) kinds.add('other');
     return kinds;
@@ -197,8 +217,9 @@ export function diffByPerson(base: StromData, current: StromData): PersonChange[
             if (MARRIAGE_FIELDS.some(f => differs(a[f], b[f]))) kinds.add('marriage');
             participantKinds(a.participants, b.participants).forEach(k => kinds.add(k));
             if (differs(a.events ?? [], b.events ?? [])) kinds.add('event');
-            if (differs(a.sourceIds ?? [], b.sourceIds ?? [])) kinds.add('citation');
+            if (differs(a.sourceIds ?? [], b.sourceIds ?? []) || differs(a.divorceSourceIds ?? [], b.divorceSourceIds ?? [])) kinds.add('citation');
             if (differs(a.story, b.story)) kinds.add('other');
+            if (confirmationsDiffer(a, b)) kinds.add('other');
         }
         if (!kinds.size) continue;
         const u = (b ?? a)!;
@@ -287,9 +308,9 @@ function personCites(p: Person): string[] {
     return [...(p.sourceIds ?? []), ...(p.birthSourceIds ?? []), ...(p.deathSourceIds ?? []), ...(p.events ?? []).flatMap(e => e.sourceIds ?? [])];
 }
 
-/** Every source a couple cites (the couple, its events). */
+/** Every source a couple cites (the couple, the divorce, its events). */
 function coupleCites(u: Partnership): string[] {
-    return [...(u.sourceIds ?? []), ...(u.events ?? []).flatMap(e => e.sourceIds ?? [])];
+    return [...(u.sourceIds ?? []), ...(u.divorceSourceIds ?? []), ...(u.events ?? []).flatMap(e => e.sourceIds ?? [])];
 }
 
 /**
@@ -386,14 +407,16 @@ export function diffOther(base: StromData | null, current: StromData): OtherChan
         } else if (differs(a, b)) {
             if (differs(a.title ?? '', b.title ?? '')) kinds.add('title');
             if (differs(a.transcript ?? '', b.transcript ?? '')) kinds.add('transcript');
-            if (differs(a.reference ?? '', b.reference ?? '')) kinds.add('page');
+            // Where the entry stands (spec 075: the call number, folio and image beside the rest of the location).
+            if (sourcePlaceDiffers(a, b)) kinds.add('page');
             const ea = new Map((a.excerpts ?? []).map(e => [e.id, e]));
             const eb = new Map((b.excerpts ?? []).map(e => [e.id, e]));
             if ([...eb.keys()].some(id => !ea.has(id))) kinds.add('excerptAdded');
             if ([...ea.keys()].some(id => !eb.has(id))) kinds.add('excerptRemoved');
             // Anything else of the entry (the archive, the date, a re-cropped excerpt, the reading…).
-            const { title: _t1, transcript: _r1, reference: _p1, excerpts: ex1, ...restA } = a;
-            const { title: _t2, transcript: _r2, reference: _p2, excerpts: ex2, ...restB } = b;
+            // Not the user's: the record it was in a loaded file, its author and tags as written there.
+            const { title: _t1, transcript: _r1, reference: _p1, callNumber: _c1, folio: _f1, image: _i1, excerpts: ex1, originalIds: _o1, gedcomAuthor: _a1, gedcomText: _x1, gedcomExtra: _g1, ...restA } = a;
+            const { title: _t2, transcript: _r2, reference: _p2, callNumber: _c2, folio: _f2, image: _i2, excerpts: ex2, originalIds: _o2, gedcomAuthor: _a2, gedcomText: _x2, gedcomExtra: _g2, ...restB } = b;
             const sameExcerpts = (ex1 ?? []).filter(e => eb.has(e.id)).every(e => !differs(e, eb.get(e.id)));
             if (differs(restA, restB) || !sameExcerpts) kinds.add('other');
         }
@@ -736,9 +759,76 @@ const EVENT_TAG: Record<string, string> = {
     education: 'EDUC', religion: 'RELI', confirmation: 'CONF', firstCommunion: 'FCOM', cremation: 'CREM', title: 'TITL',
 };
 
-/** The titles of sources (or their ids when unnamed), sorted. */
+/** A source as a citation row names it: its title (or its id when unnamed), and its page when the title does not say it. */
+function sourceLabel(id: string, sources: Record<string, Source>): string {
+    const src = sources[id];
+    const title = src?.title?.trim() || id;
+    const page = src ? sourcePlaceKey(src) : '';
+    return page && !title.includes(page) ? `${title} · ${page}` : title;
+}
+
+/** The labels of sources, sorted. */
 function sourceTitles(ids: readonly string[], sources: Record<string, Source>): string {
-    return ids.map(id => sources[id]?.title?.trim() || id).sort((a, b) => a.localeCompare(b)).join(', ');
+    return ids.map(id => sourceLabel(id, sources)).sort((a, b) => a.localeCompare(b)).join(', ');
+}
+
+/**
+ * What a citation cites: the entry and its page (title, archive, page). A
+ * page cited with its own date is a source of its own, read anew (another id)
+ * at every reading of the file, and a tree stored before that cites the
+ * record itself: still the same entry and page, not a change. Its QUAY is the
+ * citation's (spec 077), never part of what it cites: a source a tree of 3.26
+ * made for another QUAY and joined back into its entry since is the same.
+ */
+function citedKey(id: string, sources: Record<string, Source>): string {
+    const src = sources[id];
+    return src ? [src.title, src.repository, sourcePlaceKey(src)].map(v => (v ?? '').trim()).join('\u0000') : `\u0001${id}`;
+}
+
+/**
+ * The same source record names another page there (the page of a record's first citation is kept on the
+ * record itself, so the research changing it keeps the id).
+ */
+function pageMoved(id: string, as: Record<string, Source>, bs: Record<string, Source>): boolean {
+    const x = as[id];
+    const y = bs[id];
+    return !!x && !!y && sourcePlaceDiffers(x, y);
+}
+
+/**
+ * Of citations `a` (sources `as`), those `b` (sources `bs`) does not cite: neither the same entry and page,
+ * nor the same id (unless that record names another page there: `moved`; the page's change is a row, never an
+ * added citation).
+ */
+function citedOnlyIn(a: readonly string[], as: Record<string, Source>, b: readonly string[], bs: Record<string, Source>,
+    moved = true): string[] {
+    const ids = new Set(b);
+    const keys = new Set(b.map(id => citedKey(id, bs)));
+    return a.filter(id => !(ids.has(id) && !(moved && pageMoved(id, as, bs))) && !keys.has(citedKey(id, as)));
+}
+
+/**
+ * A person's note without the line an import before 3.26.0-beta.3 made of an
+ * age at the birth of the research's file ("Birth: Age: 32 years", in the
+ * language of that import): that age is Person.birthAge now, read from the
+ * same file. Only a line whose age says the same numbers as `birthAge`
+ * goes; any other text stays.
+ */
+export function withoutMadeUpBirthAge(notes: string, birthAge: string): string {
+    const digits = (v: string): string => (v.match(/\d+/g) ?? []).join(' ');
+    const want = digits(birthAge);
+    if (!notes || !birthAge.trim()) return notes;
+    const madeUp = (line: string): boolean => SUPPORTED_LANGUAGES.some(({ code }) => {
+        const g = getStringsForLang(code).gedcomNotes;
+        const [head, tail] = g.birthNote(g.age('\u0000')).split('\u0000');
+        const t = line.trim();
+        if (!t.startsWith(head) || !t.endsWith(tail)) return false;
+        const age = t.slice(head.length, t.length - tail.length).trim();
+        return want ? digits(age) === want : age === birthAge.trim();
+    });
+    const lines = notes.split('\n');
+    const kept = lines.filter(l => !madeUp(l));
+    return kept.length === lines.length ? notes : kept.join('\n').trim();
 }
 
 /** What a fact of a new person adds: its filled fields and events. */
@@ -821,7 +911,9 @@ export function diffValues(here: StromData, there: StromData): ValueDiff {
             rows.push({ personId: h.id, name: fullName(h), field: 'person', here: fullName(h), there: '' });
             continue;
         }
-        if (stable(h) === stable(t)) continue;
+        // A person the same apart from a page of a record cited (kept on the record): its citation row still.
+        if (stable(h) === stable(t) && ![...personSourceIds(h), ...(h.events ?? []).flatMap(e => e.sourceIds ?? [])]
+            .some(id => pageMoved(id, hs, ts))) continue;
         const open = openConflictFacts(t);
         field(h, 'name', fullName(h) === '?' ? '' : titledName(h), fullName(t) === '?' ? '' : titledName(t),
             open.has('NAME') || open.has('NPFX') || open.has('NSFX') ? { conflict: true } : {});
@@ -836,7 +928,8 @@ export function diffValues(here: StromData, there: StromData): ValueDiff {
         field(h, 'deathDate', str(h.deathDate), str(t.deathDate), { date: true, ...death });
         field(h, 'deathPlace', str(h.deathPlace), str(t.deathPlace), death);
         field(h, 'deathCause', str(h.deathCause), str(t.deathCause), death);
-        field(h, 'notes', str(h.notes), str(t.notes));
+        // (A note line an earlier import made of the age at the birth the research has as such is no change.)
+        if (h.birthAge || withoutMadeUpBirthAge(str(h.notes), str(t.birthAge)) !== str(t.notes)) field(h, 'notes', str(h.notes), str(t.notes));
         // Events paired (by id, else by what they say): their date, place, value; one here only goes.
         const paired = pairEvents(h.events ?? [], t.events ?? []);
         for (const e of h.events ?? []) {
@@ -851,7 +944,7 @@ export function diffValues(here: StromData, there: StromData): ValueDiff {
             field(h, 'eventPlace', str(e.place), str(o.place), ev);
             field(h, 'eventValue', str(e.note), str(o.note), ev);
             // Its citations: a source cited here and not there goes.
-            const gone = (e.sourceIds ?? []).filter(id => !(o.sourceIds ?? []).includes(id));
+            const gone = citedOnlyIn(e.sourceIds ?? [], hs, o.sourceIds ?? [], ts);
             if (gone.length) rows.push({ personId: h.id, name: fullName(h), field: 'citation', of: e.type, here: sourceTitles(gone, hs), there: sourceTitles(o.sourceIds ?? [], ts) });
         }
         const pairedThere = new Set(paired.values());
@@ -860,9 +953,9 @@ export function diffValues(here: StromData, there: StromData): ValueDiff {
         for (const [key, of] of [['sourceIds', 'person'], ['birthSourceIds', 'birth'], ['deathSourceIds', 'death']] as const) {
             const a = h[key] ?? [];
             const b = t[key] ?? [];
-            const gone = a.filter(id => !b.includes(id));
+            const gone = citedOnlyIn(a, hs, b, ts);
             if (gone.length) rows.push({ personId: h.id, name: fullName(h), field: 'citation', of, here: sourceTitles(gone, hs), there: sourceTitles(b, ts) });
-            addedFacts += b.filter(id => !a.includes(id)).length;
+            addedFacts += citedOnlyIn(b, ts, a, hs, false).length;
         }
     }
     // Couples: the wedding's date and place.

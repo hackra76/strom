@@ -8,7 +8,7 @@ const notWrittenPl = (n: number): string =>
 const sexEndPl = (sex: string | undefined): string => sex === 'female' ? 'a' : sex === 'male' ? '' : '(a)';
 
 export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' | 'attachments' | 'duplicates' | 'minimap'
-    | 'name' | 'person' | 'titles' | 'genLabels' | 'branchColors' | 'tour' | 'anniversaries' | 'releaseNotes'
+    | 'name' | 'person' | 'titles' | 'spacing' | 'marriageOrder' | 'genLabels' | 'branchColors' | 'tour' | 'anniversaries' | 'releaseNotes'
     | 'familyWizard' | 'pwa' | 'fileAccess' | 'sync' | 'researchUpdate' | 'researchImages' | 'treeSettings' | 'media'
     | 'mediaQueue' | 'batch'> = {
     crop: {
@@ -97,11 +97,28 @@ export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' 
         primaryBirth: 'Rodowe',
         primaryMarried: 'Po ślubie',
         primaryHint: 'Np. po rozwodzie z powrotem do nazwiska rodowego.',
+        marriedSurnameHint: 'Nazwisko rodowe powyżej to nazwisko z urodzenia; nazwisko przyjęte po ślubie wpisuje się tutaj.',
     },
 
     titles: {
         settingLabel: 'Tytuły',
         settingHint: 'Tytuły przed nazwiskiem i po nim (dr, inż., jr.) na kartach i w listach',
+    },
+
+    // Tree spacing: Normal / Dense (Settings > Person card, image export)
+    spacing: {
+        label: 'Odstępy',
+        normal: 'Normalne',
+        dense: 'Gęste',
+        desc: 'Mniejsze odstępy między kartami i pokoleniami; na ekranie mieści się więcej osób.',
+        scope: 'Dotyczy diagramu na tym urządzeniu.',
+        scopeExport: 'Dotyczy eksportu obrazu, plakatu i druku do PDF.',
+        smallHint: 'Na małym ekranie pomogą też karty Kompaktowe.',
+    },
+
+    // The marriage-order pill in the dense spacing: the marriage's number only (the bubble says it all)
+    marriageOrder: {
+        short: (n: number) => `∞ ${n}`,
     },
 
     // Sticky generation labels
@@ -123,21 +140,22 @@ export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' 
 
     // Interactive tour
     tour: {
-        menu: 'Uruchom przewodnik',
+        menu: 'Przewodnik po aplikacji',
         offer: 'Krótki przewodnik pokazuje najważniejsze rzeczy.',
         offerYes: 'Uruchom przewodnik',
         next: 'Dalej',
         skip: 'Pomiń',
         done: 'Gotowe',
-        step1: 'To jest karta osoby. Kliknięcie otwiera akcje – edycję, dodawanie krewnych, ustawienie w centrum lub usunięcie.',
-        step2: 'Po najechaniu na kartę pojawiają się przyciski szybkiego dodawania: u góry rodzic, po prawej partner, u dołu dziecko. Uszko z łańcuszkiem na górnej krawędzi zarządza związkami i rodzicami; dodawanie rodzeństwa jest w menu karty.',
-        step3: 'Tutaj też można dodawać osoby: jedną albo całą rodzinę naraz kreatorem rodziny.',
-        step4: 'Panel centrum pokazuje, na kim skupia się drzewo. Strzałki zmieniają, ile pokoleń przodków i potomków jest widocznych.',
-        step5: 'Przełączanie widoków: Rodzina, Potomkowie, Oś czasu lub Wachlarz przodków.',
-        step6: 'Sterowanie powiększeniem i przesuwaniem – obszar drzewa można też przeciągać myszą i powiększać kółkiem; 0 przywraca widok domyślny.',
-        step6Touch: 'Sterowanie powiększeniem – obszar drzewa można też przesuwać palcem i powiększać, rozsuwając dwa palce.',
+        step1: 'To jest karta osoby. Kliknięcie otwiera menu osoby – ustawienie w centrum, edycję, dodawanie krewnych, ustalenie pokrewieństwa i więcej.',
+        step2: 'Po najechaniu na kartę pojawiają się przyciski szybkiego dodawania: u góry rodzic, po prawej partner, u dołu dziecko. Uszko „relacje” z łańcuszkiem na górnej krawędzi zarządza wszystkimi relacjami osoby; dodawanie rodzeństwa jest w menu karty.',
+        step3: 'Tutaj dodaje się nową osobę. Całą rodzinę naraz (rodziców, partnera, dzieci) dodaje menu karty: Dodaj → Rodzinę…',
+        step4: 'Panel centrum pokazuje, na kim skupia się drzewo i ile pokoleń przodków (↑) i potomków (↓) jest widocznych; − i + to zmieniają.',
+        step5: 'Przełączanie widoków: Rodzina, Potomkowie, Oś czasu, Wachlarz przodków lub Mapa.',
+        step5Bar: 'Przełączanie widoków: Rodzina, Potomkowie i Oś czasu są tutaj; Wachlarz przodków i Mapa są w Więcej.',
+        step6: 'Powiększanie, pomniejszanie, widok domyślny lub całe drzewo na ekranie – obszar drzewa można też przeciągać myszą i powiększać kółkiem; klawisz 0 przywraca widok domyślny.',
+        step6Touch: 'Powiększanie, pomniejszanie, widok domyślny lub całe drzewo na ekranie – obszar drzewa można też przesuwać palcem i powiększać, rozsuwając dwa palce.',
         step7: 'Wyszukiwanie dowolnej osoby po imieniu i nazwisku; lejek filtruje według nazwiska, miejsca, lat urodzenia, płci lub statusu żyjący/zmarły.',
-        step8: 'Tutaj są rocznice, eksport i ustawienia. Strom eksportuje drzewo jako jeden samodzielny plik, który można wysłać rodzinie.',
+        step8: 'Tutaj są rocznice, eksport, rzeczy dla rodziny, ustawienia i Jak działa Strom. Strom eksportuje drzewo jako jeden samodzielny plik, który można wysłać rodzinie.',
     },
 
     // Anniversaries + "on this day"
@@ -481,9 +499,9 @@ export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' 
             later: 'Obraz jest przygotowywany w badaniu i przyjdzie z następną wersją.',
             other: 'Obraz jest w badaniu, ale nie trafił do aplikacji.',
         },
-        heldTag: 'obraz w badaniu',
+        heldTag: 'obraz tylko w badaniu',
         heldWhy: { scope: 'Pominięto według ustawień badania.', limit: 'Pominięto ze względu na rozmiar.', later: 'W badaniu jeszcze przygotowywany.' },
-        filter: (n: number) => `Obraz w badaniu · ${n}`,
+        filter: (n: number) => `Obraz tylko w badaniu · ${n}`,
         errMissingScan: 'W badaniu brakuje skanu tego obrazu.',
         errRevoked: 'Źródła nie ma już w badaniu.',
         errMerged: (title: string) => `W badaniu źródło zostało scalone ze źródłem ${title}.`,
@@ -493,7 +511,7 @@ export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' 
         retry: 'Spróbuj ponownie',
         metaMissingScan: 'brak skanu w badaniu',
         sizeFromResearch: (size: string) => `w tym z badania ${size}`,
-        bulkLine: (images: number, sources: number) => `${nPl(images, 'obraz', 'obrazy', 'obrazów')} z ${sources} ${plPl(sources, 'źródła', 'źródeł', 'źródeł')} ${plPl(images, 'jest', 'są', 'jest')} tylko w badaniu.`,
+        bulkLine: (images: number, sources: number) => `${nPl(images, 'obraz', 'obrazy', 'obrazów')} z ${sources} ${plPl(sources, 'źródła', 'źródeł', 'źródeł')} ${plPl(images, 'jest zapisany', 'są zapisane', 'jest zapisanych')} tylko w badaniu na tym komputerze, w aplikacji ${plPl(images, 'pokaże się', 'pokażą się', 'pokaże się')} po wczytaniu.`,
         bulkLoad: 'Wczytaj wszystkie z badania…',
         bulkTitle: 'Wczytywanie obrazów z badania',
         bulkSummary: (sources: number, images: number, size: string) => `${nPl(sources, 'źródło', 'źródła', 'źródeł')}, ${nPl(images, 'obraz', 'obrazy', 'obrazów')}, ok. ${size}. Zostaną zapisane przy drzewie w tej przeglądarce.`,
@@ -510,8 +528,8 @@ export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' 
         resume: 'Wznów',
         stop: 'Zatrzymaj',
         bulkCanClose: 'Okno można zamknąć, wczytywanie będzie trwać dalej.',
-        menuRow: (n: number) => `Obrazy w badaniu · ${n}`,
-        menuRowProgress: (done: number, total: number) => `Obrazy w badaniu · ${done} / ${total}`,
+        menuRow: (n: number) => `Obrazy tylko w badaniu · ${n}`,
+        menuRowProgress: (done: number, total: number) => `Obrazy tylko w badaniu · ${done} / ${total}`,
         bulkDone: (n: number, size: string) => `Wczytano ${nPl(n, 'źródło', 'źródła', 'źródeł')} (${size}).`,
         bulkFailed: (n: number, reasons: string) => `${n} ${plPl(n, 'nie wczytało się', 'nie wczytały się', 'nie wczytało się')}: ${reasons}.`,
         reasons: {
@@ -521,9 +539,9 @@ export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' 
             failed: 'wczytywanie nie powiodło się',
             timeout: 'badanie przestało odpowiadać',
         },
-        bulkLeft: 'Niewczytane zostają w filtrze „Obraz w badaniu”.',
+        bulkLeft: 'Niewczytane zostają w filtrze „Obraz tylko w badaniu”.',
         bulkStopped: (done: number, total: number, size: string) => `Wczytano ${done} z ${total} ${plPl(total, 'źródła', 'źródeł', 'źródeł')} (${size}).`,
-        bulkStoppedRest: 'Reszta zostaje w filtrze „Obraz w badaniu” i można ją wczytać tą samą opcją.',
+        bulkStoppedRest: 'Reszta zostaje w filtrze „Obraz tylko w badaniu” i można ją wczytać tą samą opcją.',
         bulkBridgeOff: 'Badanie nie działa na tym komputerze.',
         bulkBridgeOffRest: 'Reszta zostanie wczytana tą opcją, gdy badanie będzie działać.',
         settings: {
@@ -569,6 +587,18 @@ export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' 
         transcripts: 'Moje transkrypcje źródeł',
         guide: 'Wskazówka',
         default: '(domyślnie)',
+        // "Reading documents" (spec 059 §4, `read.sourceTask`)
+        readGroup: 'Czytanie dokumentów',
+        readTask: 'Zadanie z nowego odczytu',
+        readTaskAsk: 'Pytaj',
+        readTaskAskDesc: 'Po nowym odczycie ze zmianą merytoryczną decyduje przycisk: zadanie dla agenta albo tylko zapis.',
+        readTaskAlways: 'Zawsze twórz',
+        readTaskAlwaysDesc: 'Przy zmianie merytorycznej zadanie dla agenta powstaje samo. Praca agenta zużywa subskrypcję.',
+        readTaskNever: 'Nie twórz',
+        readTaskNeverDesc: 'Zadanie z nowego odczytu nie powstaje samo; można je utworzyć ręcznie przy źródle.',
+        readTaskSum: (v: string) => `Zadanie z nowego odczytu: ${v}`,
+        rtBusy: 'Zapisywanie w badaniu…',
+        rtOk: 'Badanie potwierdziło. Dotyczy też odczytów uruchomionych w terminalu.',
         guideDesc: 'Badanie sprawdza dane z transkrypcji własnym odczytem zapisu. Proponuje jedno zadanie weryfikacji na osobę; agent jest zawsze uruchamiany ręcznie.',
         evidence: 'Udokumentowane',
         evidenceDesc: 'Transkrypcja z aplikacji liczy się jako pierwszy odczyt zapisu. Dana jest udokumentowana dopiero wtedy, gdy badanie odczyta ją drugi raz i odczyty się zgadzają.',

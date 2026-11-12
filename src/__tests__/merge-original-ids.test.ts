@@ -1,0 +1,418 @@
+/**
+ * Merging by the ids the loaded GEDCOM files gave a record (spec 066 K3.2):
+ * a strong id (`_UID`, `UID`, `_FSFTID`, `AFN`, `EXID` + TYPE) both files give
+ * is the same person when the names are alike, the sex is not a man and a
+ * woman, the birth years are at most 3 apart and no global id differs, else
+ * a candidate (`_UID` and `UID` one kind, `_FSFTID` and a familysearch.org
+ * EXID one kind); a global id (`_FSFTID`, `AFN`,
+ * `EXID` + TYPE) that differs keeps a name match below the auto-confirm bar,
+ * a UUID that differs says nothing; an xref or RIN counts only between files
+ * of one program,
+ * only on top of a name match.
+ */
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { parseGedcom, convertToStrom } from '../ged-parser.js';
+import { createMergeState } from '../merge/matching.js';
+import { AUTO_CONFIRM_SCORE, executeMerge, isEffectivelyConfirmed } from '../merge/executor.js';
+import { MergeState, PersonMatch } from '../merge/types.js';
+import { Person, StromData } from '../types.js';
+import { StorageManager } from '../storage.js';
+import { exportToGedcom } from '../ged-exporter.js';
+import { migrateData } from '../data.js';
+import { applyLivingPrivacy, CONTENT_PRESETS } from '../privacy.js';
+
+interface Indi {
+    xref: string;
+    name: string;
+    sex: 'M' | 'F';
+    birth?: string;
+    lines?: string[];
+}
+
+/** A file `program` wrote with these people (no families needed). */
+function ged(program: string, people: Indi[]): string {
+    const out = ['0 HEAD', `1 SOUR ${program.toUpperCase().replace(/\s/g, '_')}`, `2 NAME ${program}`, '1 CHAR UTF-8'];
+    for (const p of people) {
+        out.push(`0 @${p.xref}@ INDI`, `1 NAME ${p.name}`, `1 SEX ${p.sex}`);
+        if (p.birth) out.push('1 BIRT', `2 DATE ${p.birth}`);
+        out.push(...(p.lines ?? []));
+    }
+    out.push('0 TRLR', '');
+    return out.join('\n');
+}
+
+function load(text: string, file: string): StromData {
+    return convertToStrom(parseGedcom(text), { importOrigin: { at: '2026-11-08', file } }).data;
+}
+
+function byName(data: StromData, first: string): Person {
+    const p = Object.values(data.persons).find(x => x.firstName === first);
+    if (!p) throw new Error(`no ${first}`);
+    return p;
+}
+
+function matchOf(state: MergeState, incoming: Person): PersonMatch | undefined {
+    return state.matches.find(m => m.incomingId === incoming.id);
+}
+
+const UID = '5F3A1B2C3D4E5F60718293A4B5C6D7E8';
+
+describe('strong ids', () => {
+    it('MyHeritage: the same _UID pairs a person whose surname and birth date changed, and the match confirms itself', () => {
+        const existing = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I500001', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`, '1 RIN MH:I500001'] },
+        ]), 'older.ged');
+        const incoming = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I500007', name: 'Hromoslav Jaromil /Vrbecký/', sex: 'M', birth: '3 MAR 1883', lines: [`1 _UID ${UID.toLowerCase()}`] },
+        ]), 'newer.ged');
+        const state = createMergeState(existing, incoming);
+        const match = matchOf(state, byName(incoming, 'Hromoslav Jaromil'));
+        expect(match?.existingId).toBe(byName(existing, 'Hromoslav').id);
+        expect(match?.score).toBe(100);
+        expect(match?.confidence).toBe('high');
+        expect(match?.reasons).toEqual(['id']);
+        expect(isEffectivelyConfirmed(state, match!)).toBe(true);
+    });
+
+    it('a _UID with the 4-digit checksum, or hyphenated, is the same id', () => {
+        const existing = load(ged('Legacy', [
+            { xref: 'I1', name: 'Hromoslav /Ozubec/', sex: 'M', lines: [`1 _UID ${UID}A1B2`] },
+        ]), 'a.ged');
+        const incoming = load(ged('RootsMagic', [
+            { xref: 'I9', name: 'Hromoslav /Šťovík/', sex: 'M', lines: ['1 _UID {5f3a1b2c-3d4e-5f60-7182-93a4b5c6d7e8}'] },
+        ]), 'b.ged');
+        expect(matchOf(createMergeState(existing, incoming), byName(incoming, 'Hromoslav'))?.score).toBe(100);
+    });
+
+    it('_FSFTID: the same FamilySearch id pairs people from files of different programs', () => {
+        const existing = load(ged('RootsMagic', [
+            { xref: 'I3', name: 'Libuna /Šťovíková/', sex: 'F', birth: '1902', lines: ['1 _FSFTID KWCB-HZ2'] },
+        ]), 'rm.ged');
+        const incoming = load(ged('Ancestry.com Family Trees', [
+            { xref: 'I77', name: 'Libuna /Ozubcová/', sex: 'F', birth: '1903', lines: ['1 _FSFTID KWCB-HZ2'] },
+        ]), 'anc.ged');
+        const state = createMergeState(existing, incoming);
+        const match = matchOf(state, byName(incoming, 'Libuna'));
+        expect(match?.existingId).toBe(byName(existing, 'Libuna').id);
+        expect(match?.score).toBe(100);
+        expect(isEffectivelyConfirmed(state, match!)).toBe(true);
+    });
+
+    it('EXID counts only with the same TYPE', () => {
+        const file = (xref: string, type: string, first: string): string => ged('Some Program', [
+            { xref, name: `${first} /Ozubec/`, sex: 'M', lines: ['1 EXID 4711', `2 TYPE ${type}`] },
+        ]);
+        const existing = load(file('I1', 'https://example.org/people', 'Hromoslav'), 'a.ged');
+        const same = load(file('I2', 'https://example.org/people', 'Hromoslav Mlhoň'), 'b.ged');
+        const other = load(file('I2', 'https://example.net/other', 'Hromoslav Mlhoň'), 'c.ged');
+        expect(matchOf(createMergeState(existing, same), byName(same, 'Hromoslav Mlhoň'))?.score).toBe(100);
+        const otherMatch = matchOf(createMergeState(existing, other), byName(other, 'Hromoslav Mlhoň'));
+        expect(otherMatch?.reasons ?? []).not.toContain('id');
+        expect(otherMatch?.score ?? 0).toBeLessThan(AUTO_CONFIRM_SCORE);
+    });
+
+    it('a man and a woman with the same _UID: only offered, with the reason', () => {
+        const existing = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I1', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`] },
+        ]), 'a.ged');
+        const incoming = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I1', name: 'Hromoslava /Ozubcová/', sex: 'F', birth: '1880', lines: [`1 _UID ${UID}`] },
+        ]), 'b.ged');
+        const state = createMergeState(existing, incoming);
+        const match = matchOf(state, byName(incoming, 'Hromoslava'));
+        expect(match?.existingId).toBe(byName(existing, 'Hromoslav').id);
+        expect(match?.reasons).toContain('id');
+        expect(match!.score).toBeLessThan(AUTO_CONFIRM_SCORE);
+        expect(isEffectivelyConfirmed(state, match!)).toBe(false);
+    });
+
+    it('a _UID that differs says nothing: two MyHeritage trees give one person different UUIDs, the match confirms itself', () => {
+        // Different xrefs too: two trees, nothing of one tree's numbering in common.
+        const person = (xref: string, uid: string): string => ged('MyHeritage Family Tree Builder', [
+            { xref, name: 'Hromoslav /Ozubec/', sex: 'M', birth: '2 FEB 1880', lines: [`1 _UID ${uid}`] },
+        ]);
+        const existing = load(person('I500001', UID), 'a.ged');
+        const incoming = load(person('I700042', '9D3A1B2C3D4E5F60718293A4B5C6D7E8'), 'b.ged');
+        const state = createMergeState(existing, incoming);
+        const match = matchOf(state, byName(incoming, 'Hromoslav'));
+        expect(match!.score).toBeGreaterThanOrEqual(AUTO_CONFIRM_SCORE);
+        expect(isEffectivelyConfirmed(state, match!)).toBe(true);
+        // The same as without ids.
+        delete byName(existing, 'Hromoslav').originalIds;
+        const plain = createMergeState(existing, incoming);
+        expect(matchOf(plain, byName(incoming, 'Hromoslav'))!.score).toBe(match!.score);
+    });
+
+    it('an _FSFTID that differs keeps an exact name and birth date match below the bar: it is offered', () => {
+        const person = (uid: string, fsid: string): string => ged('MyHeritage Family Tree Builder', [
+            { xref: 'I1', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '2 FEB 1880', lines: [`1 _UID ${uid}`, `1 _FSFTID ${fsid}`] },
+        ]);
+        const existing = load(person(UID, 'KWCB-HZ2'), 'a.ged');
+        const incoming = load(person('9D3A1B2C3D4E5F60718293A4B5C6D7E8', 'LZ7M-Q41'), 'b.ged');
+        const state = createMergeState(existing, incoming);
+        const match = matchOf(state, byName(incoming, 'Hromoslav'));
+        expect(match).toBeDefined();
+        expect(match!.score).toBeLessThan(AUTO_CONFIRM_SCORE);
+        expect(isEffectivelyConfirmed(state, match!)).toBe(false);
+        // Without ids the same pair confirms itself.
+        delete byName(existing, 'Hromoslav').originalIds;
+        const plain = createMergeState(existing, incoming);
+        expect(isEffectivelyConfirmed(plain, matchOf(plain, byName(incoming, 'Hromoslav'))!)).toBe(true);
+    });
+
+    it('_UID and UID are one kind: the same UUID written the GEDCOM 5.5.1 and the GEDCOM 7 way is the same person', () => {
+        const existing = load(ged('Legacy', [
+            { xref: 'I1', name: 'Hromoslav /Ozubec/', sex: 'M', lines: [`1 _UID ${UID}`] },
+        ]), 'a.ged');
+        const incoming = load(ged('GEDCOM 7 Program', [
+            { xref: 'I9', name: 'Hromoslav /Šťovík/', sex: 'M', lines: ['1 UID 5f3a1b2c-3d4e-5f60-7182-93a4b5c6d7e8'] },
+        ]), 'b.ged');
+        const match = matchOf(createMergeState(existing, incoming), byName(incoming, 'Hromoslav'));
+        expect(match?.existingId).toBe(byName(existing, 'Hromoslav').id);
+        expect(match?.score).toBe(100);
+    });
+
+    it('the id decides before a name: another person with the same name does not take the one the id names', () => {
+        const existing = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I1', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '2 FEB 1880', lines: [`1 _UID ${UID}`] },
+        ]), 'a.ged');
+        const incoming = load(ged('Gramps', [
+            { xref: 'I0001', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '2 FEB 1880' },
+            { xref: 'I0002', name: 'Hromoslav Bořivoj /Ozubec/', sex: 'M', birth: '1881', lines: [`1 _UID ${UID}`] },
+        ]), 'b.ged');
+        const state = createMergeState(existing, incoming);
+        expect(matchOf(state, byName(incoming, 'Hromoslav Bořivoj'))?.existingId).toBe(byName(existing, 'Hromoslav').id);
+        expect(matchOf(state, byName(incoming, 'Hromoslav'))).toBeUndefined();
+    });
+
+    it('the same _UID with a wholly different name is only offered, with the reason', () => {
+        const existing = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I1', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`] },
+        ]), 'a.ged');
+        const incoming = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I2', name: 'Jaromil /Vrbecký/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`] },
+        ]), 'b.ged');
+        const state = createMergeState(existing, incoming);
+        const match = matchOf(state, byName(incoming, 'Jaromil'));
+        expect(match?.existingId).toBe(byName(existing, 'Hromoslav').id);
+        expect(match?.reasons).toContain('id');
+        expect(match!.score).toBeLessThan(AUTO_CONFIRM_SCORE);
+        expect(isEffectivelyConfirmed(state, match!)).toBe(false);
+    });
+
+    it('the same _UID with birth years 5 apart is only offered; 3 apart still confirms', () => {
+        const pair = (born: string) => {
+            const existing = load(ged('MyHeritage Family Tree Builder', [
+                { xref: 'I1', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`] },
+            ]), 'a.ged');
+            const incoming = load(ged('MyHeritage Family Tree Builder', [
+                { xref: 'I2', name: 'Hromoslav /Ozubec/', sex: 'M', birth: born, lines: [`1 _UID ${UID}`] },
+            ]), 'b.ged');
+            const state = createMergeState(existing, incoming);
+            return { state, match: matchOf(state, byName(incoming, 'Hromoslav'))! };
+        };
+        const far = pair('1885');
+        expect(far.match.reasons).toContain('id');
+        expect(far.match.score).toBeLessThan(AUTO_CONFIRM_SCORE);
+        expect(isEffectivelyConfirmed(far.state, far.match)).toBe(false);
+        const near = pair('1883');
+        expect(near.match.score).toBe(100);
+        expect(isEffectivelyConfirmed(near.state, near.match)).toBe(true);
+    });
+
+    it('the same _UID but a different _FSFTID is only offered', () => {
+        const person = (fsid: string): string => ged('MyHeritage Family Tree Builder', [
+            { xref: 'I1', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`, `1 _FSFTID ${fsid}`] },
+        ]);
+        const existing = load(person('KWCB-HZ2'), 'a.ged');
+        const incoming = load(person('LZ7M-Q41'), 'b.ged');
+        const state = createMergeState(existing, incoming);
+        const match = matchOf(state, byName(incoming, 'Hromoslav'))!;
+        expect(match.reasons).toContain('id');
+        expect(match.score).toBeLessThan(AUTO_CONFIRM_SCORE);
+        expect(isEffectivelyConfirmed(state, match)).toBe(false);
+    });
+
+    it('_FSFTID and an EXID of a familysearch.org TYPE are one kind', () => {
+        const existing = load(ged('RootsMagic', [
+            { xref: 'I3', name: 'Libuna /Šťovíková/', sex: 'F', birth: '1902', lines: ['1 _FSFTID KWCB-HZ2'] },
+        ]), 'rm.ged');
+        const incoming = load(ged('GEDCOM 7 Program', [
+            { xref: 'I8', name: 'Libuna /Ozubcová/', sex: 'F', birth: '1903',
+                lines: ['1 EXID KWCB-HZ2', '2 TYPE https://www.FamilySearch.org/ark:/61903/4:1:'] },
+        ]), 'g7.ged');
+        const state = createMergeState(existing, incoming);
+        const match = matchOf(state, byName(incoming, 'Libuna'));
+        expect(match?.existingId).toBe(byName(existing, 'Libuna').id);
+        expect(match?.score).toBe(100);
+        expect(isEffectivelyConfirmed(state, match!)).toBe(true);
+        // A different FamilySearch id across the two tags keeps the name match below the bar.
+        const other = load(ged('GEDCOM 7 Program', [
+            { xref: 'I8', name: 'Libuna /Šťovíková/', sex: 'F', birth: '2 FEB 1902',
+                lines: ['1 EXID LZ7M-Q41', '2 TYPE https://www.familysearch.org/ark:/61903/4:1:'] },
+        ]), 'g7b.ged');
+        const differ = matchOf(createMergeState(existing, other), byName(other, 'Libuna'))!;
+        expect(differ.score).toBeLessThan(AUTO_CONFIRM_SCORE);
+    });
+
+    it('a _UID two persons of the tree have pairs neither of them by itself: one is only offered', () => {
+        const existing = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I1', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`] },
+            { xref: 'I2', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`] },
+        ]), 'a.ged');
+        const incoming = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I5', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`] },
+        ]), 'b.ged');
+        const state = createMergeState(existing, incoming);
+        const match = matchOf(state, byName(incoming, 'Hromoslav'))!;
+        expect(Object.keys(existing.persons)).toContain(match.existingId);
+        expect(match.reasons).toContain('id');
+        expect(match.score).toBeLessThan(AUTO_CONFIRM_SCORE);
+        expect(isEffectivelyConfirmed(state, match)).toBe(false);
+    });
+
+    it('persons of the file with one _UID: the first in the file the id confirms takes the person, the other does not', () => {
+        const existing = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I1', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`] },
+        ]), 'a.ged');
+        const twice = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I5', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`] },
+            { xref: 'I6', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '1881', lines: [`1 _UID ${UID}`] },
+        ]), 'b.ged');
+        const state = createMergeState(existing, twice);
+        const [first, second] = Object.values(twice.persons);
+        expect(matchOf(state, first)).toMatchObject({ existingId: byName(existing, 'Hromoslav').id, score: 100 });
+        expect(matchOf(state, second)).toBeUndefined();
+        // The first one of another name only offered: the next one the id confirms takes the person.
+        const renamed = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I5', name: 'Jaromil /Vrbecký/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`] },
+            { xref: 'I6', name: 'Hromoslav /Ozubec/', sex: 'M', birth: '1880', lines: [`1 _UID ${UID}`] },
+        ]), 'c.ged');
+        const again = createMergeState(existing, renamed);
+        expect(matchOf(again, byName(renamed, 'Hromoslav'))).toMatchObject({ existingId: byName(existing, 'Hromoslav').id, score: 100 });
+        expect(matchOf(again, byName(renamed, 'Jaromil'))).toBeUndefined();
+    });
+});
+
+describe('weak ids (xref, RIN)', () => {
+    const gramps = (program: string, first: string, birth: string): string => ged(program, [
+        { xref: 'I0001', name: `${first} /Kvasil/`, sex: 'M', birth },
+    ]);
+
+    it('Gramps: the same xref in two Gramps files lifts a name match over the bar', () => {
+        const existing = load(gramps('Gramps', 'Zbyhněv', '1901'), 'a.ged');
+        const incoming = load(gramps('Gramps', 'Zbyhněv', '5 MAY 1901'), 'b.ged');
+        const state = createMergeState(existing, incoming);
+        const match = matchOf(state, byName(incoming, 'Zbyhněv'));
+        expect(match?.reasons[0]).toBe('id');
+        expect(match!.score).toBeGreaterThanOrEqual(AUTO_CONFIRM_SCORE);
+        expect(isEffectivelyConfirmed(state, match!)).toBe(true);
+    });
+
+    it('the same xref from files of different programs counts for nothing', () => {
+        const existing = load(gramps('Gramps', 'Zbyhněv', '1901'), 'a.ged');
+        const incoming = load(gramps('RootsMagic', 'Zbyhněv', '5 MAY 1901'), 'b.ged');
+        const state = createMergeState(existing, incoming);
+        const match = matchOf(state, byName(incoming, 'Zbyhněv'));
+        expect(match?.reasons).not.toContain('id');
+        expect(match!.score).toBeLessThan(AUTO_CONFIRM_SCORE);
+        expect(isEffectivelyConfirmed(state, match!)).toBe(false);
+    });
+
+    it('an xref alone never pairs people whose names are not alike', () => {
+        const existing = load(gramps('Gramps', 'Zbyhněv', '1901'), 'a.ged');
+        const incoming = load(ged('Gramps', [{ xref: 'I0001', name: 'Mlhoň /Šťovík/', sex: 'M', birth: '1950' }]), 'b.ged');
+        expect(createMergeState(existing, incoming).matches).toEqual([]);
+    });
+
+    it('RIN of one program counts like the xref', () => {
+        const file = (xref: string, birth: string): string => ged('Gramps', [
+            { xref, name: 'Zbyhněv /Kvasil/', sex: 'M', birth, lines: ['1 RIN 37'] },
+        ]);
+        const existing = load(file('I0001', '1901'), 'a.ged');
+        const incoming = load(file('I0099', '5 MAY 1901'), 'b.ged');
+        const match = matchOf(createMergeState(existing, incoming), byName(incoming, 'Zbyhněv'));
+        expect(match?.reasons).toContain('id');
+        expect(match!.score).toBeGreaterThanOrEqual(AUTO_CONFIRM_SCORE);
+    });
+});
+
+describe('the merged person', () => {
+    beforeEach(() => { vi.spyOn(StorageManager, 'set').mockResolvedValue(undefined as never); });
+
+    it('carries the ids of both files', async () => {
+        const existing = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I500001', name: 'Hromoslav /Ozubec/', sex: 'M', lines: [`1 _UID ${UID}`, '1 RIN MH:I500001'] },
+        ]), 'older.ged');
+        const incoming = load(ged('MyHeritage Family Tree Builder', [
+            { xref: 'I500007', name: 'Hromoslav /Vrbecký/', sex: 'M', lines: [`1 _UID ${UID}`, '1 RIN MH:I500007'] },
+        ]), 'newer.ged');
+        const result = await executeMerge(createMergeState(existing, incoming));
+        expect(result.success).toBe(true);
+        const people = Object.values(result.mergedData.persons);
+        expect(people).toHaveLength(1);
+        expect(result.mergedData.imports?.map(r => r.id)).toEqual(['I1', 'I2']);
+        expect(people[0].originalIds).toEqual([
+            { from: 'I1', xref: 'I500001', ids: [{ tag: '_UID', value: UID }, { tag: 'RIN', value: 'MH:I500001' }] },
+            { from: 'I2', xref: 'I500007', ids: [{ tag: '_UID', value: UID }, { tag: 'RIN', value: 'MH:I500007' }] },
+        ]);
+    });
+});
+
+describe('the merged family', () => {
+    beforeEach(() => { vi.spyOn(StorageManager, 'set').mockResolvedValue(undefined as never); });
+
+    /** A couple divorced in one family record and married again in another, each record with its ids. */
+    const FILE = [
+        '0 HEAD', '1 SOUR MYHERITAGE', '2 NAME MyHeritage Family Tree Builder', '1 CHAR UTF-8',
+        '0 @I1@ INDI', '1 NAME Hromoslav /Ozubec/', '1 SEX M', '1 BIRT', '2 DATE 1870', '1 DEAT', '2 DATE 1930',
+        `1 _UID ${UID}`, '1 FAMS @F1@', '1 FAMS @F2@',
+        '0 @I2@ INDI', '1 NAME Bělinka /Vrbecká/', '1 SEX F', '1 BIRT', '2 DATE 1875', '1 DEAT', '2 DATE 1940',
+        '1 _UID 0B1C2D3E4F5061728394A5B6C7D8E9F0', '1 FAMS @F1@', '1 FAMS @F2@',
+        '0 @F1@ FAM', '1 HUSB @I1@', '1 WIFE @I2@', '1 _UID AAAA0000BBBB1111CCCC2222DDDD3333', '1 RIN 1',
+        '1 MARR', '2 DATE 1900', '1 DIV', '2 DATE 1905',
+        '0 @F2@ FAM', '1 HUSB @I1@', '1 WIFE @I2@', '1 _UID EEEE4444FFFF5555AAAA6666BBBB7777', '1 RIN 2',
+        '1 MARR', '2 DATE 1910',
+        '0 TRLR', '',
+    ].join('\n');
+    const read = (file: string): StromData =>
+        migrateData(convertToStrom(parseGedcom(FILE), { importOrigin: { at: '2026-11-10', file } }).data);
+    /**
+     * "Back to {program}" as the app makes it (for the tree's last import), as
+     * the other program reads it: without the export date and Strom's own blocks.
+     */
+    const back = (data: StromData): string[] => {
+        const out: string[] = [];
+        let skipBelow = -1;
+        const lines = exportToGedcom(applyLivingPrivacy(data, 'full', 2026, { keepDeceasedSources: true }), 'Ozubec',
+            { content: CONTENT_PRESETS.back, origins: true, backTo: data.imports![data.imports!.length - 1].id }).content.split('\n');
+        for (const line of lines) {
+            const level = parseInt(line, 10);
+            if (skipBelow >= 0 && level > skipBelow) continue;
+            skipBelow = /^\d+ _STROM_/.test(line) ? level : -1;
+            if (skipBelow < 0 && !/^1 DATE /.test(line)) out.push(line);
+        }
+        return out;
+    };
+
+    it('the same file merged again: one family, the ids of both imports, and "Back to" is the first one\'s', async () => {
+        const tree = read('a.ged');
+        const first = back(tree);
+        const merged = (await executeMerge(createMergeState(tree, read('b.ged')))).mergedData;
+        expect(Object.keys(merged.persons)).toHaveLength(2);
+        const families = Object.values(merged.partnerships);
+        expect(families).toHaveLength(1);
+        expect(families[0].originalIds?.map(e => [e.from, e.xref])).toEqual([['I1', 'F1'], ['I2', 'F1']]);
+        expect(families[0].originalIds![1].ids).toEqual(families[0].originalIds![0].ids);
+        expect(back(merged)).toEqual(first);
+        expect(first).toEqual(expect.arrayContaining(['0 @F1@ FAM', '0 @F2@ FAM', '1 _UID EEEE4444FFFF5555AAAA6666BBBB7777']));
+    });
+
+    it('a tree whose family has no ids yet takes them from the file merged into it', async () => {
+        const tree = read('a.ged');
+        for (const u of Object.values(tree.partnerships)) delete u.originalIds;
+        const merged = (await executeMerge(createMergeState(tree, read('b.ged')))).mergedData;
+        const family = Object.values(merged.partnerships)[0];
+        expect(family.originalIds?.map(e => [e.from, e.xref])).toEqual([['I2', 'F1']]);
+    });
+});

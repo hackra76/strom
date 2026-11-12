@@ -8,11 +8,18 @@
  * consecutive bands:
  *
  *   top(minGen)  = padding
- *   top(g + 1)   = top(g) + height(g) + verticalGap
+ *   top(g + 1)   = top(g) + height(g) + verticalGap + extra(g)
  *   height(g)    = max card height of the persons drawn in generation g
+ *   extra(g)     = gapExtra(g), else 0
  *
- * Without personHeights every band is cardHeight tall, so
+ * Without personHeights and gapExtra every band is cardHeight tall, so
  * top(g) = padding + (g - minGen) * (cardHeight + verticalGap).
+ *
+ * gapExtra comes from the dense spacing (LayoutConfig.dense): a gap whose
+ * buses need more than one lane above and one below its middle grows by
+ * 2 * LANE_OFFSET per further lane level (step 7 resolveDenseLanes); and
+ * from the room the screen keeps under a row (LayoutConfig.roomBelow,
+ * roomBelowExtra). The bus stays in the middle of the taller gap.
  */
 
 import { LayoutConfig, PersonId, personCardHeight } from '../../types.js';
@@ -35,14 +42,16 @@ export interface GenerationBands {
 export function computeGenerationBands(
     genModel: Pick<GenerationalModel, 'model' | 'personGen' | 'minGen' | 'maxGen'>,
     personX: ReadonlyMap<PersonId, number>,
-    config: Pick<LayoutConfig, 'cardHeight' | 'verticalGap' | 'padding' | 'personHeights'>
+    config: Pick<LayoutConfig, 'cardHeight' | 'verticalGap' | 'padding' | 'personHeights'>,
+    gapExtra?: ReadonlyMap<number, number>
 ): GenerationBands {
     const { model, personGen, minGen, maxGen } = genModel;
     const top = new Map<number, number>();
     const height = new Map<number, number>();
     const bands: GenerationBand[] = [];
+    const extra = gapExtra && gapExtra.size > 0 ? gapExtra : null;
 
-    if (!config.personHeights) {
+    if (!config.personHeights && !extra) {
         // Uniform cards: today's formula, bit for bit
         const rowHeight = config.cardHeight + config.verticalGap;
         for (let gen = minGen; gen <= maxGen; gen++) {
@@ -56,7 +65,7 @@ export function computeGenerationBands(
 
     const tallest = new Map<number, number>();
     const hidden = model.hiddenPersonIds;
-    for (const personId of model.persons.keys()) {
+    if (config.personHeights) for (const personId of model.persons.keys()) {
         if (hidden?.has(personId) || !personX.has(personId)) continue;
         const gen = personGen.get(personId);
         if (gen === undefined) continue;
@@ -71,7 +80,35 @@ export function computeGenerationBands(
         top.set(gen, y);
         height.set(gen, h);
         bands.push({ generation: gen, top: y, height: h });
-        y += h + config.verticalGap;
+        y += h + config.verticalGap + (extra?.get(gen) ?? 0);
     }
     return { bands, top, height };
+}
+
+/**
+ * LayoutConfig.roomBelow as gap growth: for each set of persons, the top
+ * generation holding one of them laid out (personX, not a hidden stand-in)
+ * gets the px its gap lacks beyond verticalGap; the larger growth where two
+ * sets meet in one generation. The last generation has no gap below it.
+ */
+export function roomBelowExtra(
+    genModel: Pick<GenerationalModel, 'model' | 'personGen' | 'maxGen'>,
+    personX: ReadonlyMap<PersonId, number>,
+    config: Pick<LayoutConfig, 'verticalGap' | 'roomBelow'>
+): Map<number, number> {
+    const extra = new Map<number, number>();
+    if (!config.roomBelow) return extra;
+    const hidden = genModel.model.hiddenPersonIds;
+    for (const { personIds, px } of config.roomBelow) {
+        const grow = px - config.verticalGap;
+        if (grow <= 0) continue;
+        let top = Infinity;
+        for (const id of personIds) {
+            if (hidden?.has(id) || !personX.has(id)) continue;
+            const gen = genModel.personGen.get(id);
+            if (gen !== undefined && gen < top) top = gen;
+        }
+        if (top < genModel.maxGen) extra.set(top, Math.max(grow, extra.get(top) ?? 0));
+    }
+    return extra;
 }

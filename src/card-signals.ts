@@ -1,19 +1,21 @@
 /**
  * What a person card shows at a glance, besides the name and years:
- *   - person status (quiet, on every card): the evidence level as stripes and
- *     the story as a folded corner;
+ *   - person status (quiet, on every card): one mark of sources and
+ *     reliability (reliability.ts cardStatus) and the story as a folded corner;
  *   - one action badge (rare, asks for the user): the research waits for them
  *     about this person, a conflict between sources, or an open question;
  *   - while following live, an arc circling the avatar of whom the agent works
  *     on (only without a badge), and a short-lived check once it is done.
- * The badge shows the most pressing signal only; the tooltip lists them all.
+ * One signal shows as its badge; two or three as a stack of badges with the
+ * most pressing in front, whose click offers what to open.
  * Which signals the card shows is a per-device setting (Settings → Show on
  * card); the tooltip keeps its status rows either way. Pure.
  */
 
 import { Partnership, Person, PersonId, ResearchConflict, StromData } from './types.js';
-import { EvidenceLevel, PersonEvidence, personEvidence } from './evidence-level.js';
+import { PersonEvidence } from './evidence-level.js';
 import type { CardSignals } from './settings.js';
+import { CardStatus, ReliabilityOptions, cardStatus } from './reliability.js';
 import { isOpenHypothesis } from './view-links.js';
 import { coupleStories } from './story-text.js';
 
@@ -63,6 +65,11 @@ export function setResearchConflictsProvider(provider: ((id: PersonId) => Resear
     researchConflictsProvider = provider;
 }
 
+/** The research's conflicts of a person as the cards read them (null: the tree's own). */
+export function researchConflictsNow(id: PersonId): ResearchConflict[] | null {
+    return researchConflictsProvider?.(id) ?? null;
+}
+
 /**
  * Materials of a person in a tree linked to a research that lists them (spec 017):
  * the tooltip says "Materials N" instead of attachments. Null: not offered here.
@@ -73,18 +80,27 @@ export function setMaterialsCountProvider(provider: ((p: Person) => number | nul
     materialsCountProvider = provider;
 }
 
+/** Materials of a person as the cards read them (null: not offered here). */
+export function materialsCountNow(p: Person): number | null {
+    return materialsCountProvider?.(p) ?? null;
+}
+
 /** Everything evaluated once per render and shared by all cards. */
 export interface CardSignalContext {
     data: StromData;
     unions: Map<string, Partnership[]>;
     /** Any source anywhere in the tree (none: no evidence level is shown). */
     treeHasSources: boolean;
+    /** Where the tree's facts came from (UI.reliabilityOptionsNow), for the card's one mark. */
+    reliability: ReliabilityOptions;
     settings: CardSignals;
     /** The research's word per person REFN. */
     research: Map<string, ResearchCardInfo>;
 }
 
 export interface CardSignalInfo {
+    /** The card's one mark of sources and reliability, whether shown or not (null: none, e.g. a placeholder). */
+    status: CardStatus | null;
     /** The evidence (null: placeholder, or no source anywhere in the tree). */
     evidence: PersonEvidence | null;
     /** The story the corner speaks for (null: none). */
@@ -101,12 +117,14 @@ export interface CardSignalInfo {
     question: string | null;
     agent: string | null;
     queued: string | null;
-    /** Show the evidence stripes on the card. */
-    showEvidence: boolean;
+    /** Show the mark of sources and reliability on the card. */
+    showStatus: boolean;
     /** Show the story's folded corner on the card. */
     showStory: boolean;
-    /** The one badge (null: none). */
+    /** The one badge (null: none): the first of `actions`. */
     action: ActionSignal | null;
+    /** Every action signal present and switched on, in ACTION_ORDER (0–3); two or more show as a stack. */
+    actions: ActionSignal[];
     /** Circle the avatar: the agent works on this person and no badge shows. */
     showAgent: boolean;
     /** The check after the agent's work: since when (null: none). */
@@ -165,11 +183,13 @@ export function storySignalInLine(text: string, lang: string): string {
 }
 
 export function cardSignalInfo(p: Person, ctx: CardSignalContext): CardSignalInfo {
-    const evidence = ctx.treeHasSources ? personEvidence(p, ctx.data, ctx.unions) : null;
+    const status = cardStatus(ctx.data, p, { ...ctx.reliability, treeHasSources: ctx.treeHasSources, unions: ctx.unions });
+    const evidence = status?.evidence ?? null;
     const story = personStoryState(p, ctx.data);
     const research = p.refn ? ctx.research.get(p.refn) : undefined;
     const conflicts = (researchConflictsProvider?.(p.id) ?? p.research?.conflicts ?? []).filter(c => c.status !== 'decided').length;
     const info: CardSignalInfo = {
+        status,
         evidence,
         story,
         attachments: p.attachments?.length ?? 0,
@@ -182,19 +202,16 @@ export function cardSignalInfo(p: Person, ctx: CardSignalContext): CardSignalInf
         question: p.question?.trim() || null,
         agent: research?.agent ?? null,
         queued: research?.queued ?? null,
-        showEvidence: !!evidence && ctx.settings.evidence,
+        showStatus: !!status && ctx.settings.status,
         showStory: !!story && ctx.settings.story,
         action: null,
+        actions: [],
         showAgent: false,
         doneSince: null,
     };
-    if (p.isPlaceholder) return { ...info, showEvidence: false, showStory: false };
-    const present: Record<ActionSignal, boolean> = {
-        waiting: !!info.waiting,
-        conflict: conflicts > 0,
-        question: !!info.question,
-    };
-    info.action = ACTION_ORDER.find(s => present[s] && ctx.settings[s]) ?? null;
+    if (p.isPlaceholder) return { ...info, showStatus: false, showStory: false };
+    info.actions = presentActions(info, ctx.settings);
+    info.action = info.actions[0] ?? null;
     // The amber badge comes first: then the agent is in the tooltip only.
     if (!info.action && ctx.settings.agent) {
         info.showAgent = !!info.agent;
@@ -204,21 +221,50 @@ export function cardSignalInfo(p: Person, ctx: CardSignalContext): CardSignalInf
 }
 
 /**
- * The person's status: evidence stripes (2 full, 1 partial, none: nothing)
- * and the story as a folded corner (faint as a draft; hollow for a couple's
- * story alone). Empty when there is nothing to show. On the card the stripes
- * sit in the bottom-right corner (left of the fold when there is one) and the
- * fold covers the card's corner; `inline`: both side by side in a tooltip or
- * menu line.
+ * The action signals a card shows: every one present and switched on
+ * (Settings → Show on card), in ACTION_ORDER. The first is the badge; two
+ * or more show as a stack of badges.
  */
-export function stateStripesHtml(evidence: EvidenceLevel | null, story: StoryMark | null, inline = false): string {
-    const ev = evidence === 'full' ? 2 : evidence === 'partial' ? 1 : 0;
-    const stripes = ev > 0 ? `<span class="st-group st-ev">${'<i></i>'.repeat(ev)}</span>` : '';
-    const fold = story
-        ? `<span class="card-story${story.final ? '' : ' draft'}${story.kind === 'couple' ? ' couple' : ''}${inline ? ' card-story--inline' : ''}" aria-hidden="true"></span>`
+export function presentActions(
+    s: Pick<CardSignalInfo, 'waiting' | 'conflicts' | 'question'>,
+    settings: Pick<CardSignals, ActionSignal>,
+): ActionSignal[] {
+    const present: Record<ActionSignal, boolean> = {
+        waiting: !!s.waiting,
+        conflict: s.conflicts > 0,
+        question: !!s.question,
+    };
+    return ACTION_ORDER.filter(a => present[a] && settings[a]);
+}
+
+/** One choice of the stack's menu: answer what waits, compare a story's new version, what the research knows, follow the research. */
+export type StackChoice = 'waiting' | 'story' | 'knows' | 'agent';
+
+/**
+ * The choices a click on a stack of badges offers, in the menu's order:
+ * what waits, a story's new version, what the research knows (conflicts,
+ * hypotheses, the question — one choice), and following the research while
+ * the agent works on the person (its arc is not drawn beside the badges).
+ * One choice opens at once; two or more open the menu.
+ */
+export function stackChoices(s: Pick<CardSignalInfo, 'waiting' | 'waitingStory' | 'conflicts' | 'question' | 'agent' | 'showAgent'>): StackChoice[] {
+    const out: StackChoice[] = [];
+    if (s.waiting) out.push('waiting');
+    if (s.waitingStory) out.push('story');
+    if (s.conflicts > 0 || s.question) out.push('knows');
+    if (s.showAgent || s.agent) out.push('agent');
+    return out;
+}
+
+/**
+ * The story as a folded corner (hollow for a couple's story alone or a
+ * draft, spec 066 P4 §6). Empty when there is none. On the card the fold
+ * covers the card's corner; `inline`: before the words in a tooltip or menu line.
+ */
+export function storyFoldHtml(story: StoryMark | null, inline = false, mark = false): string {
+    return story
+        ? `<span class="card-story${story.final ? '' : ' draft'}${story.kind === 'couple' ? ' couple' : ''}${inline ? ' card-story--inline' : ''}"${mark ? ' data-mark="story"' : ''} aria-hidden="true"></span>`
         : '';
-    if (inline) return stripes || fold ? `<span class="card-state card-state--inline" aria-hidden="true">${stripes}${fold}</span>` : '';
-    return (stripes ? `<span class="card-state${story ? ' beside-story' : ''}" aria-hidden="true">${stripes}</span>` : '') + fold;
 }
 
 /** The glyph inside the badge. */

@@ -42,7 +42,7 @@ import { ThemeMode, LanguageSetting, AppMode, AuditLog, personSourceIds } from '
 import { CryptoSession, isEncrypted, encrypt, decrypt, EncryptedData } from '../crypto.js';
 import {
     validateTreeData, ValidationResult as TreeValidationResult, ValidationIssue, translateValidationType,
-    groupValidationIssues, validationCounts, issueCategory, type IssueCategory, type ValidationGroup,
+    groupValidationIssues, validationCounts, fixAllNoteText, issueCategory, type IssueCategory, type ValidationGroup,
 } from '../validation.js';
 import { visibleValidation, summaryKind, dismissalFor, dismissalKey, dismissBody } from '../quality-dismiss.js';
 import { QUALITY_CHANGED_EVENT } from './quality-ui.js';
@@ -143,9 +143,12 @@ export const treeStatsMethods = uiModule({
     /**
      * Show tree validation dialog (checks for genealogical inconsistencies).
      * `opts.leads`: opened from the Tree overview's "n leads" — the Problems
-     * closed, the Leads open and scrolled to.
+     * closed, the Leads open and scrolled to. `opts.focus`: opened from a
+     * finding of the Table view (spec 073 §7.4) — its group open and scrolled
+     * to (a finding marked "Not an error": the marked findings).
      */
-    async showTreeValidationDialog(treeId: string, parentDialogId?: string, opts: { leads?: boolean } = {}): Promise<void> {
+    async showTreeValidationDialog(treeId: string, parentDialogId?: string,
+        opts: { leads?: boolean; focus?: { type: string; category: IssueCategory; dismissed: boolean } } = {}): Promise<void> {
         const tree = TreeManager.getTreeMetadata(treeId as TreeId);
         const treeData = await this.treeValidationData(treeId);
         if (!tree || !treeData) return;
@@ -164,6 +167,11 @@ export const treeStatsMethods = uiModule({
             treeId, sections: {}, groups: new Map(), shown: new Map(), dismissedOpen: false, asideOpen: new Set(), toastTimer: null,
         };
         if (opts.leads) view.sections = { problem: false, trace: true };
+        if (opts.focus?.dismissed) view.dismissedOpen = true;
+        else if (opts.focus) {
+            view.sections[opts.focus.category] = true;
+            view.groups.set(opts.focus.type, true);
+        }
 
         const result = validateTreeData(treeData);
         if (content) {
@@ -185,6 +193,15 @@ export const treeStatsMethods = uiModule({
         if (opts.leads && content) {
             requestAnimationFrame(() => {
                 content.querySelector<HTMLElement>('.vq-section[data-section="trace"]')?.scrollIntoView({ block: 'start' });
+            });
+        }
+        const focus = opts.focus;
+        if (focus && content) {
+            requestAnimationFrame(() => {
+                const target = focus.dismissed
+                    ? content.querySelector<HTMLElement>('[data-vq="dismissed"]')
+                    : [...content.querySelectorAll<HTMLElement>('.vq-group[data-type]')].find(g => g.dataset.type === focus.type);
+                target?.scrollIntoView({ block: 'start' });
             });
         }
     },
@@ -507,10 +524,13 @@ export const treeStatsMethods = uiModule({
                 </div>
             `;
         } else {
-            const fixableCount = ro ? 0 : shown.issues.filter(i => DataManager.isFixableIssue(i)).length;
+            const fixable = ro ? [] : shown.issues.filter(i => DataManager.isFixableIssue(i));
+            // What Fix all fixes, said under the sentence and described to the button (T54 G15).
+            const note = fixAllNoteText(fixable);
             html += `<div class="validation-summary vq-summary">
                 <span class="vq-summary-text">${esc(validationSummaryText(counts))}</span>
-                ${fixableCount > 0 ? `<button type="button" class="validation-fix-all-btn">${esc(s.valFixAll)} (${fixableCount})</button>` : ''}
+                ${fixable.length > 0 ? `<button type="button" class="validation-fix-all-btn" aria-describedby="vq-fixall-note">${esc(s.valFixAll)} (${fixable.length})</button>` : ''}
+                ${fixable.length > 0 && note ? `<span class="vq-fixall-note" id="vq-fixall-note">${esc(note)}</span>` : ''}
             </div>`;
         }
 

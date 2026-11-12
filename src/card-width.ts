@@ -36,6 +36,7 @@
  */
 
 import type { CardHeightMode, CardLine, CardLineStyle, CardValueLines } from './card-fields.js';
+import type { CardDensity } from './types.js';
 
 export const CUSTOM_CARD_MIN_WIDTH = 200;
 /** The medium width's cap: the card before the width choice, and the default. */
@@ -76,9 +77,11 @@ export function cardPlaceOffset(dateColumn: number): number {
 /**
  * The card's text styles: the name, a date, a place, a label (labels style),
  * the years under the name, the "+1" after the marriage's place (with its
- * space; the place's font at 600).
+ * space; the place's font at 600), the Normal card's name on its rows
+ * (12.5px, index.html .name-fit-2lines); and the image export's footer: the
+ * tree name and the rest (src/export-image.ts posterFooterLayout).
  */
-export type CardTextKind = 'name' | 'date' | 'place' | 'label' | 'years' | 'more';
+export type CardTextKind = 'name' | 'date' | 'place' | 'label' | 'years' | 'more' | 'nameSmall' | 'posterTitle' | 'posterNote';
 
 /** Widths of texts in one style; returns a width for every text asked for. */
 export type MeasureTexts = (kind: CardTextKind, texts: Iterable<string>) => Map<string, number>;
@@ -102,11 +105,14 @@ export interface CustomCardEntry<L extends CardLineText = CardLine> {
     /**
      * The room (px) the last line keeps free beside the pills on the bottom
      * edge of a card of one height for the view: the ⇄ pill on the right
-     * (CARD_EDGE_PILL_RIGHT), the ∞ pill on the left (CARD_EDGE_PILL_LEFT).
+     * (CARD_EDGE_PILL_RIGHT), the ∞ pill on the left (CARD_EDGE_PILL_LEFT),
+     * the status mark (CARD_STATUS_MARK_ROOM).
      * Its rows are wrapped that much narrower, so a text either fits beside
      * the pills or ends in "…".
      */
     lastLineReserve?: number;
+    /** The room (px) the name's rows keep free at their right (the lock on a locked card, index.html). */
+    nameReserve?: number;
 }
 
 export interface CustomCardMetrics {
@@ -527,8 +533,21 @@ export const CARD_NAME_ROW_HEIGHT = 19;
 export const CARD_YEARS_ROW_HEIGHT = 14;
 /** The birth surname under the name ("roz. Dvořáková", 11px text). */
 export const CARD_BIRTH_ROW_HEIGHT = 14;
-/** A name wraps into at most this many rows (when details may wrap). */
+/** A name wraps into at most this many rows (when details may wrap) on the Register and Custom cards. */
 export const CARD_NAME_MAX_ROWS = 2;
+
+/**
+ * How many rows a card type's name may take: the Normal and the Detailed
+ * card show the whole name on as many rows as it needs (0, T40; the card
+ * grows), the Register and Custom cards at most CARD_NAME_MAX_ROWS (the last
+ * ends in "…"). The Compact card keeps one row (the screen shortens it).
+ * The one source for the screen and the image export.
+ */
+export function cardNameMaxRows(density: CardDensity): CardValueLines {
+    if (density === 'normal' || density === 'detailed') return 0;
+    if (density === 'compact') return 1;
+    return CARD_NAME_MAX_ROWS;
+}
 /** The card's header: 10px padding, the 30px name row, 10px padding. A card without lines is this tall. */
 export const CARD_HEAD_HEIGHT = 50;
 /** Between the header and the first line. */
@@ -547,11 +566,33 @@ export const CARD_DETAIL_GAP = 3;
  */
 export const CARD_EDGE_PILL_ROOM = 12;
 /**
+ * The bottom-right edge (⇄ N, then the sibling order) starts this far from
+ * the card's right edge (index.html .edge-bottom-right, spec 066 P4 §2): the
+ * corner itself belongs to the status mark and the story's fold.
+ */
+export const CARD_EDGE_RIGHT_INSET = 40;
+/**
  * The room the last line of a card of one height for the view keeps at its
  * right for the ⇄ pill on the bottom-right edge (index.html .has-edge-br,
- * the same 46px as the line's padding there: "⇄ N ↗").
+ * the line's padding there): the 40px inset and the "⇄ N" pill, less the
+ * card's 12px padding.
  */
-export const CARD_EDGE_PILL_RIGHT = 46;
+export const CARD_EDGE_PILL_RIGHT = CARD_EDGE_RIGHT_INSET - 12 + 34;
+/** The same for the sibling-order pill ("2 of 5") and the 4px before it. */
+const SIBLING_ORDER_PILL_ROOM = 48;
+/** The last line's room for the pills on the bottom-right edge: ⇄ N, the sibling order, or both. */
+export function bottomRightPillsRoom(crossTree: boolean, siblingOrder: boolean): number {
+    if (!crossTree && !siblingOrder) return 0;
+    return CARD_EDGE_RIGHT_INSET - 12 + (crossTree ? 34 : 0) + (siblingOrder ? SIBLING_ORDER_PILL_ROOM + (crossTree ? 4 : 0) : 0);
+}
+/**
+ * The room a line of a card of details keeps at its right where it may reach
+ * the height of the status mark in the bottom-right corner (index.html
+ * .has-status-room, spec 066 P4 §2: padding-right 22px).
+ */
+export const CARD_STATUS_MARK_ROOM = 22;
+/** The room a locked card of details keeps at the right of its name for the lock (index.html .locked .name: padding-right). */
+export const CARD_LOCK_NAME_ROOM = 5;
 /**
  * The same at the left for the ∞ pill on the bottom-left edge ("▸ ∞ 2",
  * index.html .edge-bl-room: the line's padding there).
@@ -601,6 +642,7 @@ export function cardLinesTop(block: number = CARD_AVATAR_SIZE): number {
  */
 export function customCardRows<L extends CardLineText>(entries: Iterable<CustomCardEntry<L>>, metrics: CustomCardMetrics,
     measure: MeasureTexts, valueLines: CardValueLines, style: CardLineStyle = 'marks',
+    nameMaxRows: CardValueLines = CARD_NAME_MAX_ROWS,
 ): { rows: Map<L, CardLineRows>; heights: number[]; heads: CardHead[] } {
     const list = [...entries];
     const room = customCardContentWidth(metrics.cardWidth);
@@ -697,10 +739,12 @@ export function customCardRows<L extends CardLineText>(entries: Iterable<CustomC
         });
     }
 
-    // The name: two rows at most when details may wrap, else one (shrunk on screen when long).
+    // The name: when details may wrap, two rows at most (`nameMaxRows`, the
+    // Register and Custom cards) or the whole name (0: the Detailed card, T40);
+    // else one (shrunk on screen when long).
     const names = valueLines === 1 ? null : wrapCardTexts(list.map(e => ({
-        text: e.name, kind: 'name' as const, maxLines: CARD_NAME_MAX_ROWS as CardValueLines,
-        width: Math.max(1, room - (e.avatar ? CARD_AVATAR_WIDTH + CARD_HEAD_GAP : 0)),
+        text: e.name, kind: 'name' as const, maxLines: nameMaxRows,
+        width: Math.max(1, room - (e.avatar ? CARD_AVATAR_WIDTH + CARD_HEAD_GAP : 0) - (e.nameReserve ?? 0)),
     })), measure);
     const heads: CardHead[] = list.map((e, i) => {
         const wrapped = names?.[i];
@@ -778,6 +822,99 @@ export function customCardCutLines<L extends CardLineText>(entries: Iterable<Cus
     return cut;
 }
 
+// ============= The Normal card's name on rows (T40) =============
+
+/** The Normal card's height with a name of at most two rows (types.ts CARD_SIZE, index.html .person-card). */
+export const NORMAL_CARD_HEIGHT = 64;
+/**
+ * The Normal card's text column: 188 − 2 × 1 (border) − 2 × 9 (padding) − 34
+ * (avatar) − 8 (gap) = 126px; a card without an avatar (a placeholder) has
+ * the 34px and the gap back: 168px (index.html .person-card).
+ */
+export const NORMAL_CARD_NAME_WIDTH = 126;
+export const NORMAL_CARD_NAME_WIDTH_BARE = 168;
+/** A row of the Normal card's name on rows: 12.5px × 1.15 (index.html .name-fit-2lines). */
+export const NORMAL_CARD_NAME_ROW_HEIGHT = 14.375;
+
+/** One Normal card's name, as the card splits it: the given names, the surname, and whether the avatar stands beside it. */
+export interface NormalCardName {
+    given: string;
+    surname: string;
+    avatar: boolean;
+}
+
+/** The rows of a Normal card's name: the given names' rows, then the surname's. */
+export interface NormalCardNameRows {
+    given: string[];
+    surname: string[];
+}
+
+/**
+ * The Normal card's name on rows (the step after the two-line one in the
+ * screen's name fitting, renderer.ts fitCardNames): the given names on rows
+ * of their own, the surname on the next, each wrapped at 12.5px into the text
+ * column (wrapCardTexts: after a space, "-", "–" or "/"; a word wider than the
+ * column between characters), never shortened. A name that fits its two rows
+ * has one row each (none for an empty part). All names in one batch.
+ */
+export function normalCardNameRows(names: readonly NormalCardName[], measure: MeasureTexts): NormalCardNameRows[] {
+    const requests: WrapRequest[] = [];
+    for (const n of names) {
+        const width = n.avatar ? NORMAL_CARD_NAME_WIDTH : NORMAL_CARD_NAME_WIDTH_BARE;
+        requests.push({ text: n.given, width, maxLines: 0, kind: 'nameSmall' });
+        requests.push({ text: n.surname, width, maxLines: 0, kind: 'nameSmall' });
+    }
+    const wrapped = wrapCardTexts(requests, measure);
+    return names.map((_, i) => ({
+        given: wrapped[2 * i].rows.map(r => r.text),
+        surname: wrapped[2 * i + 1].rows.map(r => r.text),
+    }));
+}
+
+/**
+ * The Normal card's height for its name's rows: the card as it always was
+ * (64px) for two rows or fewer, 14.375px more for each row after the second,
+ * rounded up to whole pixels (the layout's card height, LayoutConfig.personHeights).
+ */
+export function normalCardHeight(nameRows: number): number {
+    if (nameRows <= 2) return NORMAL_CARD_HEIGHT;
+    return NORMAL_CARD_HEIGHT + Math.ceil((nameRows - 2) * NORMAL_CARD_NAME_ROW_HEIGHT);
+}
+
+/**
+ * The cards of a view whose name takes more than two rows and their height
+ * (normalCardHeight); null when every name fits its two rows (the layout
+ * then spaces every card by the one 64px height, as before).
+ */
+export function normalCardHeights<K>(names: ReadonlyMap<K, NormalCardName>, measure: MeasureTexts): Map<K, number> | null {
+    const keys = [...names.keys()];
+    const rows = normalCardNameRows(keys.map(k => names.get(k)!), measure);
+    let out: Map<K, number> | null = null;
+    rows.forEach((r, i) => {
+        const n = r.given.length + r.surname.length;
+        if (n <= 2) return;
+        (out ??= new Map()).set(keys[i], normalCardHeight(n));
+    });
+    return out;
+}
+
+/**
+ * Where a text's rows were broken: the text between one row and the next (a
+ * space when the row broke after one, '' after "-" or inside a word). The
+ * screen puts it between the rows' elements, so the name reads whole as text.
+ */
+export function rowSeparators(text: string, rows: readonly string[]): string[] {
+    const out: string[] = [];
+    let at = 0;
+    rows.forEach((row, i) => {
+        const found = text.indexOf(row, at);
+        const end = found < 0 ? at : found + row.length;
+        if (i > 0) out.push(found < 0 ? '' : text.slice(at, found));
+        at = end;
+    });
+    return out;
+}
+
 // ============= Browser: measuring in the card's fonts =============
 
 /** The CSS each kind is set in on the card (index.html, the custom density). */
@@ -788,6 +925,9 @@ const KIND_STYLE: Record<CardTextKind, string> = {
     label: 'font: 600 12px var(--font-sans); font-variant-numeric: tabular-nums;',
     more: 'font: 600 12px var(--font-sans); font-variant-numeric: tabular-nums;',
     years: 'font: 400 11px var(--font-sans); font-variant-numeric: tabular-nums;',
+    nameSmall: 'font: 600 12.5px var(--font-serif);',
+    posterTitle: 'font: 600 16px var(--font-serif);',
+    posterNote: 'font: 400 12px var(--font-serif);',
 };
 /** The faces those styles use, to know whether they are loaded yet. */
 const KIND_FACES = ['600 15px "Strom Serif"', '500 12px "Instrument Sans"', '400 12px "Instrument Sans"', '600 12px "Instrument Sans"'];

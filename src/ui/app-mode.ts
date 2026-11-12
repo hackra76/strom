@@ -206,7 +206,7 @@ export const appModeMethods = uiModule({
     showViewModeImportDialog(): void {
         const envelope = DataManager.getEmbeddedEnvelope();
         if (envelope) {
-            const nameEl = document.getElementById('import-tree-name');
+            const nameEl = document.getElementById('import-view-mode-tree-name');
             if (nameEl) {
                 nameEl.textContent = `"${envelope.treeName}"`;
             }
@@ -719,11 +719,22 @@ export const appModeMethods = uiModule({
         this.updateViewModeUI(); // owns the toolbar family-button visibility
     },
 
+    /** Card type: the cards change their size, the view keeps its anchor card in place (spec 069 D3). */
     setCardDensity(density: string): void {
         SettingsManager.setCardDensity(normalizeCardDensity(density));
         forgetCardTypeCopy();
-        TreeRenderer.render();
+        void TreeRenderer.renderKeepingView();
         this.renderCardSignalSettings();
+    },
+
+    /**
+     * Settings > Person card > Spacing (spec 069 §1): the tree behind the
+     * open dialog is drawn again at once, its anchor card kept in place (D3).
+     */
+    setTreeSpacing(spacing: string): void {
+        SettingsManager.setTreeSpacing(spacing === 'dense' ? 'dense' : 'normal');
+        this.syncTreeSpacingSetting();
+        void TreeRenderer.renderKeepingView();
     },
 
     toggleFanKekule(enabled: boolean): void {
@@ -737,6 +748,12 @@ export const appModeMethods = uiModule({
         TreeRenderer.render();
     },
 
+    /** The reliability marks on the person card (spec 066 §2f): an open card is marked again. */
+    toggleReliabilityCard(enabled: boolean): void {
+        SettingsManager.setReliabilityCard(enabled);
+        this.refreshPersonReliability();
+    },
+
     /** Settings > Surname display: redraw everything that shows names. */
     setSurnameDisplay(display: SurnameDisplay): void {
         SettingsManager.setSurnameDisplay(display);
@@ -746,8 +763,11 @@ export const appModeMethods = uiModule({
         if (this.relationshipsPanelPersonId) this.refreshRelationshipsPanel();
     },
 
+    /** The ⇄ N pill (Settings → Show on card → Links): the switch there follows, the view is drawn again. */
     toggleCrossTreeBadges(enabled: boolean): void {
         SettingsManager.setCrossTreeBadges(enabled);
+        const box = document.querySelector<HTMLInputElement>('#card-signals-settings input[data-signal="crossTree"]');
+        if (box) box.checked = enabled;
         TreeRenderer.render();
     },
 

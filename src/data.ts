@@ -3,6 +3,8 @@
  * Handles persons, partnerships, and relationships with type safety
  */
 
+import { rewriteStorySources, storySourceIds } from './story-sources.js';
+import { cleanCitationQuay, cleanTreeCitationQuay, joinQualityOnlySources, unionCitations } from './citation-quality.js';
 import { normalizeSingleParents, looseSingleParents, isPurePlaceholder, fillPlaceholder, tidyPlaceholders } from './single-parent.js';
 import {
     Person,
@@ -29,7 +31,8 @@ import {
     generatePartnershipId,
     LAST_FOCUSED,
     LastFocusedMarker,
-    STROM_DATA_VERSION, PERSON_CITATION_FIELDS, PersonCitationField, isGender, oppositeGender, isPrimaryName, PrimaryName, mergedPrimaryName,
+    TableView,
+    STROM_DATA_VERSION, PERSON_CITATION_FIELDS, PARTNERSHIP_CITATION_FIELDS, PersonCitationField, isGender, oppositeGender, isPrimaryName, PrimaryName, mergedPrimaryName,
     EmbeddedDataEnvelope,
     isEmbeddedEnvelope,
     FamilyWizardSpec,
@@ -44,7 +47,8 @@ import { isCoupleEventType } from './events.js';
 import { sanitizeGedcomDates } from './gedcom-date-form.js';
 import { strings, getCurrentLanguage, getStringsForLang, SUPPORTED_LANGUAGES } from './strings.js';
 import { TreeManager } from './tree-manager.js';
-import { isEncrypted, EncryptedData, decrypt } from './crypto.js';
+import { isEncrypted, EncryptedData, decrypt, classifyCryptoError, CryptoFailure } from './crypto.js';
+import { cryptoErrorText } from './crypto-errors.js';
 import * as CrossTree from './cross-tree.js';
 import { AuditLogManager } from './audit-log.js';
 import { extractSubtree } from './subtree.js';
@@ -57,15 +61,19 @@ import { ChangePacket, applyPacketOntoData } from './share-diff.js';
 import { createSnapshot, getSnapshotPayload, SnapshotReason, hasAutoSnapshotOnDay } from './snapshots.js';
 import { ValidationIssue, stripUnsafeMediaDataUrls, translateValidationType } from './validation.js';
 import { cloneTreeData } from './clone.js';
-import { UndoManager } from './undo.js';
+import { UndoManager, type UndoMark } from './undo.js';
 import { applyLivingPrivacy, applyContentOptions, resolveContentOptions, ContentOptions, PrivacyMode } from './privacy.js';
 import { safeFileName } from './filenames.js';
 import { shownName } from './person-name.js';
 import { fingerprintLike } from './research-link.js';
+import { carryMergedImports, cleanImportOrigin, dropImportedParent, mergeOriginalIds, pruneImportOrigin, factsOf, localIsoDay, FactHolder } from './import-origin.js';
+import { mergeNoteText } from './merge/notes.js';
 import { restoreViewLinks } from './view-links.js';
+import { cleanFactVerify, factConfirmation, factValueSignature, researchConfirmation, researchConfirmationWithdrawn } from './verify.js';
 import { maxGenerations, maxGenerationsWithSiblings } from './focus-depth.js';
 import { cleanPlaceGeoMeta, sanitizePlaceRecords, sanitizePlaceRefs } from './place-records.js';
 import { addPlaceAlias, sanitizePlaceAliases } from './place-groups.js';
+import { sanitizeTableViews } from './table-views-data.js';
 
 /** Extended updates for Partnership */
 
@@ -87,8 +95,17 @@ function dropUndefinedKeys(obj: object): void {
     }
 }
 
+/** What a 'strom:data-changed' event may tell: a live load from the source, with the data shown before it. */
+export interface DataChangedDetail {
+    source: 'live';
+    previous: StromData;
+}
+
 /** Import action types for view mode */
 export type ViewModeImportAction = 'new' | 'update' | 'copy';
+
+/** A person's or a couple's fact (DataManager.confirmFact). */
+export type FactTarget = { personId: PersonId } | { partnershipId: PartnershipId };
 
 /** Format person name for audit log: "FirstName LastName (*year)" or "[unknown]" for placeholders */
 export function auditPersonName(person: Person | null | undefined): string {
@@ -123,7 +140,7 @@ export function personCitationField(fact?: CitedFact | null): PersonCitationFiel
 export type SourceCitationRef =
     | { kind: 'person'; personId: PersonId; fact?: CitedFact }
     | { kind: 'event'; personId: PersonId; eventId: string }
-    | { kind: 'partnership'; partnershipId: PartnershipId }
+    | { kind: 'partnership'; partnershipId: PartnershipId; fact?: 'divorce' }
     | { kind: 'coupleEvent'; partnershipId: PartnershipId; eventId: string };
 
 /**
@@ -204,6 +221,13 @@ export function migrateData(data: unknown): StromData {
             && (typeof person.marriedSurname !== 'string' || !person.marriedSurname.trim())) {
             delete person.marriedSurname;
         }
+        // The married name's own given names: text, only with a married
+        // surname, and only when they are not the person's own.
+        if (person && typeof person === 'object' && 'marriedFirstName' in person
+            && (typeof person.marriedFirstName !== 'string' || !person.marriedFirstName.trim() || !person.marriedSurname
+                || person.marriedFirstName.trim() === (person.firstName ?? '').trim())) {
+            delete person.marriedFirstName;
+        }
         // Which surname the person goes by: 'birth' or 'married', and only
         // with a married surname (anything else means no choice).
         if (person && typeof person === 'object' && 'primaryName' in person
@@ -219,6 +243,12 @@ export function migrateData(data: unknown): StromData {
     if (d.sources && typeof d.sources === 'object') {
         result.sources = d.sources as StromData['sources'];
     }
+
+    // v19 (spec 077): the sources an import of 3.26 made only for a citation
+    // of the same page with another QUAY join their entry, the QUAY going to
+    // the citation; then only valid own QUAY of citations still cited stay.
+    if ((typeof d.version === 'number' ? d.version : 1) < 19) joinQualityOnlySources(result);
+    cleanTreeCitationQuay(result);
 
     // Photos/attachments/excerpts must be image (or PDF) data URLs — anything
     // else (data:text/html…) from a crafted file is dropped before it can be
@@ -263,6 +293,11 @@ export function migrateData(data: unknown): StromData {
     if (typeof d.researchAsOf === 'string') {
         result.researchAsOf = d.researchAsOf;
     }
+    // The research's lines and side branches (spec 073 §16.9): kept as read from its file.
+    const dirs = d.researchDirections as StromData['researchDirections'] | undefined;
+    if (dirs && typeof dirs === 'object' && Array.isArray(dirs.lines) && Array.isArray(dirs.branches)) {
+        result.researchDirections = { complete: dirs.complete === true, lines: dirs.lines, branches: dirs.branches };
+    }
 
     // v14: manual lineage corrections; ids of people no longer in the tree go.
     if (d.lineageOverrides && typeof d.lineageOverrides === 'object') {
@@ -271,6 +306,18 @@ export function migrateData(data: unknown): StromData {
         const clean = cleanLineageOverrides(result, { founders: list(o.founders), notCarriers: list(o.notCarriers) });
         if (clean) result.lineageOverrides = clean;
     }
+
+    // v17: the saved views of the Table view (src/table-views-data.ts).
+    const tableViews = sanitizeTableViews(d.tableViews);
+    if (tableViews) result.tableViews = tableViews;
+
+    // v15: the GEDCOM files loaded into the tree and the origin of facts and
+    // links from them (src/import-origin.ts). Only valid records; marks that
+    // name no record, no fact or no parent are dropped. Nothing is added.
+    cleanImportOrigin(result, d.imports);
+    // v16: the facts confirmed by hand and the research's re-verification of
+    // facts (src/verify.ts); only valid entries of existing facts.
+    cleanFactVerify(result);
 
     // Preserve default person settings if present
     if (d.defaultPersonId !== undefined) {
@@ -512,14 +559,15 @@ class DataManagerClass {
      * the user's own encrypted trees become unreadable and get overwritten
      * (review K8). Returns false on a wrong password.
      */
-    async decryptEmbeddedData(password: string): Promise<boolean> {
+    async decryptEmbeddedData(password: string): Promise<'ok' | CryptoFailure> {
         const pending = this.pendingEncryptedEmbedded;
-        if (!pending) return false;
+        if (!pending) return 'error';
         let data: StromData;
         try {
             data = JSON.parse(await decrypt(pending, password)) as StromData;
-        } catch {
-            return false;
+        } catch (err) {
+            // Only an AES-GCM refusal is a wrong password (GitHub #13).
+            return classifyCryptoError(err);
         }
         if (this.pendingEncryptedAllTrees) {
             try {
@@ -531,7 +579,7 @@ class DataManagerClass {
             this.pendingEncryptedAllTrees = null;
         }
         this.loadDecryptedEmbeddedData(data);
-        return true;
+        return 'ok';
     }
 
     /**
@@ -1147,7 +1195,20 @@ class DataManagerClass {
         this.save();
     }
 
+    /**
+     * Data revision: bumped on every change of the open tree's data (each
+     * mutation ends in save()), so derived caches (the table view's rows and
+     * cells) know when to rebuild. A swapped data object is caught by identity.
+     */
+    private revision = 0;
+
+    /** Current data revision (see `revision`). */
+    getRevision(): number {
+        return this.revision;
+    }
+
     private save(): void {
+        this.revision++;
         // Never save in view mode (read-only), over locked data (the
         // in-memory tree is a stand-in) or over a newer app's tree
         // (TreeManager would refuse both anyway).
@@ -1184,7 +1245,7 @@ class DataManagerClass {
      * stack with a description, then persist. Replaces this.save() at the end of
      * mutation methods. During a batch this defers to commitBatch (no push/save).
      */
-    private commitMutation(description: string, silent = false): void {
+    private commitMutation(description: string, silent = false, mark?: UndoMark): void {
         if (this.batchActive) {
             this.batchDirty = true;
             if (this.batchFirstDescription === null) this.batchFirstDescription = description;
@@ -1194,7 +1255,7 @@ class DataManagerClass {
         if (this.pendingBefore) {
             // Auto-backup the FIRST mutation of the day (state before it).
             this.maybeAutoSnapshot(this.pendingBefore, this.pendingBase);
-            UndoManager.push({ data: this.pendingBefore, description, base: this.pendingBase });
+            UndoManager.push({ data: this.pendingBefore, description, base: this.pendingBase, ...(mark ? { mark } : {}) });
             this.pendingBefore = null;
         }
         this.save();
@@ -1213,6 +1274,13 @@ class DataManagerClass {
     lastUndoDescription(): string | null {
         UndoManager.setActiveTree(this.currentTreeId);
         return UndoManager.peekUndoDescription();
+    }
+
+    /** The mark of the step a single undo would reverse (a sources' split), or null. */
+    lastUndoMark(): UndoMark | null {
+        if (this.isLocked() || this.isNewerData()) return null;
+        UndoManager.setActiveTree(this.currentTreeId);
+        return UndoManager.peekUndoMark();
     }
 
     /**
@@ -1663,6 +1731,43 @@ class DataManagerClass {
         return true;
     }
 
+    // ==================== TABLE VIEWS ====================
+
+    /**
+     * Save a view of the Table view (spec 073 §9.3): a new one is added, one
+     * with the same id is replaced. One undo step and a change-log entry;
+     * silent (the table shows its own state). False while read-only.
+     */
+    saveTableView(view: TableView, rename = false): boolean {
+        if (this.isReadOnly()) return false;
+        const list = this.data.tableViews ?? [];
+        const at = list.findIndex(v => v.id === view.id);
+        const copy = structuredClone(view);
+        this.beginMutation();
+        this.data.tableViews = at >= 0 ? list.map((v, i) => (i === at ? copy : v)) : [...list, copy];
+        this.commitMutation(rename ? strings.undo.renameTableView(view.name) : strings.undo.saveTableView(view.name), true);
+        if (this.currentTreeId) {
+            AuditLogManager.log(this.currentTreeId, rename ? 'tableView.rename' : 'tableView.save',
+                rename ? strings.auditLog.tableViewRenamed(view.name) : strings.auditLog.tableViewSaved(view.name));
+        }
+        return true;
+    }
+
+    /** Delete a saved view: one undo step (the usual Undo toast) and a change-log entry. */
+    deleteTableView(id: string): boolean {
+        if (this.isReadOnly()) return false;
+        const list = this.data.tableViews ?? [];
+        const view = list.find(v => v.id === id);
+        if (!view) return false;
+        this.beginMutation();
+        const next = list.filter(v => v.id !== id);
+        if (next.length) this.data.tableViews = next;
+        else delete this.data.tableViews;
+        this.commitMutation(strings.undo.deleteTableView(view.name));
+        if (this.currentTreeId) AuditLogManager.log(this.currentTreeId, 'tableView.delete', strings.auditLog.tableViewDeleted(view.name));
+        return true;
+    }
+
     // ==================== DATA QUALITY ====================
 
     /**
@@ -1930,6 +2035,8 @@ class DataManagerClass {
             deathDate: personData.deathDate,
             deathPlace: personData.deathPlace
         };
+        // Known to have died without a date (the "Deceased" box while adding).
+        if (personData.isDeceased && !personData.deathDate) person.isDeceased = true;
         // The titles of the name and the surname after marriage; an empty one
         // means none, a placeholder has none.
         for (const key of ['titleBefore', 'titleAfter', 'marriedSurname'] as const) {
@@ -2135,6 +2242,7 @@ class DataManagerClass {
         if (updates.question !== undefined && (updates.question || undefined) !== person.question) diff(strings.labels.question, person.question, updates.question);
 
         const lastNameBefore = person.lastName ?? '';
+        const firstNameBefore = person.firstName;
         if (updates.firstName !== undefined) person.firstName = updates.firstName;
         if (updates.lastName !== undefined) person.lastName = updates.lastName;
         // A placeholder that got a real name — first OR last — is a person now
@@ -2158,6 +2266,9 @@ class DataManagerClass {
         }
         if (primaryAfter) person.primaryName = primaryAfter;
         else delete person.primaryName;
+        // The married name's own given names go with its surname, and give way
+        // to a given name edited here (the editor shows only that one).
+        if (!person.marriedSurname || (updates.firstName !== undefined && updates.firstName !== firstNameBefore)) delete person.marriedFirstName;
         // The married-surname suggestion hidden in the editor (app-local, no
         // audit line: it is not a fact about the person).
         if (updates.dismissedMarriedSuggestion !== undefined) {
@@ -2193,7 +2304,11 @@ class DataManagerClass {
         }
         // isDeceased is tri-state (true / false / undefined); apply verbatim when provided.
         if ('isDeceased' in updates) person.isDeceased = updates.isDeceased;
-        if ('photo' in updates) person.photo = updates.photo || undefined;
+        if ('photo' in updates) {
+            // The date from the file belongs to the picture it came with.
+            if ((updates.photo || undefined) !== person.photo) delete person.photoDate;
+            person.photo = updates.photo || undefined;
+        }
 
         if (JSON.stringify(person) === personBefore) {
             this.pendingBefore = null;   // nothing changed — no undo step, no toast
@@ -2273,6 +2388,67 @@ class DataManagerClass {
         return true;
     }
 
+    // ==================== FACT CONFIRMATION (spec 065) ====================
+
+    /** The person or couple a fact belongs to, with its name for the undo label and the audit log. */
+    private confirmTarget(target: FactTarget): { holder: FactHolder; name: string; locked: boolean } | null {
+        if ('personId' in target) {
+            const person = this.data.persons[target.personId];
+            if (!person) return null;
+            return { holder: person, name: auditPersonName(person), locked: this.isPersonLocked(target.personId) };
+        }
+        const ps = this.data.partnerships[target.partnershipId];
+        if (!ps) return null;
+        const name = `${auditPersonName(this.data.persons[ps.person1Id])} & ${auditPersonName(this.data.persons[ps.person2Id])}`;
+        return { holder: ps, name, locked: this.isTreeLocked() };
+    }
+
+    /**
+     * "Verified from the scan": a person confirms a fact by hand. It holds
+     * while the fact keeps its current value (a later change ends it). Only a
+     * fact with a value; false when nothing changed (already confirmed so).
+     */
+    confirmFact(target: FactTarget, fact: string, at: string = localIsoDay()): boolean {
+        const t = this.confirmTarget(target);
+        if (!t || t.locked || !/^\d{4}-\d{2}-\d{2}$/.test(at)) return false;
+        if (!factsOf(t.holder).includes(fact)) return false;
+        const value = factValueSignature(t.holder, fact);
+        if (!value) return false;
+        const now = factConfirmation(t.holder, fact);
+        if (now && now.at === at && now.value === value) return false;
+
+        this.beginMutation();
+        (t.holder.confirmed ??= {})[fact] = { at, value };
+        this.commitMutation(strings.undo.confirmFact(t.name));
+        AuditLogManager.log(this.currentTreeId, 'fact.confirm', strings.auditLog.confirmedFact(t.name));
+        return true;
+    }
+
+    /**
+     * "Take back" the confirmation of a fact: a hand confirmation of the app
+     * (also one no longer valid) goes; else the research's confirmation, while
+     * valid (its value unchanged here), is taken back here
+     * (FactConfirmation.withdrawn), so the fact goes to the research without
+     * it. False when there is nothing to take back.
+     */
+    unconfirmFact(target: FactTarget, fact: string): boolean {
+        const t = this.confirmTarget(target);
+        if (!t || t.locked) return false;
+        const own = t.holder.confirmed?.[fact];
+        const ownLive = !!own && !own.withdrawn;
+        const research = researchConfirmation(t.holder, fact);
+        const takeBackResearch = !ownLive && !!research && !researchConfirmationWithdrawn(t.holder, fact);
+        if (!ownLive && !takeBackResearch) return false;
+
+        this.beginMutation();
+        if (takeBackResearch) (t.holder.confirmed ??= {})[fact] = { at: research!, withdrawn: true };
+        else delete t.holder.confirmed![fact];
+        if (t.holder.confirmed && Object.keys(t.holder.confirmed).length === 0) delete t.holder.confirmed;
+        this.commitMutation(strings.undo.unconfirmFact(t.name));
+        AuditLogManager.log(this.currentTreeId, 'fact.unconfirm', strings.auditLog.unconfirmedFact(t.name));
+        return true;
+    }
+
     // ==================== SOURCES / CITATIONS ====================
 
     /** Add a source to the per-tree catalog. Title is required. Returns it or null. */
@@ -2304,6 +2480,26 @@ class DataManagerClass {
         return true;
     }
 
+    /**
+     * Split the older locations of several sources into their fields (spec 075 §5):
+     * each source replaced by its new form (same id), ONE undo step marked as the
+     * split (its dialog offers to undo it while it is the last step), no Undo toast
+     * of its own (the split's toast has one). Returns the undo step's mark, or null
+     * when nothing changed.
+     */
+    splitSourcePlaces(next: readonly Source[]): UndoMark | null {
+        if (this.isTreeLocked() || this.isReadOnly()) return null;
+        const sources = this.data.sources;
+        const changed = next.filter(s => sources?.[s.id]);
+        if (!sources || changed.length === 0) return null;
+        this.beginMutation();
+        for (const s of changed) sources[s.id] = { ...s };
+        const mark: UndoMark = { kind: 'sourcesSplit', at: Date.now(), count: changed.length };
+        this.commitMutation(strings.undo.splitSources(changed.length), true, mark);
+        AuditLogManager.log(this.currentTreeId, 'source.update', strings.auditLog.splitSources(changed.length));
+        return mark;
+    }
+
     /** Remove a source and cascade-delete every citation of it (persons + events). */
     removeSource(sourceId: string): boolean {
         const src = this.data.sources?.[sourceId];
@@ -2321,22 +2517,33 @@ class DataManagerClass {
                 if (kept.length > 0) person[field] = kept;
                 else delete person[field];
             }
+            cleanCitationQuay(person, PERSON_CITATION_FIELDS);
             for (const ev of person.events ?? []) {
                 if (ev.sourceIds) {
                     ev.sourceIds = ev.sourceIds.filter(id => id !== sourceId);
                     if (ev.sourceIds.length === 0) delete ev.sourceIds;
                 }
+                cleanCitationQuay(ev, ['sourceIds']);
             }
             for (const att of person.attachments ?? []) {
                 if (att.sourceId === sourceId) delete att.sourceId;
             }
+            rewriteStorySources(person.story, ids => ids.filter(id => id !== sourceId));
         }
         for (const partnership of Object.values(this.data.partnerships)) {
-            for (const holder of [partnership, ...(partnership.events ?? [])]) {
+            for (const field of PARTNERSHIP_CITATION_FIELDS) {
+                const kept = partnership[field]?.filter(id => id !== sourceId);
+                if (kept?.length) partnership[field] = kept;
+                else delete partnership[field];
+            }
+            cleanCitationQuay(partnership, PARTNERSHIP_CITATION_FIELDS);
+            for (const holder of partnership.events ?? []) {
                 if (!holder.sourceIds) continue;
                 holder.sourceIds = holder.sourceIds.filter(id => id !== sourceId);
                 if (holder.sourceIds.length === 0) delete holder.sourceIds;
+                cleanCitationQuay(holder, ['sourceIds']);
             }
+            rewriteStorySources(partnership.story, ids => ids.filter(id => id !== sourceId));
         }
         this.commitMutation(strings.undo.removeSource(src.title));
         AuditLogManager.log(this.currentTreeId, 'source.remove', strings.auditLog.removedSource(src.title));
@@ -2362,6 +2569,9 @@ class DataManagerClass {
             if (partnership.sourceIds?.includes(sourceId)) {
                 out.push({ kind: 'partnership', partnershipId: partnership.id });
             }
+            if (partnership.divorceSourceIds?.includes(sourceId)) {
+                out.push({ kind: 'partnership', partnershipId: partnership.id, fact: 'divorce' });
+            }
             for (const ev of partnership.events ?? []) {
                 if (ev.sourceIds?.includes(sourceId)) {
                     out.push({ kind: 'coupleEvent', partnershipId: partnership.id, eventId: ev.id });
@@ -2380,10 +2590,12 @@ class DataManagerClass {
         for (const person of Object.values(this.data.persons)) {
             for (const field of PERSON_CITATION_FIELDS) add(person[field]);
             for (const ev of person.events ?? []) add(ev.sourceIds);
+            add(storySourceIds(person.story));
         }
         for (const partnership of Object.values(this.data.partnerships)) {
-            add(partnership.sourceIds);
+            for (const field of PARTNERSHIP_CITATION_FIELDS) add(partnership[field]);
             for (const ev of partnership.events ?? []) add(ev.sourceIds);
+            add(storySourceIds(partnership.story));
         }
         return counts;
     }
@@ -2395,12 +2607,14 @@ class DataManagerClass {
             for (const ev of person.events ?? []) {
                 if (ev.sourceIds?.includes(sourceId)) count++;
             }
+            if (storySourceIds(person.story).includes(sourceId)) count++;
         }
         for (const partnership of Object.values(this.data.partnerships)) {
-            if (partnership.sourceIds?.includes(sourceId)) count++;
+            for (const field of PARTNERSHIP_CITATION_FIELDS) if (partnership[field]?.includes(sourceId)) count++;
             for (const ev of partnership.events ?? []) {
                 if (ev.sourceIds?.includes(sourceId)) count++;
             }
+            if (storySourceIds(partnership.story).includes(sourceId)) count++;
         }
         return count;
     }
@@ -2436,31 +2650,33 @@ class DataManagerClass {
         return true;
     }
 
-    /** Add a citation of `sourceId` on a partnership (marriage record etc.). */
-    citePartnership(partnershipId: PartnershipId, sourceId: string): boolean {
+    /** Add a citation of `sourceId` on a partnership (marriage record etc.), or on its divorce. */
+    citePartnership(partnershipId: PartnershipId, sourceId: string, fact?: 'divorce'): boolean {
         const partnership = this.data.partnerships[partnershipId];
         if (!partnership || !this.data.sources?.[sourceId]) return false;
         if (this.isTreeLocked()) return false;
-        if (partnership.sourceIds?.includes(sourceId)) return false;
+        const field = fact === 'divorce' ? 'divorceSourceIds' : 'sourceIds';
+        if (partnership[field]?.includes(sourceId)) return false;
 
         this.beginMutation();
-        if (!partnership.sourceIds) partnership.sourceIds = [];
-        partnership.sourceIds.push(sourceId);
+        partnership[field] = [...(partnership[field] ?? []), sourceId];
         const names = this.partnershipNames(partnership);
         this.commitMutation(strings.undo.cite(names));
         AuditLogManager.log(this.currentTreeId, 'source.cite', strings.auditLog.citedSource(names));
         return true;
     }
 
-    /** Remove a citation of `sourceId` from a partnership. */
-    uncitePartnership(partnershipId: PartnershipId, sourceId: string): boolean {
+    /** Remove a citation of `sourceId` from a partnership (or from its divorce). */
+    uncitePartnership(partnershipId: PartnershipId, sourceId: string, fact?: 'divorce'): boolean {
         const partnership = this.data.partnerships[partnershipId];
-        if (!partnership?.sourceIds?.includes(sourceId)) return false;
+        const field = fact === 'divorce' ? 'divorceSourceIds' : 'sourceIds';
+        if (!partnership?.[field]?.includes(sourceId)) return false;
         if (this.isTreeLocked()) return false;
 
         this.beginMutation();
-        partnership.sourceIds = partnership.sourceIds.filter(id => id !== sourceId);
-        if (partnership.sourceIds.length === 0) delete partnership.sourceIds;
+        const kept = partnership[field]!.filter(id => id !== sourceId);
+        if (kept.length > 0) partnership[field] = kept;
+        else delete partnership[field];
         const names = this.partnershipNames(partnership);
         this.commitMutation(strings.undo.uncite(names));
         AuditLogManager.log(this.currentTreeId, 'source.uncite', strings.auditLog.uncitedSource(names));
@@ -2578,6 +2794,7 @@ class DataManagerClass {
         this.beginMutation();
         ev.sourceIds = ev.sourceIds.filter(id => id !== sourceId);
         if (ev.sourceIds.length === 0) delete ev.sourceIds;
+        cleanCitationQuay(ev, ['sourceIds']);
         this.commitMutation(strings.undo.uncite(auditPersonName(person)));
         AuditLogManager.log(this.currentTreeId, 'source.uncite', strings.auditLog.uncitedSource(auditPersonName(person)));
         return true;
@@ -2663,6 +2880,7 @@ class DataManagerClass {
         this.beginMutation();
         ev.sourceIds = ev.sourceIds.filter(id => id !== sourceId);
         if (ev.sourceIds.length === 0) delete ev.sourceIds;
+        cleanCitationQuay(ev, ['sourceIds']);
         const names = this.partnershipNames(partnership);
         this.commitMutation(strings.undo.uncite(names));
         AuditLogManager.log(this.currentTreeId, 'source.uncite', strings.auditLog.uncitedSource(names));
@@ -2785,6 +3003,7 @@ class DataManagerClass {
                     delete child.parentRelTypes[id];
                     if (Object.keys(child.parentRelTypes).length === 0) delete child.parentRelTypes;
                 }
+                dropImportedParent(child, id);
             }
         }
 
@@ -2867,6 +3086,8 @@ class DataManagerClass {
         if (partnership.status === status) return true;
         this.beginMutation();
         partnership.status = status;
+        // A status set here is said, not the file's default: it is written (spec 066).
+        delete partnership.marriageUnrecorded;
         const sp1 = this.data.persons[partnership.person1Id];
         const sp2 = this.data.persons[partnership.person2Id];
         this.commitMutation(strings.undo.editPartnership(auditPersonName(sp1), auditPersonName(sp2)));
@@ -2881,7 +3102,7 @@ class DataManagerClass {
 
         // Track actual changes
         let changed = false;
-        if (updates.status !== undefined && updates.status !== partnership.status) { partnership.status = updates.status; changed = true; }
+        if (updates.status !== undefined && updates.status !== partnership.status) { partnership.status = updates.status; delete partnership.marriageUnrecorded; changed = true; }
         if (updates.startDate !== undefined && (updates.startDate || undefined) !== partnership.startDate) { partnership.startDate = updates.startDate || undefined; changed = true; }
         if (updates.startPlace !== undefined && (updates.startPlace || undefined) !== partnership.startPlace) { partnership.startPlace = updates.startPlace || undefined; changed = true; }
         if (updates.endDate !== undefined && (updates.endDate || undefined) !== partnership.endDate) { partnership.endDate = updates.endDate || undefined; changed = true; }
@@ -3148,6 +3369,7 @@ class DataManagerClass {
             delete child.parentRelTypes[parentId];
             if (Object.keys(child.parentRelTypes).length === 0) delete child.parentRelTypes;
         }
+        dropImportedParent(child, parentId);
 
         // Also remove from any partnership's childIds
         for (const partnership of Object.values(this.data.partnerships)) {
@@ -3507,13 +3729,17 @@ class DataManagerClass {
     replaceWithSourceData(newData: StromData): void {
         this.rollbackEditSession();   // whole-data replacement ends a staged dialog
         if (this.isReadOnly() || !this.currentTreeId) return;
+        // The tree shown until now: the drawing goes from it to the new one (spec 055).
+        const previous = this.data;
         this.data = migrateData(newData);
         this.save();
         UndoManager.setActiveTree(this.currentTreeId);
         UndoManager.clear();
         this.onUndoRedoChanged?.();
         CrossTree.invalidateCacheForTree(this.currentTreeId);
-        if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('strom:data-changed'));
+        if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent<DataChangedDetail>('strom:data-changed', { detail: { source: 'live', previous } }));
+        }
     }
 
     /**
@@ -3734,6 +3960,10 @@ class DataManagerClass {
         if (resolvedFields.deathDate !== undefined && resolvedFields.deathDate !== (keepPerson.deathDate || '')) mergeDetails.push(`${strings.labels.deathDate}: ${resolvedFields.deathDate || '–'}`);
         if (resolvedFields.deathPlace !== undefined && resolvedFields.deathPlace !== (keepPerson.deathPlace || '')) mergeDetails.push(`${strings.labels.deathPlace}: ${resolvedFields.deathPlace || '–'}`);
 
+        // The kept person as it was: a fact taken over from the removed one
+        // keeps that one's import mark (carryMergedImports below).
+        const keepBefore = structuredClone(keepPerson);
+
         // 1. Apply resolved field values
         if (resolvedFields.firstName !== undefined) keepPerson.firstName = resolvedFields.firstName;
         if (resolvedFields.lastName !== undefined) keepPerson.lastName = resolvedFields.lastName;
@@ -3741,11 +3971,17 @@ class DataManagerClass {
         if (resolvedFields.birthPlace !== undefined) keepPerson.birthPlace = resolvedFields.birthPlace || undefined;
         if (resolvedFields.deathDate !== undefined) keepPerson.deathDate = resolvedFields.deathDate || undefined;
         if (resolvedFields.deathPlace !== undefined) keepPerson.deathPlace = resolvedFields.deathPlace || undefined;
+        // The note: the value chosen in the dialog, else both texts, each part once.
+        const notes = resolvedFields.notes !== undefined
+            ? resolvedFields.notes || undefined
+            : mergeNoteText(keepPerson.notes, removePerson.notes);
+        if (notes) keepPerson.notes = notes;
+        else delete keepPerson.notes;
         // What the register adds to the birth and death: the kept person's own
         // wins, the removed one's fills a gap.
         // The titles of the name and the surname after marriage likewise.
         const keptMarried = keepPerson.marriedSurname;
-        for (const key of ['birthAddress', 'deathCause', 'deathAge', 'deathAddress', 'titleBefore', 'titleAfter', 'marriedSurname'] as const) {
+        for (const key of ['birthAddress', 'birthAge', 'deathCause', 'deathAge', 'deathAddress', 'titleBefore', 'titleAfter', 'marriedSurname'] as const) {
             if (!keepPerson[key] && removePerson[key]) keepPerson[key] = removePerson[key];
         }
         // Which surname the person goes by travels with the married surname:
@@ -3753,6 +3989,8 @@ class DataManagerClass {
         // or is the kept one's too and the kept one made no choice.
         keepPerson.primaryName = mergedPrimaryName(keepPerson, removePerson, keptMarried);
         if (!keepPerson.primaryName) delete keepPerson.primaryName;
+        // The married name's own given names come with the married surname they belong to.
+        if (!keptMarried && keepPerson.marriedSurname && removePerson.marriedFirstName) keepPerson.marriedFirstName = removePerson.marriedFirstName;
 
         // Clear placeholder status if we have a real name now
         if (keepPerson.firstName && keepPerson.firstName !== '?') {
@@ -3862,13 +4100,15 @@ class DataManagerClass {
                             const key = pid === removeId ? keepId : pid;
                             if (!existingPartnership.ages?.[key]) existingPartnership.ages = { ...(existingPartnership.ages ?? {}), [key]: age };
                         }
-                        if (!existingPartnership.note && removePartnership.note) {
-                            existingPartnership.note = removePartnership.note;
-                        }
+                        // The couple's note: both texts, each part once.
+                        const note = mergeNoteText(existingPartnership.note, removePartnership.note);
+                        if (note !== existingPartnership.note) existingPartnership.note = note;
                         // The couple's events (banns, a census…) come along.
                         if (removePartnership.events?.length) {
                             existingPartnership.events = [...(existingPartnership.events ?? []), ...removePartnership.events];
                         }
+                        // The family's ids in the loaded files: those of both records.
+                        mergeOriginalIds(existingPartnership, removePartnership);
                     }
                     // Delete the duplicate partnership
                     const partner = this.data.persons[partnerId];
@@ -3941,10 +4181,8 @@ class DataManagerClass {
                 if (!seen.has(ev.id)) keepPerson.events.push(ev);
             }
         }
-        for (const field of PERSON_CITATION_FIELDS) {
-            const ids = removePerson[field];
-            if (ids && ids.length > 0) keepPerson[field] = [...new Set([...(keepPerson[field] ?? []), ...ids])];
-        }
+        // A citation only the removed person had keeps its own QUAY.
+        for (const field of PERSON_CITATION_FIELDS) unionCitations(keepPerson, removePerson, field);
         if (removePerson.attachments && removePerson.attachments.length > 0) {
             if (!keepPerson.attachments) keepPerson.attachments = [];
             const seenAtt = new Set(keepPerson.attachments.map(a => a.id));
@@ -3983,6 +4221,24 @@ class DataManagerClass {
             }
         }
 
+        // 6d. Origin from a GEDCOM import (spec 066): facts and parent links
+        // taken over from the removed person keep its marks; the children's
+        // marks of the removed parent now name the kept one.
+        carryMergedImports(keepPerson, keepBefore, removePerson, new Map());
+        if (!keepPerson.importId && removePerson.importId) keepPerson.importId = removePerson.importId;
+        for (const [pid, from] of Object.entries(removePerson.importedParents ?? {})) {
+            if (keepPerson.parentIds.includes(pid as PersonId) && !keepBefore.parentIds.includes(pid as PersonId)) {
+                (keepPerson.importedParents ??= {})[pid] = from;
+            }
+        }
+        for (const child of Object.values(this.data.persons)) {
+            const from = child?.importedParents?.[removeId];
+            if (!from) continue;
+            delete child.importedParents![removeId];
+            if (child.parentIds.includes(keepId) && !child.importedParents![keepId]) child.importedParents![keepId] = from;
+        }
+        pruneImportOrigin(this.data);
+
         // 7. Delete the removed person
         delete this.data.persons[removeId];
 
@@ -4015,22 +4271,24 @@ class DataManagerClass {
 
                     // Show password prompt for decryption
                     window.Strom?.UI?.showPasswordPrompt(async (password: string) => {
+                        let data: StromData;
                         try {
-                            const decrypted = await decrypt(imported, password);
-                            const data = JSON.parse(decrypted) as StromData;
-
-                            // Check version compatibility
-                            if (!window.Strom?.UI?.checkJsonVersionBeforeImport(data)) {
-                                return;
-                            }
-
-                            this.beginMutation();
-                            this.data = migrateData(data);
-                            this.commitMutation(strings.undo.loadedData, true);
-                            if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('strom:data-changed'));
-                        } catch {
-                            window.Strom?.UI?.showAlert(strings.encryption.wrongPassword, 'error');
+                            data = JSON.parse(await decrypt(imported, password)) as StromData;
+                        } catch (err) {
+                            // Wrong password only when AES-GCM refused it (GitHub #13).
+                            window.Strom?.UI?.showAlert(cryptoErrorText(err), 'error');
+                            return;
                         }
+
+                        // Check version compatibility
+                        if (!window.Strom?.UI?.checkJsonVersionBeforeImport(data)) {
+                            return;
+                        }
+
+                        this.beginMutation();
+                        this.data = migrateData(data);
+                        this.commitMutation(strings.undo.loadedData, true);
+                        if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('strom:data-changed'));
                     });
                     return;
                 }

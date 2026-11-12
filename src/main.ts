@@ -3,7 +3,7 @@
  * Main entry point
  */
 
-import { DataManager } from './data.js';
+import { DataManager, DataChangedDetail } from './data.js';
 import { TreeManager } from './tree-manager.js';
 import { TreeRenderer } from './renderer.js';
 import { UI } from './ui.js';
@@ -15,6 +15,8 @@ import { SettingsManager } from './settings.js';
 import { AuditLogManager } from './audit-log.js';
 import { TreePreview, TreeCompare } from './tree-preview.js';
 import { initModalSkeleton } from './ui/modal-skeleton.js';
+import { setHelpResearchVersion, setHelpTour } from './ui/help-ui.js';
+import { activeResearchId } from './ui/history-ui.js';
 import { initToolbarFit } from './ui/toolbar-fit.js';
 import { DebugOptions, DebugStep, DebugPhase } from './layout/pipeline/debug-types.js';
 import { CryptoSession } from './crypto.js';
@@ -156,14 +158,17 @@ function syncUrlTreeParam(): void {
 /** Listeners every startup path needs — including the locked ones (V3). */
 function registerAppListeners(): void {
     // Listen for data changes (e.g., after import)
-    window.addEventListener('strom:data-changed', () => {
+    window.addEventListener('strom:data-changed', (e) => {
         // The card timeline's chips change the open tree's default for a while only (K4.5): another tree, its default.
         keepLifelineChipsFor(DataManager.getCurrentTreeId());
         // Locked ↔ readable flips with every tree (re)load: sync the
         // read-only gating before the render reads it.
         UI.syncLockedState();
         UI.syncNewerDataState();
-        TreeRenderer.render();
+        // A live load from the research's source: the tree goes over without a flash (spec 055).
+        const detail = (e as CustomEvent<DataChangedDetail | undefined>).detail;
+        if (detail?.source === 'live') void TreeRenderer.renderLive(detail.previous);
+        else TreeRenderer.render();
         UI.refreshSearch();
         // Track changes for embedded mode unsaved warning
         UI.markDataChanged();
@@ -352,6 +357,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     // "What's new": whether this browser held trees before anything can be added.
     UI.captureReleaseNotesStart();
+    // "How Strom works" compares a rule's version with the research connected to the tree.
+    setHelpResearchVersion(() => {
+        const rid = activeResearchId();
+        return rid ? UI.researchBridgeVersion(rid) : '';
+    });
+    // Its contents start the app tour.
+    setHelpTour(() => UI.startTour());
     // The startup tree is in memory: editing may begin (see .app-loading).
     document.documentElement.classList.remove('app-loading');
     document.getElementById('storage-blocked-notice')?.remove();
@@ -362,6 +374,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     ZoomPan.init();
     // A touch tap on a card beside its edge pills stays the card's
     installCardTapTarget();
+    // The status tip of every reliability pill and card mark
+    UI.installStatusTipHost();
 
     // Overview minimap (wires ZoomPan.onChange + canvas handlers)
     UI.initMinimap();
@@ -442,6 +456,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     UI.initHistoryLayer();
     UI.initQualityBridge();
     UI.initResearchFixes();
+    UI.initVerifyPerson();
     UI.initSurnameSuggest();
 
     // Linked in the view only: the live bridge's say, other windows' changes of the shown links.
@@ -466,6 +481,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         UI.initResearchSync();
         // The other research trees' state (switcher marks, "Elsewhere" in the panel).
         UI.initOtherResearch();
+        // The switches "Research on" of the research trees (spec 064).
+        UI.initResearchLive();
         // Originals waiting for a research (their state lines).
         void UI.initOriginalsQueue();
         // The family's materials from the research (cards' counts, the person's section).

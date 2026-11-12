@@ -28,6 +28,7 @@ import {
 } from '../types.js';
 import { coupleEventLabel, newestLifeEvent } from '../events.js';
 import { strings, getCurrentLanguage } from '../strings.js';
+import { storyFactText } from '../story-sources.js';
 import { isLivingPerson, inferBirthUpperBounds } from '../privacy.js';
 import { compressPhoto, dataUrlByteSize, rotatePhotoDataUrl } from '../photo.js';
 import { personInitials } from '../initials.js';
@@ -66,6 +67,7 @@ import { clearRodSelection, getSelectedRod, setRodSelection } from './rod-view.j
 import { interleaveHistory } from '../history.js';
 import { storyWithDraft } from './story-compare-ui.js';
 import { offeredDetails, resetDetailGroup, renderAgeCheck, ageBirthDate, eventDetailLine } from './event-details-ui.js';
+import { bindDeceasedAutoTick } from './deceased-autotick.js';
 
 /**
  * Delete person sits in the footer, except on a phone (T24): there the footer
@@ -169,6 +171,7 @@ export const personModalMethods = uiModule({
         if (questionClear) questionClear.value = '';
         const addDeceased = document.getElementById('input-is-deceased') as HTMLInputElement;
         if (addDeceased) addDeceased.checked = false;
+        bindDeceasedAutoTick('input-is-deceased', ['input-deathdate', 'input-deathplace']);
         const occupationClear = document.getElementById('input-occupation') as HTMLInputElement | null;
         if (occupationClear) { occupationClear.value = ''; occupationClear.readOnly = false; }
         const residenceClear = document.getElementById('input-residence') as HTMLInputElement | null;
@@ -181,6 +184,7 @@ export const personModalMethods = uiModule({
         // The big title is "New person" until a name is typed (then the typed
         // name, live); no mode subtitle — it would just repeat the title.
         this.updatePersonModalHeader(null, '');
+        this.renderPersonReliability(null);
 
         this.applyAdvancedFieldVisibility(null);
 
@@ -350,6 +354,8 @@ export const personModalMethods = uiModule({
         this.bindLivePersonModalName();
         this.updatePersonModalName();
         this.updatePersonModalRod(person);
+        // Spec 038 §5.1 b: the directions the person is in, under the lineage row.
+        this.renderPersonInLine(person && DataManager.getPerson(person.id) ? person.id : null);
     },
 
     /**
@@ -665,7 +671,10 @@ export const personModalMethods = uiModule({
         const factsGroup = document.getElementById('story-facts-group');
         const facts = document.getElementById('story-facts');
         if (factsGroup && facts) {
-            const lines = [...(story?.facts ?? []), ...(story?.note ? [story.note] : [])];
+            // The facts readable (never the raw GEDCOM lines), each once, then the caveat.
+            const lang = getCurrentLanguage();
+            const read = [...new Set((story?.facts ?? []).map(f => storyFactText(f, strings, lang)).filter(Boolean))];
+            const lines = [...read, ...(story?.note ? [story.note] : [])];
             facts.innerHTML = lines.map(f => `<div>${this.escapeHtml(f)}</div>`).join('');
             factsGroup.style.display = lines.length > 0 ? '' : 'none';
         }
@@ -720,6 +729,7 @@ export const personModalMethods = uiModule({
             text,
             ...(existing?.facts?.length ? { facts: existing.facts } : {}),
             ...(existing?.note ? { note: existing.note } : {}),
+            ...(existing?.sources?.length ? { sources: existing.sources } : {}),
             // The research's waiting new version: its state, not the form's.
             ...(existing?.draft ? { draft: existing.draft } : {}),
         };
@@ -911,6 +921,7 @@ export const personModalMethods = uiModule({
             deceasedInput.checked = !isLivingPerson(
                 person, new Date().getFullYear(), inferBirthUpperBounds(DataManager.getData()));
         }
+        bindDeceasedAutoTick('input-is-deceased', ['input-deathdate', 'input-deathplace']);
 
         this.fillStoryFields(person);
 
@@ -1021,6 +1032,7 @@ export const personModalMethods = uiModule({
         this.disableDuplicateSuggest('person');
         // "conflict ›" at the fields the research has an open conflict about.
         this.markResearchConflicts(id);
+        this.renderPersonReliability(id);
 
         placePersonDeleteLink();
         modal.classList.add('active');
@@ -1493,6 +1505,10 @@ export const personModalMethods = uiModule({
         // The suggestion only under the empty field, the choice of the
         // surname in use only under the filled one: never both.
         const suggestion = show && !readOnly && !filled ? this.currentMarriedSuggestion() : null;
+        // Which surname goes where (the maiden name holds the one from birth),
+        // while a woman's married surname is still empty.
+        const hint = document.getElementById('married-surname-hint');
+        if (hint) hint.hidden = !(show && !readOnly && !filled && female);
         this.refreshPrimaryNameChoice(show && filled, readOnly);
         const chip = document.getElementById('married-suggestion');
         const main = document.getElementById('married-suggestion-main');
@@ -1971,6 +1987,7 @@ export const personModalMethods = uiModule({
         this.updatePersonModalHeader(person, person.isPlaceholder ? strings.personModal.completeTitle : strings.personModal.editTitle);
         this.renderEventsList();
         this.markResearchConflicts(id);
+        this.renderPersonReliability(id);
     },
 
     /**

@@ -2,8 +2,11 @@
  * Marriage order (T13).
  *
  * A person's unions in chronological order — by the wedding date, then by the
- * order they have in the data (the person's `partnerships` list); a union
- * without a usable date comes after the dated ones. The diagram uses it twice:
+ * order they have in the data (the person's `partnerships` list). A union
+ * without a wedding date takes the latest the wedding can have been (T50,
+ * T13): the end of the union (a divorce) or the birth of its first child,
+ * whichever is earlier; a union with none of them comes after the others.
+ * The diagram uses it twice:
  *
  * - the partners on one side of a person with several unions in a row
  *   (expanded view, partner chains) stand in this order, the earliest next
@@ -28,7 +31,7 @@ import { parseFlexDate, displayYear } from './dates.js';
 import { isDiagramStandIn } from './layout/pipeline/placeholders.js';
 import { childIdsShownInPlace, partnerIdsShownInPlace } from './layout/pipeline/1-select-subgraph.js';
 
-/** Chronological key of a wedding date; Infinity when there is none (after every dated union). */
+/** Chronological key of a date (the qualifier ignored); Infinity when there is none. */
 function weddingKey(date: string | undefined): number {
     const d = parseFlexDate(date);
     if (!d) return Infinity;
@@ -36,15 +39,58 @@ function weddingKey(date: string | undefined): number {
 }
 
 /**
- * Compare two unions chronologically: the wedding date first, the order in
- * the data (`index`) on a tie or when neither has a date.
+ * A key just before a date: a bound the wedding came no later than ("before
+ * 1982", a divorce in 1982, a child born in 1982) sorts ahead of a wedding
+ * in that year ("1982", "about 1982") and after every earlier year.
  */
-export function compareMarriages(
-    a: { startDate?: string; index: number },
-    b: { startDate?: string; index: number }
-): number {
-    const ka = weddingKey(a.startDate);
-    const kb = weddingKey(b.startDate);
+const BOUND = 0.5;
+
+/** What the marriage order reads of a union. */
+export interface MarriageDates {
+    /** The wedding date. */
+    startDate?: string;
+    /** The end of the union (a divorce): the wedding was no later. */
+    endDate?: string;
+    /** Birth dates of the union's children: the union began no later than the first. */
+    childBirthDates?: readonly (string | undefined)[];
+    /** The union's place in the data (the person's `partnerships` list). */
+    index: number;
+}
+
+/**
+ * The chronological key of a union: its wedding date ("before 1982" just
+ * before 1982); without one the earliest of its end and its children's
+ * births, just before that date; Infinity when there is none of them.
+ */
+function marriageKey(m: MarriageDates): number {
+    const wedding = parseFlexDate(m.startDate);
+    if (wedding) return weddingKey(m.startDate) - (wedding.qualifier === '<' ? BOUND : 0);
+    let key = Infinity;
+    for (const date of [m.endDate, ...(m.childBirthDates ?? [])]) {
+        const k = weddingKey(date);
+        if (k !== Infinity) key = Math.min(key, k - BOUND);
+    }
+    return key;
+}
+
+/** The dates of a union the marriage order reads (marriageKey), `index` its place in the data. */
+export function marriageDates(data: StromData, union: Partnership, index: number): MarriageDates {
+    return {
+        startDate: union.startDate,
+        endDate: union.endDate,
+        childBirthDates: union.childIds.map(id => data.persons[id]).filter(p => p && !p.isPlaceholder).map(p => p.birthDate),
+        index,
+    };
+}
+
+/**
+ * Compare two unions chronologically (marriageKey): the wedding date, else
+ * the latest it can have been (the union's end, its first child's birth);
+ * the order in the data (`index`) on a tie or when neither has a date.
+ */
+export function compareMarriages(a: MarriageDates, b: MarriageDates): number {
+    const ka = marriageKey(a);
+    const kb = marriageKey(b);
     if (ka !== kb) return ka < kb ? -1 : 1;
     return a.index - b.index;
 }
@@ -59,9 +105,7 @@ export function marriagesInOrder(data: StromData, personId: PersonId): Partnersh
             const partnerId = e.union.person1Id === personId ? e.union.person2Id : e.union.person1Id;
             return !isDiagramStandIn(data, partnerId);
         })
-        .sort((a, b) => compareMarriages(
-            { startDate: a.union.startDate, index: a.index },
-            { startDate: b.union.startDate, index: b.index }))
+        .sort((a, b) => compareMarriages(marriageDates(data, a.union, a.index), marriageDates(data, b.union, b.index)))
         .map(e => e.id);
 }
 
@@ -436,17 +480,35 @@ export interface SiblingGroup {
 }
 
 /**
+ * `ids` by birth (T49): the year, then the month and the day where known
+ * ("about 1880" as 1880, "before 1880" just before it, "after 1880" just
+ * after it); those without a birth date after them, in the order of `ids`.
+ */
+export function inBirthOrder(data: StromData, ids: readonly PersonId[]): PersonId[] {
+    const key = (id: PersonId): number => {
+        const date = data.persons[id]?.birthDate;
+        const d = parseFlexDate(date);
+        if (!d) return Infinity;
+        return weddingKey(date) + (d.qualifier === '<' ? -BOUND : d.qualifier === '>' ? BOUND : 0);
+    };
+    return ids
+        .map((id, index) => ({ id, index, key: key(id) }))
+        .sort((a, b) => (a.key !== b.key ? (a.key < b.key ? -1 : 1) : a.index - b.index))
+        .map(e => e.id);
+}
+
+/**
  * `ids` (siblings of the person) by the union they were born to: the full
  * siblings first, then for each parent (the person's order of parents) the
  * children of the parent's other unions in the order of the marriages.
  * Empty groups are left out; siblings of no such union close the list in a
- * group of their own (no parent).
+ * group of their own (no parent). Each group by birth (inBirthOrder).
  */
 export function siblingGroups(data: StromData, personId: PersonId, ids: readonly PersonId[]): SiblingGroup[] {
     const person = data.persons[personId];
     if (!person) return [];
     const left = new Set(ids);
-    const take = (kids: readonly PersonId[]): PersonId[] => ids.filter(id => kids.includes(id) && left.delete(id));
+    const take = (kids: readonly PersonId[]): PersonId[] => inBirthOrder(data, ids.filter(id => kids.includes(id) && left.delete(id)));
     const own = Object.values(data.partnerships).find(u => u.childIds.includes(personId));
     const out: SiblingGroup[] = [];
     const full = take(own?.childIds ?? []);
@@ -464,7 +526,7 @@ export function siblingGroups(data: StromData, personId: PersonId, ids: readonly
             out.push({ full: false, parentId: q, partnerId, ids: kids });
         }
     }
-    const rest = ids.filter(id => left.has(id));
+    const rest = inBirthOrder(data, ids.filter(id => left.has(id)));
     if (rest.length) out.push({ full: false, parentId: null, partnerId: null, ids: rest });
     return out;
 }
@@ -579,7 +641,7 @@ export interface ChildrenUnionGroup {
 /**
  * The person's children `ids` by the union they were born to, in the order
  * of the marriages (marriagesInOrder, as the marriage-order pill numbers
- * them; a "?" stand-in family after them), each in the order of `ids`.
+ * them; a "?" stand-in family after them), each by birth (inBirthOrder).
  * Children of no union of the person close the list. Empty groups are left
  * out. The bubble labels the groups only when there is more than one.
  */
@@ -593,13 +655,13 @@ export function childrenByUnion(data: StromData, personId: PersonId, ids: readon
     for (const uid of unions) {
         const u = data.partnerships[uid];
         if (!u) continue;
-        const kids = ids.filter(id => u.childIds.includes(id) && left.delete(id));
+        const kids = inBirthOrder(data, ids.filter(id => u.childIds.includes(id) && left.delete(id)));
         if (kids.length === 0) continue;
         const other = u.person1Id === personId ? u.person2Id : u.person1Id;
         const partnerId = other !== personId && data.persons[other] && !data.persons[other].isPlaceholder ? other : null;
         out.push({ partnershipId: uid, number: ordered.indexOf(uid) + 1, partnerId, ids: kids });
     }
-    const rest = ids.filter(id => left.has(id));
+    const rest = inBirthOrder(data, ids.filter(id => left.has(id)));
     if (rest.length) out.push({ partnershipId: null, number: 0, partnerId: null, ids: rest });
     return out;
 }
@@ -859,10 +921,11 @@ export interface PillSegment { x1: number; y1: number; x2: number; y2: number }
 
 /**
  * The label a pill shows: whole ("2nd ∞ 1908"; "3rd ∞" without a date),
- * without the year ("2nd ∞"), or the ordinal alone ("2nd"). The bubble and
- * the accessible label always say it all.
+ * without the year ("2nd ∞"), or the ordinal alone ("2nd"); in the dense
+ * spacing the short form ("∞ 2", strings.marriageOrder.short). The bubble
+ * and the accessible label always say it all.
  */
-export type PillLabel = 'full' | 'noYear' | 'ordinal';
+export type PillLabel = 'full' | 'noYear' | 'ordinal' | 'short';
 
 /** One label of a pill: its parts (the screen's markup draws them, the measure measures them). */
 export interface PillLabelForm {
@@ -872,6 +935,8 @@ export interface PillLabelForm {
     year: string;
     /** False for the ordinal alone (no ∞). */
     glyph: boolean;
+    /** The dense spacing's short pill ("∞ 2"): `ordinal` holds its whole text. */
+    short?: boolean;
 }
 
 /**
@@ -886,10 +951,23 @@ export function pillLabelForms(ordinal: string, year: string): PillLabelForm[] {
     return out;
 }
 
+/** The dense spacing's short pill as its one label form: `text` is strings.marriageOrder.short ("∞ 2"). */
+export function shortPillLabelForm(text: string): PillLabelForm {
+    return { label: 'short', ordinal: text, year: '', glyph: true, short: true };
+}
+
+/**
+ * The short pill's text without its ∞ ("2" of "∞ 2"): what the image writes
+ * as its number, the ∞ drawn as the pill's glyph.
+ */
+export function shortPillNumber(text: string): string {
+    return text.replace('∞', ' ').replace(/\s+/g, ' ').trim();
+}
+
 /** The widths placeUnionOrderPill takes, from the labels (pillLabelForms) and their measures, in that order. */
 export function pillLabelWidths(forms: ReadonlyArray<PillLabelForm>, widths: ReadonlyArray<number>):
-    Pick<PillPlacementInput, 'pillWidth' | 'shorter'> {
-    return { pillWidth: widths[0], shorter: forms.slice(1).map((f, i) => ({ label: f.label, width: widths[i + 1] })) };
+    Pick<PillPlacementInput, 'pillWidth' | 'pillLabel' | 'shorter'> {
+    return { pillWidth: widths[0], pillLabel: forms[0].label, shorter: forms.slice(1).map((f, i) => ({ label: f.label, width: widths[i + 1] })) };
 }
 
 export interface PillPlacementInput {
@@ -898,6 +976,8 @@ export interface PillPlacementInput {
     side: 'left' | 'right';
     /** Width of the whole pill. */
     pillWidth: number;
+    /** The whole pill's label (default 'full'; the dense spacing's 'short'). */
+    pillLabel?: PillLabel;
     /**
      * Widths of its shorter labels, longest first (pillLabelForms): tried in
      * turn when the whole pill does not fit in its half of the card.
@@ -917,6 +997,12 @@ export interface PillPlacementInput {
     rightHover?: number;
     /** The view's lines near the card, card-relative. */
     segments?: ReadonlyArray<PillSegment>;
+    /**
+     * Only on the top edge, never above the tabs (the dense spacing, D1: the
+     * row above them would reach the bus 24px over the card). Where the pill
+     * does not fit beside the tabs in its half, the card shows none.
+     */
+    edgeOnly?: boolean;
 }
 
 export interface PillPlacement {
@@ -967,7 +1053,7 @@ function hitsLine(x: number, y: number, w: number, segments: ReadonlyArray<PillS
  * shows no pill rather than one over the middle of its top edge.
  */
 export function placeUnionOrderPill(input: PillPlacementInput): PillPlacement | null {
-    const forms: Array<{ label: PillLabel; width: number }> = [{ label: 'full', width: input.pillWidth }, ...(input.shorter ?? [])];
+    const forms: Array<{ label: PillLabel; width: number }> = [{ label: input.pillLabel ?? 'full', width: input.pillWidth }, ...(input.shorter ?? [])];
     for (const clearOnly of [true, false]) {
         for (const f of forms) {
             const slot = placeWidth(input, f.width, clearOnly);
@@ -1006,6 +1092,8 @@ function placeWidth(input: PillPlacementInput, w: number, clearOnly: boolean):
         }
     }
 
+    if (input.edgeOnly) return clearOnly ? null : edgeSlot(input, w);
+
     // Above the tabs: in the half, within the card, the corner first.
     const lo = side === 'left' ? 0 : mid + CENTRE_CLEAR;
     const hi = side === 'left' ? mid - CENTRE_CLEAR - w : W - w;
@@ -1020,6 +1108,27 @@ function placeWidth(input: PillPlacementInput, w: number, clearOnly: boolean):
         }
     }
     return clearOnly ? null : { x: corner, y: ABOVE_ROW_Y, row: 'above', clear: false };
+}
+
+/**
+ * The pill on the top edge beside the corner's tabs whatever lines it meets
+ * there (edgeOnly, no place clear of them), or null when it is wider than
+ * the room there in its half.
+ */
+function edgeSlot(input: PillPlacementInput, w: number): { x: number; y: number; row: 'edge'; clear: boolean } | null {
+    const { cardWidth: W, side, leftTabs, rightTabs, leftInset, rightInset } = input;
+    const mid = W / 2;
+    const leftEnd = leftTabs > 0 ? leftInset + leftTabs : -Infinity;
+    const rightStart = rightTabs > 0 ? W - rightInset - rightTabs : Infinity;
+    const hover = input.rightHover ?? 0;
+    const rightHoverStart = hover > 0 ? (rightTabs > 0 ? rightStart - EDGE_GAP : W - rightInset) - hover : Infinity;
+    if (side === 'left') {
+        const x = leftTabs > 0 ? leftEnd + EDGE_GAP : leftInset;
+        return x + w <= mid - CENTRE_CLEAR && x + w + EDGE_GAP <= Math.min(rightStart, rightHoverStart)
+            ? { x, y: EDGE_ROW_Y, row: 'edge', clear: false } : null;
+    }
+    const x = (rightTabs > 0 ? rightStart - EDGE_GAP : W - rightInset) - w;
+    return x >= mid + CENTRE_CLEAR && x >= leftEnd + EDGE_GAP ? { x, y: EDGE_ROW_Y, row: 'edge', clear: false } : null;
 }
 
 /**
@@ -1075,6 +1184,21 @@ export function estimatePillTextWidth(text: string): number {
     let w = 0;
     for (const c of text) w += /[0-9~<>]/.test(c) ? 6 : c === '.' ? 2.8 : c === ' ' ? 2.6 : 5.6;
     return w;
+}
+
+/**
+ * The dense spacing's short pill ("∞ 2", strings.marriageOrder.short)
+ * measured without a browser: its parts in the order of its text.
+ */
+export function estimateShortPillMetrics(text: string): PillMetrics {
+    const at = text.indexOf('∞');
+    // The ∞ after the number: laid out as the whole pill without a year.
+    if (at < 0 || text.slice(0, at).trim()) return estimatePillMetrics(shortPillNumber(text), '', at >= 0);
+    // The ∞ first ("∞ 2"): the glyph, 3px, the number.
+    const glyphW = 9;
+    const glyphX = 8 + glyphW / 2;
+    const numX = 8 + glyphW + 3;
+    return { width: numX + estimatePillTextWidth(shortPillNumber(text)) + 8, numX, glyphX, yearX: 0 };
 }
 
 /**

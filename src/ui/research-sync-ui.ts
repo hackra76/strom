@@ -26,10 +26,13 @@ import { TreeManager } from '../tree-manager.js';
 import { TreeRenderer } from '../renderer.js';
 import { ZoomPan } from '../zoom.js';
 import { strings, getCurrentLanguage } from '../strings.js';
-import { TreeId, PersonId, ResearchLink, ResearchSend, ResearchSendMode, StromData, ResearchConflict } from '../types.js';
+import { TreeId, PersonId, ResearchLink, ResearchSend, ResearchSendMode, StromData, ResearchConflict, ResearchHypothesis } from '../types.js';
+import { HypothesisPick, hypothesisPickable } from '../research-hypothesis-pick.js';
 import { formatLiveClock } from '../live-time.js';
 import { PhoneSummary } from '../phone.js';
 import { localNetworkDenied } from '../local-network.js';
+import { BRIDGE_ANSWER_MS, askOnce, tallyBridgeAsk, waitAtMost } from '../bridge-ask.js';
+import { completeStatus, statusAskUrl } from '../status-parts.js';
 import { currentAppBrowser } from '../research-transfer.js';
 import { isTreeStale } from '../tab-sync.js';
 import { formatFlexDate } from '../dates.js';
@@ -37,7 +40,7 @@ import { parseGedcom, convertToStrom } from '../ged-parser.js';
 import {
     LiveStatus, contentFingerprint, fingerprintLike, sanitizeLiveStatus, sanitizeSyncReply, isSafariBrowser,
     parseLiveBridge, researchSchemeUrl, readResearchHeader, stabilizeIds, researchPersonRef, ResearchAccepts,
-    researchIdsByContent, holdsResearchIds, ResearchSendRecord, AdoptIds, ExportXrefs, applySyncIds, sourceIdOfXref, researchGedcomTitles, researchSendsReadings, SyncReading,
+    researchIdsByContent, holdsResearchIds, ResearchSendRecord, AdoptIds, ExportXrefs, applySyncIds, sourceIdOfXref, researchGedcomTitles, researchSendsReadings, researchSendsSourceFields, SyncReading,
     researchHasTitles, hasTitles, withoutTitles, TITLES_FEATURE, researchConflictRef, isResearchHead, SYNC_REMOVED_FEATURE, SyncPersonConflict,
     researchLinkMark, researchUrlMark, type ResearchActionMark,
 } from '../research-link.js';
@@ -60,11 +63,12 @@ import { MATERIAL_ASSIGN_FEATURE } from '../materials.js';
 import { rememberedMaterialFeatures } from './materials-ui.js';
 import { setResearchConflictsProvider } from '../card-signals.js';
 import { ConflictDecideMode, conflictDecideMode, DecideKind, DecideBody, DecideResult, postBridgeDecide, canDecideInApp } from '../research-decide.js';
+import { postBridgeRevert, researchShowsOrigin, RevertRequest, RevertResult } from '../research-revert.js';
 import { researchConflictTitle } from './person-research-ui.js';
 import { uiModule } from './module.js';
 import { researchWrittenList } from './research-changes-ui.js';
 import {
-    fetchWithTimeout, fetchGedcomText, postSync, onComputer, readTree, researchGedcom, researchGedcomExport,
+    fetchWithTimeout, readStatusPart, readResearchTreeFile, postSync, onComputer, readTree, researchGedcom, researchGedcomExport,
 } from './research-ui.js';
 import { shownNameOrEmpty } from '../person-name.js';
 
@@ -124,8 +128,12 @@ const POLL_PENDING_MS = 15_000;
 const POLL_DOWN_MS = 15_000;
 /** A status this fresh counts as "the bridge runs" without asking again. */
 const FRESH_MS = 30_000;
-/** Timeouts: the background ask, the ask before a send, the send itself (the research writes it, up to 20 s and then 202). */
-const POLL_TIMEOUT_MS = 3000;
+/**
+ * Timeouts: the background ask (as long as the bridge's own answer may take, a little more: a
+ * big research needs seconds), the ask before a send (it goes on with the last status known
+ * meanwhile), the send itself (the research writes it, up to 20 s and then 202).
+ */
+const POLL_TIMEOUT_MS = BRIDGE_ANSWER_MS + 1000;
 const PING_TIMEOUT_MS = 1500;
 const SEND_TIMEOUT_MS = 120_000;
 /** An answer younger than this is not asked again when the menu opens or the window comes back. */
@@ -183,8 +191,9 @@ interface BridgeRuntime {
     /** Since when it does not answer (ms; 0 = it answers). */
     downSince: number;
     /**
-     * How the last ask failed: `hung` — connected, no answer in time (the bridge
-     * runs but is stuck); `refused` — it answered but not to this address (the
+     * How the last ask failed: `hung` — connected, no answer in time several
+     * asks in a row (HUNG_AFTER_TIMEOUTS: the bridge runs but is stuck; one slow
+     * answer leaves the last state standing); `refused` — it answered but not to this address (the
      * token or the tree no longer its: open the research from the app again);
      * `denied` — the browser blocks the address (its local network permission,
      * "Apps on device" in Edge): the research may well be running;
@@ -194,6 +203,8 @@ interface BridgeRuntime {
 }
 
 const runtime = new Map<string, BridgeRuntime>();
+/** Asks in a row a research's bridge did not answer in time (tallyBridgeAsk). */
+const strikes = new Map<string, number>();
 
 /** Where to allow the research in this browser's site settings (Brave: its localhost access). */
 const blockedSub = (): string => strings.sync.blockedSub(currentAppBrowser() === 'brave' ? strings.sync.settingBrave : strings.sync.settingApps);
@@ -344,10 +355,27 @@ export function onBridgeStatus(listener: BridgeStatusListener): void {
     if (!bridgeStatusListeners.includes(listener)) bridgeStatusListeners.push(listener);
 }
 
+/**
+ * The last status each research's bridge gave in this page, kept while the
+ * bridge is down (the runtime forgets it then): what a row at rest shows.
+ */
+const lastSaidStatus = new Map<string, LiveStatus>();
+
+/** What a research's bridge last said in this page (also while it is down now), or null. */
+export function lastBridgeStatus(researchId: string): LiveStatus | null {
+    return lastSaidStatus.get(researchId.toLowerCase()) ?? null;
+}
+
 function tellBridgeStatus(researchId: string, status: LiveStatus): void {
+    lastSaidStatus.set(researchId.toLowerCase(), status);
     for (const listener of bridgeStatusListeners) {
         try { listener(researchId, status); } catch (err) { console.warn('Bridge status listener failed', err); }
     }
+}
+
+/** The research's last status in this page, as its bridge answers now (null: not asked yet, or it does not answer). */
+export function researchStatusNow(researchId: string): LiveStatus | null {
+    return runtime.get(researchId)?.status ?? null;
 }
 
 /** A status the bridge gave elsewhere (?live=, ?send=, following): it runs, and this is what it said. */
@@ -522,6 +550,21 @@ export const researchSyncMethods = uiModule({
     },
 
     /**
+     * How the card of a hypothesis of the active research tree is offered (spec 074, DEV §2):
+     * the research's features as its bridge says them now, else as it said them last in this
+     * page; the `hypothesis` link announced on this computer; a tree that takes no edits only read.
+     */
+    researchHypothesisPickable(h: ResearchHypothesis): HypothesisPick {
+        const id = this.activeResearchId();
+        const status = id ? this.researchStatusOf(id) ?? lastBridgeStatus(id) : null;
+        return hypothesisPickable(h, {
+            readOnly: !id || DataManager.isReadOnly(),
+            features: status?.features ?? null,
+            linkAvailable: this.researchLinkAvailable('hypothesis'),
+        });
+    },
+
+    /**
      * Decide a conflict (later a hypothesis) of the active research tree through its bridge: one
      * request, as the only window doing a research step for the tree (a send of another window
      * goes first). The answer typed; never throws. Changes nothing of the tree (the research's new
@@ -541,6 +584,74 @@ export const researchSyncMethods = uiModule({
             const rt = runtime.get(ctx.link.id);
             if (rt?.status) runtime.set(ctx.link.id, { ...rt, status: { ...rt.status, head: answer.head } });
             noteResearchBridgeStatus(ctx.link.id, null, answer.head);
+        }
+        return answer;
+    },
+
+    /**
+     * The active research tree's bridge shows where its values came from and
+     * puts back a family tree's value (`origin` in /status.features). Off
+     * (no bridge, an older research, a tree that is no research's): the
+     * person card shows only the app's own "from family tree" mark, no
+     * "Originally" row and no Revert.
+     */
+    researchShowsOriginNow(): boolean {
+        const id = this.activeResearchId();
+        return researchShowsOrigin(id ? this.researchStatusOf(id)?.features : null);
+    },
+
+    /**
+     * Put back a family tree's value in the active research tree through its
+     * bridge (POST <token>/facts/revert), as the only window doing a research
+     * step for the tree. The answer typed; never throws; no bridge:
+     * `noBridge`. Changes nothing of the tree (the research's new head is
+     * noted); researchRevertFact loads the value.
+     */
+    async postRevert(req: RevertRequest): Promise<RevertResult> {
+        const ctx = this.researchSyncLink();
+        const bridge = ctx ? parseLiveBridge(storedResearchBridge(ctx.link.id)?.base) : null;
+        let result: RevertResult = { kind: 'noBridge' };
+        if (!ctx || !bridge) return result;
+        const features = this.researchStatusOf(ctx.link.id)?.features;
+        await this.researchWindowLock(ctx.treeId, false, async () => {
+            result = await postBridgeRevert(bridge.base, req, features);
+        });
+        const answer = result as RevertResult;
+        if (answer.kind === 'ok' && answer.head) {
+            const rt = runtime.get(ctx.link.id);
+            if (rt?.status) runtime.set(ctx.link.id, { ...rt, status: { ...rt.status, head: answer.head } });
+            noteResearchBridgeStatus(ctx.link.id, null, answer.head);
+        }
+        return answer;
+    },
+
+    /**
+     * One write of the app's own through the active research tree's bridge
+     * (verifying a fact, confirming one from the scan): `send` gets the
+     * bridge's address and the features it said, run as the only window
+     * doing a research step for the tree (a send of another window goes
+     * first). On an answer with a head, the research's new version is noted
+     * at once and (unless `load: false`) taken quietly when it changes no
+     * value here, as after a decided conflict (researchConflictKeptLoad).
+     * Null: no bridge, or `send` threw. Never throws.
+     */
+    async postResearchBridgeWrite<T extends { ok: boolean }>(send: (base: string, features: readonly string[]) => Promise<T>,
+        opts: { load?: boolean } = {}): Promise<T | null> {
+        const ctx = this.researchSyncLink();
+        const bridge = ctx ? parseLiveBridge(storedResearchBridge(ctx.link.id)?.base) : null;
+        if (!ctx || !bridge) return null;
+        const features = (this.researchStatusOf(ctx.link.id) ?? lastBridgeStatus(ctx.link.id))?.features ?? [];
+        let result: T | null = null;
+        await this.researchWindowLock(ctx.treeId, false, async () => {
+            try { result = await send(bridge.base, features); } catch { result = null; }
+        });
+        const answer = result as T | null;
+        const head = answer?.ok ? (answer as { head?: unknown }).head : undefined;
+        if (typeof head === 'string' && head) {
+            const rt = runtime.get(ctx.link.id);
+            if (rt?.status) runtime.set(ctx.link.id, { ...rt, status: { ...rt.status, head } });
+            noteResearchBridgeStatus(ctx.link.id, null, head);
+            if (opts.load !== false) void this.researchConflictKeptLoad(head).catch(() => undefined);
         }
         return answer;
     },
@@ -883,43 +994,63 @@ export const researchSyncMethods = uiModule({
     // ==================== ASKING THE BRIDGE ====================
 
     /**
-     * Ask a research's bridge for its status (short timeout); takes in what it says. Null: it does not answer.
+     * Ask a research's bridge for its status; takes in what it says. Null: it does not answer.
+     * `timeout`: how long this caller waits — the ask itself may take BRIDGE_ANSWER_MS (a big
+     * research needs seconds), one at a time per bridge; a caller whose time is up goes on with
+     * what was last known (the answer is taken in when it comes). Only HUNG_AFTER_TIMEOUTS asks
+     * in a row without an answer make it "not responding".
      * `base`: at that address (the followed bridge) instead of the one kept.
      */
     async askResearchBridge(researchId: string, timeout: number, base?: string): Promise<LiveStatus | null> {
         const bridge = parseLiveBridge(base ?? storedResearchBridge(researchId)?.base);
         if (!bridge) return null;
-        let status: LiveStatus | null = null;
-        let blocked = false;
-        let busyFor = 0;
-        let why: BridgeRuntime['why'] = '';
-        try {
-            const res = await fetchWithTimeout(`${bridge.status}?poll=1`, timeout);
-            if (res.ok) status = sanitizeLiveStatus(await res.json());
-            // Busy (starting up, a long write): ask again after the time it names.
-            else if (res.status === 503) busyFor = retryAfterMs(res.headers.get('Retry-After'));
-            // Something answers there, but not to this address (an old token, another tree's bridge).
-            else if (res.status === 401 || res.status === 403 || res.status === 404) why = 'refused';
-        } catch (err) {
-            blocked = err instanceof TypeError;
-            // No answer in time: the bridge is there but stuck (B5 of the rc.22 round).
-            if ((err as { name?: string })?.name === 'AbortError' || (err as { name?: string })?.name === 'TimeoutError') why = 'hung';
-            // Refused by the browser itself: never said as "not running" (F4 of the Windows round).
-            else if (blocked && await localNetworkDenied()) why = 'denied';
-        }
-        // An address of another research (the port went to another tree's bridge): not ours.
-        if (status && status.treeId !== researchId) { status = null; why = 'refused'; }
-        const prev = runtime.get(researchId);
-        const downSince = status ? 0 : (prev?.up || !prev?.downSince ? Date.now() : prev.downSince);
-        runtime.set(researchId, { up: !!status, checkedAt: Date.now(), status, blocked: !status && blocked, downSince,
-            busyUntil: busyFor ? Date.now() + busyFor : 0, why: status ? '' : why });
-        if (status) {
-            noteResearchLinks(status.links, status.linkScheme);
-            noteResearchWaiting(researchId, status.waiting, status);
-            noteResearchBridgeStatus(researchId, status.accepts, status.head, researchTreeOfStatus(status));
-            tellBridgeStatus(researchId, status);
-        }
-        return status;
+        const url = `${bridge.status}?poll=1`;
+        const ask = askOnce(`${researchId} ${url}`, async (): Promise<LiveStatus | null> => {
+            let status: LiveStatus | null = null;
+            let blocked = false;
+            let busyFor = 0;
+            let why: BridgeRuntime['why'] = '';
+            let timedOut = false;
+            try {
+                // A bridge that answers the light status: its heavy parts read only when they changed.
+                const res = await fetchWithTimeout(statusAskUrl(url), BRIDGE_ANSWER_MS);
+                if (res.ok) status = sanitizeLiveStatus(await completeStatus(url, await res.json(), readStatusPart));
+                // Busy (starting up, a long write): ask again after the time it names.
+                else if (res.status === 503) busyFor = retryAfterMs(res.headers.get('Retry-After'));
+                // Something answers there, but not to this address (an old token, another tree's bridge).
+                else if (res.status === 401 || res.status === 403 || res.status === 404) why = 'refused';
+            } catch (err) {
+                blocked = err instanceof TypeError;
+                // No answer in time: slow, or stuck once it happens a few times in a row (B5 of the rc.22 round).
+                if ((err as { name?: string })?.name === 'AbortError' || (err as { name?: string })?.name === 'TimeoutError') timedOut = true;
+                // Refused by the browser itself: never said as "not running" (F4 of the Windows round).
+                else if (blocked && await localNetworkDenied()) why = 'denied';
+            }
+            const tally = tallyBridgeAsk(strikes.get(researchId) ?? 0, timedOut ? 'timeout' : 'answer');
+            strikes.set(researchId, tally.strikes);
+            const prev = runtime.get(researchId);
+            // Slow, not stuck: what it said last stands (nothing is called off, no "strom live stop").
+            if (tally.keepLast) return prev?.up ? prev.status : null;
+            if (tally.hung) why = 'hung';
+            // An address of another research (the port went to another tree's bridge): not ours.
+            if (status && status.treeId !== researchId) { status = null; why = 'refused'; }
+            const downSince = status ? 0 : (prev?.up || !prev?.downSince ? Date.now() : prev.downSince);
+            runtime.set(researchId, { up: !!status, checkedAt: Date.now(), status, blocked: !status && blocked, downSince,
+                busyUntil: busyFor ? Date.now() + busyFor : 0, why: status ? '' : why });
+            if (status) {
+                noteResearchLinks(status.links, status.linkScheme);
+                noteResearchWaiting(researchId, status.waiting, status);
+                noteResearchBridgeStatus(researchId, status.accepts, status.head, researchTreeOfStatus(status));
+                tellBridgeStatus(researchId, status);
+            }
+            return status;
+        });
+        const waited = await waitAtMost(ask, timeout);
+        if (waited.done) return waited.value;
+        // Still on its way: this caller goes on with what was last known; the answer is shown when it comes.
+        void ask.then(() => this.refreshResearchSyncUi());
+        const rt = runtime.get(researchId);
+        return rt?.up ? rt.status : null;
     },
 
     /**
@@ -969,6 +1100,8 @@ export const researchSyncMethods = uiModule({
             // was decided there): read again, never counted from the old one (B1 of beta.56).
             const held = this.researchHeld(ctx.treeId);
             if (held && status.head && status.head !== held.head) await this.researchReadHeld(ctx.treeId);
+            // A hypothesis asked from this page: its new version read, the decision loaded (spec 074 DEV §4).
+            if (status.head) await this.researchHypothesesHeadSeen(ctx.treeId, status.head);
         }
         this.refreshResearchSyncUi();
         // Updated since: it takes sends now — what waits starts its quiet time.
@@ -1008,6 +1141,7 @@ export const researchSyncMethods = uiModule({
      */
     researchBridgeMoved(researchId: string): void {
         runtime.delete(researchId);
+        strikes.delete(researchId);
         olderAsked.delete(researchId);
         for (const tree of TreeManager.getTrees()) {
             const link = tree.research;
@@ -1478,6 +1612,18 @@ export const researchSyncMethods = uiModule({
         await this.postResearchSend(treeId, { auto: true, keepalive: why === 'leave' });
     },
 
+    /**
+     * Following stopped by the user: "How should changes go to the research?" comes now, not at the next
+     * answer of the bridge (063 U3 A7) — under the same conditions (its research running and taking sends,
+     * asked once). The bridge not heard from yet: it is asked now, and its answer asks.
+     */
+    researchAskSendModeAfterFollow(): void {
+        const ctx = this.researchSyncLink();
+        if (!ctx) return;
+        if (runtime.get(ctx.link.id)?.up && this.researchSyncCapable(ctx.link.id)) this.maybeAskResearchSendMode(ctx.treeId);
+        else void this.pollResearchBridge();
+    },
+
     /** After an answer from the bridge: what waited for it goes now (the research's version loads only when asked). */
     async researchAutoCheck(): Promise<void> {
         const ctx = this.researchSyncLink();
@@ -1596,8 +1742,9 @@ export const researchSyncMethods = uiModule({
         // Another window stored this tree since: what this one holds would
         // take back what that one has. Never send it; a reload brings it up to date.
         // Leaving the page: only what is known at once (another window's save is told to this one as it
-        // happens) — reading the stored base takes longer than the page has (audit 017 a-D1).
-        if (isTreeStale(treeId) || (!opts.keepalive && !await TreeManager.researchBaseMatches(treeId))) {
+        // happens, and the base this window last stored or read) — reading the stored base takes longer
+        // than the page has (audit 017 a-D1).
+        if (isTreeStale(treeId) || (opts.keepalive ? !TreeManager.researchBaseKnownMatches(treeId) : !await TreeManager.researchBaseMatches(treeId))) {
             console.warn('Not sending a stale copy of the tree to the research', treeId);
             if (!opts.auto) this.showToast(s.staleTab, 8000, { action: { label: strings.storageSafety.reload, run: () => window.location.reload() } });
             return;
@@ -1689,7 +1836,7 @@ export const researchSyncMethods = uiModule({
         const exported = again ? null : researchGedcomExport(data, meta?.name ?? '', {
             id: link.id, head: link.head, appTree: treeId, transcripts: this.researchTranscriptsLink(link).transcripts, sent: fps.current,
             ...(since ? { since } : {}),
-        }, titles, researchSendsReadings(this.researchStatusOf(link.id)));
+        }, titles, researchSendsReadings(this.researchStatusOf(link.id)), researchSendsSourceFields(this.researchStatusOf(link.id)));
         const gedcom = exported?.content ?? '';
         // What this send carries, person by person (what was written, once it is).
         if (!again) this.researchNoteSending(treeId, data, fps.current);
@@ -2022,8 +2169,9 @@ export const researchSyncMethods = uiModule({
         const bridge = parseLiveBridge(storedResearchBridge(link.id)?.base);
         if (!bridge) return { ok: false, why: 'unreachable' };
         let text: string;
+        let images: ReadonlyMap<string, string> | undefined;
         try {
-            text = await fetchGedcomText(bridge.ged);
+            ({ text, images } = await readResearchTreeFile(bridge.ged, this.researchStatusOf(link.id)?.features));
         } catch (err) {
             console.warn('Loading the research version for its numbers failed', err);
             return { ok: false, why: 'unreachable' };
@@ -2033,7 +2181,7 @@ export const researchSyncMethods = uiModule({
             console.warn('The research version is not this tree', { stromResearch: header.isStromResearch, tree: header.treeId, expected: link.id });
             return { ok: false, why: 'other-tree' };
         }
-        const research = convertToStrom(parseGedcom(text)).data;
+        const research = convertToStrom(parseGedcom(text), { images }).data;
         if (this.researchSyncFingerprints(treeId, link).matchesBase) {
             const done = await this.applyResearch(research, header, { quiet: true });
             return done === treeId && !TreeManager.getTreeMetadata(treeId)?.research?.awaitingIds
@@ -2512,6 +2660,10 @@ export const researchSyncMethods = uiModule({
         this.surnameSuggestBridgeChanged();
         // Kinds of history in Settings (spec 035 §5): the Search column follows the bridge, up or gone.
         this.historyKindsBridgeChanged();
+        // The Research overview open without following: drawn from what the bridge says now (spec 057 §7.2).
+        this.syncOverviewViewing();
+        // The Table's agent and queue cells without following (spec 057 §7.4): drawn again when what the bridge says changed.
+        this.tableResearchAgentChanged();
     },
 
     /**
@@ -2773,8 +2925,9 @@ export const researchSyncMethods = uiModule({
             if (list && list.length > 0) {
                 // The facts on one line (menu 1020 §2.2): "2 people changed · 14:32", not "… · Changed 14:32".
                 const timeOnly = (state.kind === 'unsent' || state.kind === 'unsentBridgeDown') && !!changed && b.sub === s.changedAt(changed);
-                const facts = timeOnly ? changed : b.sub;
-                // The time never stands alone on a line of a narrow block: "· 16:01" stays with the word before it.
+                // The time never stands alone on a line of a narrow block: "· 16:01" stays with the word before it,
+                // and a 12-hour time keeps its "PM" ("11:13 PM" is one word).
+                const facts = timeOnly ? changed.replace(/\s/g, '\u00a0') : b.sub;
                 b.sub = [strings.changes.personsChanged(list.length), facts].filter(Boolean).join(timeOnly ? '\u00a0·\u00a0' : ' · ');
                 b.actions = [...(b.actions ?? []), { action: 'showChanges', label: strings.changes.whatWillBeSent, asLink: true }];
             }
@@ -3031,8 +3184,9 @@ export const researchSyncMethods = uiModule({
         const bridge = parseLiveBridge(storedResearchBridge(link.id)?.base);
         if (!bridge) return false;
         let text: string;
+        let images: ReadonlyMap<string, string> | undefined;
         try {
-            text = await fetchGedcomText(bridge.ged);
+            ({ text, images } = await readResearchTreeFile(bridge.ged, this.researchStatusOf(link.id)?.features));
         } catch {
             return false;
         }
@@ -3040,7 +3194,7 @@ export const researchSyncMethods = uiModule({
         if (!header.isStromResearch || header.treeId !== link.id) return false;
         let data: StromData;
         try {
-            data = convertToStrom(parseGedcom(text)).data;
+            data = convertToStrom(parseGedcom(text), { images }).data;
         } catch {
             return false;
         }

@@ -75,10 +75,10 @@ function fullTree(): Required<StromData> {
                 id: 'att1', name: 'page-57.jpg', mimeType: 'image/jpeg',
                 dataUrl: 'data:image/jpeg;base64,AA==', sizeBytes: 1,
                 original: { sha256: 'b'.repeat(64), name: 'page-57.tif', mimeType: 'image/tiff', bytes: 148_000_000, orientation: 6 },
-            }] },
+            }], importId: 'I1', importedValues: { firstName: { from: 'I1', value: 'Alice' } } },
             [BOB]: person(BOB, 'Bob'),
         },
-        partnerships: { [UNION]: partnership() },
+        partnerships: { [UNION]: { ...partnership(), importId: 'I1' } },
         sources: {
             s1: {
                 id: 's1', title: 'Parish register, Kolín', quality: 3,
@@ -109,7 +109,18 @@ function fullTree(): Required<StromData> {
         surnameRejections: [{ forms: ['Lhoták', 'Lhota'], id: 'sg_lhotak_lhota', at: '2026-10-20T10:00:00.000Z' }],
         qualityDismissed: [{ kind: 'possibleDuplicate', persons: [ALICE, BOB].sort(), at: '2026-10-21T09:00:00.000Z', sync: 'sent' }],
         lineageOverrides: { founders: [BOB], notCarriers: [ALICE] },
+        tableViews: [{
+            id: 'tv-1', name: 'Births 1840–1870', rowType: 'persons', columns: [{ id: 'name', width: 240 }, { id: 'bDate' }], pinned: 1,
+            collapsedGroups: ['birth'], coverageRow: false, filter: { op: 'and', items: [{ chip: 'deceased' }] },
+            sort: [{ col: 'bDate', dir: -1 }], unions: { collapsed: true, except: [ALICE] }, updated: '2026-11-10T09:00:00.000Z',
+        }],
         researchAsOf: '2026-09-20',
+        researchDirections: {
+            complete: true,
+            lines: [{ id: 'G0001', name: 'Line one', kind: 'ancestors', focus: 'P0001', state: 'active' }],
+            branches: [{ id: 'B-P0004', person: 'P0004', via: { person: 'P0002', rel: 'sibling' }, nearest: 'G0001', mode: 'occasional' }],
+        },
+        imports: [{ id: 'I1', program: 'Rodokmenář 5', version: '5.2', fileDate: '12 MAR 2024', at: '2026-11-08', file: 'rodokmen.ged', encoding: 'windows-1250' }],
         defaultPersonId: LAST_FOCUSED,
         defaultView: 'last',
         lastFocusPersonId: ALICE,
@@ -329,11 +340,24 @@ type OwnedElsewhere =
     | 'deathSourceIds'      // citePerson / uncitePerson with the death
     | 'attachments'         // addAttachment / removeAttachment
     | 'photoOriginalName'   // set with the photo itself (import / upload)
+    | 'photoDate'           // GEDCOM import only (G8): the portrait's date from the file, dropped with a new photo
     | 'refnType'            // GEDCOM import only; updatePerson drops it with a changed refn
     | 'research'            // written by Strom Research only (GEDCOM import), never edited
     | 'birthStatus'         // the research's status of the birth (GEDCOM import), never edited
+    | 'birthAge'            // a Strom file's BIRT > AGE (GEDCOM import), kept for the way back, never edited
     | 'deathStatus'         // …and of the death
-    | 'gedcomDates';        // GEDCOM import only; a changed date simply has no entry
+    | 'gedcomDates'         // GEDCOM import only; a changed date simply has no entry
+    | 'importId'            // GEDCOM import only (spec 066): the import the person came from
+    | 'importedValues'      // GEDCOM import only: an edit ends the mark by changing the value
+    | 'importedParents'     // GEDCOM import only: the parent links from the file
+    | 'originalIds'         // GEDCOM import only (K3.2): the person's ids in the loaded files
+    | 'gedcomExtra'         // GEDCOM import only (G8): another program's own tags, for "Back to {prog}"
+    | 'alsoChildOf'         // GEDCOM import only (066): a second family that also lists the person as a child
+    | 'marriedFirstName'    // GEDCOM import only (066): the married name's own given names; goes with the married surname
+    | 'citationQuay'        // GEDCOM import only (spec 077): a citation's own QUAY; follows its list (merge, removal)
+    | 'researchOrigins'     // written by Strom Research only (GEDCOM import), never edited
+    | 'confirmed'           // confirmFact / unconfirmFact (spec 065); a changed value ends it by itself
+    | 'researchVerify';     // written by Strom Research only (GEDCOM import, spec 065), never edited
 
 /**
  * Compile-time proof that the two lists together cover Person exactly. Add a
@@ -432,6 +456,30 @@ describe('updatePerson applies every field it owns', () => {
         // The two whitelists in one go: edited, then carried through a load.
         const reloaded = migrateData(structuredClone(DataManager.getData()));
         expect(reloaded.persons[created.id]).toEqual(DataManager.getPerson(created.id));
+    });
+
+    it('a new photo drops the date the old one came with from a file; other edits keep it', () => {
+        const created = DataManager.createPerson({ firstName: 'Jan', lastName: 'Novak', gender: 'male' });
+        const p = DataManager.getData().persons[created.id];
+        p.photo = 'data:image/png;base64,AAAA';
+        p.photoDate = '24 JUL 2007';
+        DataManager.updatePerson(created.id, { notes: 'Kept bees.', photo: 'data:image/png;base64,AAAA' });
+        expect(DataManager.getPerson(created.id)?.photoDate).toBe('24 JUL 2007');
+        DataManager.updatePerson(created.id, { photo: 'data:image/png;base64,BBBB' });
+        expect(DataManager.getPerson(created.id)?.photoDate).toBeUndefined();
+    });
+
+    it('the married name’s own given names stay through other edits, go with the married surname or an edited given name', () => {
+        const created = DataManager.createPerson({ firstName: 'Libuna', lastName: 'Šťovíková', gender: 'female', marriedSurname: 'Ozubcová' });
+        const p = DataManager.getData().persons[created.id];
+        p.marriedFirstName = 'Libuna Mlhoslava';
+        DataManager.updatePerson(created.id, { firstName: 'Libuna', marriedSurname: 'Ozubcová', notes: 'Kept bees.' });
+        expect(DataManager.getPerson(created.id)?.marriedFirstName).toBe('Libuna Mlhoslava');
+        DataManager.updatePerson(created.id, { firstName: 'Libunka' });
+        expect(DataManager.getPerson(created.id)?.marriedFirstName).toBeUndefined();
+        DataManager.getData().persons[created.id].marriedFirstName = 'Libuna Mlhoslava';
+        DataManager.updatePerson(created.id, { marriedSurname: '' });
+        expect(DataManager.getPerson(created.id)?.marriedFirstName).toBeUndefined();
     });
 });
 

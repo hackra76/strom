@@ -15,7 +15,7 @@ import { TreeRenderer } from '../renderer.js';
 import { TreeManager } from '../tree-manager.js';
 import { DataManager } from '../data.js';
 import { ZoomPan, CARD_PAN_THRESHOLD_PX } from '../zoom.js';
-import { isPhoneBar } from '../breakpoints.js';
+import { isPhoneBar, MQ_PHONE_LANDSCAPE } from '../breakpoints.js';
 import { menuItemBody, menuItemAria, PersonMenuAction } from './context-menu.js';
 import { shownName, shownNameFull, nameHtml } from '../person-name.js';
 import type { ResearchSheetGroup } from './research-actions-ui.js';
@@ -51,6 +51,8 @@ interface MenuRow {
     page?: { title: string; rows: MenuRow[] };
     /** A stable id for the row (tests, focus). */
     id?: string;
+    /** A small sign before the label (the Table view's row actions: ⌖ ▤ ✎); '' keeps its place empty. */
+    icon?: string;
     /** A second line of the row's own (the tree's research marks). */
     extra?: HTMLElement;
 }
@@ -131,8 +133,11 @@ export const bottomSheetMethods = uiModule({
                 return `${divider}${header}<button type="button" class="bottom-sheet-item sheet-submenu-row" role="menuitem" aria-haspopup="menu" data-submenu="${index}" data-menu="${esc(a.action)}"${menuItemAria(a)}>${menuItemBody(a)}</button>`;
             }
             // Keep the class out of the attribute (see context-menu.ts note).
-            const cls = a.danger ? 'bottom-sheet-item danger' : a.strong ? 'bottom-sheet-item is-strong' : 'bottom-sheet-item';
+            const cls = a.danger ? 'bottom-sheet-item danger' : a.strong ? 'bottom-sheet-item is-strong'
+                : a.disabled ? 'bottom-sheet-item is-disabled' : a.link ? 'bottom-sheet-item is-link' : 'bottom-sheet-item';
             const note = a.sheetNote ? `<p class="bottom-sheet-row-note">${esc(a.sheetNote)}</p>` : '';
+            // Greyed: read out, a tap runs nothing and the sheet stays (no data-action).
+            if (a.disabled) return `${divider}${header}<button type="button" class="${cls}" role="menuitem" aria-disabled="true"${menuItemAria(a)}>${menuItemBody(a)}</button>${note}`;
             return `${divider}${header}<button type="button" class="${cls}" role="menuitem" data-action="${esc(a.action)}"${menuItemAria(a)}>${menuItemBody(a)}</button>${note}`;
         };
         const tilesHtml = tiles.length === 0 ? '' : `<div class="sheet-tiles" style="--tiles: ${tiles.length}">`
@@ -229,6 +234,9 @@ export const bottomSheetMethods = uiModule({
         });
 
         // Swipe down to dismiss; on the second page a swipe right goes back.
+        // A phone held sideways shows the sheet as a panel at the right (spec 066
+        // P4 §9): there a swipe right dismisses it and a swipe down scrolls.
+        const panel = (): boolean => typeof matchMedia === 'function' && matchMedia(MQ_PHONE_LANDSCAPE).matches;
         let dragStartX = 0;
         let dragStartY = 0;
         let dragging = false;
@@ -242,14 +250,17 @@ export const bottomSheetMethods = uiModule({
             if (!dragging) return;
             const dy = e.touches[0].clientY - dragStartY;
             const dx = e.touches[0].clientX - dragStartX;
-            if (dy > 0 && dy > Math.abs(dx)) sheet.style.transform = `translateY(${dy}px)`;
+            if (panel()) {
+                if (sub.hidden && dx > 0 && dx > Math.abs(dy)) sheet.style.transform = `translateX(${dx}px)`;
+            } else if (dy > 0 && dy > Math.abs(dx)) sheet.style.transform = `translateY(${dy}px)`;
         }, { passive: true });
         sheet.addEventListener('touchend', (e) => {
             dragging = false;
             sheet.style.transition = '';
             const dy = e.changedTouches[0].clientY - dragStartY;
             const dx = e.changedTouches[0].clientX - dragStartX;
-            if (dy > SWIPE_CLOSE_PX && dy > Math.abs(dx)) {
+            const away = panel() ? sub.hidden && dx > SWIPE_CLOSE_PX && dx > Math.abs(dy) : dy > SWIPE_CLOSE_PX && dy > Math.abs(dx);
+            if (away) {
                 this.hideBottomSheet();
                 return;
             }
@@ -419,16 +430,17 @@ export const bottomSheetMethods = uiModule({
             ] });
         }
 
-        // 5) View: Fan | Map tiles (no bottom-bar tab of their own); on a phone under them the
+        // 5) View: Fan | Map | Table tiles (no bottom-bar tab of their own); on a phone under them the
         //    family line's choice (spec 039 §5.1: not on the timeline and the map, nor in a tree
         //    without a line; a tablet has it in its top bar).
         const rod = getSelectedRod();
-        const rodRow: ValueRow | undefined = isPhoneBar() && mode !== 'timeline' && mode !== 'map' && rodPickerOffered()
+        const rodRow: ValueRow | undefined = isPhoneBar() && mode !== 'timeline' && mode !== 'map' && mode !== 'table' && rodPickerOffered()
             ? { label: s.rodView.row, value: rod ? rodLabel(rod) : s.familyPages.wholeTree, id: 'sheet-rod', run: () => this.showRodPickerSheet() }
             : undefined;
         blocks.push({ divider: true, rows: [], pairLabel: s.menu.sectionView, pair: [
             { label: s.viewModeSwitch.fan, run: () => this.setDisplayViewMode('fan'), active: mode === 'fan' },
             { label: s.viewModeSwitch.map, run: () => this.setDisplayViewMode('map'), active: mode === 'map' },
+            { label: s.viewModeSwitch.table, run: () => this.setDisplayViewMode('table'), active: mode === 'table' },
         ], valueRow: rodRow });
 
         // 6) [Ancestor research · New] · "Tree: {name} ›" (every whole-tree action) · Add family.
@@ -449,9 +461,10 @@ export const bottomSheetMethods = uiModule({
             ] });
         }
 
-        // 7) Settings | About tiles (the version is in About).
+        // 7) Settings | How Strom works | About tiles (the version is in About).
         blocks.push({ divider: true, rows: [], pair: [
             { label: s.menu.settings, id: 'sheet-settings', run: () => this.showSettingsDialog() },
+            { label: s.help.title, id: 'sheet-help', run: () => this.showHelp() },
             { label: s.about.title, id: 'sheet-about', run: () => this.showAboutDialog() },
         ] });
 
@@ -513,6 +526,13 @@ export const bottomSheetMethods = uiModule({
             btn.type = 'button';
             btn.className = 'bottom-sheet-item' + (row.danger ? ' danger' : '') + (row.active ? ' active' : '');
             if (row.id) btn.id = row.id;
+            if (row.icon !== undefined) {
+                const icon = document.createElement('span');
+                icon.className = 'bottom-sheet-icon';
+                icon.setAttribute('aria-hidden', 'true');
+                icon.textContent = row.icon;
+                btn.appendChild(icon);
+            }
             const label = document.createElement('span');
             label.className = 'bottom-sheet-label';
             label.textContent = row.label;

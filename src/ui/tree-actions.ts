@@ -64,8 +64,6 @@ export interface TreeActionRow {
     hint?: string;
     /** Opens the research: its mark at the row's end. */
     research?: boolean;
-    /** A secondary shortcut drawn muted (the overview's "Data quality" under "Tree overview"). */
-    quiet?: boolean;
 }
 
 export type TreeActionGroupKey = 'overview' | 'outputs' | 'research' | 'settings' | 'structure' | 'manage' | 'trees';
@@ -190,7 +188,8 @@ export const treeActionsMethods = uiModule({
             { key: 'overview', rows: [
                 { key: 'overview', label: strings.treeOverview.menu, run: () => void this.showTreeOverview(id, { parent }) },
                 {
-                    key: 'overview-quality', label: strings.treeOverview.menuQuality, quiet: true,
+                    // A shortcut to the overview's quality section, drawn like its neighbours (T43).
+                    key: 'overview-quality', label: strings.treeOverview.menuQuality,
                     run: () => void this.showTreeOverview(id, { section: 'quality', scroll: true, parent }),
                 },
                 ...(editable ? [{ key: 'snapshots', label: strings.snapshots.menu, editOnly: true, run: () => void this.showSnapshotsDialog(id, parent) }] : []),
@@ -198,14 +197,18 @@ export const treeActionsMethods = uiModule({
             ] },
             { key: 'outputs', rows: by.export
                 ? [{ key: 'export', label: s.export, run: () => this.showExportDialogFromManager(id) }] : [] },
-            { key: 'research', header: g.research, rows: editable ? [
-                ...(by.researchSend && tree.research && researchRunsHere()
+            { key: 'research', header: g.research, rows: [
+                // The open tree's research overview, followed or not, read-only too, where no Research menu has it
+                // (a phone, a tablet; spec 057 §7.1, §6b).
+                ...(isActive && tree.research && this.canOpenResearchOverview() && !this.researchMenuShown()
+                    ? [{ key: 'researchOverview', label: strings.live.overviewTitle, run: () => this.openResearchOverview() }] : []),
+                ...(!editable ? [] : by.researchSend && tree.research && researchRunsHere()
                     // Through the bridge with no mark; without it, the send link opens the research's terminal.
                     ? [{ key: 'researchSend', label: strings.research.sendMenu, editOnly: true,
                         research: !this.researchSyncCapable(tree.research.id) && this.researchLinkAvailable('send') && researchLinkMark('send') !== 'none',
                         run: () => void this.researchSendTree(id) }] : []),
-                ...this.treeResearchRow(id, isActive),
-            ] : [] },
+                ...(editable ? this.treeResearchRow(id, isActive) : []),
+            ] },
             { key: 'settings', header: g.settings, rows: editable ? [
                 { key: 'rename', label: s.rename, editOnly: true, run: () => this.showRenameTreeDialog(id, parent) },
                 // The narrow flyout may cut the label and the value: the tooltip says both.
@@ -342,7 +345,7 @@ export const treeActionsMethods = uiModule({
         const rowButton = (row: TreeActionRow): HTMLButtonElement => {
             const btn = document.createElement('button');
             btn.type = 'button';
-            btn.className = 'bottom-sheet-item tree-actions-row' + (row.danger ? ' danger' : '') + (row.quiet ? ' is-quiet' : '');
+            btn.className = 'bottom-sheet-item tree-actions-row' + (row.danger ? ' danger' : '');
             btn.dataset.action = row.key;
             const label = document.createElement('span');
             label.className = 'bottom-sheet-label';

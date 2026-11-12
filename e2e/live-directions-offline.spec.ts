@@ -1,0 +1,757 @@
+import { test, expect, Page } from '@playwright/test';
+import {
+    ago, BridgeReply, CAPS, directionRow, followManaged, GED, launchedLinks, ManagedBridge, MANAGED_DIRECTIONS, openOverview, overview,
+} from './live-directions-bridge.js';
+
+/**
+ * Work outside the research's directions (spec 038 §9, K7) through its
+ * bridge: the branches under the directions (folded, open with a growing
+ * branch waiting), a branch's choices written with Undo (how it is taken,
+ * add to a direction and shown there, do not research, create a direction
+ * from it), a refusal said at the branch, the queue's reason of each task,
+ * a task's own place, a branch's tasks behind a chip, the growing branch in
+ * Awaiting action, a narrow window acting as a computer, and an older
+ * research unchanged. Invented data only (the Fíškovi of Smrkov).
+ */
+
+const GED_OFFLINE = GED.replace('0 @F0001@ FAM', [
+    '0 @P0031@ INDI', '1 NAME Alois /Fíšek/', '1 SEX M', '1 BIRT', '2 DATE 1868', '1 REFN P0031',
+    '0 @P0040@ INDI', '1 NAME Bohumil /Svoboda/', '1 SEX M', '1 BIRT', '2 DATE 1838', '1 REFN P0040',
+    '0 @P0045@ INDI', '1 NAME Václav /Lhoták/', '1 SEX M', '1 BIRT', '2 DATE 1869', '1 REFN P0045',
+    '0 @F0001@ FAM',
+].join('\n'));
+
+const OFF_CAPS = { ...CAPS, offLineBranches: true };
+const FEATURES = ['directions.edit', 'directions.order', 'directions.found', 'directions.people', 'offLine.branches', 'queue.own'];
+
+const BRANCHES = [
+    { id: 'B-P0031', person: 'P0031', via: { person: 'P0012', rel: 'sibling' }, nearest: 'G0001', tasks: 14, persons: 6,
+        samples: [{ id: 'T0412', text: 'Sňatek Aloise Fíška, Vídeň 1894' }, { id: 'T0413', text: 'Křest Terezie Fíškové' }],
+        mode: 'occasional', own: false, grows: true },
+    { id: 'B-P0040', person: 'P0040', via: { person: 'P0002', rel: 'sibling' }, nearest: 'G0004', tasks: 7, persons: 3,
+        samples: [{ id: 'T0420', text: 'Úmrtí Bohumila Svobody' }], mode: 'normal', own: true },
+    { id: 'B-P0045', person: 'P0045', via: { person: 'P0050', rel: 'partner' }, nearest: 'G0002', tasks: 3, persons: 1,
+        samples: [], mode: 'never', own: true },
+];
+const OFF_LINE = { mode: 'occasional', own: false, share: 10, suggest: true, tasks: 24, queued: 21, ownTasks: 0, branches: BRANCHES };
+
+const QUEUE = [
+    { id: 'T0101', text: 'Matriky Smrkov', state: 'next', research: 'G0001', why: { kind: 'line', research: 'G0001' } },
+    { id: 'T0412', text: 'Sňatek Aloise Fíška, Vídeň 1894', state: 'next', branch: 'B-P0031', why: { kind: 'off', mode: 'occasional', branch: 'B-P0031' } },
+    { id: 'T0102', text: 'Kdo byl Josef Fíšek', state: 'next', research: 'G0002', why: { kind: 'helps', research: 'G0002', by: 'question' } },
+    { id: 'T0413', text: 'Křest Terezie Fíškové', state: 'next', branch: 'B-P0031', why: { kind: 'off', mode: 'occasional', branch: 'B-P0031' } },
+    { id: 'T0420', text: 'Úmrtí Bohumila Svobody', state: 'next', branch: 'B-P0040', why: { kind: 'off', mode: 'normal', branch: 'B-P0040' } },
+];
+
+const GROWING = {
+    id: 'W-B-P0031', kind: 'branch', branch: 'B-P0031', person: 'P0031', research: 'G0001', tasks: 14, persons: 6,
+    at: ago(30), what: 'Větev Alois Fíšek roste', on: 'user',
+};
+
+/** A growing branch near the paused direction G0004 (Předci: Anna Svobodová). */
+const GROWING_PAUSED = {
+    id: 'W-B-P0040', kind: 'branch', branch: 'B-P0040', person: 'P0040', research: 'G0004', tasks: 7, persons: 3,
+    at: ago(30), what: 'Větev Bohumil Svoboda roste', on: 'user',
+};
+
+const follow = (page: Page, opts: {
+    waiting?: Record<string, unknown>[]; size?: { width: number; height: number }; people?: Record<string, string[]>;
+} = {}): Promise<ManagedBridge> =>
+    followManaged(page, { caps: OFF_CAPS, features: FEATURES, offLine: OFF_LINE, queue: QUEUE, ged: GED_OFFLINE, ...opts });
+
+const section = (page: Page) => overview(page).locator('.research-directions--managed');
+const outToggle = (page: Page) => section(page).locator('.research-offline__toggle');
+const branchRow = (page: Page, id: string) => section(page).locator(`.research-offline__branch[data-branch="${id}"]`);
+const offWrites = (b: ManagedBridge) => b.writes.filter(w => w.method === 'POST' && /^(offline|queue\/|waiting\/)/.test(w.path));
+const toast = (page: Page) => page.locator('.toast[data-kind="direction"]');
+
+test.describe('work outside the directions through the bridge', () => {
+    test('the branches: under the directions above the ended ones, folded, person, how taken, growing, nearest, samples', async ({ page }) => {
+        await follow(page);
+        await openOverview(page);
+        const toggle = outToggle(page);
+        await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+        await expect(toggle).toHaveText('▸Outside the directions· 21 tasks in 2 branches');
+        await expect(section(page).locator('.research-offline__mode')).toHaveText('now and then');
+        // Below the order of work, above Ended.
+        const order = await section(page).locator('.research-directions__list > *').evaluateAll(els => els.map(e =>
+            e.classList.contains('research-offline__head') ? 'out' : (e as HTMLElement).dataset.ended ? 'ended' : (e as HTMLElement).dataset.direction ?? ''));
+        expect(order).toEqual(['G0001', 'G0004', 'G0002', 'out', 'ended']);
+        await expect(section(page).locator('.research-offline__branch')).toHaveCount(0);
+
+        await toggle.click();
+        await expect(outToggle(page)).toHaveAttribute('aria-expanded', 'true');
+        const alois = branchRow(page, 'B-P0031');
+        await expect(alois.locator('.research-offline__person')).toHaveText('Alois Fíšek');
+        await expect(alois.locator('.research-offline__years')).toHaveText(/1868/);
+        await expect(alois.locator('.research-offline__tag')).toHaveText('now and then');
+        await expect(alois.locator('.research-offline__dot')).toHaveCount(0);
+        await expect(alois.locator('.research-offline__grows')).toHaveText('growing · +6 people');
+        await expect(alois.locator('.research-offline__meta')).toHaveText(/brother of Jan Fíšek.*near the direction Předci: Jan Fíšek.*14 tasks/);
+        await expect(alois.locator('.research-offline__samples')).toHaveText('Sňatek Aloise Fíška, Vídeň 1894 · Křest Terezie Fíškové');
+        // Its own choice: a dot and the word, said to a reader too.
+        const bohumil = branchRow(page, 'B-P0040');
+        await expect(bohumil.locator('.research-offline__tag')).toHaveText('as usual');
+        await expect(bohumil.locator('.research-offline__dot')).toHaveCount(1);
+        await expect(bohumil.locator('.research-offline__tag')).toHaveAttribute('aria-label', 'as usual, own choice');
+        await expect(bohumil.locator('.research-offline__meta')).toHaveText(/brother of Anna Svobodová.*near the direction Předci: Anna Svobodová \(paused\)/);
+        // Not researched: folded last, its row muted with Reset to default.
+        const never = section(page).locator('.research-offline__never');
+        await expect(never).toHaveText('▸Not researched · 1 branch');
+        await never.click();
+        await expect(branchRow(page, 'B-P0045')).toHaveClass(/is-never/);
+        await expect(branchRow(page, 'B-P0045').locator('.research-offline__tag')).toHaveText('not researched');
+        await expect(branchRow(page, 'B-P0045').locator('[data-do="default"]')).toHaveText('Reset to default');
+        // Its tasks are out of the queue: said in its row, it does not unfold.
+        await expect(branchRow(page, 'B-P0045').locator('.research-offline__never-note')).toHaveText('The tasks are out of the queue, nothing was deleted.');
+        await expect(branchRow(page, 'B-P0045').locator('.research-offline__expand')).toHaveCount(0);
+        // No marks: everything here goes through the bridge.
+        await expect(section(page).locator('.research-offline__branches .research-open-mark, .research-offline__branches .research-ai-badge')).toHaveCount(0);
+    });
+
+    test('how a branch is taken: the segment writes it, Undo puts the default back; the tree\'s choice says (default)', async ({ page }) => {
+        const b = await follow(page);
+        await openOverview(page);
+        await outToggle(page).click();
+        const alois = branchRow(page, 'B-P0031');
+        await alois.locator('.research-offline__expand').click();
+        const seg = alois.locator('.research-offline__seg');
+        await expect(seg).toHaveText(['Now and then (default)', 'At the end', 'As usual']);
+        await expect(alois.locator('.research-offline__seg[aria-checked="true"]')).toHaveText('Now and then (default)');
+        await alois.locator('[data-mode="last"]').click();
+        await expect.poll(() => offWrites(b).map(w => [w.path, w.body])).toEqual([['offline/B-P0031', { mode: 'last' }]]);
+        await expect(branchRow(page, 'B-P0031').locator('.research-offline__tag')).toHaveText('at the end');
+        await expect(branchRow(page, 'B-P0031').locator('.research-offline__dot')).toHaveCount(1);
+        await expect(branchRow(page, 'B-P0031').locator('[data-mode="last"]')).toBeFocused();
+        await expect(toast(page)).toContainText('Saved');
+        await toast(page).locator('.toast-action').click();
+        await expect.poll(() => offWrites(b).length).toBe(2);
+        expect(offWrites(b)[1]).toMatchObject({ path: 'offline/B-P0031', body: { mode: 'default' } });
+        await expect(branchRow(page, 'B-P0031').locator('.research-offline__tag')).toHaveText('now and then');
+        // Arrows move along the segment (a radio group) and write the choice.
+        await branchRow(page, 'B-P0031').locator('.research-offline__seg[aria-checked="true"]').focus();
+        await page.keyboard.press('ArrowRight');
+        await expect.poll(() => offWrites(b).length).toBe(3);
+        expect(offWrites(b)[2]).toMatchObject({ path: 'offline/B-P0031', body: { mode: 'last' } });
+        expect(await launchedLinks(page)).toEqual([]);
+    });
+
+    test('add to a direction: the nearest first, the branch leaves the section and helps the direction (Remove = default)', async ({ page }) => {
+        const b = await follow(page);
+        await openOverview(page);
+        await outToggle(page).click();
+        const alois = branchRow(page, 'B-P0031');
+        await alois.locator('.research-offline__expand').click();
+        const add = alois.locator('[data-do="add"]');
+        await expect(add).toHaveText('Add to the direction Předci: Jan Fíšek');
+        await add.click();
+        const pick = page.locator('#research-offline-pick');
+        await expect(pick.locator('.research-offline-pick__item')).toHaveText(['Předci: Jan Fíšeknearest', 'Potomci: Josef Fíšek']);
+        await expect(pick.locator('.research-offline-pick__item').first()).toBeFocused();
+        await page.keyboard.press('Escape');
+        await expect(pick).toHaveCount(0);
+        await expect(add).toBeFocused();
+        await add.click();
+        await pick.locator('[data-direction="G0001"]').click();
+        await expect.poll(() => offWrites(b).map(w => [w.path, w.body])).toEqual([['offline/B-P0031', { mode: 'line', line: 'G0001' }]]);
+        await expect(branchRow(page, 'B-P0031')).toHaveCount(0);
+        await expect(toast(page)).toContainText('Added to the direction');
+        await directionRow(page, 'G0001').locator('.research-direction__head').click();
+        const helps = directionRow(page, 'G0001').locator('.research-offline__helps[data-branch="B-P0031"]');
+        await expect(helps).toHaveText(/^Branch Alois Fíšek helps too·▸14 tasks·Remove from the direction$/);
+        // The count unfolds the branch's tasks under the line: the same list, the queue narrowed to the branch.
+        const count = helps.locator('[data-do="branch-tasks"]');
+        await expect(count).toHaveAttribute('aria-expanded', 'false');
+        await count.click();
+        const list = directionRow(page, 'G0001').locator('.research-offline__helps-box[data-branch="B-P0031"] .research-offline__queue');
+        await expect(list.locator('.research-offline__queue-head')).toHaveText('In the queue · queue order');
+        await expect(list.locator('.research-offline__task-num')).toHaveText(['2', '4']);
+        await expect(list.locator('.research-offline__task-text')).toHaveText(['Sňatek Aloise Fíška, Vídeň 1894', 'Křest Terezie Fíškové']);
+        await expect(helps.locator('[data-do="branch-tasks"]')).toHaveAttribute('aria-expanded', 'true');
+        await expect(helps.locator('[data-do="branch-tasks"]')).toBeFocused();
+        await helps.locator('[data-do="remove-branch"]').click();
+        await expect.poll(() => offWrites(b).length).toBe(2);
+        expect(offWrites(b)[1]).toMatchObject({ path: 'offline/B-P0031', body: { mode: 'default' } });
+        await expect(directionRow(page, 'G0001').locator('.research-offline__helps')).toHaveCount(0);
+        await expect(branchRow(page, 'B-P0031')).toHaveCount(1);
+    });
+
+    test('the branch ⋯: do not research (no question, Undo), create a direction from it (the form with its person)', async ({ page }) => {
+        const b = await follow(page);
+        await openOverview(page);
+        await outToggle(page).click();
+        const more = branchRow(page, 'B-P0040').locator('.research-offline__more');
+        await more.click();
+        const menu = page.locator('#research-offline-menu');
+        await expect(menu.locator('.research-direction-menu__label')).toHaveText(['Create a direction from this branch', 'Do not research', 'Reset to default']);
+        await expect(menu.locator('[data-do="never"] .research-direction-menu__hint')).toHaveText('Its tasks leave the queue, nothing is deleted');
+        await menu.locator('[data-do="never"]').click();
+        await expect.poll(() => offWrites(b).map(w => [w.path, w.body])).toEqual([['offline/B-P0040', { mode: 'never' }]]);
+        await expect(toast(page)).toContainText('Branch not researched');
+        await expect(section(page).locator('.research-offline__never')).toHaveText('▸Not researched · 2 branches');
+        await expect(outToggle(page)).toHaveText(/in 1 branch/);
+        await toast(page).locator('.toast-action').click();
+        await expect.poll(() => offWrites(b).length).toBe(2);
+        // Back as it was: its own choice "as usual".
+        expect(offWrites(b)[1]).toMatchObject({ path: 'offline/B-P0040', body: { mode: 'normal' } });
+
+        // A sibling of an ancestor: Descendants, said to be from the relation.
+        await branchRow(page, 'B-P0031').locator('.research-offline__more').click();
+        await expect(page.locator('#research-offline-menu [data-do="default"]')).toHaveCount(0);
+        await page.locator('#research-offline-menu [data-do="create"]').click();
+        const f = page.locator('#direction-form-modal');
+        await expect(f).toBeVisible();
+        await expect(f.locator('.direction-form__who-name')).toHaveText('Alois Fíšek');
+        await expect(f.locator('.direction-form__kind[aria-checked="true"]')).toHaveText('↓Descendants');
+        await f.locator('#direction-form-submit').click();
+        await expect.poll(() => b.writes.filter(w => w.path === 'directions').map(w => w.body))
+            .toEqual([expect.objectContaining({ person: 'P0031', direction: 'descendants', branch: 'B-P0031' })]);
+    });
+
+    test('a refused choice is said at the branch, nothing changes', async ({ page }) => {
+        const b = await follow(page);
+        await openOverview(page);
+        await outToggle(page).click();
+        await branchRow(page, 'B-P0031').locator('.research-offline__expand').click();
+        b.replies.push({ status: 404, body: { error: 'offline.none' } } satisfies BridgeReply);
+        await branchRow(page, 'B-P0031').locator('[data-mode="normal"]').click();
+        const box = branchRow(page, 'B-P0031').locator('.research-direction__problem');
+        await expect(box).toHaveText('The branch is gone: its tasks are done or in a direction already.');
+        await expect(box).toHaveAttribute('role', 'alert');
+        await expect(branchRow(page, 'B-P0031').locator('.research-offline__tag')).toHaveText('now and then');
+        await expect(toast(page)).toHaveCount(0);
+    });
+
+    test('a branch\'s relation by the person\'s sex (neutral without it), the related person\'s name as it is', async ({ page }) => {
+        const branches = [
+            { ...BRANCHES[0] },
+            { id: 'B-P0050', person: 'P0050', via: { person: 'P0012', rel: 'sibling' }, nearest: 'G0001', tasks: 2, persons: 1, samples: [], mode: 'occasional', own: false },
+            { id: 'B-P0099', person: 'P0099', via: { person: 'P0012', rel: 'child' }, nearest: 'G0001', tasks: 1, persons: 1, samples: [], mode: 'occasional', own: false },
+            { id: 'B-P0045', person: 'P0045', via: { person: 'P0050', rel: 'partner' }, nearest: 'G0002', tasks: 3, persons: 1, samples: [], mode: 'occasional', own: false },
+        ];
+        await followManaged(page, { caps: OFF_CAPS, features: FEATURES, offLine: { ...OFF_LINE, branches }, queue: QUEUE, ged: GED_OFFLINE });
+        await openOverview(page);
+        await outToggle(page).click();
+        const via = (id: string) => branchRow(page, id).locator('.research-offline__meta > span').first();
+        await expect(via('B-P0031')).toHaveText('brother of Jan Fíšek');
+        await expect(via('B-P0050')).toHaveText('sister of Jan Fíšek');
+        await expect(via('B-P0099')).toHaveText('child of Jan Fíšek');
+        await expect(via('B-P0045')).toHaveText('husband of Marie Fíšková');
+        await page.evaluate(() => window.Strom.UI.setLanguage('cs' as never));
+        await expect(via('B-P0031')).toHaveText('bratr: Jan Fíšek');
+        await expect(via('B-P0050')).toHaveText('sestra: Jan Fíšek');
+        await expect(via('B-P0099')).toHaveText('dítě: Jan Fíšek');
+        await expect(via('B-P0045')).toHaveText('manžel: Marie Fíšková');
+    });
+
+    test('the queue: each task\'s reason in one line, its own place from ⋯, a branch\'s tasks behind a chip', async ({ page }) => {
+        const b = await follow(page);
+        await openOverview(page);
+        const queue = overview(page).locator('.live-queue');
+        const why = queue.locator('.live-queue-why');
+        await expect(why).toHaveText([
+            'in the direction Předci: Jan Fíšek',
+            'outside the directions · now and then · branch Alois Fíšek',
+            'helps the direction Potomci: Josef Fíšek · a question of the direction',
+            'outside the directions · now and then · branch Alois Fíšek',
+            'outside the directions · as usual · branch Bohumil Svoboda',
+        ]);
+        await expect(why.first()).toHaveAttribute('title', 'in the direction Předci: Jan Fíšek');
+        expect(await why.first().evaluate(e => getComputedStyle(e).whiteSpace)).toBe('nowrap');
+
+        // The overview's queue is folded at first.
+        await overview(page).locator('.live-queue-toggle').click();
+        // Do next: no mark, above the research's Park / Drop.
+        await queue.locator('.live-queue-more[data-task="T0420"]').click();
+        const menu = page.locator('#live-task-menu');
+        await expect(menu.locator('[data-order]')).toHaveText(['Do nextComes up next', 'To the endAfter everything else in the queue']);
+        await expect(menu.locator('[data-order] .research-open-mark')).toHaveCount(0);
+        await expect(menu.locator('.context-menu-divider')).toHaveCount(1);
+        await menu.locator('[data-order="next"]').click();
+        await expect.poll(() => offWrites(b).map(w => [w.path, w.body])).toEqual([['queue/T0420', { do: 'next' }]]);
+        await expect(toast(page)).toContainText('Saved');
+        await expect(queue.locator('.live-queue-row', { hasText: 'Úmrtí Bohumila Svobody' }).locator('.live-queue-why')).toHaveText('set by hand: next');
+        // Set by hand: Reset to default too.
+        await queue.locator('.live-queue-more[data-task="T0420"]').click();
+        await expect(menu.locator('[data-order]')).toHaveCount(3);
+        await menu.locator('[data-order="default"]').click();
+        await expect.poll(() => offWrites(b).length).toBe(2);
+        expect(offWrites(b)[1]).toMatchObject({ path: 'queue/T0420', body: { do: 'default' } });
+
+        // The agent at work on it: said at the task.
+        b.replies.push({ status: 409, body: { error: 'queue.doing' } });
+        await queue.locator('.live-queue-more[data-task="T0101"]').click();
+        await menu.locator('[data-order="last"]').click();
+        await expect(queue.locator('.live-queue-problem')).toHaveText('The agent is working on this task now; its place cannot change.');
+
+    });
+
+    test('Now: a task that helps its line says the line and how, in place of the line\'s name (036 K1.8)', async ({ page }) => {
+        const helping = { who: 'agent-matriky', since: ago(16), task: 'Křest Terezie Fíškové', person: 'P0012', research: 'G0002', helps: 'joins', branch: 'B-P0031', session: 'N0132' };
+        const nowRow = (who: string) => overview(page).locator('.research-overview__now-row', { hasText: who });
+        // One at work: its row says the line it helps and how, in place of the line's name.
+        await followManaged(page, { caps: OFF_CAPS, features: [...FEATURES, 'working.helps'], offLine: OFF_LINE, queue: QUEUE, ged: GED_OFFLINE, working: [helping] });
+        // The live panel's row says the same.
+        await expect(page.locator('#live-panel .live-working .live-working__why'))
+            .toHaveText(' · helps the direction Potomci: Josef Fíšek · connects people to the tree');
+        await openOverview(page);
+        await expect(nowRow('agent-matriky').locator('.research-overview__dir'))
+            .toHaveText(' · helps the direction Potomci: Josef Fíšek · connects people to the tree');
+        await expect(nowRow('agent-matriky').locator('.research-overview__why')).toHaveCount(1);
+    });
+
+    test('Now with two at work: under its line how the task helps it (without the line\'s name), the branch under Outside the directions (036 K1.8)', async ({ page }) => {
+        const helping = { who: 'agent-matriky', since: ago(16), task: 'Křest Terezie Fíškové', person: 'P0012', research: 'G0002', helps: 'joins', session: 'N0132' };
+        const outside = { who: 'agent-scitani', since: ago(5), task: 'Sňatek Aloise Fíška, Vídeň 1894', branch: 'B-P0031', session: 'N0133' };
+        await followManaged(page, { caps: OFF_CAPS, features: [...FEATURES, 'working.helps'], offLine: OFF_LINE, queue: QUEUE, ged: GED_OFFLINE, working: [helping, outside] });
+        // The live panel's lines say the same.
+        const panelLine = page.locator('#live-panel .live-line[data-direction="G0002"]');
+        await expect(panelLine.locator('.live-line__name')).toHaveText('Potomci: Josef Fíšek');
+        await expect(panelLine.locator('.live-line__why')).toHaveText('connects people to the tree');
+        await expect(page.locator('#live-panel .live-line--outside .live-line__why')).toHaveText('branch Alois Fíšek');
+        await openOverview(page);
+        const rows = overview(page).locator('.research-overview__now-row--line');
+        await expect(rows.filter({ hasText: 'agent-matriky' }).locator('strong')).toHaveText('Potomci: Josef Fíšek');
+        await expect(rows.filter({ hasText: 'agent-matriky' }).locator('.research-overview__why')).toHaveText('connects people to the tree');
+        await expect(rows.filter({ hasText: 'agent-scitani' }).locator('strong')).toHaveText('Outside the directions');
+        await expect(rows.filter({ hasText: 'agent-scitani' }).locator('.research-overview__why')).toHaveText('branch Alois Fíšek');
+    });
+
+    test('Now with an older research (no working.helps): the line\'s name as before, nothing read of helps (036 K1.8)', async ({ page }) => {
+        const helping = { who: 'agent-matriky', since: ago(16), task: 'Křest Terezie Fíškové', person: 'P0012', research: 'G0002', helps: 'joins', branch: 'B-P0031', session: 'N0132' };
+        await followManaged(page, { caps: OFF_CAPS, features: FEATURES, offLine: OFF_LINE, queue: QUEUE, ged: GED_OFFLINE, working: [helping] });
+        await openOverview(page);
+        const row = overview(page).locator('.research-overview__now-row', { hasText: 'agent-matriky' });
+        await expect(row.locator('.research-overview__dir')).toHaveText(' · Potomci: Josef Fíšek');
+        await expect(row.locator('.research-overview__why')).toHaveCount(0);
+        await expect(page.locator('#live-panel .live-working__why')).toHaveCount(0);
+    });
+
+    test('a branch\'s tasks unfold under it: no jump, their places in the queue, ⋯ as in the queue, all of them behind the chip', async ({ page }) => {
+        const off = (id: string, more: Record<string, unknown> = {}) => ({ state: 'next', branch: id, why: { kind: 'off', mode: 'occasional', branch: id }, ...more });
+        const queue = [
+            QUEUE[0],
+            { id: 'T0412', text: 'Sňatek Aloise Fíška, Vídeň 1894', ...off('B-P0031') },
+            QUEUE[2],
+            { id: 'T0413', text: 'Křest Terezie Fíškové', ...off('B-P0031'), own: 'next', why: { kind: 'own', do: 'next' } },
+            { id: 'T0414', text: 'Úmrtí Aloise Fíška, Vídeň', ...off('B-P0031') },
+            { id: 'T0415', text: 'Sčítání lidu 1900, Vídeň', ...off('B-P0031') },
+            { id: 'T0416', text: 'Domovská obec Aloise Fíška', ...off('B-P0031') },
+            { id: 'T0418', text: 'Křest Karla Fíška', state: 'parked', branch: 'B-P0031', why: { kind: 'paused', research: 'G0004' } },
+            { id: 'T0420', text: 'Úmrtí Bohumila Svobody', state: 'parked', branch: 'B-P0040' },
+        ];
+        const branches = [BRANCHES[0], BRANCHES[1], { ...BRANCHES[2], mode: 'occasional', own: false, tasks: 0 }];
+        const at = { who: 'agent-mimo', since: ago(2), task: 'Sňatek Aloise Fíška, Vídeň 1894', person: 'P0031' };
+        const b = await followManaged(page, {
+            caps: OFF_CAPS, features: FEATURES, offLine: { ...OFF_LINE, branches }, queue, ged: GED_OFFLINE, working: [at],
+        });
+        await openOverview(page);
+        await outToggle(page).click();
+        const alois = branchRow(page, 'B-P0031');
+        await expect(alois.locator('.research-offline__samples')).toHaveCount(1);
+        const yBefore = (await alois.boundingBox())!.y;
+        const scrollBefore = await overview(page).locator('.research-overview__body').evaluate(e => e.scrollTop);
+
+        // A click on the count (the whole head) unfolds the tasks right under the branch: nothing scrolls.
+        await alois.locator('.research-offline__count').click();
+        const list = alois.locator('.research-offline__queue');
+        await expect(list.locator('.research-offline__queue-head')).toHaveText('In the queue · first 3 of 5');
+        await expect(alois.locator('.research-offline__expand')).toHaveAttribute('aria-expanded', 'true');
+        await expect(alois.locator('.research-offline__expand')).toBeFocused();
+        expect((await alois.boundingBox())!.y).toBe(yBefore);
+        expect(await overview(page).locator('.research-overview__body').evaluate(e => e.scrollTop)).toBe(scrollBefore);
+        expect(await page.evaluate(() => window.scrollY)).toBe(0);
+        await expect(alois.locator('.research-offline__samples')).toHaveCount(0);
+        // Above the branch's choices; each task with its number in the whole queue, the arc while worked on.
+        const tasks = list.locator('.research-offline__task:not(.is-parked)');
+        await expect(tasks.locator('.research-offline__task-text')).toHaveText([
+            'Sňatek Aloise Fíška, Vídeň 1894The agent is working on this task now; its place cannot change.',
+            'Křest Terezie Fíškovéset by hand: next',
+            'Úmrtí Aloise Fíška, Vídeň',
+        ]);
+        await expect(tasks.locator('.research-offline__task-num')).toHaveText(['', '4', '5']);
+        await expect(tasks.first().locator('.agent-mark--spin')).toHaveAttribute('aria-label', '2 in the queue');
+        await expect(tasks.nth(1).locator('.research-offline__task-num')).toHaveAttribute('aria-label', '4 in the queue');
+        await expect(list.locator('.research-offline__task.is-parked')).toHaveText('Set aside: Křest Karla Fíškawaiting: the direction is paused');
+        await expect(list.locator('.research-offline__task.is-parked .live-queue-more')).toHaveCount(0);
+        const order = await alois.locator('.research-offline__queue, .research-offline__choices').evaluateAll(els => els.map(e => e.className));
+        expect(order).toEqual(['research-offline__queue', 'research-offline__choices']);
+        await expect(alois.locator('[data-do="tasks"]')).toHaveCount(0);
+
+        // ⋯ of a task: the queue's own menu, the list counts again in place.
+        await tasks.nth(2).locator('.live-queue-more').click();
+        const menu = page.locator('#live-task-menu');
+        await expect(menu.locator('[data-order]')).toHaveText(['Do nextComes up next', 'To the endAfter everything else in the queue']);
+        await menu.locator('[data-order="last"]').click();
+        await expect.poll(() => offWrites(b).map(w => [w.path, w.body])).toEqual([['queue/T0414', { do: 'last' }]]);
+        await expect(alois.locator('.research-offline__task[data-task="T0414"] .research-offline__task-why')).toHaveText('set by hand: at the end');
+
+        // All of them: the queue unfolded and narrowed, its heading and the chip at the top, the focus on the chip.
+        const all = alois.locator('[data-do="all-tasks"]');
+        await expect(all).toHaveText('All 5 tasks in the queue ›');
+        await all.click();
+        const chip = overview(page).locator('.research-offline__chip');
+        await expect(chip).toHaveText('Branch Alois Fíšek 5 ×');
+        await expect(chip).toBeFocused();
+        // The heading at the top of the panel (or as high as the panel scrolls), the chip under it in view.
+        const placed = await overview(page).locator('.research-overview__body').evaluate((body) => {
+            const head = body.querySelector('[aria-controls="ov-sec-queue"]')!.getBoundingClientRect();
+            const chip = body.querySelector('.research-offline__chip')!.getBoundingClientRect();
+            const box = body.getBoundingClientRect();
+            const atMax = body.scrollTop >= body.scrollHeight - body.clientHeight - 1;
+            return { top: head.top - box.top, atMax, chipIn: chip.bottom <= box.bottom && chip.top >= box.top };
+        });
+        expect(placed.top).toBeGreaterThanOrEqual(0);
+        expect(placed.top < 20 || placed.atMax).toBe(true);
+        expect(placed.chipIn).toBe(true);
+        await expect(overview(page).locator('.live-queue .live-queue-row:not(.live-queue-row--parked):not(.live-queue-row--more)')).toHaveCount(5);
+        // × shows the whole queue again and gives the focus back to the link.
+        await chip.click();
+        await expect(chip).toHaveCount(0);
+        await expect(alois.locator('[data-do="all-tasks"]')).toBeFocused();
+
+        // Only set aside: said so, the set-aside task under it; "nothing in the queue" in the row.
+        const bohumil = branchRow(page, 'B-P0040');
+        await expect(bohumil.locator('.research-offline__count')).toHaveText('nothing in the queue');
+        await bohumil.locator('.research-offline__expand').click();
+        await expect(alois.locator('.research-offline__queue')).toHaveCount(0);
+        await expect(bohumil.locator('.research-offline__queue-head')).toHaveText('In the queue');
+        await expect(bohumil.locator('.research-offline__queue-empty')).toHaveText('No task of this branch in the queue now, only set-aside ones.');
+        await expect(bohumil.locator('.research-offline__task.is-parked')).toHaveText(/^Set aside: Úmrtí Bohumila Svobody/);
+        await expect(bohumil.locator('[data-do="all-tasks"]')).toHaveCount(0);
+        // Nothing at all: one sentence.
+        const vaclav = branchRow(page, 'B-P0045');
+        await vaclav.locator('.research-offline__meta').click();
+        await expect(vaclav.locator('.research-offline__queue-empty')).toHaveText('No task of this branch in the queue now. The next research run proposes more.');
+        await expect(vaclav.locator('.research-offline__task')).toHaveCount(0);
+        // A second click folds it.
+        await vaclav.locator('.research-offline__meta').click();
+        await expect(vaclav.locator('.research-offline__queue')).toHaveCount(0);
+        expect(await launchedLinks(page)).toEqual([]);
+    });
+
+    for (const size of [{ width: 390, height: 844 }, { width: 1440, height: 900 }]) {
+        test(`${size.width} many directions: the branch's chip first in the queue's filters, whole in view, each task numbered by its place in the whole queue`, async ({ page }) => {
+            const off = (id: string, text: string) => ({ id, text, state: 'next', branch: 'B-P0031', why: { kind: 'off', mode: 'occasional', branch: 'B-P0031' } });
+            const queue = [
+                QUEUE[0], off('T0412', 'Sňatek Aloise Fíška, Vídeň 1894'), QUEUE[2], off('T0413', 'Křest Terezie Fíškové'),
+                { id: 'T0103', text: 'Pozemková kniha Smrkov', state: 'next', research: 'G0001', why: { kind: 'line', research: 'G0001' } },
+                off('T0414', 'Úmrtí Aloise Fíška, Vídeň'), off('T0415', 'Sčítání lidu 1900, Vídeň'),
+            ];
+            // Running directions with long names: the row of filters is wider than the panel at either width.
+            const more = ['Potomci: Bohuslava Svobodová-Lhotáková', 'Předci: Maxmilián Fíšek ze Smrkova', 'Kdo byl Václav Lhoták z Vídně?',
+                'Potomci: Terezie Fíšková ze Smrkova', 'Předci: Aloisius Fíšek-Lhoták'].map((name, i) => ({
+                id: `G00${21 + i}`, name, state: 'active', direction: 'descendants', focus: 'P0001', order: 4 + i, tasks: 0, waiting: 0,
+                working: false, since: ago(30),
+            }));
+            await followManaged(page, {
+                caps: OFF_CAPS, features: FEATURES, offLine: OFF_LINE, queue, ged: GED_OFFLINE, size,
+                researches: [...MANAGED_DIRECTIONS, ...more],
+            });
+            if (size.width < 641) {
+                await page.locator('#live-panel .live-panel-toggle').click();
+                await expect(overview(page)).toHaveClass(/research-overview--sheet/);
+            } else {
+                await openOverview(page);
+            }
+            await outToggle(page).click();
+            const alois = branchRow(page, 'B-P0031');
+            await alois.locator('.research-offline__expand').click();
+            await expect(alois.locator('.research-offline__task-num')).toHaveText(['2', '4', '6']);
+            await alois.locator('[data-do="all-tasks"]').click();
+            const chip = overview(page).locator('.research-offline__chip');
+            await expect(chip).toBeFocused();
+            // The active narrowing first in the row, the row scrolled to its start: the whole chip in view.
+            const row = overview(page).locator('.research-overview__queue-filters');
+            await expect.poll(() => row.evaluate((r) => {
+                const first = r.firstElementChild as HTMLElement;
+                const c = r.querySelector('.research-offline__chip')!.getBoundingClientRect();
+                const box = r.getBoundingClientRect();
+                return {
+                    first: first.classList.contains('research-offline__chip'),
+                    wider: r.scrollWidth > r.clientWidth,
+                    whole: r.scrollLeft === 0 && c.left >= box.left - 0.5 && c.right <= box.right + 0.5 && c.right <= window.innerWidth,
+                };
+            })).toEqual({ first: true, wider: true, whole: true });
+            await expect(chip).toHaveText('Branch Alois Fíšek 4 ×');
+            await expect(row.locator('[role="radio"][aria-checked="true"]')).toHaveCount(0);
+            // The same numbers as under the branch: the places in the whole queue.
+            const nums = overview(page).locator('.live-queue .live-queue-row:not(.live-queue-row--parked):not(.live-queue-row--more) .live-queue-num');
+            await expect(nums).toHaveText(['2', '4', '6', '7']);
+            await expect(nums.nth(1)).toHaveAttribute('aria-label', '4 in the queue');
+            // A line's pill replaces the branch's narrowing and counts its tasks anew, as before.
+            await row.locator('[role="radio"][data-direction="G0001"]').click();
+            await expect(chip).toHaveCount(0);
+            await expect(nums).toHaveText(['1', '2']);
+            await expect(nums.first()).not.toHaveAttribute('aria-label', /.*/);
+            expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
+        });
+    }
+
+    test('a growing branch in Awaiting action: the section open, its answers through the bridge, gone at once, Undo', async ({ page }) => {
+        const b = await follow(page, { waiting: [GROWING] });
+        await openOverview(page);
+        // A growing branch waits: the section is open.
+        await expect(outToggle(page)).toHaveAttribute('aria-expanded', 'true');
+        const item = overview(page).locator('.research-overview__waiting-item[data-id="W-B-P0031"]');
+        await expect(item).toHaveClass(/is-fresh/);
+        await expect(item.locator('.live-kind--decide')).toHaveText('suggestion');
+        await expect(item.locator('.research-overview__waiting-what'))
+            .toHaveText('suggestionBranch Alois Fíšek: 14 tasks outside the directions (6 new people). Near the direction Předci: Jan Fíšek.');
+        await item.locator('.research-overview__waiting-row').click();
+        const acts = item.locator('.research-offline__wait-actions button');
+        await expect(acts).toHaveText(['Add to the direction Předci: Jan Fíšek', 'Create direction', 'Leave as it is', 'Do not research']);
+        await expect(acts.first()).toHaveClass(/is-primary/);
+        await expect(item.locator('.research-offline__wait-hint')).toHaveText('Without an answer the branch is still taken now and then.');
+        await expect(item.locator('.research-open-mark')).toHaveCount(0);
+        await item.locator('[data-do="line"]').click();
+        await expect.poll(() => offWrites(b).map(w => [w.path, w.body])).toEqual([['waiting/W-B-P0031', { do: 'line', line: 'G0001' }]]);
+        await expect(item).toHaveCount(0);
+        await expect(toast(page)).toContainText('Added to the direction');
+        await expect(branchRow(page, 'B-P0031')).toHaveCount(0);
+        await toast(page).locator('.toast-action').click();
+        await expect.poll(() => offWrites(b).length).toBe(2);
+        expect(offWrites(b)[1]).toMatchObject({ path: 'offline/B-P0031', body: { mode: 'default' } });
+    });
+
+    test('a growing branch near a paused direction: the nearest running one its person is in, the sentence says paused', async ({ page }) => {
+        // Anna Svobodová is in the paused G0004 and in the running G0001 (her son's ancestors).
+        const b = await follow(page, { waiting: [GROWING_PAUSED], people: { P0002: ['G0001'] } });
+        await openOverview(page);
+        const item = overview(page).locator('.research-overview__waiting-item[data-id="W-B-P0040"]');
+        await expect(item.locator('.research-overview__waiting-what'))
+            .toHaveText('suggestionBranch Bohumil Svoboda: 7 tasks outside the directions (3 new people). Near the direction Předci: Anna Svobodová (paused).');
+        await item.locator('.research-overview__waiting-row').click();
+        const acts = item.locator('.research-offline__wait-actions button');
+        await expect(acts.first()).toHaveText('Add to the direction Předci: Jan Fíšek');
+        await expect(acts.first()).toHaveClass(/is-primary/);
+        await item.locator('[data-do="line"]').click();
+        await expect.poll(() => offWrites(b).map(w => [w.path, w.body])).toEqual([['waiting/W-B-P0040', { do: 'line', line: 'G0001' }]]);
+    });
+
+    test('a growing branch whose person is in no running direction: the paused one, said so', async ({ page }) => {
+        const b = await follow(page, { waiting: [GROWING_PAUSED] });
+        await openOverview(page);
+        const item = overview(page).locator('.research-overview__waiting-item[data-id="W-B-P0040"]');
+        await item.locator('.research-overview__waiting-row').click();
+        const acts = item.locator('.research-offline__wait-actions button');
+        await expect(acts).toHaveText(['Add to the direction Předci: Anna Svobodová (paused)', 'Create direction', 'Leave as it is', 'Do not research']);
+        await acts.first().click();
+        await expect.poll(() => offWrites(b).map(w => [w.path, w.body])).toEqual([['waiting/W-B-P0040', { do: 'line', line: 'G0004' }]]);
+    });
+
+    test('a narrow window with the bridge acts as a computer: 44 px, the segment across, no sideways scroll', async ({ page }) => {
+        const b = await follow(page, { size: { width: 390, height: 844 } });
+        await page.locator('#live-panel .live-panel-toggle').click();
+        await expect(overview(page)).toHaveClass(/research-overview--sheet/);
+        await outToggle(page).click();
+        const alois = branchRow(page, 'B-P0031');
+        await alois.locator('.research-offline__expand').click();
+        // Every status redraws the overview: measure what is there.
+        const height = (sel: string) => expect.poll(async () => (await alois.locator(sel).first().boundingBox())?.height ?? 0);
+        await height('.research-offline__seg').toBeGreaterThanOrEqual(44);
+        await height('.research-offline__more').toBeGreaterThanOrEqual(44);
+        // Its tasks above the segment: rows and their ⋯ 44 px.
+        await height('.research-offline__task').toBeGreaterThanOrEqual(44);
+        await height('.research-offline__task-more').toBeGreaterThanOrEqual(44);
+        expect(await alois.locator('.research-offline__task-more').first().evaluate(e => e.getBoundingClientRect().width)).toBeGreaterThanOrEqual(44);
+        await expect.poll(async () => {
+            const row = await alois.boundingBox();
+            const seg = await alois.locator('.research-offline__segment').boundingBox();
+            return row && seg ? seg.width / row.width : 0;
+        }).toBeGreaterThan(0.7);
+        expect(await overview(page).evaluate(e => e.scrollWidth <= e.clientWidth + 1)).toBe(true);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
+        await alois.locator('[data-mode="normal"]').click();
+        await expect.poll(() => offWrites(b).map(w => [w.path, w.body])).toEqual([['offline/B-P0031', { mode: 'normal' }]]);
+    });
+
+    test('an older research (no branches): today\'s row outside the directions, today\'s note of a task, the research\'s ⋯', async ({ page }) => {
+        await followManaged(page, {
+            caps: CAPS, ged: GED_OFFLINE,
+            researches: MANAGED_DIRECTIONS,
+            working: [{ who: 'agent-mimo', since: ago(5), task: 'Sňatek Aloise Fíška, Vídeň 1894', person: 'P0031' }],
+            queue: [{ id: 'T0412', text: 'Sňatek Aloise Fíška, Vídeň 1894', state: 'next', offLine: 'last' }],
+            features: ['tasks.offLine'],
+        });
+        await openOverview(page);
+        await expect(section(page).locator('.research-offline__head')).toHaveCount(0);
+        await expect(section(page).locator('.research-direction--outside')).toHaveText(/Outside the directions.*Sňatek Aloise Fíška, Vídeň 1894/);
+        const queue = overview(page).locator('.live-queue');
+        await expect(queue.locator('.live-queue-why')).toHaveCount(0);
+        await expect(queue.locator('.live-queue-note')).toHaveCount(1);
+        await overview(page).locator('.live-queue-toggle').click();
+        await queue.locator('.live-queue-more').first().click();
+        await expect(page.locator('#live-task-menu [data-order]')).toHaveCount(0);
+        await expect(page.locator('#live-task-menu [data-action]')).toHaveCount(2);
+    });
+});
+
+/**
+ * The whole queue read by pages (`queue.page`, spec 038 K7.5): 236 tasks,
+ * the status sends a window of 14, the branch Alois Fíšek has its 6 tasks at
+ * places 201–206 and the direction Potomci: Josef Fíšek its 5 at 40, 80, …, 200.
+ */
+const PAGED_FEATURES = [...FEATURES, 'queue.page'];
+const ALOIS_PLACES = [201, 202, 203, 204, 205, 206];
+
+function bigQueue(size: number, alois: number[] = ALOIS_PLACES): Record<string, unknown>[] {
+    const queue: Record<string, unknown>[] = [];
+    for (let i = 1; i <= size; i++) {
+        const id = `T${String(10000 + i)}`;
+        if (alois.includes(i)) {
+            queue.push({ id, text: `Alois Fíšek, úkol ${alois.indexOf(i) + 1}`, state: 'next', branch: 'B-P0031', why: { kind: 'off', mode: 'occasional', branch: 'B-P0031' } });
+        } else if (i % 40 === 0) {
+            queue.push({ id, text: `Josef Fíšek, úkol ${i / 40}`, state: 'next', research: 'G0002', why: { kind: 'line', research: 'G0002' } });
+        } else {
+            queue.push({ id, text: `Matriky Smrkov ${i}`, state: 'next', research: 'G0001', why: { kind: 'line', research: 'G0001' } });
+        }
+    }
+    queue.push({ id: 'T19999', text: 'Křest Karla Fíška', state: 'parked', branch: 'B-P0031', why: { kind: 'paused', research: 'G0004' } });
+    return queue;
+}
+
+/** Alois's branch: 6 tasks up next and 1 set aside (an older research knows only the 7). */
+const PAGED_LINE = { ...OFF_LINE, branches: [{ ...BRANCHES[0], tasks: 7, grows: false }, BRANCHES[1], BRANCHES[2]] };
+
+const followBig = (page: Page, opts: { size?: number; features?: string[] } = {}): Promise<ManagedBridge> =>
+    followManaged(page, {
+        caps: OFF_CAPS, features: opts.features ?? PAGED_FEATURES, offLine: PAGED_LINE, queue: bigQueue(opts.size ?? 236),
+        ged: GED_OFFLINE, paged: true,
+    });
+
+const nextNums = (page: Page) =>
+    overview(page).locator('.live-queue .live-queue-row:not(.live-queue-row--parked):not(.live-queue-row--more):not(.live-queue-state) .live-queue-num');
+
+test.describe('the whole queue by pages through the bridge (queue.page)', () => {
+    test('a branch beyond the window: its tasks with their places, the chips count the whole queue, Load more adds a page', async ({ page }) => {
+        const b = await followBig(page);
+        await openOverview(page);
+        await outToggle(page).click();
+        const alois = branchRow(page, 'B-P0031');
+        // The branch's tasks as the research counts them; nothing read before unfolding.
+        await expect(alois.locator('.research-offline__count')).toHaveText('7 tasks');
+        expect(b.queueReads).toEqual([]);
+
+        // Unfolded: the branch's first page read, the first three with their places in the whole queue.
+        await alois.locator('.research-offline__expand').click();
+        const list = alois.locator('.research-offline__queue');
+        await expect(list.locator('.research-offline__queue-head')).toHaveText('In the queue · first 3 of 6');
+        await expect(list.locator('.research-offline__task:not(.is-parked) .research-offline__task-num')).toHaveText(['201', '202', '203']);
+        await expect(list.locator('.research-offline__task:not(.is-parked) .research-offline__task-text')).toHaveText([
+            'Alois Fíšek, úkol 1', 'Alois Fíšek, úkol 2', 'Alois Fíšek, úkol 3',
+        ]);
+        await expect(list.locator('.research-offline__task.is-parked')).toHaveText(/^Set aside: Křest Karla Fíška/);
+        expect(b.queueReads).toEqual(['count=50&branch=B-P0031']);
+        // Folded and unfolded again: no new read.
+        await alois.locator('.research-offline__expand').click();
+        await alois.locator('.research-offline__expand').click();
+        await expect(list.locator('.research-offline__task:not(.is-parked) .research-offline__task-num')).toHaveText(['201', '202', '203']);
+
+        // All of them: the queue narrowed to the branch, the chip counts 6, the same list (no new read).
+        await alois.locator('[data-do="all-tasks"]').click();
+        const chip = overview(page).locator('.research-offline__chip');
+        await expect(chip).toHaveText('Branch Alois Fíšek 6 ×');
+        await expect(nextNums(page)).toHaveText(ALOIS_PLACES.map(String));
+        await expect(nextNums(page).first()).toHaveAttribute('aria-label', '201 in the queue');
+        await expect(overview(page).locator('.live-queue .live-queue-row--parked')).toHaveText(/Křest Karla Fíška/);
+        await expect(overview(page).locator('.live-queue-load')).toHaveCount(0);
+        expect(b.queueReads).toEqual(['count=50&branch=B-P0031']);
+
+        // A line's pill: its count from the whole queue, its tasks read from the whole queue with their places.
+        const row = overview(page).locator('.research-overview__queue-filters');
+        const josef = row.locator('[role="radio"][data-direction="G0002"]');
+        await expect(josef).toHaveText('Potomci: Josef Fíšek 5');
+        await expect(row.locator('[role="radio"][data-direction="all"]')).toHaveText('All 236');
+        await josef.click();
+        await expect(nextNums(page)).toHaveText(['40', '80', '120', '160', '200']);
+        expect(b.queueReads).toEqual(['count=50&branch=B-P0031', 'count=50&research=G0002']);
+
+        // The whole queue: the window, then Load more reads the next page after it.
+        await row.locator('[role="radio"][data-direction="all"]').click();
+        await expect(nextNums(page)).toHaveCount(14);
+        const load = overview(page).locator('.live-queue-load');
+        await expect(load).toHaveText('Load more');
+        await expect(overview(page).locator('.live-queue-shown')).toHaveText('14 of 236 shown');
+        await load.click();
+        await expect(nextNums(page)).toHaveCount(64);
+        await expect(nextNums(page).nth(14)).toHaveText('15');
+        await expect(overview(page).locator('.live-queue-shown')).toHaveText('64 of 236 shown');
+        await expect(load).toBeFocused();
+        expect(b.queueReads.at(-1)).toBe('from=14&count=50&state=next');
+        await load.click();
+        await expect(nextNums(page)).toHaveCount(114);
+        expect(b.queueReads.at(-1)).toBe('from=64&count=50&state=next');
+        expect(b.queueReads).toHaveLength(4);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
+        expect(await launchedLinks(page)).toEqual([]);
+    });
+
+    test('a line with tasks set aside: "N of M shown" counts only the tasks up next, as its chip does', async ({ page }) => {
+        const queue = bigQueue(236);
+        for (let i = 1; i <= 3; i++) {
+            queue.push({ id: `T1990${i}`, text: `Matriky Smrkov odložené ${i}`, state: 'parked', research: 'G0001', why: { kind: 'paused', research: 'G0001' } });
+        }
+        const b = await followManaged(page, { caps: OFF_CAPS, features: PAGED_FEATURES, offLine: PAGED_LINE, queue, ged: GED_OFFLINE, paged: true });
+        await openOverview(page);
+        await overview(page).locator('.live-queue-toggle').click();
+        const row = overview(page).locator('.research-overview__queue-filters');
+        const line = row.locator('[role="radio"][data-direction="G0001"]');
+        await expect(line).toHaveText(/ 225$/);
+        await line.click();
+        await expect(nextNums(page)).toHaveCount(50);
+        await expect(overview(page).locator('.live-queue-shown')).toHaveText('50 of 225 shown');
+        expect(b.queueReads.at(-1)).toBe('count=50&research=G0001');
+        await overview(page).locator('.live-queue-load').click();
+        await expect(nextNums(page)).toHaveCount(100);
+        await expect(overview(page).locator('.live-queue-shown')).toHaveText('100 of 225 shown');
+    });
+
+    test('an older research without pages: no "first 0 of N", the branch says its tasks stand further on', async ({ page }) => {
+        const b = await followBig(page, { features: FEATURES });
+        await openOverview(page);
+        await outToggle(page).click();
+        const alois = branchRow(page, 'B-P0031');
+        await alois.locator('.research-offline__expand').click();
+        const list = alois.locator('.research-offline__queue');
+        await expect(list.locator('.research-offline__queue-head')).toHaveText('In the queue');
+        await expect(list.locator('.research-offline__queue-beyond')).toHaveText('The branch\'s tasks stand further on in the queue (6).');
+        await expect(list).not.toContainText('first 0');
+        await expect(list.locator('[data-do="all-tasks"]')).toHaveCount(0);
+        await expect(overview(page).locator('.live-queue-load')).toHaveCount(0);
+        expect(b.queueReads).toEqual([]);
+    });
+
+    test('5000 tasks: the queue and the branch stay smooth, the DOM holds at most 300 rows', async ({ page }) => {
+        const places = [4201, 4202, 4203, 4204, 4205, 4206];
+        await followManaged(page, {
+            caps: OFF_CAPS, features: PAGED_FEATURES, offLine: PAGED_LINE, queue: bigQueue(5000, places), ged: GED_OFFLINE, paged: true,
+        });
+        await page.evaluate(() => {
+            const w = window as unknown as { __longTasks: number[] };
+            w.__longTasks = [];
+            new PerformanceObserver(list => { for (const e of list.getEntries()) w.__longTasks.push(Math.round(e.duration)); })
+                .observe({ type: 'longtask' });
+        });
+        await openOverview(page);
+        await outToggle(page).click();
+        const alois = branchRow(page, 'B-P0031');
+        await alois.locator('.research-offline__expand').click();
+        await expect(alois.locator('.research-offline__task:not(.is-parked) .research-offline__task-num')).toHaveText(['4201', '4202', '4203']);
+        await overview(page).locator('.live-queue-toggle').click();
+        const load = overview(page).locator('.live-queue-load');
+        for (let k = 1; k <= 6; k++) {
+            await load.click();
+            await expect(nextNums(page)).toHaveCount(Math.min(300, 14 + 50 * k));
+        }
+        // At the cap: said so, no more reads, the rest through the filters.
+        await expect(load).toHaveCount(0);
+        await expect(overview(page).locator('.live-queue-row--cap .live-queue-shown'))
+            .toHaveText('300 of 5000 shown. A direction\'s or a branch\'s filter narrows the rest.');
+        expect(await overview(page).locator('.live-queue .live-queue-row').count()).toBeLessThanOrEqual(302);
+        const long = await page.evaluate(() => (window as unknown as { __longTasks: number[] }).__longTasks);
+        test.info().annotations.push({ type: 'longtasks', description: JSON.stringify(long) });
+        // No long task over 200 ms (a 50 ms one may come from the machine's load).
+        expect(long.filter(d => d > 200)).toEqual([]);
+    });
+});

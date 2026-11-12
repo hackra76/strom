@@ -279,6 +279,21 @@ describe('the text', () => {
         expect(buildFamilyBook(d, { lang: 'cs', privacy: 'full' }, ENV)).not.toContain('class="book-notes');
     });
 
+    it('a story\'s sources: nothing under the text, numbered in the list at the end; a bare code reads as the title; none without the Sources part (1104)', () => {
+        const d = ostruznik();
+        d.sources!['s4'].refn = 'S0004';
+        d.partnerships['u2' as PartnershipId].story = { status: 'final', text: 'Svatba byla v zimě [S0004].', sources: ['s4', 's3'], facts: ['MARR 1878 Lhota [S0004]'] };
+        const html = buildFamilyBook(d, { lang: 'cs', privacy: 'full' }, ENV);
+        expect(html).toContain('Svatba byla v zimě (Nikým necitovaný pramen).');
+        // No block, no facts, no section under the story's text.
+        expect(html).not.toMatch(/book-story-src|Z čeho text vychází|Opírá se o prameny|MARR 1878/);
+        // The source only the story rests on is in the list at the end under a number.
+        expect(html).toMatch(/<span class="book-pn">P\d+<\/span>Nikým necitovaný pramen/);
+        const off = buildFamilyBook(d, { lang: 'cs', privacy: 'full', parts: { ...defaultBookOptions('cs').parts, sources: false } }, ENV);
+        expect(off).not.toContain('Nikým necitovaný pramen<');
+        expect(off).toContain('Svatba byla v zimě (Nikým necitovaný pramen).');
+    });
+
     it('escapes the text before it renders emphasis', () => {
         const d = ostruznik();
         d.persons['v' as PersonId].story = { status: 'final', text: '<script>alert(1)</script> a **tučně**' };

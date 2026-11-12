@@ -8,9 +8,11 @@
  * still renders.
  */
 
+import { rewriteStorySources, storySourceIds } from './story-sources.js';
 import { StromData, Person, Partnership, SourceExcerpt } from './types.js';
 import { strings } from './strings.js';
 import { yearOf } from './dates.js';
+import { forgetHiddenImports } from './import-origin.js';
 import { stripPhotos } from './photo.js';
 import { stripAttachments, stripExcerpts } from './attachments.js';
 
@@ -54,15 +56,24 @@ export type ContentPreset = 'complete' | 'small' | 'skeleton';
  * - small: no heavy media (photos + attachments), text kept — a file to email,
  * - skeleton: structure and names only (all four off).
  */
-export const CONTENT_PRESETS: Record<ContentPreset, ContentOptions> = {
+export const CONTENT_PRESETS: Record<ContentPreset | 'back', ContentOptions> = {
     complete: { photos: true, attachments: true, notes: true, sources: true, sourceImages: 'app' },
     small: { photos: false, attachments: false, notes: true, sources: true, sourceImages: 'none' },
     skeleton: { photos: false, attachments: false, notes: false, sources: false, sourceImages: 'none' },
+    /**
+     * GEDCOM "Back to {prog}" (spec 066 §4): the text of the tree with every
+     * source and citation, no media — other programs do not read embedded
+     * data URLs. Not a choice of the Content section (no button of its own).
+     */
+    back: { photos: false, attachments: false, notes: true, sources: true, sourceImages: 'none' },
 };
+
+/** The presets offered as buttons in the Content section, in their order. */
+const DIALOG_PRESETS: readonly ContentPreset[] = ['complete', 'small', 'skeleton'];
 
 /** The preset whose pattern equals `opts`, or null when the state is custom. */
 export function matchContentPreset(opts: ContentOptions): ContentPreset | null {
-    for (const name of Object.keys(CONTENT_PRESETS) as ContentPreset[]) {
+    for (const name of DIALOG_PRESETS) {
         const p = CONTENT_PRESETS[name];
         // Source images: "complete" takes those in the app or all of them.
         const images = opts.sourceImages === undefined || opts.sourceImages === p.sourceImages
@@ -119,10 +130,13 @@ export function stripSources(data: StromData): StromData {
         delete person.research;
         for (const ev of person.events ?? []) delete ev.sourceIds;
         for (const att of person.attachments ?? []) delete att.sourceId;
+        rewriteStorySources(person.story, () => []);
     }
     for (const partnership of Object.values(copy.partnerships)) {
         delete partnership.sourceIds;
+        delete partnership.divorceSourceIds;
         for (const ev of partnership.events ?? []) delete ev.sourceIds;
+        rewriteStorySources(partnership.story, () => []);
     }
     return copy;
 }
@@ -135,7 +149,8 @@ const FACT_SCOPES: readonly string[] = ['living', 'off-tree'];
  * of the tree (what is missing and why, the window searched, the books, the
  * estimate, the hypotheses and the family outside the tree) and drops how
  * the research works on it: what comes next, the queue, tasks, searches,
- * sessions and their cost, the direction, a story's waiting new version.
+ * sessions and their cost, the direction, a story's waiting new version,
+ * the lines and side branches and who stands where in them, the waits.
  * That is the research's own state, stale in any copy and meaningless to
  * anyone else; the research tree gets it back with its next load. Mutates and returns `data` (a fresh copy).
  */
@@ -167,7 +182,12 @@ export function stripResearchWork(data: StromData): StromData {
             };
         }
         if (r.island) r.island = { size: r.island.size, hypos: r.island.hypos };
+        // Where the person stands in the lines, what is waited for and when the research added them: its workshop.
+        delete r.places;
+        delete r.waits;
+        delete r.added;
     }
+    delete data.researchDirections;
     return data;
 }
 
@@ -208,6 +228,9 @@ export function applyContentOptions(data: StromData, content: boolean | ContentO
     } else if (!opts.attachments) out = stripAttachments(out);
     if (!opts.notes) out = stripNotes(out);
     if (!opts.sources) out = stripSources(out);
+    // A fact left out takes its stored import value with it.
+    for (const person of Object.values(out.persons)) forgetHiddenImports(person, false);
+    for (const ps of Object.values(out.partnerships)) forgetHiddenImports(ps, false);
     return out;
 }
 
@@ -302,6 +325,7 @@ function stripDetails(person: Person): void {
     delete person.deathPlace;
     delete person.gedcomDates;
     delete person.birthAddress;
+    delete person.birthAge;
     delete person.deathCause;
     delete person.deathAge;
     delete person.deathAddress;
@@ -311,6 +335,7 @@ function stripDetails(person: Person): void {
     delete person.story;
     delete person.photo;
     delete person.photoOriginalName;
+    delete person.photoDate;
     // Life events carry places and dates — drop them for living people.
     delete person.events;
     // Source citations may point at sensitive references — drop them too.
@@ -328,6 +353,7 @@ function stripDetails(person: Person): void {
     delete person.titleAfter;
     // The surname after marriage is the name a living woman goes by today.
     delete person.marriedSurname;
+    delete person.marriedFirstName;
     // …which of the two she goes by (it hints at a divorce; initials keep
     // the married surname's initial, not the choice)…
     delete person.primaryName;
@@ -359,6 +385,7 @@ function stripPartnershipDetails(partnership: Partnership, mode: PrivacyMode): v
     delete partnership.participants;
     delete partnership.story;
     delete partnership.sourceIds;
+    delete partnership.divorceSourceIds;
     // The banns, the household at a census: dates, places, witnesses.
     delete partnership.events;
     if (startYear !== null) partnership.startDate = String(startYear);
@@ -398,10 +425,13 @@ export function applyLivingPrivacy(
             delete person.deathSourceIds;
             delete person.attachments;
             for (const ev of person.events ?? []) delete ev.sourceIds;
+            rewriteStorySources(person.story, () => []);
         }
         for (const partnership of Object.values(copy.partnerships)) {
             delete partnership.sourceIds;
+            delete partnership.divorceSourceIds;
             for (const ev of partnership.events ?? []) delete ev.sourceIds;
+            rewriteStorySources(partnership.story, () => []);
         }
     }
 
@@ -422,6 +452,7 @@ export function applyLivingPrivacy(
     for (const partnership of Object.values(copy.partnerships)) {
         if (living.has(partnership.person1Id) || living.has(partnership.person2Id)) {
             stripPartnershipDetails(partnership, mode);
+            forgetHiddenImports(partnership, true);
         }
     }
 
@@ -454,6 +485,19 @@ export function applyLivingPrivacy(
                 break;
             }
         }
+        // The file's values of what was just hidden must not stay behind.
+        forgetHiddenImports(person, true);
+    }
+    // A "?" of a loaded file (a spouse the file names without a name) goes out
+    // as its record, with nothing of its own to hide but its ids there, which
+    // name the person in the other program: gone when it may be living. Which
+    // files it was a record of stays (no id in it), so it is not taken for a
+    // stand-in the app made up and its family keeps both partners.
+    for (const person of Object.values(copy.persons)) {
+        if (!person.isPlaceholder || !person.originalIds || !isLivingPerson(person, currentYear, bounds)) continue;
+        const files = person.originalIds.map(e => ({ from: e.from, ids: [] }));
+        forgetHiddenImports(person, true);
+        person.originalIds = files;
     }
 
     // The living lost their citations above; a source only they cited goes too.
@@ -466,15 +510,73 @@ export function applyLivingPrivacy(
             cite(p.deathSourceIds);
             for (const ev of p.events ?? []) cite(ev.sourceIds);
             for (const a of p.attachments ?? []) if (a.sourceId) cited.add(a.sourceId);
+            cite(storySourceIds(p.story));
         }
         for (const u of Object.values(copy.partnerships)) {
             cite(u.sourceIds);
+            cite(u.divorceSourceIds);
             for (const ev of u.events ?? []) cite(ev.sourceIds);
+            cite(storySourceIds(u.story));
         }
         for (const id of Object.keys(copy.sources)) if (!cited.has(id)) delete copy.sources[id];
     }
 
     return copy;
+}
+
+/**
+ * The citations of a tree: every reference from a person, a couple, their
+ * events and narratives to a source of the catalog (an attachment's link to
+ * its source is an image, not a citation).
+ */
+export function countCitations(data: StromData): number {
+    let n = 0;
+    const count = (ids: readonly string[] | undefined) => { n += ids?.length ?? 0; };
+    for (const p of Object.values(data.persons)) {
+        count(p.sourceIds);
+        count(p.birthSourceIds);
+        count(p.deathSourceIds);
+        for (const ev of p.events ?? []) count(ev.sourceIds);
+        count(storySourceIds(p.story));
+    }
+    for (const u of Object.values(data.partnerships)) {
+        count(u.sourceIds);
+        count(u.divorceSourceIds);
+        for (const ev of u.events ?? []) count(ev.sourceIds);
+        count(storySourceIds(u.story));
+    }
+    return n;
+}
+
+/** The tree's own people (no placeholders) the privacy filter treats as living. */
+export function countLivingPersons(data: StromData, currentYear: number = new Date().getFullYear()): number {
+    const bounds = inferBirthUpperBounds(data);
+    return Object.values(data.persons).filter(p => !p.isPlaceholder && isLivingPerson(p, currentYear, bounds)).length;
+}
+
+/**
+ * What a GEDCOM export leaves out of the tree's sources (spec 066 §5): the
+ * sources of the catalog and the citations the tree has and the file will
+ * not. Without "Sources & citations" everything; otherwise, under a privacy
+ * mode, the citations of the living (and of couples with a living partner)
+ * and the sources only they cite — the deceased keep theirs
+ * (`keepDeceasedSources`). Pure: does not touch `data`.
+ */
+export function droppedSources(
+    data: StromData,
+    privacy: PrivacyMode,
+    content: Pick<ContentOptions, 'sources'>,
+    currentYear: number = new Date().getFullYear()
+): { sources: number; citations: number } {
+    const sources = Object.keys(data.sources ?? {}).length;
+    const citations = countCitations(data);
+    if (!content.sources) return { sources, citations };
+    if (privacy === 'full' || (sources === 0 && citations === 0)) return { sources: 0, citations: 0 };
+    const kept = applyLivingPrivacy(data, privacy, currentYear, { keepDeceasedSources: true });
+    return {
+        sources: sources - Object.keys(kept.sources ?? {}).length,
+        citations: citations - countCitations(kept),
+    };
 }
 
 /**

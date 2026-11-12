@@ -16,6 +16,7 @@ import { yearOf } from '../dates.js';
 import {
     RESEARCH_LINK_ACTIONS, RESEARCH_TOOL_ACTIONS, RESEARCH_TOOL_GROUPS, ResearchLinkAction, ResearchReviewScope, ResearchStoryDo,
     ResearchToolAction, researchPersonRef, researchLinkMark, type ResearchActionMark,
+    RESEARCH_BRIDGE_MARKS,
 } from '../research-link.js';
 import { uiModule } from './module.js';
 import { onComputer, updateBusyText } from './research-ui.js';
@@ -366,6 +367,9 @@ export const researchActionsMethods = uiModule({
         // Linked in the view only: the list, with how many are shown (a tree whose research says what a variant connects).
         const viewLinks: SubmenuItem[] = this.viewLinksListOffered()
             ? [{ id: 'research-item-view-links', label: strings.viewLinks.menuItem(this.viewLinksShownCount()), method: 'researchActionViewLinks' }] : [];
+        // Verify facts in the tree (spec 065 §10l): through the bridge, the AI badge alone; not in an archive.
+        const verifyRow: SubmenuItem[] = !noAgent && this.verifyBulkAvailable()
+            ? [{ id: 'research-item-verify', label: strings.verify.bulkRow, method: 'showVerifyBulkDialog', ai: RESEARCH_BRIDGE_MARKS['verify-bulk'] === 'bridgeAgent' }] : [];
         let first: SubmenuItem[];
         let more: SubmenuItem[];
         // Read a document (spec 013): now and then, the first item of "Other actions" (its link and badge as they are).
@@ -374,6 +378,12 @@ export const researchActionsMethods = uiModule({
         let note = r.footerFull;
         let moreAttention = '';
         let tools: ResearchToolAction[] = [];
+        // First of all, followed or not (spec 057 §7.1): the overview, then following live — Stop while
+        // following, else "Follow live" (it stays in the app: no mark; an archive has no agent to follow).
+        const followingHere = this.isFollowingActiveResearch();
+        const overviewRows: SubmenuItem[] = [{ id: 'research-item-overview', label: strings.live.overviewTitle, method: 'researchActionOverview' }];
+        if (followingHere) overviewRows.push({ id: 'research-item-stop', label: r.stop, method: 'researchActionStop' });
+        else if (!noAgent && this.researchLinkAvailable('live')) overviewRows.push({ id: 'research-item-live', label: r.followLive, method: 'researchActionLive' });
         if (!this.researchAnyAnnounced()) {
             // No strom-research:// links here (an older research, none announced, or
             // switched off): the way back, and what it is. A research that says what
@@ -393,18 +403,14 @@ export const researchActionsMethods = uiModule({
             // Read a document goes through the bridge, not a strom-research:// link: offered here too.
             const read = noAgent ? null : this.readMenuEntry();
             if (read) readRow = [{ id: 'research-item-read', method: 'showReadDocumentDialog', ...read, link: undefined }];
-            first = [...startRow, ...sendRow.map(i => ({ ...i, ext: false }))];
-            more = [...changesRow, ...viewLinks, ...materials, ...phone];
+            first = [...overviewRows, ...startRow, ...sendRow.map(i => ({ ...i, ext: false }))];
+            more = [...changesRow, ...verifyRow, ...viewLinks, ...materials, ...phone];
             moreQuiet = [...treeSettings, ...aboutRow];
         } else {
-            // First: what waits, the agent, following live, the research itself, the send.
-            first = [];
+            // First: the overview and following live, what waits, the agent, the research itself, the send.
+            first = [...overviewRows];
             if (waiting > 0) first.push({ id: 'research-item-waiting', label: r.waiting, method: 'researchActionWaiting', count: waiting });
             if (!noAgent && this.researchLinkAvailable('chat')) first.push({ id: 'research-item-chat', label: r.continueAgent, method: 'researchActionChat', ...opens(researchLinkMark('chat')) });
-            // Right under the agent: following live, its overview; else "Follow live" — the research starts
-            // (or reuses) its bridge and opens ?live= here (an archive has no agent to follow).
-            if (this.isFollowingActiveResearch()) first.push({ id: 'research-item-overview', label: strings.live.overviewTitle, method: 'researchActionOverview' });
-            else if (!noAgent && this.researchLinkAvailable('live')) first.push({ id: 'research-item-live', label: r.followLive, method: 'researchActionLive', ...opens(researchLinkMark('live')) });
             const read = noAgent ? null : this.readMenuEntry();
             if (read) readRow = [{ id: 'research-item-read', method: 'showReadDocumentDialog', ...read, link: read.link && this.researchLinkAvailable('open') ? read.link : undefined }];
             if (this.researchLinkAvailable('open')) first.push({ id: 'research-item-open', label: r.openResearch, method: 'researchActionOpen', ...opens(researchLinkMark('open')) });
@@ -431,6 +437,7 @@ export const researchActionsMethods = uiModule({
             // "Tree fixes" (§7): a list of its own in the app, so here and not among the research tools (§8 rule 5).
             const fixes = this.researchFixesMenuEntry();
             if (fixes) more.push({ id: 'research-item-fixes', method: 'researchActionFixes', ...fixes });
+            more.push(...verifyRow);
             // "Research tools ›" (§8): the actions the research announced that have no place of their own here.
             tools = RESEARCH_TOOL_ACTIONS.filter(t => this.researchLinkAvailable(t.action) && !(t.ai && noAgent));
             if (tools.length) more.push({ id: 'research-item-tools', label: strings.research.tools.title, method: 'openResearchTools', submenu: true });
@@ -841,7 +848,7 @@ export const researchActionsMethods = uiModule({
         if (!this.researchMenuShown()) return null;
         const model = this.researchMenuModel();
         // "Open research", "Read a document" and the rest: on the second level, "All research actions ›".
-        const frequent = new Set(['research-item-waiting', 'research-item-chat', 'research-item-images', 'research-item-materials']);
+        const frequent = new Set(['research-item-overview', 'research-item-waiting', 'research-item-chat', 'research-item-images', 'research-item-materials']);
         const ui = this as unknown as Record<string, (...args: string[]) => void>;
         const rows: ResearchSheetRow[] = [...model.first, ...model.more].filter(i => frequent.has(i.id) && !i.disabled).map(i => ({
             label: i.label, count: i.count, ai: i.ai, ext: i.ext, ariaLabel: itemAria(i), value: i.val, id: `sheet-${i.id}`,
@@ -925,10 +932,16 @@ export const researchActionsMethods = uiModule({
         this.showResearchWaiting();
     },
 
+    /** "Follow live": through the research's bridge here when known, else its link (one way for every place). */
     researchActionLive(): void {
         this.closeActionsMenu();
-        const url = this.activeResearchLink('live');
-        if (url) this.launchResearchLink(url);
+        this.startFollowLive('menu');
+    },
+
+    /** "Stop following": the tree is the user's again. */
+    researchActionStop(): void {
+        this.closeActionsMenu();
+        this.stopLiveFollow();
     },
 
     researchActionOverview(): void {
@@ -1012,7 +1025,12 @@ export const researchActionsMethods = uiModule({
             badge: mark === 'agent' ? 'ai' : undefined,
             ariaLabel: [label, note, mark === 'agent' ? r.aiBadge : '', mark !== 'none' ? r.opensInResearchSr : ''].filter(Boolean).join(', '),
         });
-        if (this.researchLinkAvailable('research')) {
+        // A research that manages its directions through the bridge: the app's form, no mark (spec 038 §2.9).
+        const managed = this.managesDirections();
+        if (managed) {
+            items.push({ action: 'research-ancestors', label: r.findAncestors });
+            items.push({ action: 'research-descendants', label: r.findDescendants });
+        } else if (this.researchLinkAvailable('research')) {
             // A new direction: the research's terminal asks and writes its tasks; nothing is paid on the click.
             items.push({ action: 'research-ancestors', label: r.findAncestors, ...marked(r.findAncestors, researchLinkMark('research')) });
             items.push({ action: 'research-descendants', label: r.findDescendants, ...marked(r.findDescendants, researchLinkMark('research')) });
@@ -1023,6 +1041,10 @@ export const researchActionsMethods = uiModule({
             if (!d) continue;
             if (d.state === 'active') {
                 items[i] = { ...items[i], external: false, badge: undefined, state: r.dirRunning, ariaLabel: `${items[i].label}, ${r.dirRunning}` };
+            } else if (managed) {
+                // Restarting it through the bridge: no mark.
+                const note = r.dirResumeNote(d.state === 'paused' ? r.dirStatePaused : r.dirStateDone);
+                items[i] = { ...items[i], note, ariaLabel: `${items[i].label}, ${note}` };
             } else if (this.researchLinkAvailable('direction')) {
                 // Restarting it: the research's terminal asks (its tasks wait for the next session).
                 const note = r.dirResumeNote(d.state === 'paused' ? r.dirStatePaused : r.dirStateDone);
@@ -1043,12 +1065,19 @@ export const researchActionsMethods = uiModule({
             this.openResearchDirection(direction.id);
             return;
         }
-        if (direction && this.researchLinkAvailable('direction')) {
+        const managed = this.managesDirections();
+        if (direction && managed) {
+            void this.changeDirectionState(direction, 'resume');
+            return;
+        }
+        if (direction && !managed && this.researchLinkAvailable('direction')) {
             this.runDirection(direction.id, 'resume');
             return;
         }
         if (action === 'research-review') {
             this.showResearchReviewDialog(personId);
+        } else if (managed && (action === 'research-ancestors' || action === 'research-descendants')) {
+            this.openDirectionForm({ mode: 'new', person, kind: action === 'research-ancestors' ? 'ancestors' : 'descendants' });
         } else if (action === 'research-ancestors' || action === 'research-descendants') {
             const direction = action === 'research-ancestors' ? 'ancestors' : 'descendants';
             const url = this.activeResearchLink('research', { person, direction });

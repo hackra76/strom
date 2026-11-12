@@ -32,7 +32,27 @@ import { compressPhoto, dataUrlByteSize } from '../photo.js';
 import { compressImageAttachment, readFileAsDataUrl, MAX_PDF_BYTES, countImages, stripMedia } from '../attachments.js';
 import { getDemoTree, DEMO_FOCUS } from '../demo-tree.js';
 import { demoImageMaker } from '../demo-images.js';
-import { parseGedcom, convertToStrom, decodeGedcomFile, GedcomConversionResult } from '../ged-parser.js';
+import {
+    parseGedcom, convertToStrom, decodeGedcomBytes, GedcomConversionResult, GedcomEncoding, GEDCOM_ENCODING_CHOICES,
+    gedcomSampleNames, GedcomImportOrigin,
+} from '../ged-parser.js';
+import { createSha256 } from '../sha256.js';
+import { dropMediaLink, localIsoDay } from '../import-origin.js';
+import { importProgramName } from '../import-next.js';
+
+/**
+ * What an import brought, for the steps after it (spec 066). `gedcom`: from a
+ * GEDCOM file; `path`: a new tree, inserted into the current (empty) tree, or
+ * merged into a new tree; `importId`: the file's import record in the tree;
+ * `added` / `updated`: people a merge added and merged into existing ones.
+ */
+export interface AfterImportOptions {
+    gedcom?: boolean;
+    path?: 'new' | 'insert' | 'merge';
+    importId?: string;
+    added?: number;
+    updated?: number;
+}
 import {
     validateJsonImport,
     ValidationResult,
@@ -46,7 +66,8 @@ import { PersonPicker } from '../person-picker.js';
 import { AppExporter } from '../export.js';
 import { SettingsManager } from '../settings.js';
 import { ThemeMode, LanguageSetting, AppMode, AuditLog, uniqueIdSuffix } from '../types.js';
-import { CryptoSession, isEncrypted, encrypt, decrypt, EncryptedData } from '../crypto.js';
+import { CryptoSession, isEncrypted, encrypt, decrypt, EncryptedData, classifyCryptoError, CryptoFailure } from '../crypto.js';
+import { cryptoErrorText, cryptoFailureText, resetPasswordError } from '../crypto-errors.js';
 import { validateTreeData, ValidationResult as TreeValidationResult, ValidationIssue } from '../validation.js';
 import * as CrossTree from '../cross-tree.js';
 import { AuditLogManager } from '../audit-log.js';
@@ -217,7 +238,9 @@ export const importExportMethods = uiModule({
     /**
      * Export target tree as GEDCOM file
      */
-    async exportTargetTreeGedcom(): Promise<void> {
+    async exportTargetTreeGedcom(opts: { preset?: 'back' } = {}): Promise<void> {
+        // `preset: 'back'` ("Back to {prog}: export with sources…" of the What next card,
+        // spec 066 §4) opens the dialog with "Back to {prog}" chosen.
         const treeId = this.getExportTargetTreeId();
         if (!treeId) {
             this.closeExportDialog();
@@ -237,13 +260,17 @@ export const importExportMethods = uiModule({
 
             const { isFaithfulExport } = await import('../research-link.js');
             const { resolveContentOptions } = await import('../privacy.js');
+            // "Back to {prog}" gives Full data and its own content (read through the dialog).
             const privacy = this.readExportPrivacyMode();
             const content = this.readExportContentOptions();
-            const filtered = applyLivingPrivacy(data, privacy);
+            const researchNote = this.exportGedcomResearchNote();
+            // Every privacy choice keeps the deceased's sources and citations (spec 066 §4).
+            const filtered = applyLivingPrivacy(data, privacy, undefined, { keepDeceasedSources: true });
             // A faithful export of a research tree names the research and its version.
             const research = metadata?.research && isFaithfulExport(privacy, resolveContentOptions(content))
                 ? { id: metadata.research.id, head: metadata.research.head, appTree: treeId, transcripts: this.researchTranscriptsLink(metadata.research).transcripts } : undefined;
-            const result = exportToGedcom(filtered, metadata?.name, { content, research });
+            const backTo = this.exportGedcomBackTo(data);
+            const result = exportToGedcom(filtered, metadata?.name, { content, research, origins: true, confirmations: true, researchNote, backTo });
 
             // Download file
             const blob = new Blob([result.content], { type: 'text/plain;charset=utf-8' });
@@ -253,8 +280,8 @@ export const importExportMethods = uiModule({
             a.download = `${safeFileName(metadata?.name, 'family-tree')}.ged`;
             a.click();
             URL.revokeObjectURL(url);
-            if (this.readExportPrivacyMode() === 'full') TreeManager.noteFileCopy([treeId]);
-        }, false, { defaultPrivacy: 'initials', passwordless: true, content: true, format: 'gedcom', treeId });
+            if (privacy === 'full') TreeManager.noteFileCopy([treeId]);
+        }, false, { defaultPrivacy: 'initials', passwordless: true, content: true, format: 'gedcom', treeId, gedcomPurpose: opts.preset === 'back' ? 'back' : 'share' });
     },
 
     /**
@@ -387,11 +414,17 @@ export const importExportMethods = uiModule({
         const reader = new FileReader();
         reader.onload = (e) => {
             try {
-                // Raw bytes, not readAsText: the file's own HEAD > CHAR decides
-                // the encoding (ANSEL files were silently mangled as UTF-8).
-                const content = decodeGedcomFile(e.target?.result as ArrayBuffer);
-                const gedcom = parseGedcom(content);
-                this.gedcomResult = convertToStrom(gedcom);
+                // Raw bytes, not readAsText: the file's own HEAD > CHAR (or, for
+                // ANSI, its bytes) decides the encoding; the summary offers another.
+                const buffer = e.target?.result as ArrayBuffer;
+                const decoding = decodeGedcomBytes(buffer);
+                const sha = createSha256();
+                sha.update(new Uint8Array(buffer));
+                this.gedcomFileInfo = { name: file.name, sha: sha.digestHex(), at: localIsoDay() };
+                this.gedcomResult = convertToStrom(parseGedcom(decoding.text),
+                    { importOrigin: this.gedcomImportOrigin(decoding.encoding) });
+                this.gedcomRawBuffer = buffer;
+                this.gedcomDecoding = decoding;
                 this.gedcomImportImages = null;
                 this.importFromTreeManager = fromManager;
                 this.importToCurrentTree = toCurrent;
@@ -453,11 +486,13 @@ export const importExportMethods = uiModule({
 
         // Images in the file: offer to leave them out (pre-set from the
         // setting; the choice applies to this import only). The re-render
-        // after a media attach keeps the choice already made.
+        // after a media attach keeps the choice already made. Only images
+        // that are in the data: the files a GEDCOM merely names come in by
+        // the media row below, and before that there is nothing to leave out
+        // ("≈ 0.0 MB").
         if (this.gedcomImportImages === null) this.gedcomImportImages = SettingsManager.isImportImages();
         const imagesRow = document.getElementById('gedcom-images-row');
-        const hasImages = images.photos + images.attachments + images.excerpts > 0
-            || this.gedcomResult.externalMedia.length > 0;
+        const hasImages = images.photos + images.attachments + images.excerpts > 0;
         if (imagesRow) imagesRow.style.display = hasImages ? '' : 'none';
         const imagesCheck = document.getElementById('gedcom-import-images') as HTMLInputElement | null;
         if (imagesCheck) imagesCheck.checked = this.gedcomImportImages;
@@ -468,23 +503,38 @@ export const importExportMethods = uiModule({
         // What exactly was skipped (previously a dead counter — always 0).
         const detailEl = document.getElementById('gedcom-stat-detail');
         if (detailEl) {
-            const parts: string[] = [];
-            if (this.gedcomResult.stats.droppedTagSummary) {
-                parts.push(`${strings.gedcom.skippedTags}: ${this.gedcomResult.stats.droppedTagSummary}`);
-            }
-            if (this.gedcomResult.stats.unknownSexPersons > 0) {
-                parts.push(strings.gedcom.unknownSex(this.gedcomResult.stats.unknownSexPersons));
-            }
-            if (this.gedcomResult.stats.otherFamilyLinks > 0) {
-                parts.push(strings.gedcom.otherFamilyLinks(this.gedcomResult.stats.otherFamilyLinks));
-            }
-            if (parts.length === 0 && this.gedcomResult.stats.unsupportedTags === 0) {
-                // Say it out loud — silence reads as "who knows what got lost".
-                parts.push(strings.gedcom.allImported);
-            }
-            detailEl.textContent = parts.join(' · ');
+            const stats = this.gedcomResult.stats;
+            // What was not carried over: what the number means, before the list it names.
+            const lost = stats.droppedTagSummary
+                ? [strings.gedcom.unsupportedHint, `${strings.gedcom.skippedTags}: ${stats.droppedTagSummary}`] : [];
+            // Another program's own tags, kept for the way back (spec 066 G8):
+            // a line of their own after what was not carried over, never in
+            // the "Unsupported" count.
+            const keptFrom = this.gedcomResult.data.imports?.find(r => r.id === this.gedcomResult?.importId);
+            const kept = stats.keptTags > 0 && keptFrom
+                ? [strings.gedcom.keptTags(importProgramName(keptFrom), stats.keptTags, stats.keptTagSummary)] : [];
+            const people = [
+                ...(stats.unknownSexPersons > 0 ? [strings.gedcom.unknownSex(stats.unknownSexPersons)] : []),
+                ...(stats.otherFamilyLinks > 0 ? [strings.gedcom.otherFamilyLinks(stats.otherFamilyLinks)] : []),
+                ...(stats.joinedFamilies > 0
+                    ? [strings.gedcom.joinedFamilies(stats.joinedFamilies, keptFrom ? importProgramName(keptFrom) : undefined)] : []),
+            ];
+            // Nothing lost and nothing to say about people: said out loud —
+            // silence reads as "who knows what got lost".
+            const all = lost.length === 0 && people.length === 0 && stats.unsupportedTags === 0 ? [strings.gedcom.allImported] : [];
+            const parts = lost.length > 0 ? [...lost, ...kept, ...people] : [...all, ...people, ...kept];
+            // One line each: the people of unknown sex were imported, and next to
+            // "Skipped records" on the same line they read as skipped people.
+            detailEl.replaceChildren(...parts.map(text => {
+                const line = document.createElement('span');
+                line.className = 'gedcom-stat-line';
+                line.textContent = text;
+                return line;
+            }));
             detailEl.style.display = parts.length > 0 ? '' : 'none';
         }
+
+        this.renderGedcomEncoding();
 
         // External media (photos exported as a separate folder by platforms):
         // offer bulk attach BEFORE the data is inserted anywhere.
@@ -562,6 +612,8 @@ export const importExportMethods = uiModule({
         }
 
         this.gedcomResult.externalMedia = remaining;
+        // Files brought in by hand are images wanted in this import.
+        if (matched > 0) this.gedcomImportImages = true;
         this.showToast(matched > 0
             ? strings.gedcom.mediaAttached(matched, total)
             : strings.gedcom.mediaNoMatch);
@@ -569,14 +621,17 @@ export const importExportMethods = uiModule({
     },
 
     /** Attach one picked/downloaded file to the person of a media ref. */
-    async attachFileToGedcomRef(ref: { personId: PersonId; title?: string }, file: File): Promise<boolean> {
+    async attachFileToGedcomRef(ref: { personId: PersonId; title?: string; date?: string; filePath?: string }, file: File): Promise<boolean> {
         const person = this.gedcomResult?.data.persons[ref.personId];
         if (!person) return false;
+        // The picture's date from the file goes with it (spec 066 G8).
+        const date = ref.date ? { date: ref.date } : {};
         try {
             if (file.type.startsWith('image/')) {
                 if (!person.photo) {
                     person.photo = await compressPhoto(file);
                     person.photoOriginalName = file.name;
+                    if (ref.date) person.photoDate = ref.date;
                 } else {
                     (person.attachments ??= []).push({
                         id: `att_${Date.now()}_${uniqueIdSuffix()}`,
@@ -584,6 +639,7 @@ export const importExportMethods = uiModule({
                         mimeType: 'image/jpeg',
                         dataUrl: await compressImageAttachment(file),
                         sizeBytes: 0,
+                        ...date,
                     });
                 }
             } else if (file.type === 'application/pdf' && file.size <= MAX_PDF_BYTES) {
@@ -593,10 +649,12 @@ export const importExportMethods = uiModule({
                     mimeType: 'application/pdf',
                     dataUrl: await readFileAsDataUrl(file),
                     sizeBytes: file.size,
+                    ...date,
                 });
             } else {
                 return false;
             }
+            if (ref.filePath) dropMediaLink(person, ref.filePath);
             return true;
         } catch {
             return false;
@@ -632,17 +690,88 @@ export const importExportMethods = uiModule({
                 }
             } catch { /* expired link, offline, CORS — ref stays offered */ }
         }
-        if (btn) btn.disabled = false;
+        // Its own label again ("Downloading photos… 1/1" stood after a failed download); the links not downloaded stay offered.
+        if (btn) { btn.disabled = false; btn.textContent = strings.gedcom.downloadMedia; }
 
         this.gedcomResult.externalMedia = refs.filter(r => !succeeded.has(r));
+        // The photos go into the import, not yet into the tree: no "Undo" of an earlier change rides in this message.
+        this.dismissUndoToast();
+        if (ok > 0) this.gedcomImportImages = true;
         this.showToast(ok > 0
             ? strings.gedcom.mediaAttached(ok, urlRefs.length)
-            : strings.gedcom.mediaNoMatch);
+            : strings.gedcom.mediaDownloadFailed(urlRefs.length));
         this.showGedcomResultDialog();
+    },
+
+    /**
+     * The text-encoding row of the GEDCOM summary: shown when the file has
+     * non-ASCII text in a single-byte or guessed encoding (ANSI, no CHAR,
+     * ANSEL …), with a sample of names and a menu of other encodings.
+     */
+    renderGedcomEncoding(): void {
+        const row = document.getElementById('gedcom-encoding-row');
+        const d = this.gedcomDecoding;
+        if (!row) return;
+        const unicode = d?.encoding === 'utf-8' || d?.encoding === 'utf-16le' || d?.encoding === 'utf-16be';
+        const show = !!d && !!this.gedcomResult && d.nonAscii && (d.how === 'chosen' || !unicode);
+        row.style.display = show ? '' : 'none';
+        if (!show || !d || !this.gedcomResult) return;
+
+        const select = document.getElementById('gedcom-encoding-select') as HTMLSelectElement | null;
+        if (select) {
+            const choices = GEDCOM_ENCODING_CHOICES.includes(d.encoding)
+                ? GEDCOM_ENCODING_CHOICES : [d.encoding, ...GEDCOM_ENCODING_CHOICES];
+            select.replaceChildren(...choices.map(enc => {
+                const option = document.createElement('option');
+                option.value = enc;
+                option.textContent = strings.gedcom.encodingNames[enc] ?? enc.toUpperCase();
+                return option;
+            }));
+            select.value = d.encoding;
+        }
+        const how = document.getElementById('gedcom-encoding-how');
+        if (how) {
+            const said = d.how === 'chosen' ? strings.gedcom.encodingChosen
+                : d.how === 'content' ? strings.gedcom.encodingGuessed(d.declared)
+                    : strings.gedcom.encodingDeclared;
+            how.textContent = `${said} ${strings.gedcom.encodingHint}`;
+        }
+        const names = document.getElementById('gedcom-encoding-names');
+        if (names) names.textContent = gedcomSampleNames(this.gedcomResult.data).join(' · ');
+    },
+
+    /** Re-read the GEDCOM file of the summary in another encoding and show the summary again. */
+    setGedcomEncoding(encoding: string): void {
+        if (!this.gedcomRawBuffer || !(GEDCOM_ENCODING_CHOICES as readonly string[]).includes(encoding)) return;
+        try {
+            const decoding = decodeGedcomBytes(this.gedcomRawBuffer, encoding as GedcomEncoding);
+            // The import record says which encoding the file was read in: this one now.
+            const result = convertToStrom(parseGedcom(decoding.text),
+                { importOrigin: this.gedcomImportOrigin(decoding.encoding) });
+            this.gedcomDecoding = decoding;
+            this.gedcomResult = result;
+        } catch (error) {
+            this.showAlert(strings.gedcom.parseError, 'error');
+            console.error('GEDCOM parse error:', error);
+            return;
+        }
+        this.showGedcomResultDialog();
+    },
+
+    /** The origin of the GEDCOM file in the result dialog, read in `encoding` (its import record). */
+    gedcomImportOrigin(encoding: string): GedcomImportOrigin {
+        const info = this.gedcomFileInfo;
+        return {
+            at: info?.at ?? localIsoDay(),
+            ...(info?.name ? { file: info.name } : {}),
+            encoding,
+            ...(info?.sha ? { sha: info.sha } : {}),
+        };
     },
 
     closeGedcomResultDialog(): void {
         document.getElementById('gedcom-result-modal')?.classList.remove('active');
+        this.gedcomRawBuffer = null;
         if (this.importFromTreeManager) {
             this.returnToParentDialog();
             this.importFromTreeManager = false;
@@ -655,9 +784,16 @@ export const importExportMethods = uiModule({
         this.applyGedcomImagesChoice();
     },
 
-    /** Dim the image tiles and hide the external-media offer when images stay out. */
+    /**
+     * Dim the image tiles and hide the external-media offer when images stay
+     * out — while the checkbox is there to bring them back (with no image in
+     * the data yet, the offer itself is the choice).
+     */
     applyGedcomImagesChoice(): void {
-        const off = this.gedcomImportImages === false;
+        const result = this.gedcomResult;
+        const images = result ? countImages(result.data) : null;
+        const off = this.gedcomImportImages === false
+            && !!images && images.photos + images.attachments + images.excerpts > 0;
         for (const key of ['photos', 'documents', 'excerpts']) {
             document.getElementById(`gedcom-stat-${key}-item`)?.classList.toggle('muted', off);
         }
@@ -689,6 +825,8 @@ export const importExportMethods = uiModule({
 
     importGedcomAsNewTree(): void {
         if (!this.gedcomResult) return;
+        this.gedcomRawBuffer = null;
+        const importId = this.gedcomResult.importId;
 
         // Check if importing directly to current tree (from empty state)
         if (this.importToCurrentTree) {
@@ -696,11 +834,16 @@ export const importExportMethods = uiModule({
             // Close gedcom result dialog
             document.getElementById('gedcom-result-modal')?.classList.remove('active');
             this.clearDialogStack();
+            // Back up the current state before overwriting it (as a JSON file does).
+            void DataManager.snapshotNow('pre-import');
             // Load data directly into current tree
             DataManager.loadStromData(this.gedcomDataForImport());
             TreeRenderer.render();
-            this.showToast(strings.buttons.importComplete);
             this.gedcomResult = null;
+            const treeId = DataManager.getCurrentTreeId();
+            // A file from another program gets the "What next" card in place of the toast.
+            if (!importId || !treeId) this.showToast(strings.buttons.importComplete);
+            if (treeId) void this.afterImport(treeId, { gedcom: true, path: 'insert', ...(importId ? { importId } : {}) });
             return;
         }
 
@@ -713,6 +856,7 @@ export const importExportMethods = uiModule({
 
         // Show import tree dialog with parent preserved
         this.showImportTreeDialog(this.gedcomDataForImport(), strings.treeManager.importTreeName, fromManager);
+        this.pendingGedcomImport = importId ? { importId } : {};
         this.gedcomResult = null;
     },
 
@@ -723,7 +867,8 @@ export const importExportMethods = uiModule({
         if (!this.gedcomResult) return;
 
         // Start merge process
-        MergerUI.startMerge(this.gedcomDataForImport());
+        MergerUI.startMerge(this.gedcomDataForImport(), undefined, false,
+            { gedcom: true, ...(this.gedcomResult.importId ? { importId: this.gedcomResult.importId } : {}) });
         this.gedcomResult = null;
         this.closeGedcomResultDialog();
     },
@@ -850,12 +995,10 @@ export const importExportMethods = uiModule({
 
         if (!modal || !input) return;
 
-        // Clear fields but keep modal behind tree manager
+        // Clear fields but keep modal behind tree manager (outside a
+        // secure context the notice shows at once)
         input.value = '';
-        if (error) {
-            error.style.display = 'none';
-            error.textContent = '';
-        }
+        resetPasswordError(error);
 
         // Set callback for this specific import - callback manages dialog
         this.passwordPromptCallback = async (password: string) => {
@@ -875,21 +1018,15 @@ export const importExportMethods = uiModule({
 
         const error = document.getElementById('password-prompt-error');
 
+        let decrypted: string;
         try {
             const { decrypt } = await import('../crypto.js');
-            const decrypted = await decrypt(this.pendingEncryptedImport, password);
-
-            // Success - close dialog and reset flag
-            document.getElementById('password-prompt-modal')?.classList.remove('active');
-            this.passwordPromptCallbackManagesDialog = false;
-            this.pendingEncryptedImport = null;
-
-            // Same routing as a plain file (single tree or "Export all" backup)
-            await this.importJsonString(decrypted);
-        } catch {
-            // Wrong password - show error and keep dialog open
+            decrypted = await decrypt(this.pendingEncryptedImport, password);
+        } catch (err) {
+            // Wrong password (or another failure, said as what it is):
+            // show the error and keep the dialog open (GitHub #13)
             if (error) {
-                error.textContent = strings.encryption.wrongPassword;
+                error.textContent = cryptoErrorText(err);
                 error.style.display = 'block';
             }
             // Clear input for retry
@@ -898,7 +1035,16 @@ export const importExportMethods = uiModule({
                 input.value = '';
                 input.focus();
             }
+            return;
         }
+
+        // Success - close dialog and reset flag
+        document.getElementById('password-prompt-modal')?.classList.remove('active');
+        this.passwordPromptCallbackManagesDialog = false;
+        this.pendingEncryptedImport = null;
+
+        // Same routing as a plain file (single tree or "Export all" backup)
+        await this.importJsonString(decrypted);
     },
 
     // ---- SAVE CURRENT DATA DIALOG ----
@@ -1089,11 +1235,11 @@ export const importExportMethods = uiModule({
                         if (isMultiTreeBackup(parsed)) trees = parsed;
                     }
                     if (envEnc) single = JSON.parse(await decrypt(envEnc, password)) as StromData;
-                } catch {
-                    return false;
+                } catch (err) {
+                    return classifyCryptoError(err);
                 }
                 await this.continueHtmlImport(trees, single ?? (envData as StromData | undefined) ?? null);
-                return true;
+                return 'ok';
             });
             return;
         }
@@ -1119,32 +1265,30 @@ export const importExportMethods = uiModule({
 
     /**
      * Ask for a file's password in the shared prompt. `tryPassword` resolves
-     * false on a wrong password (the prompt stays open for a retry).
+     * 'ok', or why it failed (the prompt stays open for a retry).
      */
-    promptFilePassword(tryPassword: (password: string) => Promise<boolean>): void {
+    promptFilePassword(tryPassword: (password: string) => Promise<'ok' | CryptoFailure>): void {
         const modal = document.getElementById('password-prompt-modal');
         const input = document.getElementById('password-prompt-input') as HTMLInputElement;
         const error = document.getElementById('password-prompt-error');
         if (!modal || !input) return;
 
         input.value = '';
-        if (error) {
-            error.style.display = 'none';
-            error.textContent = '';
-        }
+        resetPasswordError(error);
         this.pendingEncryptedData = null;
         this.passwordPromptOnCancel = null;
         this.passwordPromptCallback = async (password: string) => {
             // Close BEFORE continuing: the import flow opens its own dialogs.
             modal.classList.remove('active');
-            const ok = await tryPassword(password);
-            if (ok) {
+            const result = await tryPassword(password);
+            if (result === 'ok') {
                 this.passwordPromptCallbackManagesDialog = false;
                 return;
             }
             modal.classList.add('active');
             if (error) {
-                error.textContent = strings.encryption.wrongPassword;
+                // Wrong password only when AES-GCM refused it (GitHub #13).
+                error.textContent = cryptoFailureText(result);
                 error.style.display = 'block';
             }
             input.value = '';
@@ -1214,6 +1358,8 @@ export const importExportMethods = uiModule({
 
         this.importTreeData = data;
         this.importFromTreeManager = fromTreeManager;
+        // Set again by a GEDCOM import right after this.
+        this.pendingGedcomImport = null;
 
         // Handle dialog stack - if from tree manager, it's already in stack
         if (fromTreeManager) {
@@ -1260,6 +1406,7 @@ export const importExportMethods = uiModule({
         document.getElementById('import-tree-modal')?.classList.remove('active');
         this.importTreeData = null;
         this.pendingImportResearch = null;
+        this.pendingGedcomImport = null;
         if (this.importFromTreeManager) {
             this.returnToParentDialog();
             this.importFromTreeManager = false;
@@ -1275,6 +1422,7 @@ export const importExportMethods = uiModule({
         const nameInput = document.getElementById('import-tree-name') as HTMLInputElement;
         const name = nameInput?.value.trim() || strings.treeManager.importTreeName;
 
+        const gedcomImport = this.pendingGedcomImport;
         const newTreeId = await DataManager.importAsNewTree(this.importTreeData, name);
         this.restoreImportResearch(newTreeId);
 
@@ -1289,14 +1437,22 @@ export const importExportMethods = uiModule({
         // If this import came from "open from file", attach that handle now.
         void this.attachPendingFileHandle(newTreeId);
         // M6: post-import health check — offer to review any data issues.
-        void this.afterImport(newTreeId);
+        void this.afterImport(newTreeId, gedcomImport
+            ? { gedcom: true, path: 'new', ...(gedcomImport.importId ? { importId: gedcomImport.importId } : {}) }
+            : {});
     },
 
     /**
      * The two questions worth asking about a file somebody just imported, one
      * after the other so they do not pile up on top of each other.
      */
-    async afterImport(treeId: TreeId): Promise<void> {
+    async afterImport(treeId: TreeId, options: AfterImportOptions = {}): Promise<void> {
+        this.lastImport = { treeId, ...options };
+        // A file from another program (spec 066 §1): the "What next" card on
+        // every path, once per import, instead of the two questions below.
+        if (options.gedcom && this.offerImportNextCard(treeId, options)) return;
+        // Merging asks its own question about new issues.
+        if (options.path === 'merge') return;
         await this.offerPostImportValidation(treeId);
         await this.offerPostImportSplit(treeId);
         // A tree of a research: its places not on the map, once the research here takes them (spec 034 U5 point 7).

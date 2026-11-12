@@ -17,7 +17,7 @@
 import type { StromData, PlaceGeo, PlaceRecord, PersonId, PlaceJurisdictionKind } from './types.js';
 import { forEachPlaceFact, placeKey, townOfPlace } from './places.js';
 import { yearOf } from './dates.js';
-import { surnameForms, surnameKey } from './surnames.js';
+import { masculineFormIn, surnameForms, surnameKey, withSurnameRules } from './surnames.js';
 import { foldText, tokens, streetWord } from './streets.js';
 import { placeGeoHash, sameCoords } from './place-records.js';
 import { expandPlaceQuery } from './place-query.js';
@@ -34,7 +34,7 @@ export type CheckFinding =
     | { kind: 'far'; km: number; family: string; years: [number, number] }
     | { kind: 'district'; expected: string; actual: string; jurisdiction?: PlaceJurisdictionKind }
     | { kind: 'label'; type: 'street' | 'area' | 'other-town' }
-    | { kind: 'multi' };
+    | { kind: 'multi'; count?: number };
 
 /** Great-circle distance in km. */
 export function distanceKm(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
@@ -80,21 +80,39 @@ function indexFacts(facts: readonly CheckFact[]): FactIndex {
 
 /** The facts of the tree with a place, each person's family by surname (spellings of a family share it). */
 function checkFacts(data: StromData): FactIndex {
-    return indexFacts(collectCheckFacts(data));
+    return withSurnameRules(data, () => indexFacts(collectCheckFacts(data)));
+}
+
+/**
+ * The family of each surname: the surnames joined by their forms (surnameForms),
+ * as a whole — Jaworska and Jaworski are one family even where the forms of one
+ * reach a spelling the other's do not. A family is named by its first key.
+ */
+function familiesOf(surnames: Iterable<string>, data: StromData): (surname: string) => string {
+    const parent = new Map<string, string>();
+    const find = (k: string): string => {
+        let r = k;
+        while (parent.has(r) && parent.get(r) !== r) r = parent.get(r)!;
+        parent.set(k, r);
+        return r;
+    };
+    const join = (a: string, b: string): void => {
+        const ra = find(a), rb = find(b);
+        if (ra !== rb) parent.set(ra < rb ? rb : ra, ra < rb ? ra : rb);
+    };
+    for (const s of surnames) {
+        const k = surnameKey(s);
+        find(k);
+        for (const f of surnameForms(s, data)) {
+            const fk = surnameKey(f);
+            if (fk) join(k, fk);
+        }
+    }
+    return surname => find(surnameKey(surname));
 }
 
 function collectCheckFacts(data: StromData): CheckFact[] {
-    const familyOf = new Map<string, string>();
-    const family = (surname: string): string => {
-        const k = surnameKey(surname);
-        let f = familyOf.get(k);
-        if (f === undefined) {
-            f = surnameForms(surname, data).map(surnameKey).sort()[0] ?? k;
-            familyOf.set(k, f);
-        }
-        return f;
-    };
-    const out: CheckFact[] = [];
+    const facts: Omit<CheckFact, 'family'>[] = [];
     forEachPlaceFact(data, fact => {
         const raw = fact.place?.trim();
         if (!raw) return;
@@ -105,10 +123,11 @@ function collectCheckFacts(data: StromData): CheckFact[] {
             const surname = p?.lastName?.trim();
             if (!p || p.isPlaceholder || !surname) continue;
             const year = yearOf(fact.date) ?? yearOf(p.birthDate);
-            out.push({ key, raw, year, family: family(surname), surname });
+            facts.push({ key, raw, year, surname });
         }
     });
-    return out;
+    const family = familiesOf(new Set(facts.map(f => f.surname)), data);
+    return facts.map(f => ({ ...f, family: family(f.surname) }));
 }
 
 /** The research's record of a place, through the tree's refs. */
@@ -124,6 +143,8 @@ interface FamilyContext {
     years: [number, number];
     /** The family's other located places counted (one point each). */
     points: { lat: number; lon: number }[];
+    /** Their placeKeys, in the order of `points`. */
+    keys: string[];
 }
 
 /** Needs at least this many other places of the family to say anything. */
@@ -143,21 +164,30 @@ function familyContexts(key: string, facts: FactIndex, places: Record<string, Pl
             && own.some(o => Math.abs(o.year! - f.year!) <= PLACE_YEARS));
         if (new Set(refs.map(r => r.key)).size < MIN_OTHER_PLACES) continue;
         const years = refs.map(r => r.year!);
+        const keys = [...new Set(refs.map(r => r.key))];
         out.push({
             family,
             median: { lat: median(refs.map(r => places[r.key].lat)), lon: median(refs.map(r => places[r.key].lon)) },
             years: [Math.min(...years), Math.max(...years)],
-            points: [...new Set(refs.map(r => r.key))].map(k => places[k]),
+            points: keys.map(k => places[k]),
+            keys,
         });
     }
     return out;
 }
 
-/** The surname shown for a family: the spelling its people here use most (ties: alphabetical). */
-function familyName(family: string, facts: FactIndex): string {
+/**
+ * The surname shown for a family: its basic (masculine) form — Jaworski, not
+ * Jaworska, Novák, not Nováková — the one its people here use most (ties:
+ * alphabetical); a feminine form only where the family has no other.
+ */
+function familyName(family: string, facts: FactIndex, data: StromData): string {
     const counts = new Map<string, number>();
     for (const f of facts.byFamily.get(family) ?? []) counts.set(f.surname, (counts.get(f.surname) ?? 0) + 1);
-    return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0] ?? family;
+    return withSurnameRules(data, () => {
+        const feminine = (s: string): number => (masculineFormIn(s, data) ? 1 : 0);
+        return [...counts].sort((a, b) => feminine(a[0]) - feminine(b[0]) || b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0] ?? family;
+    });
 }
 
 const DISTRICT_PATTERNS: readonly RegExp[] = [
@@ -259,7 +289,7 @@ function findingsFor(
         const km = Math.min(...ctx.points.map(p => distanceKm(geo, p)));
         if (km > PLACE_FAR_KM && (!far || km > far.km)) far = { km, ctx };
     }
-    if (far) out.push({ kind: 'far', km: Math.round(far.km), family: familyName(far.ctx.family, facts), years: far.ctx.years });
+    if (far) out.push({ kind: 'far', km: Math.round(far.km), family: familyName(far.ctx.family, facts, data), years: far.ctx.years });
     const rec = recordOf(data, key);
     // A location the research itself gave knows its jurisdictions.
     if (!(rec?.coords && sameCoords(rec.coords, geo))) {
@@ -271,7 +301,7 @@ function findingsFor(
         const l = labelFinding(geo, namesOf(key, facts, data));
         if (l) out.push(l);
     }
-    if (geo.origin !== 'hand' && (geo.townChoices ?? 0) > 1) out.push({ kind: 'multi' });
+    if (geo.origin !== 'hand' && (geo.townChoices ?? 0) > 1) out.push({ kind: 'multi', count: geo.townChoices });
     return out;
 }
 
@@ -387,6 +417,18 @@ export function checkCandidate(
 ): CheckFinding[] {
     const places = data.places ?? {};
     return findingsFor(data, key, { ...candidate, origin: 'map' }, checkFacts(data), places);
+}
+
+/**
+ * The family's places of a place, as the check measures by them (§5): the
+ * other located places of each family with facts here, within ±PLACE_YEARS
+ * of those facts. Empty when no family has enough of them to say anything
+ * (the search then measures by the whole tree).
+ */
+export function familyPlaceKeys(data: StromData, key: string): Set<string> {
+    const out = new Set<string>();
+    for (const ctx of familyContexts(key, checkFacts(data), data.places ?? {})) for (const k of ctx.keys) out.add(k);
+    return out;
 }
 
 /**

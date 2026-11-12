@@ -9,26 +9,29 @@
  * hypotheses: a conflict is amber and two sides, a hypothesis a ghost.
  */
 
+import { keepTableViews } from '../table-views-data.js';
 import { researchActionLabel } from './research-open-mark.js';
 import { DataManager } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { strings, getCurrentLanguage } from '../strings.js';
-import { PersonId, ResearchConflict, ResearchConflictValue, StromData } from '../types.js';
+import { FactPart, PartnershipId, PersonId, ResearchConflict, ResearchConflictValue, StromData } from '../types.js';
 import { formatFlexDate } from '../dates.js';
 import { parseGedcom, convertToStrom } from '../ged-parser.js';
 import {
     researchConflictRef, ResearchConflictTake, ResearchHeader, parseLiveBridge, readResearchHeader, stabilizeIds, keepTitles, keepMarriedSurname, keepSurnameVariants, keepLineageOverrides, researchHasTitles,
-    researchLinkMark,
+    researchLinkMark, researchPersonRef,
 } from '../research-link.js';
+import { keepImports } from '../import-origin.js';
 import { storedResearchBridge, researchAutoState } from '../research-device.js';
 import { diffValues } from '../research-changes.js';
 import { canDecideInApp, conflictSides, DecideResult } from '../research-decide.js';
+import { otherRevertChanges, revertedFact, RevertResult } from '../research-revert.js';
 import {
     ConflictCardState, ConflictCardView, ConflictDecidedValues, DecidedFact, DECIDED_CARD_MS, conflictCardView, conflictFactParts, conflictSentChanged,
     isDecidedRow, otherLoadChanges,
 } from '../research-conflict-card.js';
 import { conflictScope, conflictValueHtml, conflictValueSaid as said, researchConflictTitle, researchValueText } from './person-research-ui.js';
-import { fetchGedcomText, researchDateLabel } from './research-ui.js';
+import { readResearchTreeFile, researchDateLabel } from './research-ui.js';
 import { researchSendMode } from './research-sync-ui.js';
 import { uiModule } from './module.js';
 
@@ -174,6 +177,10 @@ export const conflictDecideMethods = uiModule({
         const decidedValues = state && 'values' in state ? state.values : this.researchConflictDecidedValues(c);
         const sources = DataManager.getData().sources ?? {};
         const ctx = this.researchSyncLink();
+        // A conflict about a family tree's value or a person's (spec 066 §3): its sentence, its sides, one row of choices.
+        const o = strings.origin;
+        const kind = c.kind === 'import' || c.kind === 'user' ? c.kind : null;
+        const kindLine = kind && view.body === 'sides' ? `<p class="prc-kind">${esc(kind === 'import' ? o.proposeImport : o.proposeUser)}.</p>` : '';
 
         const tag = view.tag === 'busy'
             ? `<span class="person-research-open-tag prc-tag prc-tag--busy"><span class="prc-spinner prc-spinner--tag" aria-hidden="true"></span>${esc(k.busyTag)}</span>`
@@ -217,32 +224,38 @@ export const conflictDecideMethods = uiModule({
                 const busy = view.busyTake === which;
                 const off = view.disabled || (view.busyTake !== null && !busy);
                 const value = which === 'user' && view.unsent ? this.researchConflictValueNow(personId, c) : sideText(c, v);
+                const importSource = which === 'user' && kind === 'import' ? this.originConflictImportSource(personId, c) : '';
                 const meta = which === 'research'
                     ? sourceLink(v, 'source')
+                    : importSource
+                        ? `<span class="prc-meta">${esc(importSource)}</span>`
                     : view.unsent
                         ? `<span class="prc-meta">${esc(k.appUnsent(dayOf(ctx ? TreeManager.getTreeMetadata(ctx.treeId)?.changedAt : undefined) || dayOf(new Date().toISOString())))}</span>
                            <span class="prc-knows">${esc(k.researchKnows(said(sideText(c, v))))}</span>`
                         : `<span class="prc-meta">${esc(k.appSource(dayOf(ctx?.link.sent?.at)))}</span>`;
                 let choice = '';
-                if (view.choices === 'buttons') {
+                if (kind) {
+                    // A conflict of a kind: the choices stand in one row under both sides (kindRow).
+                } else if (view.choices === 'buttons') {
                     choice = `<button type="button" class="prc-choice" data-decide="${which}" data-focus="choice-${which}"${busy ? ' aria-busy="true" aria-disabled="true"' : ''}${off ? ' disabled' : ''}${view.notes ? ` aria-describedby="${noteId}"` : ''}>${busy
                         ? `<span class="prc-spinner" aria-hidden="true"></span>${esc(k.busy)}`
                         : esc(which === 'user' ? k.keep : k.take)}</button>`;
                 } else if (view.choices === 'links') {
                     choice = `<button type="button" class="prc-choice" data-conflict="${esc(id)}" data-do="decide" data-take="${which}" data-focus="choice-${which}"${off ? ' disabled' : ''}${view.notes ? ` aria-describedby="${noteId}"` : ''}>${researchActionLabel(which === 'user' ? k.keepLink : k.takeLink, researchLinkMark('conflict', { conflictDo: 'decide' }))}</button>`;
                 }
-                const note = view.notes && view.choices !== 'none'
+                const note = !kind && view.notes && view.choices !== 'none'
                     ? `<p class="prc-note" id="${noteId}">${esc(which === 'user' ? k.keepNote : this.researchConflictTakeNote(c))}</p>` : '';
                 return `
                     <div class="prc-side" data-side="${which}">
-                        <span class="prc-side-label">${esc(which === 'user' ? k.sideApp : k.sideResearch)}</span>
+                        <span class="prc-side-label">${esc(which === 'research' ? (kind ? o.sideProposal : k.sideResearch)
+                            : kind === 'import' ? o.sideImport : kind === 'user' ? o.sideUser : k.sideApp)}</span>
                         <span class="prc-side-main"><span class="prc-value">${conflictValueHtml(value)}</span>
                         <span class="prc-side-meta">${meta}</span></span>
                         ${choice}${note}
                     </div>`;
             };
             body = `
-                <div class="prc-sides${view.choices === 'none' ? ' prc-sides--plain' : ''}">${side('user')}${side('research')}</div>
+                <div class="prc-sides${view.choices === 'none' || kind ? ' prc-sides--plain' : ''}">${side('user')}${side('research')}</div>${kind ? this.originConflictChoicesHtml(c, view, id) : ''}
                 ${view.linkNote ? `<p class="prc-link-note">${esc(k.linkNote)}</p>` : ''}`;
         } else if (view.body === 'decided' && state && state.kind !== 'busy' && state.kind !== 'error' && state.kind !== 'gone') {
             const take: ResearchConflictTake | undefined = state.kind === 'kept' ? 'user' : state.kind === 'taken' ? 'research'
@@ -279,7 +292,7 @@ export const conflictDecideMethods = uiModule({
                     <span class="person-research-fact">${esc(researchConflictTitle(c))}</span>
                     ${tag}
                 </div>
-                ${notice}${body}${links}
+                ${kindLine}${notice}${body}${links}
             </div>`;
     },
 
@@ -428,6 +441,40 @@ export const conflictDecideMethods = uiModule({
         // An edit form open meanwhile shows the value loaded.
         this.syncPersonFormWithData();
         return quiet ? 'quiet' : 'asked';
+    },
+
+    /**
+     * Put back a family tree's value (spec 066 §3 "Revert"): `personId` the
+     * person whose fact it is (a couple's fact: either partner, with
+     * `partnershipId`), `fact` its key (name, sex, birth, death, marriage,
+     * divorce, event:<id>), `ref` the earlier value's `_REF`
+     * (researchOrigins[fact].was.ref), `part` one part (none: every part
+     * changed). Written (or nothing left to put back): the research's version
+     * loads quietly when it changes nothing here but that fact (a backup
+     * first), else it waits as any newer version (`loaded: 'later'`).
+     */
+    async researchRevertFact(personId: PersonId, fact: string, ref: string, part?: FactPart,
+        partnershipId?: PartnershipId): Promise<RevertResult & { loaded?: 'quiet' | 'later' }> {
+        const ctx = this.researchSyncLink();
+        const person = DataManager.getPerson(personId);
+        const refn = researchPersonRef(person?.refn);
+        if (!ctx) return { kind: 'noBridge' };
+        if (!person || !refn) return { kind: 'error', status: 0, code: 'invalid', reason: '' };
+        const { treeId } = ctx;
+        const result = await this.postRevert({ person: refn, ref, ...(part ? { part } : {}) });
+        if (result.kind !== 'ok' && result.kind !== 'nothing') return result;
+        const holder = partnershipId ? DataManager.getData().partnerships[partnershipId] : person;
+        const version = await this.researchVersionRead(true);
+        if (!holder || !version || DataManager.getCurrentTreeId() !== treeId) return { ...result, loaded: 'later' };
+        const here = DataManager.getData();
+        const there = this.researchVersionAsLoaded(version.data);
+        if (otherRevertChanges(diffValues(here, there), revertedFact(holder, fact)) !== 0) return { ...result, loaded: 'later' };
+        if (!await this.ensureLocalUnlocked()) return { ...result, loaded: 'later' };
+        const head = version.header.head || (result.kind === 'ok' ? result.head : '');
+        const done = await this.applyResearch(version.data, version.header, { force: true, quiet: true, ...(head ? { head } : {}) });
+        if (done !== treeId) return { ...result, loaded: 'later' };
+        this.syncPersonFormWithData();
+        return { ...result, loaded: 'quiet' };
     },
 
     /**
@@ -585,10 +632,10 @@ export const conflictDecideMethods = uiModule({
         const researchId = ctx.link.id;
         const job = (async (): Promise<ResearchVersion | null> => {
             try {
-                const text = await fetchGedcomText(bridge.ged);
+                const { text, images } = await readResearchTreeFile(bridge.ged, this.researchStatusOf(researchId)?.features);
                 const header = readResearchHeader(text);
                 if (!header.isStromResearch || header.treeId !== researchId) return null;
-                return { key: header.head ? `${researchId}|${header.head}` : key, data: convertToStrom(parseGedcom(text)).data, header };
+                return { key: header.head ? `${researchId}|${header.head}` : key, data: convertToStrom(parseGedcom(text), { images }).data, header };
             } catch {
                 return null;
             }
@@ -606,7 +653,7 @@ export const conflictDecideMethods = uiModule({
         const link = this.researchSyncLink()?.link;
         const here = DataManager.getData();
         const features = link ? this.researchStatusOf(link.id)?.features : null;
-        return stabilizeIds(keepLineageOverrides(keepSurnameVariants(keepMarriedSurname(keepTitles(data, here, features, researchHasTitles(link, features)), here, features), here), here), here);
+        return stabilizeIds(keepTableViews(keepImports(keepLineageOverrides(keepSurnameVariants(keepMarriedSurname(keepTitles(data, here, features, researchHasTitles(link, features)), here, features), here), here), here, features), here), here);
     },
 
     /** A card's notice action: try the same side again, send the tree, load the research's version, decide in the research. */

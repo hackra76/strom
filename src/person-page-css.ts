@@ -208,10 +208,15 @@ button.pp-chip, a.pp-chip { cursor: pointer; }
 .pp-prose { font-family: var(--font-serif); font-size: clamp(16px, 2.5cqi, 17.5px); line-height: 1.65; overflow-wrap: anywhere; }
 .pp-prose p, .pp-prose ul { margin: 0 0 0.9em; }
 .pp-prose .story-subhead { font-size: 1.05em; margin: 1.1em 0 0.4em; }
+/* What the story's text is based on: one folded section under each story (sources, facts, the caveat). */
 .pp-basis { margin-top: 10px; }
-.pp-basis-body { padding: 10px 14px; border-radius: 8px; background: var(--surface-2); font-size: 13.5px; }
-.pp-basis-body ul { margin: 0 0 6px; padding-left: 18px; }
-.pp-basis-note { font-style: italic; }
+.pp-basis .pp-disc--inline { gap: 6px; }
+.pp-basis-body { padding: 10px 14px; border-radius: 8px; background: var(--surface-2); font-family: var(--font-sans); font-size: 13.5px; overflow-wrap: anywhere; }
+.pp .pp-basis-h { margin: 0 0 4px; font-size: 11.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent-text); }
+.pp-basis-list { margin: 0 0 10px; padding-left: 18px; }
+.pp-basis-list li { margin: 2px 0; }
+.pp-basis-note { margin: 0; font-style: italic; }
+@media (pointer: coarse) { .pp-basis-src a { display: inline-flex; align-items: center; min-height: 44px; } }
 .pp-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-faint); margin-left: 4px; white-space: nowrap; }
 .pp .pp-notes-text { margin-top: 8px; font-size: 15px; white-space: pre-line; overflow-wrap: anywhere; }
 .pp-toggles { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -333,6 +338,15 @@ span.pp-gal-thumb { cursor: default; }
 .pp-src-ref { font-size: 12.5px; color: var(--text-faint); overflow-wrap: anywhere; }
 .pp-src-body { padding: 0 0 12px; display: flex; flex-direction: column; gap: 8px; font-size: 14px; }
 .pp-transcript { font-family: var(--font-serif); font-size: 15px; white-space: pre-line; overflow-wrap: anywhere; }
+.pp-translation > summary { display: flex; align-items: center; gap: 6px; min-height: 32px; width: fit-content; max-width: 100%; list-style: none; cursor: pointer; }
+.pp-translation > summary::-webkit-details-marker { display: none; }
+.pp-translation > summary::after { content: '▸'; font-size: 12px; letter-spacing: 0; }
+.pp-translation[open] > summary::after { content: '▾'; }
+.pp-translation > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: 4px; }
+.pp-translation > .pp-transcript { margin: 4px 0 0; }
+@media (hover: hover) { .pp-translation > summary:hover { text-decoration: underline; } }
+@media (pointer: coarse) { .pp-translation > summary { min-height: 44px; } }
+@media print { .pp-translation > summary::after { content: none; } }
 .pp-research-intro { display: block; font-size: 14px; color: var(--text-light); }
 .pp-rgroup { margin-top: 14px; }
 .pp-rgroup ul { margin: 6px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; font-size: 14px; }

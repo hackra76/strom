@@ -1,15 +1,27 @@
 {
   "name": "strom-rodokmen",
-  "version": "3.21.1",
+  "version": "3.27.0",
+  "stromDoc": "f1f6a992bb9cafaa788ee51023070309bb452997",
   "description": "Dvorský Family Tree - Web Viewer",
+  "main": "dist/bundle.js",
   "scripts": {
     "embed": "tsx scripts/embed-tree.ts",
     "sync": "tsx scripts/sync-tree.ts",
     "build": "tsx scripts/embed-tree.ts",
+    "build:bundle": "node scripts/bundle.js",
     "build:dev": "esbuild src/main.ts --bundle --sourcemap --outfile=dist/bundle.js",
     "watch": "esbuild src/main.ts --bundle --sourcemap --outfile=dist/bundle.js --watch",
     "dev": "npm run embed && npx http-server -p 8080 -c-1",
-    "typecheck": "tsc --noEmit --incremental --tsBuildInfoFile .tsbuildinfo"
+    "typecheck": "tsc --noEmit --incremental --tsBuildInfoFile .tsbuildinfo",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:real": "npx tsx scripts/test-real-data.ts",
+    "gen:etalon": "tsx scripts/generate-etalon.ts",
+    "gen:devel-demo": "tsx scripts/generate-devel-demo.ts",
+    "test:e2e": "sh scripts/e2e.sh",
+    "test:e2e:smoke": "sh scripts/e2e.sh --grep @smoke",
+    "test:quick": "sh scripts/e2e.sh --quick",
+    "help:pin": "node scripts/pin-strom-doc.mjs"
   },
   "keywords": [
     "family-tree",
@@ -23,9 +35,11 @@
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/node": "^25.0.10",
     "esbuild": "^0.27.2",
     "tsx": "^4.23.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.17"
   }
 }

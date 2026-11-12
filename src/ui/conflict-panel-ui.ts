@@ -12,6 +12,8 @@
  */
 
 import { researchActionLabel } from './research-open-mark.js';
+import { isHelpOpen } from './help-ui.js';
+import { helpMark } from './help-mark.js';
 import { DataManager } from '../data.js';
 import { strings } from '../strings.js';
 import { PersonId, ResearchConflict, ResearchConflictValue } from '../types.js';
@@ -83,6 +85,8 @@ export const conflictPanelMethods = uiModule({
         tag.setAttribute('aria-expanded', 'true');
 
         const onKey = (e: KeyboardEvent): void => {
+            // "How Strom works" opened from the panel sits above it and takes the keys.
+            if (isHelpOpen()) return;
             if (e.key === 'Escape') {
                 e.preventDefault();
                 e.stopImmediatePropagation();
@@ -100,7 +104,7 @@ export const conflictPanelMethods = uiModule({
         };
         const onDown = (e: Event): void => {
             const t = e.target as Node;
-            if (sheet || panel.contains(t) || tag.contains(t)) return;
+            if (sheet || panel.contains(t) || tag.contains(t) || isHelpOpen()) return;
             // A click elsewhere: the panel goes, the keyboard where the click went.
             this.closeResearchConflictPanel({ focus: false });
         };
@@ -170,6 +174,10 @@ export const conflictPanelMethods = uiModule({
         const focusKey = panel.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset.focus ?? '' : null;
         // The arrow outside the scrolling body (it sticks out of the box).
         panel.innerHTML = `<span class="prc-panel-arrow" aria-hidden="true"></span><div class="prc-panel-body">${html}</div>`;
+        // "?" right before ×: how a conflict is decided here (1105 §10).
+        const mark = helpMark('conflicts');
+        mark.dataset.focus = 'help';
+        panel.querySelector('.prc-panel-close')?.before(mark);
         if (focusKey !== null) {
             const target = focusKey ? panel.querySelector<HTMLElement>(`[data-focus="${focusKey}"]:not(:disabled)`) : null;
             // Not decidable from the app: the choice asked is off, the keyboard on the way that is left.
@@ -217,6 +225,12 @@ export const conflictPanelMethods = uiModule({
 
         const disabled = view.disabled || saveFirst;
         const notes = view.notes && view.choices !== 'none' && !saveFirst;
+        // A conflict about a family tree's value or a person's (spec 066 §3): its sentence, its sides' names and choices.
+        const o = strings.origin;
+        const kind = c.kind === 'import' || c.kind === 'user' ? c.kind : null;
+        const importSource = kind === 'import' ? this.originConflictImportSource(personId, c) : '';
+        const keepLabel = kind === 'import' ? o.keepImport : null;
+        const takeLabel = kind ? o.accept : null;
         const sourceLink = (v: ResearchConflictValue): string => {
             const sid = v.sourceIds?.find(s => sources[s]);
             return sid ? `<button type="button" class="link-button prc-panel-source" data-source="${esc(sid)}" data-focus="source">${esc(sources[sid].title)}</button>` : '';
@@ -229,20 +243,23 @@ export const conflictPanelMethods = uiModule({
             const value = which === 'user' && view.unsent ? this.researchConflictValueNow(personId, c) : researchValueText(c.fact, v.raw ?? v.value);
             let choice = '';
             if (view.choices === 'buttons') {
-                choice = `<button type="button" class="prc-panel-choice" data-decide="${which}" data-focus="choice-${which}"
-                    aria-label="${esc(which === 'user' ? k.keep : k.take)}"${busy ? ' aria-busy="true" aria-disabled="true"' : ''}${off ? ' disabled' : ''}${notes ? ` aria-describedby="${noteId}"` : ''}>${busy
-                    ? `<span class="prc-spinner" aria-hidden="true"></span>${esc(k.busyTag)}` : esc(which === 'user' ? k.keepShort : k.takeShort)}</button>`;
+                const label = which === 'user' ? keepLabel : takeLabel;
+                choice = `<button type="button" class="prc-panel-choice${kind && which === 'research' ? ' prc-kind-choice--primary' : ''}" data-decide="${which}" data-focus="choice-${which}"
+                    aria-label="${esc(label ?? (which === 'user' ? k.keep : k.take))}"${busy ? ' aria-busy="true" aria-disabled="true"' : ''}${off ? ' disabled' : ''}${notes ? ` aria-describedby="${noteId}"` : ''}>${busy
+                    ? `<span class="prc-spinner" aria-hidden="true"></span>${esc(k.busyTag)}` : esc(label ?? (which === 'user' ? k.keepShort : k.takeShort))}</button>`;
             } else if (view.choices === 'links') {
                 choice = `<button type="button" class="prc-panel-choice" data-take="${which}" data-focus="choice-${which}"
-                    aria-label="${esc(`${which === 'user' ? k.keepLink : k.takeLink}, ${strings.research.opensInResearchSr}`)}"${off ? ' disabled' : ''}${notes ? ` aria-describedby="${noteId}"` : ''}>${researchActionLabel(which === 'user' ? k.keepShort : k.takeShort, researchLinkMark('conflict', { conflictDo: 'decide' }), { sr: false })}</button>`;
+                    aria-label="${esc(`${(which === 'user' ? keepLabel : takeLabel) ?? (which === 'user' ? k.keepLink : k.takeLink)}, ${strings.research.opensInResearchSr}`)}"${off ? ' disabled' : ''}${notes ? ` aria-describedby="${noteId}"` : ''}>${researchActionLabel((which === 'user' ? keepLabel : takeLabel) ?? (which === 'user' ? k.keepShort : k.takeShort), researchLinkMark('conflict', { conflictDo: 'decide' }), { sr: false })}</button>`;
             }
-            const note = notes ? `<p class="prc-panel-note" id="${noteId}">${esc(which === 'user' ? k.keepNote : this.researchConflictTakeNote(c))}</p>` : '';
+            const was = kind === 'import' && which === 'research' ? this.originConflictWas(c) : '';
+            const note = notes ? `<p class="prc-panel-note" id="${noteId}">${esc(which === 'user' ? k.keepNote : was ? o.acceptNote(was) : this.researchConflictTakeNote(c))}</p>` : '';
             return `
                 <div class="prc-panel-row" data-side="${which}">
                     <div class="prc-panel-main">
-                        <span class="prc-side-label">${esc(which === 'user' ? k.sideApp : k.sideResearch)}</span>
+                        <span class="prc-side-label">${esc(which === 'research' ? (kind ? o.sideProposal : k.sideResearch)
+                            : kind === 'import' ? o.sideImport : kind === 'user' ? o.sideUser : k.sideApp)}</span>
                         <span class="prc-panel-value">${conflictValueHtml(value)}</span>
-                        ${which === 'research' ? sourceLink(v) : ''}
+                        ${which === 'research' ? sourceLink(v) : importSource ? `<span class="prc-panel-meta">${esc(importSource)}</span>` : ''}
                     </div>
                     ${choice}${note}
                 </div>`;
@@ -253,7 +270,7 @@ export const conflictPanelMethods = uiModule({
                 <h3 class="prc-panel-title" id="${PANEL_ID}-title">${esc(k.panelTitle(researchConflictTitle(c)))}</h3>
                 <button type="button" class="prc-panel-close" data-focus="close" aria-label="${esc(strings.buttons.close)}">&times;</button>
             </div>
-            ${notice}
+            ${kind ? `<p class="prc-kind">${esc(kind === 'import' ? o.proposeImport : o.proposeUser)}.</p>` : ''}${notice}
             <div class="prc-panel-box${view.choices === 'none' ? ' prc-panel-box--plain' : ''}">${row('user')}${row('research')}</div>
             ${view.linkNote && !saveFirst ? `<p class="prc-link-note">${esc(k.linkNote)}</p>` : ''}
             <button type="button" class="link-button prc-panel-more" data-focus="more" data-conflict-id="${esc(id)}">${esc(k.moreInKnows)}</button>`;

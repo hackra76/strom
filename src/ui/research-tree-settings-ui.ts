@@ -15,14 +15,19 @@ import { DataManager } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { strings } from '../strings.js';
 import { TreeId, ResearchTranscripts, ResearchSendMode, StromData } from '../types.js';
-import { researchSchemeUrl, TERMINAL_CHOICE_FEATURE, STORIES_HISTORY_FEATURE, researchLinkMark } from '../research-link.js';
-import { postBridgeStories } from '../history-bridge.js';
+import {
+    researchSchemeUrl, TERMINAL_CHOICE_FEATURE, STORIES_HISTORY_FEATURE, HYPOTHESES_DECIDE_FEATURE, researchLinkMark, researchUrlMark,
+    type ResearchHypothesesDecide,
+} from '../research-link.js';
+import { postBridgeStories, postBridgeHypotheses, postBridgeReadTask } from '../history-bridge.js';
+import { READ_SOURCE_TASK_FEATURE, type ReadTaskSetting } from '../research-read-task.js';
+import { readTaskSettingHtml, type ReadTaskSettingNote } from './read-task-setting-view.js';
 import { researchAutoState, patchResearchAutoState, researchSendPreviewSkipped, noteResearchSendPreviewSkipped, announcedResearchScheme } from '../research-device.js';
 import { sourceReadingHash, unverifiedOlderSources, newTieSendMode } from '../research-sync.js';
 import { uiModule } from './module.js';
 import { normalizeModal } from './modal-skeleton.js';
 import { onComputer, readTree } from './research-ui.js';
-import { researchDisplayName, researchSendMode, onBridgeStatus } from './research-sync-ui.js';
+import { researchDisplayName, researchSendMode, onBridgeStatus, lastBridgeStatus } from './research-sync-ui.js';
 import { SettingsManager } from '../settings.js';
 import { formatBytesShort } from './originals-ui.js';
 import { isBetaBuildHere } from '../pwa.js';
@@ -40,6 +45,21 @@ const askLater = new Set<TreeId>();
  */
 const stories: { rid: string; note?: { text: string; link?: ResearchNoteLink }; want?: boolean; busy?: boolean } = { rid: '' };
 let storiesListening = false;
+
+/**
+ * "Who decides hypotheses" (spec 060): the same parts as `stories` — the
+ * research's answer under the row (`link`: its terminal confirms the agent),
+ * the value asked until the status says it (`want`), a write on its way (`busy`).
+ */
+const hypos: { rid: string; note?: { text: string; link?: ResearchNoteLink }; want?: ResearchHypothesesDecide; busy?: boolean } = { rid: '' };
+
+/**
+ * "Task from a new reading" (spec 059 §4): the same parts as `hypos` — the note under the choices (the write on
+ * its way, the research's confirmation, a refusal), the value asked until the status says it (`want`), the group open.
+ */
+const readTask: { rid: string; note?: ReadTaskSettingNote; want?: ReadTaskSetting; busy?: boolean; open?: boolean } = { rid: '' };
+/** How long the group stays highlighted when a link opens the dialog at it. */
+const READ_TASK_FLASH_MS = 1500;
 
 /** A phone-sized or touch screen: short card texts, and a note instead of the effect box and the status line. */
 function compactScreen(): boolean {
@@ -259,6 +279,11 @@ export const researchTreeSettingsMethods = uiModule({
                     </div>
                     <button type="button" class="close-btn" id="research-tree-settings-x" aria-label="${esc(strings.buttons.close)}">&times;</button>
                 </div>
+                ${archive ? '' : `
+                <dl class="research-tree-agent" data-browser-research="${esc(link.id)}">
+                    <dt>${esc(strings.install.agentRowLabel)}</dt><dd class="install-ready-agent" data-row="agent"></dd>
+                </dl>
+                <p class="browser-live" role="status" aria-live="polite"></p>`}
                 ${archive || agentAway ? '' : `
                 <fieldset class="research-transcripts">
                     <legend>${esc(t.transcripts)}</legend>
@@ -271,6 +296,9 @@ export const researchTreeSettingsMethods = uiModule({
                 ${originalsHtml}
                 <div class="research-images-host" id="research-images-host"></div>
                 <div class="research-stories-host" id="research-stories-host"></div>
+                ${archive || agentAway ? '' : `<div class="research-hypos-host" id="research-hypos-host"></div>`}
+                ${archive || agentAway ? '' : `<div class="research-readtask-host" id="research-readtask-host"></div>`}
+                ${archive || agentAway ? '' : `<div class="research-offline-host" id="research-offline-host" data-research="${esc(link.id)}"></div>`}
                 <button type="button" class="link-button research-read-history" id="research-read-history" hidden></button>
                 ${modeWhereHtml}
                 ${terminalWhereHtml}
@@ -281,6 +309,13 @@ export const researchTreeSettingsMethods = uiModule({
             </div>`;
         document.body.appendChild(overlay);
         this.pushDialog(SETTINGS_ID);
+        // The agent and its browser (spec 048 §11), kept up with each status of the research.
+        const agentDl = overlay.querySelector<HTMLElement>('dl.research-tree-agent');
+        if (agentDl) {
+            const st = this.researchStatusOf(link.id);
+            this.renderBrowserRows(agentDl, { name: st?.agentName ?? '', away: agentAway }, st?.browser);
+            this.watchBrowserRows();
+        }
         // Source images the research left out of its file (filled once the tree's stored images are read).
         const imagesHost = overlay.querySelector<HTMLElement>('#research-images-host');
         if (imagesHost) void this.renderResearchImagesSettings(treeId, imagesHost);
@@ -394,9 +429,23 @@ export const researchTreeSettingsMethods = uiModule({
         stories.rid = link.id;
         delete stories.note; delete stories.want; delete stories.busy;
         this.renderResearchStoriesRow();
+        hypos.rid = link.id;
+        delete hypos.note; delete hypos.want; delete hypos.busy;
+        this.renderResearchHypothesesRow();
+        readTask.rid = link.id;
+        delete readTask.note; delete readTask.want; delete readTask.busy; delete readTask.open;
+        this.renderResearchReadTaskRow();
+        // Work outside the directions (§9.5): the same condition as the transcripts, with the research's branches.
+        this.startOffLineSettings(link.id);
         if (!storiesListening) {
             storiesListening = true;
-            onBridgeStatus((rid) => { if (rid === stories.rid) this.renderResearchStoriesRow(); });
+            onBridgeStatus((rid) => {
+                if (rid !== stories.rid) return;
+                this.renderResearchStoriesRow();
+                this.renderResearchHypothesesRow();
+                this.renderResearchReadTaskRow();
+                this.renderOffLineSettings();
+            });
         }
         const historyBtn = overlay.querySelector<HTMLButtonElement>('#research-read-history');
         if (historyBtn) void this.fillReadHistoryRow(historyBtn, treeId);
@@ -476,6 +525,180 @@ export const researchTreeSettingsMethods = uiModule({
             stories.note = { text: r.reason || (r.held ? this.researchWriteHeldText(r.held, false).toast : strings.live.waitingWrite.writeFailed) };
         }
         this.renderResearchStoriesRow();
+    },
+
+    /**
+     * Spec 060: "Who decides hypotheses" — only with `hypotheses.decide` and a
+     * value in `/status` (not in an archive nor a research waiting for its
+     * agent: no host there); the choice follows the research's status; without
+     * the bridge at rest with its sentence.
+     */
+    renderResearchHypothesesRow(): void {
+        const host = document.querySelector<HTMLElement>(`#${SETTINGS_ID} #research-hypos-host`);
+        if (!host) return;
+        const rid = hypos.rid;
+        const ctx = this.historyManageContext();
+        const last = ctx?.researchId === rid ? ctx.lastStatus : this.researchStatusOf(rid);
+        const features = ctx?.researchId === rid ? ctx.features : last?.features ?? [];
+        const up = this.researchBridgeUp(rid);
+        const said = up && last ? last.hypothesesDecide : last?.hypothesesDecide ?? lastBridgeStatus(rid)?.hypothesesDecide;
+        if (!features.includes(HYPOTHESES_DECIDE_FEATURE) || !said) {
+            host.innerHTML = '';
+            return;
+        }
+        const r = strings.research;
+        if (hypos.want !== undefined && said === hypos.want) delete hypos.want;
+        const value = hypos.want ?? said;
+        const note = !up ? { text: strings.history.storiesBridgeDown } : hypos.note;
+        const focused = (document.activeElement as HTMLInputElement | null)?.name === 'research-hypos-decide'
+            ? (document.activeElement as HTMLInputElement).value : '';
+        const off = up && !hypos.busy ? '' : ' disabled';
+        const option = (v: ResearchHypothesesDecide, label: string, ai: boolean): string => `
+                <label class="settings-checkbox research-hypos-row">
+                    <input type="radio" name="research-hypos-decide" value="${v}"${v === value ? ' checked' : ''}${off}>
+                    <span class="settings-text"><span class="settings-name">${esc(label)}${ai
+                        ? ` <span class="research-ai-badge" title="${esc(r.aiCostHint)}" aria-hidden="true">${esc(r.aiBadge)}</span>` : ''}</span></span>
+                </label>`;
+        host.innerHTML = `
+            <fieldset class="research-transcripts research-hypos" id="research-hypos">
+                <legend>${esc(r.hypoDecideTitle)}</legend>
+                ${option('person', r.hypoDecidePerson, false)}
+                ${option('agent', r.hypoDecideAgent, true)}
+                <p class="research-hypos-desc">${esc(r.hypoDecideDesc)}</p>
+                <p class="research-not-retroactive"><span class="research-not-retroactive-icon" aria-hidden="true">i</span><span>${esc(r.hypoDecideNotRetro)}</span></p>
+                ${note ? `<p class="research-stories-note research-hypos-note" id="research-hypos-note"><span>${esc(note.text)}</span>${'link' in note && note.link
+                    ? ` <button type="button" class="link-button" id="research-hypos-note-link">${researchActionLabel(note.link.label, note.link.mark ?? 'none', { size: 12 })}</button>` : ''}</p>` : ''}
+            </fieldset>`;
+        host.querySelectorAll<HTMLInputElement>('input[name="research-hypos-decide"]').forEach(input => {
+            input.addEventListener('change', () => { if (input.checked) void this.setResearchHypothesesDecide(input.value as ResearchHypothesesDecide); });
+            // The choice as it stands taken again (no change): the answer to another choice under the row goes.
+            input.addEventListener('click', () => {
+                if (input.value !== value || !hypos.note || hypos.busy) return;
+                delete hypos.note;
+                this.renderResearchHypothesesRow();
+            });
+            if (focused && input.value === focused) input.focus({ preventScroll: true });
+        });
+        host.querySelector<HTMLButtonElement>('#research-hypos-note-link')?.addEventListener('click', () => hypos.note?.link?.run());
+    },
+
+    /**
+     * Spec 060: `POST /hypotheses {decide}` — the person at once; the agent the research confirms in its
+     * terminal (the sentence and its link under the row); the choice stays as the research says.
+     */
+    async setResearchHypothesesDecide(decide: ResearchHypothesesDecide): Promise<void> {
+        const rid = hypos.rid;
+        const ctx = this.historyManageContext();
+        const base = ctx?.researchId === rid ? ctx.base : null;
+        if (!base || hypos.busy) { this.renderResearchHypothesesRow(); return; }
+        const r = strings.research;
+        hypos.busy = true;
+        delete hypos.note;
+        this.renderResearchHypothesesRow();
+        const scheme = announcedResearchScheme();
+        const res = await postBridgeHypotheses(base, decide, ctx!.features, { tree: rid, ...(scheme ? { scheme } : {}) });
+        if (hypos.rid !== rid) return;
+        delete hypos.busy;
+        if (res.ok) {
+            hypos.want = res.decide ?? decide;
+        } else if (res.code === 'link') {
+            const url = res.link;
+            hypos.note = {
+                text: r.hypoDecideConfirm,
+                ...(url ? { link: { label: r.hypoDecideConfirmLink, run: () => this.launchResearchLink(url, 'terminal'), mark: researchUrlMark(url) ?? 'terminal' } } : {}),
+            };
+        } else if (res.code === 'busy') {
+            hypos.note = { text: strings.history.errBusy };
+        } else {
+            hypos.note = { text: res.reason || (res.held ? this.researchWriteHeldText(res.held, false).toast : strings.live.waitingWrite.writeFailed) };
+        }
+        this.renderResearchHypothesesRow();
+    },
+
+    /**
+     * Spec 059 §4: "Reading documents" — only with `read.sourceTask` (not in an archive nor a research waiting for
+     * its agent: no host there); the choice follows the research's status (no value said: `ask`); without the
+     * bridge the choices rest, dimmed, with its sentence.
+     */
+    renderResearchReadTaskRow(): void {
+        const host = document.querySelector<HTMLElement>(`#${SETTINGS_ID} #research-readtask-host`);
+        if (!host) return;
+        const rid = readTask.rid;
+        const ctx = this.historyManageContext();
+        const last = (ctx?.researchId === rid ? ctx.lastStatus : this.researchStatusOf(rid)) ?? lastBridgeStatus(rid);
+        const features = ctx?.researchId === rid ? ctx.features : last?.features ?? [];
+        if (!features.includes(READ_SOURCE_TASK_FEATURE)) {
+            host.innerHTML = '';
+            return;
+        }
+        const was = host.querySelector<HTMLDetailsElement>('#research-readtask-group');
+        if (was) readTask.open = was.open;
+        const up = this.researchBridgeUp(rid);
+        const said: ReadTaskSetting = last?.accepts?.read?.sourceTask ?? 'ask';
+        if (readTask.want !== undefined && said === readTask.want) delete readTask.want;
+        const value = readTask.want ?? said;
+        const note: ReadTaskSettingNote | undefined = readTask.busy ? { kind: 'busy' }
+            : !up ? { kind: 'text', text: strings.history.storiesBridgeDown } : readTask.note;
+        const focused = (document.activeElement as HTMLInputElement | null)?.name === 'research-read-task'
+            ? (document.activeElement as HTMLInputElement).value : '';
+        host.innerHTML = readTaskSettingHtml({ value, open: !!readTask.open, up, note });
+        host.querySelector<HTMLDetailsElement>('#research-readtask-group')?.addEventListener('toggle', (e) => {
+            readTask.open = (e.currentTarget as HTMLDetailsElement).open;
+        });
+        host.querySelectorAll<HTMLInputElement>('input[name="research-read-task"]').forEach(input => {
+            input.addEventListener('change', () => { if (input.checked) void this.setResearchReadTask(input.value as ReadTaskSetting); });
+            if (focused && input.value === focused) input.focus({ preventScroll: true });
+        });
+    },
+
+    /** Spec 059 §4: `POST /sourceTask {sourceTask}` — written at once; the choice stays as the research says. */
+    async setResearchReadTask(value: ReadTaskSetting): Promise<void> {
+        const rid = readTask.rid;
+        const ctx = this.historyManageContext();
+        const base = ctx?.researchId === rid ? ctx.base : null;
+        if (!base || readTask.busy) { this.renderResearchReadTaskRow(); return; }
+        readTask.busy = true;
+        readTask.want = value;
+        delete readTask.note;
+        this.renderResearchReadTaskRow();
+        const res = await postBridgeReadTask(base, value, ctx!.features, { tree: rid });
+        if (readTask.rid !== rid) return;
+        delete readTask.busy;
+        if (res.ok) {
+            readTask.want = res.value ?? value;
+            readTask.note = { kind: 'ok' };
+        } else {
+            delete readTask.want;
+            readTask.note = {
+                kind: 'text',
+                text: res.code === 'busy' ? strings.history.errBusy
+                    : res.reason || (res.held ? this.researchWriteHeldText(res.held, false).toast : strings.live.waitingWrite.writeFailed),
+            };
+        }
+        this.renderResearchReadTaskRow();
+    },
+
+    /**
+     * "Change in the research settings ›" (the reading's footer, spec 059 §1 C/D): the dialog opens with
+     * "Reading documents" open, scrolled into view in the dialog (its own scroll, not the page's) and
+     * highlighted for a moment.
+     */
+    openReadTaskSettings(): void {
+        this.closeActionsMenu();
+        const id = TreeManager.getActiveTreeId();
+        if (!id) return;
+        void this.showResearchTreeSettings(id).then(() => {
+            const group = document.querySelector<HTMLDetailsElement>(`#${SETTINGS_ID} #research-readtask-group`);
+            if (!group) return;
+            group.open = true;
+            readTask.open = true;
+            let box: HTMLElement | null = group.parentElement;
+            while (box && box.scrollHeight <= box.clientHeight + 1) box = box.parentElement;
+            if (box) box.scrollTop += group.getBoundingClientRect().top - box.getBoundingClientRect().top - 12;
+            group.classList.add('is-flash');
+            window.setTimeout(() => group.classList.remove('is-flash'), READ_TASK_FLASH_MS);
+            group.querySelector<HTMLInputElement>('input[name="research-read-task"]:checked')?.focus({ preventScroll: true });
+        });
     },
 
     /** Save the choice at once (it goes with the next send). */

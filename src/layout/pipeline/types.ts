@@ -36,7 +36,26 @@ export interface DisplayPolicy {
      * Used by the descendants view in its default "lineage only" mode.
      */
     expandLineageOnly?: boolean;
+    /**
+     * How the partners of a partner chain stand around the shared person
+     * (T13). 'chronological' (default): when no partner of the person has
+     * parents in view, in the order of the marriages left to right
+     * (compareMarriages), the older half of the unions left of the person,
+     * the newer right, the primary union next to the person. 'compact': all
+     * extra partners on the outer side of the primary couple (a man's left
+     * of him, nearest first; a woman's right of her), the layout before T13.
+     */
+    partnerOrder?: PartnerOrder;
+    /**
+     * Chain persons whose chain keeps the compact order whatever
+     * partnerOrder says: chains made only by things shown in place (the
+     * children tab, the "▸ ∞" pill), set by runLayoutPipeline.
+     */
+    compactChainPersonIds?: Set<PersonId>;
 }
+
+/** Order of the partners in a partner chain (DisplayPolicy.partnerOrder). */
+export type PartnerOrder = 'chronological' | 'compact';
 
 export const DEFAULT_DISPLAY_POLICY: DisplayPolicy = { mode: 'standard' };
 
@@ -44,8 +63,17 @@ export const DEFAULT_DISPLAY_POLICY: DisplayPolicy = { mode: 'standard' };
 export interface PartnerChain {
     /** The person shared across all unions in the chain */
     sharedPersonId: PersonId;
-    /** Ordered union IDs in the chain (left to right) */
+    /** Union IDs in the chain: the primary union first, then the others in the order of the marriages */
     unionIds: UnionId[];
+    /**
+     * All unions of the chain in the order of the marriages (the primary one
+     * at its place), when the chronological partner order may apply
+     * (DisplayPolicy.partnerOrder); absent for 'compact' and for a chain
+     * merged from the chains of several persons.
+     */
+    chronologicalUnionIds?: UnionId[];
+    /** Step 4 placed the partners in the chronological order, other than the compact one */
+    chronologicalOrderUsed?: boolean;
     /** Total width of the chain couple row */
     width: number;
     /** X position of the shared person's card center */
@@ -507,6 +535,12 @@ export interface RoutedModel {
     spouseLines: SpouseLine[];
     /** Lines not drawn (see OmittedEdge); absent when every line was drawn. */
     omittedEdges?: OmittedEdge[];
+    /**
+     * Dense spacing only (LayoutConfig.dense): px added to the gap below a
+     * generation whose buses need more lanes than one above and one below
+     * the gap's middle (bands.ts); absent when no gap grew.
+     */
+    gapExtra?: ReadonlyMap<number, number>;
 }
 
 // ==================== STEP 8: EMIT RESULT ====================
@@ -547,9 +581,12 @@ export interface LayoutResult {
     /**
      * Generation bands top to bottom (set by runLayoutPipeline). Every card
      * of a generation has its top at the band's top; the band is as tall as
-     * its tallest card (LayoutConfig.personHeights), verticalGap between bands.
+     * its tallest card (LayoutConfig.personHeights), verticalGap between bands
+     * (plus gapExtra below a generation in the dense spacing).
      */
     bands?: GenerationBand[];
+    /** See RoutedModel.gapExtra (generation → px added to the gap below it); absent when no gap grew. */
+    gapExtra?: ReadonlyMap<number, number>;
     /** The view links laid out (PipelineInput.viewLinks); absent when none was applied. */
     viewLayer?: LayoutViewLayer;
     /** Parent-child lines not drawn (see OmittedEdge); absent when every line was drawn. */

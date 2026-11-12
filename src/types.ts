@@ -191,6 +191,15 @@ export function parseFactStatus(value: string | undefined): FactStatus | undefin
     return (FACT_STATUSES as readonly string[]).includes(v ?? '') ? v as FactStatus : undefined;
 }
 
+/** One more family a GEDCOM file recorded a person in as a child (Person.alsoChildOf). */
+export interface AlsoChildOf {
+    partnershipId: PartnershipId;
+    /** FAMC > PEDI as the file gave it (lower case), when it gave one. */
+    pedi?: string;
+    /** The line of the person's note the import wrote for it. */
+    note: string;
+}
+
 export interface LifeEvent {
     id: string;
     type: LifeEventType;
@@ -208,10 +217,33 @@ export interface LifeEvent {
     note?: string;
     /** Ids of Source entries (StromData.sources) citing this event. */
     sourceIds?: string[];
+    /** A citation's own QUAY where it differs from its source's (see CitationQuay). */
+    citationQuay?: CitationQuay<'sourceIds'>;
     /** Godparents, witnesses, the officiating priest… (see EventParticipant). */
     participants?: EventParticipant[];
     /** The research's status of the event (see FactStatus). */
     status?: FactStatus;
+    /**
+     * The e-mail addresses the GEDCOM file gave under the event (`2 EMAIL`,
+     * MyHeritage's contact under RESI), as written. Each is also a line of
+     * the note ("E-mail: …"), which is what the app shows; "Back to {prog}"
+     * writes it back as `2 EMAIL` while that line is still in the note.
+     */
+    gedcomEmails?: string[];
+    /**
+     * What another program's file wrote on the event's own line where
+     * GEDCOM gives it no value (`1 EDUC Gymnázium`, `1 BURI By the church`,
+     * `1 EVEN …` beside its TYPE), as written. It is the first line of the
+     * note, which is what the app shows; "Back to {prog}" writes it on the
+     * line again while the note still begins with it.
+     */
+    gedcomValue?: string;
+    /**
+     * The event's ADDR as the file wrote it, from `2 ADDR` with the lines
+     * under it (`3 ADR1 Ulice 5`), and the address the import read from it.
+     * "Back to {prog}" writes those lines while the address is still that one.
+     */
+    gedcomAddress?: { value: string; lines: string[] };
 }
 
 /**
@@ -270,13 +302,36 @@ export interface Source {
     title: string;
     /** Archive / institution holding the source. */
     repository?: string;
-    /** Signature / inventory number / page. */
+    /**
+     * The call number of the book the entry is in ("N 7", "inv. no. 1702";
+     * spec 075, data v18). GEDCOM `2 CALN` under the record's `1 REPO`.
+     */
+    callNumber?: string;
+    /**
+     * The folio or page as the book numbers it, with its word ("fol. 12v",
+     * "pag. 112", a bare "12v" too; spec 075, data v18). GEDCOM `1 _STROM_FOLIO`.
+     */
+    folio?: string;
+    /**
+     * The image number as the archive's portal counts it ("34", "57–58",
+     * "34a"; text, spec 075, data v18). GEDCOM `1 _STROM_IMAGE`.
+     */
+    image?: string;
+    /**
+     * "Further location" — the rest of where the entry stands (its number, a
+     * column) when the source has any of callNumber / folio / image; without
+     * them (an older source) the whole location as written ("fol. 12v, č. 5,
+     * snímek 34"), kept as it is (see src/source-location.ts). GEDCOM: the
+     * PAGE composed of folio, this and the image; `1 _STROM_LOCATOR` this alone.
+     */
     reference?: string;
     url?: string;
     note?: string;
     /**
-     * GEDCOM QUAY 0–3 (unreliable … primary evidence). Preserved on import
-     * (first citation wins, like `reference`) and re-exported on citations.
+     * GEDCOM QUAY 0–3 (unreliable … primary evidence): the source's default
+     * reliability. Preserved on import (the record's own first citation wins,
+     * like `reference`) and re-exported on citations; a citation with another
+     * QUAY keeps its own (CitationQuay, data v19).
      */
     quality?: number;
     /** Verbatim transcript of the entry (GEDCOM SOUR.TEXT). */
@@ -307,6 +362,19 @@ export interface Source {
      */
     readBy?: SourceReadBy;
     /**
+     * The day the user confirmed the research's transcript in the app (ISO
+     * `YYYY-MM-DD`, GEDCOM `2 _CONF` under `_STROM_READ`): the user's part of
+     * `readBy: both` comes from that confirmation and can be taken back. Only
+     * while it holds for the wording the research has; from the research only.
+     */
+    readConfirmed?: string;
+    /**
+     * The research's mark of the transcript's wording (GEDCOM `2 _TXT` under
+     * `_STROM_READ`): opaque, never computed here — only given back with a
+     * confirmation (POST /sources/confirm), so it applies to that wording.
+     */
+    readMark?: string;
+    /**
      * The research's reading this entry was written from ("Read a document":
      * its id, `D…`). With it the research takes the source as that reading's
      * entry. GEDCOM `1 _STROM_READING` on the record (only to a research that
@@ -315,6 +383,14 @@ export interface Source {
     reading?: string;
     /** That reading's entry (`entries[].id`, e.g. "e1"). GEDCOM `2 _STROM_ENTRY` under `_STROM_READING`. */
     readingEntry?: string;
+    /**
+     * The research has this source's original on its computer (an excerpt, an
+     * image or the input scan) and a transcript to compare a new reading with:
+     * it can read the source again from the original (spec 059, `POST
+     * sources/read`). GEDCOM `1 _STROM_ORIG Y` on the record; from the
+     * research only, written back as it came.
+     */
+    originalInResearch?: boolean;
     /**
      * The SHA-256 of the page the entry is on, when no excerpt carries it
      * (`excerpts[].originalSha`). GEDCOM `1 _STROM_SHA` on the record.
@@ -336,6 +412,37 @@ export interface Source {
      * mark as an excerpt's `clip`; `input` = the whole input of a document).
      */
     heldClips?: string[];
+    /** The import (StromData.imports id) the source record came from. */
+    importId?: string;
+    /**
+     * Another program's own level-1 tags of the source record (`1 _TYPE`,
+     * `1 _MEDI` of MyHeritage…), kept as the file wrote them for "Back to
+     * {prog}" (spec 066 G8), as Person.gedcomExtra. A `1 _STROM_CITE` block
+     * holds the lines of the citation this entry came from that Strom does
+     * not read (DATA > TEXT, EVEN > ROLE), written under the citation.
+     */
+    gedcomExtra?: GedcomExtra[];
+    /**
+     * The source record's xref in the loaded GEDCOM files (only `from` and
+     * `xref` of OriginalIds). The sources a record became — one per page
+     * cited, see the import — share it, and "Back to {prog}" writes them
+     * as that one record again, the pages on the citations (spec 066 K3.1).
+     */
+    originalIds?: OriginalIds[];
+    /**
+     * The record's AUTH as the file wrote it. It is also a line of the note
+     * ("Author: …", in the language of the import), which is what the app
+     * shows; "Back to {prog}" writes it as `1 AUTH` while that line is still
+     * in the note (like LifeEvent.gedcomEmails).
+     */
+    gedcomAuthor?: string;
+    /**
+     * The record's TEXT as the file wrote it when it had HTML in it (a link
+     * of MyHeritage); the transcript is its plain text, the link's address
+     * kept. "Back to {prog}" writes it as written while the transcript is
+     * still that text.
+     */
+    gedcomText?: string;
 }
 
 /** Why the research left a source's image out of its file (see Source.imageHeld). */
@@ -386,6 +493,12 @@ export interface Attachment {
      * file by its hash. The research may bring a preview in a later version.
      */
     originalOnly?: true;
+    /**
+     * The picture's date as the file it came from wrote it (GEDCOM `_DATE`
+     * under its OBJE, e.g. MyHeritage's photo date; spec 066 G8). Not shown;
+     * written back by "Back to {prog}" only.
+     */
+    date?: string;
 }
 
 export interface Person {
@@ -406,6 +519,14 @@ export interface Person {
      * surname. Search and merge matching find the person under both.
      */
     marriedSurname?: string;
+    /**
+     * The given names of the name after marriage when they are not the
+     * person's own (firstName): "Jana Kateřina /Nováková/" beside the birth
+     * name "Jana /…/" (GEDCOM NAME > TYPE married, as the file wrote it).
+     * Shown with the married surname and written back in that NAME. Only with
+     * a married surname — without it the field is dropped (load and save).
+     */
+    marriedFirstName?: string;
     /**
      * Which surname the person goes by (the user's choice, never derived from
      * a divorce or the order of names): 'birth' = the birth surname
@@ -435,6 +556,11 @@ export interface Person {
     birthPlace?: string;
     /** House or address of the birth (GEDCOM BIRT > ADDR). */
     birthAddress?: string;
+    /**
+     * An age written at the birth (BIRT > AGE) by a Strom file (the
+     * research's): not shown, kept so it goes back as it came.
+     */
+    birthAge?: string;
     deathDate?: string;
     deathPlace?: string;
     /** Cause of death as recorded (DEAT > CAUS). */
@@ -493,10 +619,21 @@ export interface Person {
      * undefined = fall back to the age heuristic.
      */
     isDeceased?: boolean;
+    /**
+     * Families the GEDCOM file also recorded the person in as a child, besides
+     * the one the person hangs from here (a person has one pair of parents):
+     * each with the line of the note that says so ("Also recorded as child
+     * of …", in the language of the import). While that line is in the note,
+     * an export writes the link back (`1 FAMC` + PEDI, the family's `1 CHIL`)
+     * instead of the line (spec 066 K3.1).
+     */
+    alsoChildOf?: AlsoChildOf[];
     /** Compressed square JPEG portrait as a data URL (see src/photo.ts). */
     photo?: string;
     /** Original file name of the uploaded photo (UX only). */
     photoOriginalName?: string;
+    /** The portrait's date as the file it came from wrote it (see Attachment.date); goes with the photo. */
+    photoDate?: string;
     /** Life events other than birth/death (see LifeEvent). */
     events?: LifeEvent[];
     /** This person's chapter in the family book (GEDCOM _STORY on INDI). */
@@ -507,6 +644,8 @@ export interface Person {
     birthSourceIds?: string[];
     /** Sources citing the death fields (deathDate / deathPlace; GEDCOM DEAT.SOUR). */
     deathSourceIds?: string[];
+    /** A citation's own QUAY where it differs from its source's, per list (see CitationQuay). */
+    citationQuay?: CitationQuay<PersonCitationField>;
     /** Attached documents (scans, certificates, letters…). */
     attachments?: Attachment[];
     /**
@@ -522,6 +661,222 @@ export interface Person {
      * whole by each new version.
      */
     research?: PersonResearch;
+    /**
+     * Origin from a loaded GEDCOM file (spec 066, data version 15): the
+     * import (StromData.imports id) the person came from. Absent: entered here.
+     */
+    importId?: string;
+    /**
+     * Each fact's value as it came from a loaded GEDCOM file, by fact key
+     * (`firstName`, `lastName`, `gender`, `birthDate`, `birthPlace`,
+     * `deathDate`, `deathPlace`, `event:<id>.date|place|value`, see
+     * src/import-origin.ts). A fact is "from the family tree" only while its
+     * value equals the stored one; an edit ends it, nothing is switched by hand.
+     */
+    importedValues?: Record<string, ImportedValue>;
+    /** Parent links that came from a loaded GEDCOM file: parent id -> import id. */
+    importedParents?: Record<string, string>;
+    /**
+     * The person's ids in the loaded GEDCOM files (spec 066 K3.2): one entry
+     * per import the person came from or was merged with, the record's xref
+     * and its id lines as the file wrote them. Written back by "Back to {prog}".
+     */
+    originalIds?: OriginalIds[];
+    /**
+     * Another program's own level-1 tags on the person (`1 _XXX` and the lines
+     * under it) that the app does not read (spec 066 G8): kept as the file
+     * wrote them, one entry per import, and written back only by "Back to
+     * {prog}" for that program. Never sent to the research, never in Strom's
+     * own file.
+     */
+    gedcomExtra?: GedcomExtra[];
+    /**
+     * The research's origin of each fact (GEDCOM `_STROM_ORIGIN`, `_STROM_WAS`,
+     * `_STROM_SEX_ORIGIN`), by fact (`name`, `sex`, `birth`, `death`,
+     * `event:<id>`). Research trees only; read from the research's file,
+     * never from another file, never sent back.
+     */
+    researchOrigins?: Record<string, ResearchFactOrigin>;
+    /**
+     * Facts a person confirmed by hand ("Verified from the scan", spec 065),
+     * by fact (`name`, `sex`, `birth`, `death`, `event:<id>`). Valid only
+     * while the fact keeps the value it was confirmed with. Kept in JSON and
+     * in Strom's own GEDCOM (`2 _STROM_CONFIRMED <date>` under the fact).
+     */
+    confirmed?: Record<string, FactConfirmation>;
+    /**
+     * What the research says about re-verifying each fact (GEDCOM
+     * `_STROM_CONFIRMED`, `_STROM_VERIFY`, `_STROM_CHECKED`, spec 065), by
+     * fact. Research trees only; read from the research's file, never sent back.
+     */
+    researchVerify?: Record<string, ResearchFactVerify>;
+}
+
+/** One GEDCOM file loaded into the tree (StromData.imports, spec 066). */
+export interface ImportRecord {
+    /** "I1", "I2"… (the app's), "R1"… (an import the research made). */
+    id: string;
+    /** The program that wrote the file (HEAD > SOUR > NAME, else the SOUR value). */
+    program: string;
+    /** HEAD > SOUR > VERS. */
+    version?: string;
+    /** HEAD > DATE as written. */
+    fileDate?: string;
+    /** When it was loaded into Strom (ISO date). */
+    at: string;
+    /** The file's name. */
+    file?: string;
+    /** The encoding the file was read in (e.g. "windows-1250"). */
+    encoding?: string;
+    /** SHA-256 of the file's bytes (lowercase hex). */
+    sha?: string;
+    /** The "what next" card after this import was closed. */
+    nextCardClosed?: boolean;
+}
+
+/** One id line of a record in a loaded GEDCOM file (`1 _UID`, `1 RIN`, `1 EXID` + `2 TYPE`…). */
+export interface OriginalIdLine {
+    /** `_UID`, `UID`, `RIN`, `EXID`, `_FSFTID` or `AFN`. */
+    tag: string;
+    /** The value as written. */
+    value: string;
+    /** EXID > TYPE: the system the id belongs to. */
+    type?: string;
+}
+
+/** A record's ids in one loaded GEDCOM file (Person/Partnership.originalIds). */
+export interface OriginalIds {
+    /** The import (ImportRecord.id). */
+    from: string;
+    /** The record's xref in that file, without the @ signs ("I37"). */
+    xref?: string;
+    /** Its id lines, in file order. */
+    ids?: OriginalIdLine[];
+}
+
+/** Another program's level-1 tags of a record kept as written (Person/Partnership/Source.gedcomExtra). */
+export interface GedcomExtra {
+    /** The import (ImportRecord.id). */
+    from: string;
+    /** The lines as the file wrote them, from the level-1 `_XXX` line down (no line is re-wrapped). */
+    lines: string[];
+}
+
+/** A fact's value as it came from a loaded file (Person/Partnership.importedValues). */
+export interface ImportedValue {
+    /** The import (ImportRecord.id). */
+    from: string;
+    value: string;
+}
+
+/**
+ * Whose a fact is according to the research (GEDCOM `_STROM_ORIGIN`): `tree` a
+ * value taken from the user's own Strom tree and not changed by a person since
+ * (research 1.30.0+), `user` a person's change (an edit, a revert, an accepted
+ * proposal, a value added).
+ */
+export type FactOriginKind = 'import' | 'user' | 'research' | 'tree';
+
+/** A part of a fact (GEDCOM `_PART`, the parts list of `_STROM_IMPORT` / `_STROM_ORIGIN`). */
+export type FactPart = 'DATE' | 'PLAC' | 'VAL' | 'GIVN' | 'SURN' | 'SEX';
+
+/** What the fact was before the research changed it (GEDCOM `_STROM_WAS`). */
+export interface ResearchFactWas {
+    /** The family tree's value, as the research wrote it. */
+    value: string;
+    /** `3 _STROM_IMPORT`: the import the value came from. */
+    importId?: string;
+    /** `3 _PART`: which parts changed (none listed: the whole fact). */
+    parts?: FactPart[];
+    /** `3 _REF`: the research's key of the fact, sent back in /facts/revert. */
+    ref?: string;
+    /**
+     * Each changed part's own value when more than one part changed (the
+     * research writes one `2 _STROM_WAS` per part; a place holds commas, so
+     * the values are never joined). `value` is then the first part's.
+     */
+    partValues?: Partial<Record<FactPart, string>>;
+}
+
+/** The research's origin of one fact (Person/Partnership.researchOrigins). */
+export interface ResearchFactOrigin {
+    /** `_STROM_ORIGIN`; absent when the research sent only `_STROM_WAS`. */
+    kind?: FactOriginKind;
+    /** The import of an `import` origin. */
+    importId?: string;
+    /** The parts from the import (none listed: the whole fact). */
+    parts?: FactPart[];
+    was?: ResearchFactWas;
+    /** Sources cited under the fact (the record a change was made by). */
+    sourceIds?: string[];
+}
+
+/** A fact confirmed by hand from a scan of the record (spec 065). */
+export interface FactConfirmation {
+    /** The day of the confirmation, `YYYY-MM-DD`. */
+    at: string;
+    /**
+     * The fact's value when it was confirmed (its parts joined, see
+     * factValueSignature). A later change of the value ends the confirmation.
+     * Absent: valid whatever the value (an older record).
+     */
+    value?: string;
+    /**
+     * Not a confirmation: the research's confirmation of the day `at` is
+     * taken back here (research trees). The fact then goes to the research
+     * without its `_STROM_CONFIRMED`, which the research reads as taking it
+     * back; a version of the research loaded afterwards replaces it.
+     */
+    withdrawn?: true;
+}
+
+/** Why a fact waits for re-verification in the research (`2 _STROM_VERIFY`). */
+export type FactVerifyPending = 'wait' | 'asked' | 'images' | 'permission';
+
+/** The research's last re-verification of a fact (`2 _STROM_CHECKED`). */
+export interface FactVerifyChecked {
+    /** `proven`: the record confirmed it; `kept`: it stays as it was (see why). */
+    result: 'proven' | 'kept';
+    /** `3 DATE`, `YYYY-MM-DD` (or as written when not a full date). */
+    date?: string;
+    /** `3 _WHY`: why a kept fact stays (kept only). */
+    why?: string;
+    /** `3 _READERS`: how many independent readings agreed. */
+    readers?: number;
+}
+
+/** The research's re-verification state of one fact (Person/Partnership.researchVerify). */
+export interface ResearchFactVerify {
+    /** `2 _STROM_CONFIRMED <date>`: confirmed by a person in the research. */
+    confirmed?: string;
+    /**
+     * The fact's value the research's file gave with its confirmation (see
+     * factValueSignature): the confirmation holds while the fact keeps it, a
+     * change here ends it (as the app's own, FactConfirmation.value). Only
+     * with `confirmed`. Absent in a tree stored before it was kept: filled
+     * once when the tree is read (fillResearchConfirmedValues).
+     */
+    value?: string;
+    pending?: FactVerifyPending;
+    /**
+     * `3 _POS n` under `_STROM_VERIFY wait|asked`: the fact's task is the
+     * n-th the research's next session would take (1 = next), as of the file.
+     */
+    position?: number;
+    checked?: FactVerifyChecked;
+    /**
+     * `2 _STROM_EID E0012`: the fact's id in the research (what /verify and
+     * /facts/confirm name). Never sent back; a fact copied or made here has none.
+     */
+    eid?: string;
+    /**
+     * `3 _TXT 3f9a0c51d2e4b788` under `_STROM_EID`: the research's mark of what
+     * the fact says in its file (research 1.30.0+), sent back with
+     * /facts/confirm so the research confirms only the value shown here.
+     */
+    txt?: string;
+    /** The fact's value (factValueSignature) when the file gave `txt`: the mark holds only for it. */
+    txtValue?: string;
 }
 
 /** What the research knows about one person (see Person.research). */
@@ -533,6 +888,86 @@ export interface PersonResearch {
     edge?: ResearchEdge;
     /** The person belongs to a family nothing links to the tree yet (GEDCOM _STROM_ISLAND). */
     island?: ResearchIsland;
+    /**
+     * Where the person stands in the research's lines (GEDCOM INDI
+     * _STROM_DIRECTION, spec 073 §16.9), the narrowest first.
+     */
+    places?: ResearchPlace[];
+    /** What is being waited for outside the app about the person: a letter, an office (GEDCOM _STROM_WAIT, §16.10). */
+    waits?: ResearchWait[];
+    /** When the research added the person to the tree (GEDCOM _STROM_ADDED, ISO UTC instant). */
+    added?: string;
+}
+
+/** How a person belongs to a line (GEDCOM 2 TYPE under INDI _STROM_DIRECTION). */
+export type ResearchPlaceRole = 'line' | 'partner' | 'branch' | 'island';
+
+/** One place of a person in the research's lines (§16.9). */
+export interface ResearchPlace {
+    role: ResearchPlaceRole;
+    /** The line (G…); absent for a branch or an island outside any line. */
+    line?: string;
+    /** The side branch (B-P…) the person is in. */
+    branch?: string;
+}
+
+/** Who a wait is with (GEDCOM 2 _GROUP under _STROM_WAIT). */
+export type ResearchWaitGroupType = 'archive' | 'office' | 'family' | 'web' | 'other';
+
+/** A wait for an answer from outside (GEDCOM INDI _STROM_WAIT T…, §16.10 items 5 and 6). */
+export interface ResearchWait {
+    /** The research's task (T…). */
+    id: string;
+    type?: 'letter' | 'family' | 'web' | 'images' | 'check' | 'permission' | 'other';
+    title?: string;
+    /** What it is about (2 _ON, as written). */
+    on?: string;
+    group?: { name: string; type?: ResearchWaitGroupType; key?: string; url?: string };
+    stat?: 'todo' | 'sent';
+    /** When it was sent (ISO). */
+    sent?: string;
+    /** Its priority (1 = first). */
+    prio?: number;
+}
+
+/** A line of the research (GEDCOM HEAD _STROM_DIRECTION G…). */
+export interface ResearchLine {
+    id: string;
+    name: string;
+    kind?: 'ancestors' | 'descendants' | 'person' | 'question';
+    /** The person it starts from (REFN P…). */
+    focus?: string;
+    state?: 'active' | 'paused' | 'done';
+}
+
+/** How a side branch hangs on its nearest person (GEDCOM 3 TYPE under _VIA). */
+export type ResearchBranchRel = 'sibling' | 'partner' | 'child' | 'parent' | 'other';
+
+/** A side branch outside the lines (GEDCOM HEAD _STROM_BRANCH B-P…). */
+export interface ResearchBranch {
+    /** B-P…: the branch of person P…. */
+    id: string;
+    /** The person of the branch (REFN P…, from the id). */
+    person: string;
+    /** The person it hangs on and how. */
+    via?: { person: string; rel?: ResearchBranchRel };
+    /** The nearest line (G…). */
+    nearest?: string;
+    /** The line it was added to (G…). */
+    line?: string;
+    /** How work outside the lines is ordered for it. */
+    mode?: 'never' | 'occasional' | 'last' | 'normal';
+}
+
+/**
+ * The research's lines and side branches (GEDCOM HEAD _STROM_DIRECTIONS,
+ * _STROM_DIRECTION, _STROM_BRANCH). Research trees only, never sent back.
+ */
+export interface ResearchDirections {
+    /** HEAD _STROM_DIRECTIONS Y: every person's places are written, so a person without one is off the lines. */
+    complete: boolean;
+    lines: ResearchLine[];
+    branches: ResearchBranch[];
 }
 
 /** A span of years (inclusive). */
@@ -679,6 +1114,8 @@ export interface ResearchConflict {
      * the bridge's JSON). Missing: decided in the research only.
      */
     take?: true;
+    /** Whose value the research proposes to change (GEDCOM 2 _STROM_KIND): from the family tree, or entered by a person. */
+    kind?: 'import' | 'user';
 }
 
 /** A question the research works with ("Father: Václav, or Jan?"). */
@@ -694,8 +1131,80 @@ export interface ResearchHypothesis {
     status?: string;
     /** The variant it was decided for (2 _CHOSEN, decided only): its letter. */
     chosen?: string;
+    /**
+     * Who decided it (2 _BY, decided or abandoned only): `agent` when the
+     * research's agent did, `app` when a person did by a link from the app
+     * (spec 074); absent: the person in the research (also every older record).
+     */
+    decidedBy?: 'agent' | 'app';
+    /** Why it was decided so (2 DECI, CONC/CONT joined; decided or abandoned only). */
+    decision?: string;
+    /** The day it was decided (2 _AT, ISO "YYYY-MM-DD"; decided or abandoned only). */
+    decidedAt?: string;
     /** Its variants and what each would connect (2 _VAR), in the file's order. */
     variants?: ResearchHypothesisVariant[];
+    /**
+     * It can be decided by a version from the app (2 _PICK Y, spec 074): every
+     * link of every version is `child` or `partners` and one at least has one.
+     * The research's word; links of people not in the file are missing there.
+     */
+    pickable?: true;
+    /** The decision before the last one (2 _PREV, spec 074): its version (null: no version held), who, why, when. */
+    previous?: ResearchHypothesisPrevious;
+    /** It cannot be reopened (2 _REOPEN no, decided or abandoned only, spec 074): why, how many links, the versions that would not change the tree. */
+    reopen?: ResearchHypothesisReopen;
+    /** The agent's open proposal (2 _PROP, open only, spec 074): its version (null: no version holds), its sentence, its day. */
+    proposal?: ResearchHypothesisProposal;
+    /** Left open on this day (2 _LEFT, open only, spec 074): a proposal not taken, or none waited. ISO "YYYY-MM-DD". */
+    leftOpen?: string;
+}
+
+/** Who decided a hypothesis besides the person in the research: its agent, or a person by a link from the app. */
+export type ResearchHypothesisDecider = 'agent' | 'app';
+
+/** The decision a hypothesis had before (2 _PREV, only the last one). */
+export interface ResearchHypothesisPrevious {
+    /** Its version's letter; null when it was "no version holds" (abandoned). */
+    variant: string | null;
+    /** 3 _BY; absent: the person in the research. */
+    by?: ResearchHypothesisDecider;
+    /** 3 DECI (CONC/CONT joined). */
+    reason?: string;
+    /** 3 _AT, ISO "YYYY-MM-DD". */
+    day?: string;
+}
+
+/**
+ * Why a decided hypothesis cannot be reopened by a link (2 _REOPEN no):
+ * `tree` — the chosen version's links are in the tree, written otherwise than
+ * by this decision (the agent, an older research); `work` — further work
+ * stands on links this decision wrote; another word as written (a sentence
+ * of its own is not known: the general one).
+ */
+export interface ResearchHypothesisReopen {
+    ok: false;
+    /** 3 TYPE, lower case ('' when not said). */
+    type: 'tree' | 'work' | string;
+    /** 3 _COUNT: how many such links. */
+    count?: number;
+    /** 3 _STAYS (repeated): versions whose choice leaves the tree as it is (the old link stays, the new one is not written). */
+    stays?: string[];
+}
+
+/** The agent's open proposal for a hypothesis (2 _PROP). */
+export interface ResearchHypothesisProposal {
+    /** Its version's letter; null for "no version holds". */
+    variant: string | null;
+    /** 3 DECI: its sentence (CONC/CONT joined). */
+    text?: string;
+    /** 3 _AT, ISO "YYYY-MM-DD". */
+    day?: string;
+}
+
+/** A text against a version (3 _AGAINST) and the sources it names (4 SOUR), catalog ids. */
+export interface ResearchHypothesisAgainst {
+    text: string;
+    sourceIds?: string[];
 }
 
 /** One answer to a hypothesis ("B: son of Jakub and Marie"). */
@@ -714,6 +1223,10 @@ export interface ResearchHypothesisVariant {
     inTree?: ResearchVariantLink[];
     /** The sources it names (3 SOUR), catalog ids. */
     sourceIds?: string[];
+    /** What speaks against it (3 _AGAINST, spec 074), each a text with the sources it names. */
+    against?: ResearchHypothesisAgainst[];
+    /** How many people outside the tree it would join to it (3 _PEOPLE, spec 074; only more than 0). */
+    people?: number;
 }
 
 /** What a variant would connect (3 _LINK); people as the research's person numbers (REFN). */
@@ -784,6 +1297,12 @@ export interface Story {
     /** The author's caveat, kept verbatim ("not a source, proves nothing"). */
     note?: string;
     /**
+     * The sources the story rests on (ids into StromData.sources): the
+     * sources of its facts and of its background, as Strom Research names
+     * them (`2 SOUR @S…@` under _STORY). Shown as "Based on sources".
+     */
+    sources?: string[];
+    /**
      * A newer version of an APPROVED story waiting for the user (Strom Research
      * _STORY > _DRAFT). The approved text above stays the story — the book and
      * the person's panel show it — until the user takes the new version or
@@ -800,6 +1319,8 @@ export interface StoryDraft {
     text: string;
     facts?: string[];
     note?: string;
+    /** The sources the new version rests on (`3 SOUR @S…@` under _DRAFT). */
+    sources?: string[];
     /** When it was written (YYYY-MM-DD as the research sends it). */
     at?: string;
 }
@@ -839,6 +1360,15 @@ export interface Partnership {
     /** Ids of Source entries citing this partnership (marriage record etc.). */
     sourceIds?: string[];
     /**
+     * Ids of Source entries citing the divorce (GEDCOM DIV > SOUR), each
+     * citation's page, quality and entry text kept like the wedding's (a
+     * source of its own per page). Optional, no data version bump: an older
+     * app keeps partnerships whole and only does not show them.
+     */
+    divorceSourceIds?: string[];
+    /** A citation's own QUAY where it differs from its source's, per list (see CitationQuay). */
+    citationQuay?: CitationQuay<PartnershipCitationField>;
+    /**
      * Witnesses at the wedding (see EventParticipant). A marriage entry names
      * them the way a baptism names godparents, and they are the same kind of
      * lead — the model has no union event to hang them on, so they live here.
@@ -851,6 +1381,41 @@ export interface Partnership {
      * (which stay fields above): banns, a contract, a census of the household…
      */
     events?: CoupleEvent[];
+    /** The import (StromData.imports id) the partner link came from. */
+    importId?: string;
+    /**
+     * The GEDCOM file the couple was read from wrote no marriage for it (no
+     * MARR; "married", or "divorced" by a DIV alone, is only how a couple is
+     * read). An export then adds no empty MARR the file never had (spec 066
+     * K3.1); a wedding detail (date, place, witnesses…) writes one as before.
+     */
+    marriageUnrecorded?: boolean;
+    /**
+     * The file wrote the family of one parent alone as not a couple
+     * (`1 _STROM_NO_COUPLE Y`, as Strom Research does): while the other
+     * parent is still the "?" and the family says nothing a couple would,
+     * an export writes the mark back, so the family goes out as it came.
+     */
+    noCouple?: boolean;
+    /** Each fact's value as it came from a loaded file (`startDate`, `startPlace`, `endDate`, `endPlace`, `event:<id>.date|place|value`). */
+    importedValues?: Record<string, ImportedValue>;
+    /** The family record's ids in the loaded GEDCOM files (xref, `_UID`…), see Person.originalIds. */
+    originalIds?: OriginalIds[];
+    /** The family record's own tags of another program, see Person.gedcomExtra. */
+    gedcomExtra?: GedcomExtra[];
+    /** The research's origin of each fact (`marriage`, `divorce`, `event:<id>`), research trees only. */
+    researchOrigins?: Record<string, ResearchFactOrigin>;
+    /** Facts confirmed by hand (`marriage`, `divorce`, `event:<id>`), see Person.confirmed. */
+    confirmed?: Record<string, FactConfirmation>;
+    /** The research's re-verification of each fact, see Person.researchVerify. */
+    researchVerify?: Record<string, ResearchFactVerify>;
+    /**
+     * The family's id in the research ("F0003", its record `0 @F0003@ FAM`),
+     * read from the research's own file: what /verify {family} names. Never
+     * sent back (what goes to the research numbers its families afresh) and
+     * no change of the tree; a couple made here has none.
+     */
+    researchId?: string;
     // Primary partnership flag - when person has multiple partnerships,
     // this one is shown by default (unless viewing from child's perspective)
     isPrimary?: boolean;
@@ -888,6 +1453,8 @@ export interface CoupleEvent {
     note?: string;
     /** Ids of Source entries citing this event. */
     sourceIds?: string[];
+    /** A citation's own QUAY where it differs from its source's (see CitationQuay). */
+    citationQuay?: CitationQuay<'sourceIds'>;
     /** Witnesses and others the record names. */
     participants?: EventParticipant[];
     /** The research's status of the event (see FactStatus). */
@@ -904,6 +1471,17 @@ export type PartnershipUpdates = Partial<Pick<Partnership,
 export const LAST_FOCUSED = "__last_focused__" as const;
 export type LastFocusedMarker = typeof LAST_FOCUSED;
 
+/**
+ * The reliability (GEDCOM QUAY 0–3) of single citations, by citation list and
+ * source id (spec 077, data v19): only a citation whose QUAY differs from its
+ * source's default (Source.quality) has an entry; `null` is a citation that
+ * gave no QUAY while its source has one. The same entry cited at two facts
+ * with another QUAY each stays one source. Read through citationQuality()
+ * (src/citation-quality.ts); an entry of a source no longer in its list says
+ * nothing (dropped when the tree is read).
+ */
+export type CitationQuay<F extends string = string> = Partial<Record<F, Record<string, number | null>>>;
+
 /** A person's citation lists: the person as a whole, the birth, the death. */
 export const PERSON_CITATION_FIELDS = ['sourceIds', 'birthSourceIds', 'deathSourceIds'] as const;
 export type PersonCitationField = typeof PERSON_CITATION_FIELDS[number];
@@ -913,9 +1491,13 @@ export function personSourceIds(p: Pick<Person, PersonCitationField>): string[] 
     return [...new Set(PERSON_CITATION_FIELDS.flatMap(f => p[f] ?? []))];
 }
 
-/** Every source a couple's citations name (the union itself and each of its events), once each. */
-export function partnershipSourceIds(u: Pick<Partnership, 'sourceIds' | 'events'>): string[] {
-    return [...new Set([...(u.sourceIds ?? []), ...(u.events ?? []).flatMap(e => e.sourceIds ?? [])])];
+/** A couple's citation lists: the union itself (the wedding), the divorce. */
+export const PARTNERSHIP_CITATION_FIELDS = ['sourceIds', 'divorceSourceIds'] as const;
+export type PartnershipCitationField = typeof PARTNERSHIP_CITATION_FIELDS[number];
+
+/** Every source a couple's citations name (the union itself, the divorce and each of its events), once each. */
+export function partnershipSourceIds(u: Partial<Pick<Partnership, PartnershipCitationField | 'events'>>): string[] {
+    return [...new Set([...PARTNERSHIP_CITATION_FIELDS.flatMap(f => u[f] ?? []), ...(u.events ?? []).flatMap(e => e.sourceIds ?? [])])];
 }
 
 /** Everyone a couple's records name: the wedding witnesses and the people at each of its events. */
@@ -968,6 +1550,9 @@ export function partnershipParticipants(u: Pick<Partnership, 'participants' | 'e
  * GEDCOM import skips `_STROM_PRIMARY` under a NAME silently and its export
  * does not write it (the research takes the missing mark as no change).
  * Person.dismissedMarriedSuggestion (3.13, app-local) the same way.
+ * Person.marriedFirstName (3.26) came without a bump too: an older app keeps
+ * it on a re-save and shows the married name with the person's own given
+ * name meanwhile; its GEDCOM export writes that name so.
  * Source.reading / readingEntry / readingSha (3.14) came without a bump too: an
  * older app loads sources whole (migrateData) and edits them in place
  * (updateSource), so it keeps the reading's marks on a re-save. Its merge keeps
@@ -993,8 +1578,71 @@ export function partnershipParticipants(u: Pick<Partnership, 'participants' | 'e
  *   founder moved down, a line split off by hand). A tree-level field; an
  *   older app (v13) would drop it on a re-save (migrateData builds field by
  *   field), so the bump makes it warn first.
+ * v15 (2026-11, spec 066): StromData.imports (the GEDCOM files loaded into
+ *   the tree) and the origin of facts and links from them
+ *   (Person/Partnership.importedValues, importId, Person.importedParents,
+ *   Source.importId), plus the research's origin of facts (researchOrigins,
+ *   ResearchConflict.kind), and the records' ids in the loaded files
+ *   (Person/Partnership.originalIds: xref, _UID, RIN, EXID…) and another
+ *   program's own level-1 tags kept for "Back to {prog}"
+ *   (Person/Partnership/Source.gedcomExtra; the source's came after
+ *   3.26.0-beta.2 without a bump: a v15 app keeps sources whole) and a
+ *   picture's date (Attachment.date, Person.photoDate, kept whole the same
+ *   way). Additive;
+ *   existing trees get no origin and no ids (nothing is guessed). An older
+ *   app (v14) would drop imports on a re-save.
+ * v16 (2026-11, spec 065): Person/Partnership.confirmed (facts confirmed by
+ *   hand from a scan, each with its day and the value it was confirmed with)
+ *   and Person/Partnership.researchVerify (the research's re-verification of
+ *   facts: confirmed, waiting, last checked). Additive; existing trees get
+ *   neither. An older app (v15) keeps persons whole but would show a
+ *   confirmed fact as unconfirmed and drop the mark from its GEDCOM export,
+ *   so the bump makes it warn first. The value the research's confirmation
+ *   holds for (ResearchFactVerify.value) came within v16 without a bump: an
+ *   entry without it is filled when the tree is read, from the research's
+ *   kept copy of the tree, else from the current value.
+ * v17 (2026-11, spec 073): StromData.tableViews (saved views of the Table
+ *   view). Additive; existing trees get none. An older app (v16) ignores the
+ *   field and would drop it on a re-save, so the bump makes it warn first.
+ * v18 (2026-11, spec 075): Source.callNumber, Source.folio, Source.image
+ *   (where the entry stands, field by field); Source.reference is then the
+ *   rest of the location. Additive: an existing source keeps its whole
+ *   location in reference, nothing is split by itself. An older app (v17)
+ *   keeps sources whole but would write neither the folio nor the image to
+ *   its GEDCOM export (only the reference), so the bump makes it warn first.
+ * v19 (2026-11, spec 077): the reliability of a single citation
+ *   (Person/Partnership/LifeEvent/CoupleEvent.citationQuay) where it differs
+ *   from its source's; Source.quality is the source's default. A page cited
+ *   with another QUAY is no longer a source of its own: the sources an import
+ *   of 3.26 made only for that are joined back into their entry when the
+ *   tree is read (src/citation-quality.ts, a backup first). An older app
+ *   (v18) would show and export the source's QUAY at every citation, so the
+ *   bump makes it warn first.
  */
-export const STROM_DATA_VERSION = 14;
+export const STROM_DATA_VERSION = 19;
+
+/** The rows of a saved Table view (spec 073 §2; events and sources come later). */
+export type TableViewRowType = 'persons' | 'unions' | 'events' | 'sources';
+
+/**
+ * A saved view of the Table view (spec 073 §9.1). The filter items are the
+ * table's own (src/ui/table-view/table-filter.ts); a sort key's `dir` is 1
+ * (ascending) or -1. `unions` only for the People rows (§3.2).
+ */
+export interface TableView {
+    id: string;
+    name: string;
+    rowType: TableViewRowType;
+    columns: { id: string; width?: number }[];
+    pinned: number;
+    collapsedGroups: string[];
+    coverageRow: boolean;
+    filter: { op: 'and'; items: Record<string, unknown>[] };
+    sort: { col: string; dir: 1 | -1 }[];
+    unions?: { collapsed: boolean; except: string[] };
+    /** ISO time of the last save. */
+    updated: string;
+}
 
 /**
  * Manual corrections of the lineages (rody, see src/lineage.ts), by person id.
@@ -1214,10 +1862,30 @@ export interface StromData {
     lineageOverrides?: LineageOverrides;
 
     /**
+     * Saved views of the Table view (spec 073 §9.1, data version 17): row
+     * type, columns, pinning, collapsed groups, coverage row, filter, sort
+     * and the union sub-rows. The built-in views are not stored. Absent or
+     * empty = none saved.
+     */
+    tableViews?: TableView[];
+
+    /**
      * When Strom Research wrote what the people's `research` says (GEDCOM
      * header `_STROM_ASOF`, ISO date): "as of". Research trees only.
      */
     researchAsOf?: string;
+
+    /**
+     * The research's lines and side branches (GEDCOM header, spec 073 §16.9).
+     * Research trees only; never leaves the app.
+     */
+    researchDirections?: ResearchDirections;
+
+    /**
+     * The GEDCOM files loaded into this tree (data version 15, spec 066),
+     * oldest first. People, facts, links and sources name them by id.
+     */
+    imports?: ImportRecord[];
 
     // Last focused state (used when defaultPersonId === LAST_FOCUSED)
     lastFocusPersonId?: PersonId;
@@ -1229,11 +1897,12 @@ export interface StromData {
  * How the tree is drawn. 'family' is the default focus-centric view; the others
  * are alternative readings of the SAME selection of people ('descendants'
  * chart, 'timeline' life-bars, 'fan' ancestor chart, 'map' of their places).
+ * 'table' lists the whole tree (every real person or union) as rows.
  */
-export type ViewMode = 'family' | 'descendants' | 'timeline' | 'fan' | 'map';
+export type ViewMode = 'family' | 'descendants' | 'timeline' | 'fan' | 'map' | 'table';
 
 /** Views drawn by something other than the layout pipeline (own containers). */
-export const STANDALONE_VIEWS: readonly ViewMode[] = ['timeline', 'fan', 'map'];
+export const STANDALONE_VIEWS: readonly ViewMode[] = ['timeline', 'fan', 'map', 'table'];
 
 // ==================== UI TYPES ====================
 
@@ -1256,6 +1925,8 @@ export interface NewPersonData {
     birthPlace?: string;
     deathDate?: string;
     deathPlace?: string;
+    /** Known to have died (the "Deceased" box); kept only without a death date, which says so by itself. */
+    isDeceased?: boolean;
     /** The titles of the name ("Ing.", "ml."), set with the person so its first undo step names them. */
     titleBefore?: string;
     titleAfter?: string;
@@ -1319,6 +1990,20 @@ export interface LayoutConfig {
      * partner line runs at the same height on every card of a row.
      */
     personHeights?: ReadonlyMap<PersonId, number>;
+    /**
+     * The dense spacing (Settings → Spacing → Dense, DENSE_LAYOUT_CONFIG):
+     * bus lanes stay at most one lane below a gap's middle; a gap that needs
+     * more lanes grows instead (step 7, bands.ts). Unset: the normal spacing.
+     */
+    dense?: boolean;
+    /**
+     * Room the screen keeps under a row for something drawn there (the
+     * button of a family outside the tree under its top couple): for each
+     * set of persons, the gap below the top generation that holds one of
+     * them laid out is at least `px` tall (bands.ts roomBelowExtra). Unset:
+     * every gap is verticalGap (plus the dense lanes' growth).
+     */
+    roomBelow?: ReadonlyArray<{ personIds: ReadonlySet<PersonId>; px: number }>;
 }
 
 /** The partner line's distance from the card's top: the set offset, else the card's middle. */
@@ -1369,6 +2054,31 @@ export const DEFAULT_LAYOUT_CONFIG: LayoutConfig = {
     minEdgeClearance: 14
 };
 
+/**
+ * Spacing of the tree view (Settings → Person card → Spacing): the normal
+ * gaps between cards and generations, or tighter ones that fit more cards
+ * into the view. A setting of this device, never stored with the tree data.
+ */
+export type TreeSpacing = 'normal' | 'dense';
+
+/**
+ * The dense spacing: the same cards, smaller gaps. Everything derived from
+ * the gaps (couple and chain widths, generation bands, the bus in the middle
+ * of a gap) follows by itself; `dense` caps the bus lanes (step 7).
+ */
+export const DENSE_LAYOUT_CONFIG: LayoutConfig = {
+    ...DEFAULT_LAYOUT_CONFIG,
+    horizontalGap: 20,
+    verticalGap: 48,
+    partnerGap: 14,
+    dense: true,
+};
+
+/** The layout configuration of a spacing (card size still to be spread over it). */
+export function layoutConfigFor(spacing: TreeSpacing): LayoutConfig {
+    return spacing === 'dense' ? DENSE_LAYOUT_CONFIG : DEFAULT_LAYOUT_CONFIG;
+}
+
 // ==================== AUDIT LOG ====================
 
 export type AuditAction =
@@ -1402,6 +2112,8 @@ export type AuditAction =
     | 'place.split'
     | 'quality.dismiss'
     | 'quality.restore'
+    | 'fact.confirm'
+    | 'fact.unconfirm'
     | 'surname.reject'
     | 'surname.unreject'
     | 'surname.accept'
@@ -1409,6 +2121,9 @@ export type AuditAction =
     | 'lineage.founder'
     | 'lineage.split'
     | 'surnames.removeForm'
+    | 'tableView.save'
+    | 'tableView.rename'
+    | 'tableView.delete'
     | 'undo'
     | 'redo';
 
@@ -1437,7 +2152,7 @@ export interface AuditLog {
  * should be kept in sync with package.json.
  */
 declare const __APP_VERSION__: string | undefined;
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '3.21.1';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '3.27.0';
 
 /** Envelope wrapping embedded data in exported HTML files */
 export interface EmbeddedDataEnvelope {
@@ -1544,7 +2259,8 @@ export interface AppSettings {
     deathAnniversaries?: boolean;  // default: false - include yearly death anniversaries
     onThisDayAllTrees?: boolean;   // default: false - "on this day" also from the other visible trees
     whatsNewAfterUpdate?: boolean;  // default: true - the "What's new" dialog at the first start of a new version
-    crossTreeBadges?: boolean;  // default: true - show cross-tree connection badges
+    /** Before 3.26: the ⇄ pill on cards (default true). Read only once, to bring it to `strom-card-signals.crossTree` (spec 066 P4 §8). */
+    crossTreeBadges?: boolean;
     fanKekule?: boolean;  // default: false - show Kekule (ahnentafel) numbers in the fan chart
     lifelineChildEvents?: boolean;  // default: false - person card's life timeline also lists the children's events (fallback of every tree, see lifelineByTree)
     historyLayer?: boolean;  // default: true (undefined = never chosen) - the research's events of the time in the life timeline (spec 020)
@@ -1564,11 +2280,17 @@ export interface AppSettings {
     placesSort?: 'state' | 'name' | 'people';  // default: 'state' - Places dialog order (a stored 'unplaced' reads as 'state')
     cardDensity?: CardDensity;  // default: 'normal' - how much detail a card shows
     exportScope?: 'tree' | 'view';  // default: 'tree' - the export dialog's whole tree / current view switch
+    treeSpacing?: TreeSpacing;  // default: 'normal' - gaps between cards and generations in the tree view
+    posterSpacing?: TreeSpacing;  // default: 'normal' - the same for an exported image, poster or PDF
     /** The custom density's lines (src/card-fields.ts); set the first time "Custom" is chosen. */
     cardFields?: import('./card-fields.js').CardFieldSettings;
     familyButton?: boolean;  // default: false - toolbar shortcut to the family wizard
     descendantsFullFamilies?: boolean;  // default: false - descendants view shows partners' other families
     showTitles?: boolean;  // default: true - titles before/after the name (Person.titleBefore / titleAfter) shown with it
+    /** Settings `display.reliabilityCard` (spec 066 §2f), default: true - the reliability marks on the person card. */
+    reliabilityCard?: boolean;
+    /** Before 3.26: the reliability mini mark on the tree cards (default false). Read only once, into `strom-card-signals.status` (spec 066 P4 §8). */
+    reliabilityTree?: boolean;
     surnameDisplay?: SurnameDisplay;  // default: 'both' - which surname names show (Person.lastName / marriedSurname)
     advancedFields?: boolean;  // default: false (basic mode) - sources/attachments/refn/name variants/question on a person
     geocoding?: boolean;   // default: undefined (never asked) - user allowed sending place names to the geocoder
@@ -1769,7 +2491,31 @@ export interface ResearchLink {
      * Survives updates from the research.
      */
     titlesIn?: string;
+    /**
+     * The bridge's ETag of the file this tree was last loaded from (a bridge
+     * with `ged.etag`), with the base that load gave the tree: asked again
+     * with `If-None-Match` while the tree is still that load unchanged. Any
+     * other load replaces the link and drops it (setResearchLink).
+     */
+    treeEtag?: ResearchTreeEtag;
 }
+
+/** The ETag of the research's file a tree holds (ResearchLink.treeEtag). */
+export interface ResearchTreeEtag {
+    /** The `ETag` the bridge sent with the file, verbatim. */
+    tag: string;
+    /** The link's head the load gave (ResearchLink.head; '' without one). */
+    head: string;
+    /** The link's fingerprint the load gave (ResearchLink.fingerprint). */
+    fingerprint: string;
+    /** The file's images were taken (the import setting then): reused only while the setting is the same. */
+    images: boolean;
+    /** The file's variant: `ref` its images by their hash (`ged.imagesByHash`); absent: with them in it. */
+    variant?: 'ref';
+}
+
+/** A research's file with its images by their hash (`ref`) or in it (`data`). */
+export type TreeImagesVariant = 'ref' | 'data';
 
 /** How changes go to the research (see ResearchLink.sendMode). */
 export type ResearchSendMode = 'auto' | 'manual' | 'off';

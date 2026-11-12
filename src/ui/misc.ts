@@ -4,6 +4,8 @@
  */
 
 import { initDialogFocus } from './dialog-focus.js';
+import { initClosedPopups } from './closed-popups.js';
+import { initSheetSlide } from './sheet-slide.js';
 import { initKeyboardAccess } from './keyboard-access.js';
 import { DataManager, auditPersonName } from '../data.js';
 import { announcedResearchLinks, researchLinksEnabled, setResearchLinksEnabled } from '../research-device.js';
@@ -25,6 +27,9 @@ import {
     LastFocusedMarker
 } from '../types.js';
 import { strings, getCurrentLanguage } from '../strings.js';
+import { CARD_STATUS_CLASSES } from '../reliability.js';
+import { cardStatusLegendLabel, statusMarkHtml } from './fact-status.js';
+import { storyFoldHtml } from '../card-signals.js';
 import { aboutUsersGroupLink, aboutChangelogLink, changelogIsBeta } from '../about-links.js';
 import { parseGedcom, convertToStrom, GedcomConversionResult } from '../ged-parser.js';
 import {
@@ -50,6 +55,9 @@ import { twoFiguresSvg } from '../icons.js';
 import { shownNameOrEmpty, nameHtml } from '../person-name.js';
 import { forgetCardTypeCopy } from './card-fields-ui.js';
 import { setResearchOpenLabel } from './research-open-mark.js';
+import { helpMark, setHelpMarkTopic } from './help-mark.js';
+import { HELP_TOPICS, type HelpTopic } from '../help/topics.js';
+import { openHelp } from './help-ui.js';
 import { syncControlBlock } from './minimap.js';
 import { addLender, cancelWaiting, removeLender, watchToasts, whenFree } from '../toast-slot.js';
 
@@ -66,6 +74,8 @@ interface ToastOptions {
     hold?: boolean;
     /** A notice to be read: it stands 3 s at least before a newer toast takes its place (round 7 §53). */
     notice?: boolean;
+    /** Said as an alert (`role="alert"`): something asked for did not happen. */
+    alert?: boolean;
     /** A dialog's footer (selector) the toast stands above while it is on the screen: shown over a
      *  dialog, the toast must not cover the dialog's action buttons. */
     clearOf?: string;
@@ -86,8 +96,10 @@ export const miscMethods = uiModule({
             versionEl.textContent = APP_VERSION;
         }
 
-        // What's new: the changelog in the UI language at this version's
-        // section, on the beta branch for a beta build (see about-links.ts).
+        // What's new: the same dialog as after an update (its "All changes"
+        // leads on to GitHub). A version without notes in the UI language:
+        // the changelog in that language at this version's section, on the
+        // beta branch for a beta build (see about-links.ts).
         const changelogEl = modal.querySelector<HTMLAnchorElement>('#about-changelog');
         if (changelogEl) {
             const changelog = aboutChangelogLink(getCurrentLanguage(), APP_VERSION,
@@ -95,7 +107,15 @@ export const miscMethods = uiModule({
             changelogEl.href = changelog.href;
             changelogEl.target = changelog.target;
             changelogEl.rel = changelog.rel;
-            changelogEl.textContent = changelog.label;
+            const inApp = this.hasAppReleaseNotes();
+            changelogEl.textContent = inApp ? strings.releaseNotes.title : changelog.label;
+            changelogEl.dataset.opens = inApp ? 'dialog' : 'web';
+            if (inApp) changelogEl.setAttribute('aria-haspopup', 'dialog');
+            else changelogEl.removeAttribute('aria-haspopup');
+            changelogEl.onclick = inApp ? (e) => {
+                e.preventDefault();
+                this.showAboutWhatsNew();
+            } : null;
         }
 
         // The users' group: a row of its own under the source link, only in the
@@ -352,9 +372,10 @@ export const miscMethods = uiModule({
         if (kekuleToggle) kekuleToggle.checked = SettingsManager.isFanKekuleEnabled();
         const titlesToggle = document.getElementById('show-titles-toggle') as HTMLInputElement | null;
         if (titlesToggle) titlesToggle.checked = SettingsManager.isShowTitles();
+        const relCardToggle = document.getElementById('reliability-card-toggle') as HTMLInputElement | null;
+        if (relCardToggle) relCardToggle.checked = SettingsManager.isReliabilityCardEnabled();
         this.syncSurnameDisplaySetting();
-        const crossTreeToggle = document.getElementById('cross-tree-badges-toggle') as HTMLInputElement | null;
-        if (crossTreeToggle) crossTreeToggle.checked = SettingsManager.isCrossTreeBadgesEnabled();
+        this.syncTreeSpacingSetting();
         const branchColorsToggle = document.getElementById('branch-colors-toggle') as HTMLInputElement | null;
         if (branchColorsToggle) branchColorsToggle.checked = SettingsManager.isBranchColorsEnabled();
         const descFamiliesToggle = document.getElementById('descendants-families-default-toggle') as HTMLInputElement | null;
@@ -377,6 +398,8 @@ export const miscMethods = uiModule({
         this.syncSettingsDependents();
         this.renderHistorySettings(true);
         this.syncExperimentsGroup();
+        this.renderResearchFollowSettings();
+        this.renderResearchLiveSettings();
         modal.classList.add('active');
         this.fitSurnameDisplaySetting();
     },
@@ -398,6 +421,20 @@ export const miscMethods = uiModule({
         });
         const shared = document.getElementById('surname-display-sample');
         if (shared) shared.innerHTML = nameHtml(SURNAME_SAMPLE, { display: current });
+    },
+
+    /**
+     * Spacing (Settings > Person card): the checked option, and the hint
+     * about the Compact card while another type is chosen (spec 069 §5; the
+     * stylesheet shows it only on a small screen).
+     */
+    syncTreeSpacingSetting(): void {
+        const current = SettingsManager.getTreeSpacing();
+        document.querySelectorAll<HTMLInputElement>('input[name="tree-spacing"]').forEach(radio => {
+            radio.checked = radio.value === current;
+        });
+        const hint = document.getElementById('tree-spacing-hint');
+        if (hint) hint.hidden = SettingsManager.getCardDensity() === 'compact';
     },
 
     /**
@@ -467,6 +504,8 @@ export const miscMethods = uiModule({
         // reliable beat to keep the toolbar Undo/Redo state honest.
         this.refreshUndoRedoToolbar();
         const mode = TreeRenderer.getViewMode();
+        // Away from the Table view its rows kept in place after an edit are sorted again next time (§10.3).
+        if (mode !== 'table') this.forgetTableOrder();
         // The family line's choice (spec 039 §1.5): hidden on the timeline and the map.
         this.syncRodPickerHost();
         // Mobile CSS hides the focus bar under the descendants badge.
@@ -474,18 +513,18 @@ export const miscMethods = uiModule({
         // Standalone views (map/timeline/fan) have their own top-left controls;
         // the tree focus chip does not apply there and must not overlap them.
         document.body.classList.toggle('standalone-view',
-            mode === 'map' || mode === 'timeline' || mode === 'fan');
+            mode === 'map' || mode === 'timeline' || mode === 'fan' || mode === 'table');
         // The map's bottom bars lift the toasts and offers (index.html).
         document.body.classList.toggle('map-view', mode === 'map');
-        for (const m of ['family', 'descendants', 'timeline', 'fan', 'map']) {
+        for (const m of ['family', 'descendants', 'timeline', 'fan', 'map', 'table']) {
             document.getElementById(`view-mode-${m}`)?.classList.toggle('active', mode === m);
         }
-        // Mobile bottom bar: three primary view tabs plus "More" (fan/map live
-        // in the More sheet, so More lights up while either is active).
+        // Mobile bottom bar: three primary view tabs plus "More" (fan, map and
+        // table live in the More sheet, so More lights up while one is active).
         document.getElementById('bb-view-family')?.classList.toggle('active', mode === 'family');
         document.getElementById('bb-view-descendants')?.classList.toggle('active', mode === 'descendants');
         document.getElementById('bb-view-timeline')?.classList.toggle('active', mode === 'timeline');
-        document.getElementById('bb-view-more')?.classList.toggle('active', mode === 'fan' || mode === 'map');
+        document.getElementById('bb-view-more')?.classList.toggle('active', mode === 'fan' || mode === 'map' || mode === 'table');
 
         const badge = document.getElementById('descendants-badge');
         const text = document.getElementById('descendants-badge-text');
@@ -562,6 +601,48 @@ export const miscMethods = uiModule({
         if (legend) {
             legend.style.display = (cardsShown && SettingsManager.isBranchColorsEnabled()
                 && SettingsManager.isBranchLegendEnabled()) ? 'flex' : 'none';
+        }
+        if (treeLegend) this.updateLegendMarks(treeLegend);
+    },
+
+    /**
+     * The legend's part on the card marks (spec 066 P4 §5): only the marks the
+     * cards drawn now show (each status mark, the story's two corners, what
+     * waits, ⇄), then "What the marks mean" (the help, in the app).
+     */
+    updateLegendMarks(treeLegend: HTMLElement): void {
+        let part = treeLegend.querySelector<HTMLElement>('#legend-marks');
+        const has = (sel: string): boolean => !!document.querySelector(`#tree-canvas .person-card ${sel}`);
+        const l = strings.card.legend;
+        const rows: [string, string][] = [];
+        for (const cls of CARD_STATUS_CLASSES) {
+            if (has(`> .card-status-mark.${cls}`)) {
+                rows.push([statusMarkHtml({ cls, source: 'evidence', facts: [] }, { className: 'card-status-mark--inline' }), cardStatusLegendLabel(cls)]);
+            }
+        }
+        if (has('> .card-story:not(.couple):not(.draft)')) rows.push([storyFoldHtml({ kind: 'own', final: true }, true), l.storyOwn]);
+        if (has('> .card-story:is(.couple, .draft)')) rows.push([storyFoldHtml({ kind: 'couple', final: true }, true), l.storyOther]);
+        if (has(':is(.card-signal, .card-signal-stack)')) rows.push(['<span class="menu-signal-glyph" aria-hidden="true">≠</span>', l.action]);
+        if (has('.cross-tree-badge')) rows.push(['<span class="legend-cross" aria-hidden="true">⇄ 1</span>', l.cross]);
+        treeLegend.classList.toggle('has-marks', rows.length > 0);
+        if (rows.length === 0) { part?.remove(); return; }
+        if (!part) {
+            part = document.createElement('div');
+            part.id = 'legend-marks';
+            part.className = 'legend-marks';
+            treeLegend.appendChild(part);
+        }
+        const esc = (t: string): string => this.escapeHtml(t);
+        const html = `<div class="legend-marks-title">${esc(l.marksTitle)}</div>`
+            + rows.map(([mark, text]) => `<div class="legend-mark-row"><span class="legend-mark">${mark}</span><span>${esc(text)}</span></div>`).join('')
+            + `<button type="button" class="link-button legend-marks-help">${esc(strings.reliability.help)}</button>`;
+        // Rendered again only when it says something else (a render redraws the legend often).
+        if (part.dataset.html !== html) {
+            part.dataset.html = html;
+            part.innerHTML = html;
+            part.querySelector('.legend-marks-help')?.addEventListener('click', (e) => {
+                void openHelp(HELP_TOPICS.reliability, e.currentTarget as HTMLElement);
+            });
         }
     },
 
@@ -659,6 +740,11 @@ export const miscMethods = uiModule({
         // Central dialog focus (open → into the dialog, Tab trapped, close →
         // back to the opener) and keyboard access for click-only controls.
         initDialogFocus();
+        // Closed dialogs and menus out of the accessibility tree (after the focus
+        // watcher: focus has returned before a closed dialog is hidden).
+        initClosedPopups();
+        // A bottom sheet hits nothing while it slides in.
+        initSheetSlide();
         initKeyboardAccess();
         // Every single user mutation raises the Undo toast (bulk import/merge
         // pass silent — they have their own UI). Registered once, at startup.
@@ -758,6 +844,11 @@ export const miscMethods = uiModule({
                 // The one-time "What's new" card (not a modal): Escape = "Not now".
                 if (this.isWhatsNewCardOpen()) {
                     this.dismissWhatsNewCard(false);
+                    return;
+                }
+                // The "What next" card after a GEDCOM import (not a modal): Escape = Close.
+                if (this.isImportNextOpen() && !this.topActiveOverlay()) {
+                    this.closeImportNextCard();
                     return;
                 }
                 // The interactive tour takes precedence (it is not a modal).
@@ -890,6 +981,8 @@ export const miscMethods = uiModule({
                         confirmModal.classList.remove('active');
                         return;
                     }
+                    // The image field's help closes first, the editor stays.
+                    if (this.closeSourceImageHelp()) return;
                     this.closeSourceEditor();
                     return;
                 }
@@ -978,6 +1071,10 @@ export const miscMethods = uiModule({
                         this.closePersonPage();
                         return;
                     }
+                    if (currentDialog === 'direction-form-modal') {
+                        this.closeDirectionForm();
+                        return;
+                    }
                     if (currentDialog === 'research-review-modal') {
                         this.closeResearchReviewDialog();
                         return;
@@ -1060,6 +1157,10 @@ export const miscMethods = uiModule({
                     }
                     if (currentDialog === 'history-align-modal') {
                         this.closeHistoryAlign();
+                        return;
+                    }
+                    if (currentDialog === 'source-split-modal') {
+                        this.closeSourceSplit();
                         return;
                     }
                     if (currentDialog === 'history-map-modal') {
@@ -1204,7 +1305,17 @@ export const miscMethods = uiModule({
             const activeModals = document.querySelectorAll('.modal-overlay.active');
             if (activeModals.length > 0) return;
 
-            // Alt+Left / Alt+Right: focus-history back / forward
+            // Alt+Left / Alt+Right: focus-history back / forward. Not in the
+            // Table view (T54 G14): it neither shows nor sets the diagram's
+            // focus, so its ↩ ↪ are hidden and these keys step nothing either;
+            // a text field keeps its own Alt+arrow, elsewhere the browser does
+            // not go back a page.
+            if (e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight') && TreeRenderer.getViewMode() === 'table') {
+                const el = document.activeElement as HTMLElement | null;
+                const typing = !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable);
+                if (!typing) e.preventDefault();
+                return;
+            }
             if (e.altKey && e.key === 'ArrowLeft') {
                 e.preventDefault();
                 TreeRenderer.goBack();
@@ -1529,7 +1640,7 @@ export const miscMethods = uiModule({
             }
         });
 
-        this.installFieldHints();
+        this.installFieldHelpMarks();
         const cur = getCurrentLanguage();
         const isSk = cur === 'cs';
         document.getElementById('lang-btn-sk')?.classList.toggle('active', isSk);
@@ -1537,53 +1648,27 @@ export const miscMethods = uiModule({
     },
 
     /**
-     * Move long field explanations off the form and behind a "?" on the label.
-     *
-     * These paragraphs run to three or four lines and sat open permanently, so
-     * on a phone a single explained field pushed the rest of the form off the
-     * screen — and the text is read once, when someone first meets the field.
-     * Pressing the "?" opens it as a popup the reader dismisses, rather than
-     * unfolding it in place: an explanation that grows the form as you read it
-     * moves the field you were about to fill in.
-     *
-     * Folded only when all three hold, so nothing useful is hidden:
-     * - the text is static (carries data-i18n) — a hint written by code, like
-     *   the birth-date estimate, is a live result and keeps showing itself;
-     * - it is long enough to be in the way (a line of date formats is quicker
-     *   to read than to open);
-     * - it has a label to hang the "?" on. A note explaining a whole section
-     *   has nowhere to attach and stays where it is.
+     * A field whose rule "How Strom works" explains carries the help mark "?"
+     * right after its label (061; the mark of 1105 §9): `label[data-help]`
+     * names its topic in HELP_TOPICS. The mark stands beside the label, never
+     * inside it (the label stays the field's name, its words free to change),
+     * in a row made once; again on a change of language it only takes the new
+     * name and title.
      */
-    installFieldHints(): void {
-        /** Below this a hint costs less to read than to open. */
-        const LONG_HINT = 80;
-
-        document.querySelectorAll('.field-hint[data-i18n]').forEach(hint => {
-            if (!(hint instanceof HTMLElement)) return;
-            const text = hint.textContent?.trim() ?? '';
-            if (text.length < LONG_HINT) return;
-
-            const group = hint.closest('.form-group');
-            const label = group?.querySelector('label');
-            if (!label || label.querySelector('.hint-toggle')) return;
-
-            hint.classList.add('is-folded');
-
-            const toggle = document.createElement('button');
-            toggle.type = 'button';
-            toggle.className = 'hint-toggle';
-            toggle.textContent = '?';
-            toggle.setAttribute('aria-label', strings.labels.showHint);
-            toggle.title = strings.labels.showHint;
-            toggle.onclick = () => {
-                // Read at click time: the language can change under us, and the
-                // hint element keeps being refreshed by initializeStrings.
-                const title = (label.cloneNode(true) as HTMLElement);
-                title.querySelector('.hint-toggle')?.remove();
-                void this.showAlert(hint.textContent?.trim() ?? '', 'info',
-                    title.textContent?.trim() || undefined);
-            };
-            label.appendChild(toggle);
+    installFieldHelpMarks(): void {
+        document.querySelectorAll<HTMLElement>('label[data-help]').forEach(label => {
+            const topic = label.dataset.help ?? '';
+            if (!Object.prototype.hasOwnProperty.call(HELP_TOPICS, topic)) return;
+            let row = label.parentElement;
+            if (!row?.classList.contains('field-label-row')) {
+                row = document.createElement('div');
+                row.className = 'field-label-row';
+                label.before(row);
+                row.append(label);
+            }
+            const mark = row.querySelector<HTMLButtonElement>(':scope > .help-mark');
+            if (mark) setHelpMarkTopic(mark, topic as HelpTopic);
+            else row.append(helpMark(topic as HelpTopic));
         });
     },
 
@@ -1632,7 +1717,7 @@ export const miscMethods = uiModule({
 
         const toast = document.createElement('div');
         toast.className = opts.title || opts.spinner ? 'toast toast--rich' : 'toast';
-        toast.setAttribute('role', 'status');
+        toast.setAttribute('role', opts.alert ? 'alert' : 'status');
         if (opts.kind) toast.dataset.kind = opts.kind;
         if (opts.notice) toast.dataset.notice = '';
         if (opts.spinner) {
@@ -1852,6 +1937,7 @@ export const miscMethods = uiModule({
         this.refreshUndoRedoToolbar();  // R3
         this.materialsTreeChanged();    // attachments brought back or gone again
         this.placesManagerTreeChanged();
+        this.sourceSplitTreeChanged();  // the Sources manager's lines, an open split dialog
         this.showToast(strings.undo.undone(result.description), 3000, { kind: 'undo-result' });
     },
 
@@ -1869,6 +1955,7 @@ export const miscMethods = uiModule({
         this.refreshUndoRedoToolbar();  // R3
         this.materialsTreeChanged();
         this.placesManagerTreeChanged();
+        this.sourceSplitTreeChanged();  // the Sources manager's lines, an open split dialog
         this.showToast(strings.undo.redone(result.description), 3000, { kind: 'undo-result' });
     },
 

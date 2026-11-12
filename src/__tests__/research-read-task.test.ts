@@ -1,0 +1,348 @@
+/**
+ * Who creates the task after a source is read again (spec 059, `read.sourceTask`): the research's fields are
+ * checked and cleaned, an older research (no feature, no fields) gives "nothing said", the app's choice goes
+ * through one call, `taskChoice` only with the feature. Invented data only (Vlk, Doubrava).
+ */
+
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import {
+    READ_SOURCE_TASK_FEATURE, readTaskChoiceFor, readTaskPath, sanitizeSourceTaskInfo, sanitizeVariantTask, sanitizeReadTaskReply,
+    sanitizeReadSourceProposal, sanitizeReadSourceState, sanitizeReadAgain, sanitizeTaskSetting, readTaskId, sanitizeWaitingProposals,
+    readJudgedId, readJudgedKept, readTaskRefusal, readProposalStale, READ_TASK_CODES,
+    READ_SOURCE_TASK_UNSURE_FEATURE, readUnsureOn, readAgainSaid, readTaskBody,
+} from '../research-read-task.js';
+import { sanitizeReadAccepts, sanitizeReadResult, startSourceRead, postReadTask, postReadProposal } from '../research-read.js';
+import { sanitizeLiveStatus } from '../research-link.js';
+
+const ID = 'D20261019153012-a1b2';
+const BASE = 'http://127.0.0.1:1/t';
+
+const result = (source: Record<string, unknown>) => ({
+    id: ID, state: 'done', lang: 'cs',
+    doc: { kind: 'register.baptism', language: ['la'], legible: 'yes', why: null },
+    readers: { asked: 2, ran: 2, agree: 'differ' },
+    pages: [],
+    entries: [{ id: 'e1', page: 1, transcript: 'Josephi Vlk in Doubrava N. 7', variants: [] }],
+    source,
+});
+
+describe('the research\'s fields', () => {
+    it('a source read again with the setting, the offer, the task for whom, a decision made before, the open task', () => {
+        const r = sanitizeReadResult(result({
+            id: 'S0042', agree: 'differ', task: 'T0417', taskSetting: 'ask', taskOffer: true, taskFor: 'person', decided: 'saved', openTask: 'T0399',
+            variants: [{ at: 'Dubrava', other: 'Doubrava', sure: true }, { at: 'N. 4', other: 'N. 7', sure: false }, { at: 'Wlk', other: 'Vlk', judged: 'T0399' }],
+        }))!;
+        expect(r.source).toMatchObject({ id: 'S0042', task: 'T0417', taskSetting: 'ask', taskOffer: true, taskFor: 'person', decided: 'saved', openTask: 'T0399' });
+        expect(r.source!.variants).toEqual([
+            { at: 'Dubrava', other: 'Doubrava', sure: true }, { at: 'N. 4', other: 'N. 7', sure: false }, { at: 'Wlk', other: 'Vlk', judged: 'T0399' },
+        ]);
+    });
+
+    it('without the fields (an older research): nothing added, the result as before', () => {
+        const r = sanitizeReadResult(result({ id: 'S0042', agree: 'differ', task: 'T0417', variants: [{ at: 'Dubrava', other: 'Doubrava' }] }))!;
+        expect(r.source).toEqual({ id: 'S0042', agree: 'differ', task: 'T0417', variants: [{ at: 'Dubrava', other: 'Doubrava' }] });
+        expect(sanitizeSourceTaskInfo({})).toBeNull();
+        expect(sanitizeVariantTask({ at: 'a', other: 'b' })).toEqual({});
+        expect(sanitizeReadAccepts({ ready: true })?.sourceTask).toBeUndefined();
+    });
+
+    it('cleans what is not the contract', () => {
+        expect(sanitizeSourceTaskInfo({ taskSetting: 'sometimes', taskOffer: true })).toBeNull();
+        expect(sanitizeSourceTaskInfo({ taskSetting: 'never', taskOffer: 'yes', taskFor: 'robot', decided: 'later', openTask: '../x' }))
+            .toEqual({ taskSetting: 'never', taskOffer: false });
+        expect(sanitizeVariantTask({ sure: 'no', judged: 'T04x' })).toEqual({});
+        expect(sanitizeTaskSetting('always')).toBe('always');
+        expect(readTaskId('T0417')).toBe('T0417');
+        expect(readTaskId('S0417')).toBe('');
+        expect(sanitizeReadAccepts({ ready: true, sourceTask: 'ask' })?.sourceTask).toBe('ask');
+        expect(sanitizeReadAccepts({ ready: true, sourceTask: 'often' })?.sourceTask).toBeUndefined();
+    });
+
+    it('judged: a task (T…) or a reading a person kept (D…); anything else none', () => {
+        const KEPT = 'D20261105101500-c3d4';
+        expect(sanitizeVariantTask({ judged: KEPT })).toEqual({ judged: KEPT });
+        expect(sanitizeVariantTask({ judged: 'T0399', sure: true })).toEqual({ judged: 'T0399', sure: true });
+        expect(readJudgedId('D2026-x')).toBe('');
+        expect(readJudgedKept(KEPT)).toBe(true);
+        expect(readJudgedKept('T0399')).toBe(false);
+        expect(readJudgedKept(undefined)).toBe(false);
+        const r = sanitizeReadResult(result({ id: 'S0042', agree: 'differ', variants: [{ at: 'Wlk', other: 'Vlk', judged: KEPT }] }))!;
+        expect(r.source!.variants).toEqual([{ at: 'Wlk', other: 'Vlk', judged: KEPT }]);
+    });
+
+    it('source.state: the source\'s state after this reading, in the shape of /status.readAgain', () => {
+        const r = sanitizeReadResult(result({ id: 'S0042', agree: 'differ', task: 'T0417', taskSetting: 'ask', taskOffer: true,
+            state: { read: ID, state: 'task', task: 'T0417', taskFor: 'agent', taskOpen: true, taskQueued: true }, variants: [] }))!;
+        expect(r.source!.state).toEqual({ read: ID, state: 'task', task: 'T0417', taskFor: 'agent', taskOpen: true, taskQueued: true });
+        // Without its `read`, or a bare word: of this reading.
+        expect(sanitizeReadResult(result({ id: 'S0042', agree: 'differ', taskSetting: 'ask', state: { state: 'unchecked' }, variants: [] }))!.source!.state)
+            .toEqual({ read: ID, state: 'unchecked' });
+        expect(sanitizeReadResult(result({ id: 'S0042', agree: 'differ', taskSetting: 'ask', state: 'saved', variants: [] }))!.source!.state)
+            .toEqual({ read: ID, state: 'saved' });
+        expect(sanitizeReadResult(result({ id: 'S0042', agree: 'differ', taskSetting: 'ask', state: 'later', variants: [] }))!.source).not.toHaveProperty('state');
+    });
+
+    it('the answer to a choice: the task, a chat asked for, the places added to the open task', () => {
+        expect(sanitizeReadTaskReply({ task: 'T0418', chat: 'C12', appended: true })).toEqual({ task: 'T0418', chat: 'C12', appended: true });
+        expect(sanitizeReadTaskReply(null)).toEqual({ task: '', chat: '', appended: false });
+        expect(sanitizeReadTaskReply({ task: 'rm -rf', appended: 'yes' })).toEqual({ task: '', chat: '', appended: false });
+    });
+});
+
+describe('/status.readAgain and the agent\'s proposal (for the source\'s row)', () => {
+    const proposal = { text: 'Josephi Vlk\nin Doubrava N. 7', by: { program: 'agent', model: 'm-1' }, task: 'T0417', at: '2026-11-06T10:00:00Z',
+        places: [{ at: 'in Doubrava', old: 'Dubrava', new: 'Doubrava', kind: 'spelling' }, { old: '', new: '' }] };
+
+    it('each source\'s state with its task and flags; a proposal with its places', () => {
+        const m = sanitizeReadAgain({
+            S0042: { read: ID, state: 'task', task: 'T0417', taskFor: 'agent', taskOpen: true, taskQueued: false, proposal },
+            S0043: { read: ID, state: 'saved', minorOnly: true, unsureOnly: 'yes' },
+            S0044: { read: 'nope', state: 'task' },
+            '../x': { read: ID, state: 'saved' },
+        });
+        expect([...m.keys()]).toEqual(['S0042', 'S0043']);
+        expect(m.get('S0042')).toEqual({
+            read: ID, state: 'task', task: 'T0417', taskFor: 'agent', taskOpen: true,
+            proposal: { text: 'Josephi Vlk\nin Doubrava N. 7', by: 'agent · m-1', task: 'T0417', at: '2026-11-06T10:00:00Z',
+                places: [{ at: 'in Doubrava', old: 'Dubrava', new: 'Doubrava', kind: 'spelling' }] },
+        });
+        expect(m.get('S0043')).toEqual({ read: ID, state: 'saved', minorOnly: true });
+        expect(sanitizeReadAgain(undefined).size).toBe(0);
+        expect(sanitizeReadSourceState({ read: ID, state: 'done' })).toBeNull();
+    });
+
+    it('a proposal without its text or task is none; no places said: the app counts them itself', () => {
+        expect(sanitizeReadSourceProposal({ ...proposal, text: '' })).toBeNull();
+        expect(sanitizeReadSourceProposal({ ...proposal, task: 'x' })).toBeNull();
+        const { places: _p, ...noPlaces } = proposal;
+        expect(sanitizeReadSourceProposal(noPlaces)).not.toHaveProperty('places');
+        // The research's own shape: `by` a string, no places.
+        expect(sanitizeReadSourceProposal({ text: 'x', by: 'agent · opus · high + agent · m-2', task: 'T0417', at: '2026-11-06T10:00:00Z' }))
+            .toEqual({ text: 'x', by: 'agent · opus · high + agent · m-2', task: 'T0417', at: '2026-11-06T10:00:00Z' });
+    });
+});
+
+describe('the agent\'s proposal from its own work (`/status.waiting`, kind transcript)', () => {
+    // The research's own item (`waiting.ts`: a task with a proposal), a confirmed source with no differing newer reading.
+    const item = (over: Record<string, unknown> = {}, p: Record<string, unknown> = {}) => ({
+        id: 'T0003', what: 'Transcript of S0001: a new wording', on: '', at: '2026-11-07T17:40:00Z', kind: 'transcript',
+        section: 'decide', group: { key: 'transcripts', name: 'Transcripts', kind: 'other' }, phase: 'todo', priority: 3,
+        choices: ['proposal', 'keep'], actions: [],
+        proposal: { source: 'S0001', text: 'Josephi Vlk in Doubrava N. 7', mark: 'a1b2c3', by: 'agent', at: '2026-11-07T17:40:00Z',
+            why: 'the register says Doubrava', current: 'Josephi Vlk in Dubrava N. 7', txt: 'f0e1d2', choices: ['proposal', 'keep'], ...p },
+        ...over,
+    });
+
+    it('the proposal by its source, the task being the item\'s id', () => {
+        const m = sanitizeWaitingProposals([
+            item(),
+            item({ id: 'T0004' }, { source: 'S0002', text: 'Catharinae Hora' }),
+            item({ id: 'T0005', kind: 'check' }, { source: 'S0003' }),
+            item({ id: 'nope' }, { source: 'S0004' }),
+            item({ id: 'T0006' }, { source: '../S1' }),
+            item({ id: 'T0007' }, { text: '' }),
+            { id: 'T0008', what: 'x', kind: 'transcript' },
+        ]);
+        expect([...m.keys()]).toEqual(['S0001', 'S0002']);
+        expect(m.get('S0001')).toEqual({ text: 'Josephi Vlk in Doubrava N. 7', by: 'agent', task: 'T0003', at: '2026-11-07T17:40:00Z' });
+        expect(m.get('S0002')!.task).toBe('T0004');
+        expect(sanitizeWaitingProposals(undefined).size).toBe(0);
+        expect(sanitizeWaitingProposals({ S0001: item() }).size).toBe(0);
+    });
+
+    it('in the bridge\'s status only with read.sourceTask, also without readAgain and without waiting.groups', () => {
+        const status = (features: string[]) => sanitizeLiveStatus({ tree: { id: 'R1', name: 'Vlk' }, head: 'h', features, waiting: [item()] });
+        expect(status(['read.sourceTask'])!.sourceProposals).toEqual({ S0001: { text: 'Josephi Vlk in Doubrava N. 7', by: 'agent', task: 'T0003', at: '2026-11-07T17:40:00Z' } });
+        expect(status(['read.sourceTask'])!.readAgain).toBeUndefined();
+        expect(status(['waiting.groups'])!).not.toHaveProperty('sourceProposals');
+        expect(sanitizeLiveStatus({ tree: { id: 'R1', name: 'Vlk' }, head: 'h', features: ['read.sourceTask'], waiting: [] })!).not.toHaveProperty('sourceProposals');
+    });
+});
+
+describe('the bridge calls', () => {
+    afterEach(() => { vi.unstubAllGlobals(); });
+
+    function stubFetch(status: number, body: unknown): ReturnType<typeof vi.fn> {
+        const f = vi.fn(async () => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }));
+        vi.stubGlobal('fetch', f);
+        return f;
+    }
+    const sent = (f: ReturnType<typeof vi.fn>): { url: string; body: Record<string, unknown> } => {
+        const [url, init] = f.mock.calls[0] as [string, RequestInit];
+        return { url: url.replace(/[?&]v=[^&]*/, ''), body: JSON.parse(String(init.body)) };
+    };
+
+    it('taskChoice only with the feature: an older research gets the request as before', async () => {
+        expect(readTaskChoiceFor(null)).toEqual({});
+        expect(readTaskChoiceFor(['read', 'read.source'])).toEqual({});
+        expect(readTaskChoiceFor(['read', 'read.source', READ_SOURCE_TASK_FEATURE])).toEqual({ taskChoice: true });
+        for (const features of [['read.source'], ['read.source', READ_SOURCE_TASK_FEATURE]]) {
+            const f = stubFetch(202, { read: ID, state: 'queued' });
+            await startSourceRead(BASE, { source: 'S0042', readers: 2, ...readTaskChoiceFor(features) });
+            const { body } = sent(f);
+            if (features.includes(READ_SOURCE_TASK_FEATURE)) expect(body.taskChoice).toBe(true);
+            else expect(body).not.toHaveProperty('taskChoice');
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('the choice: one call `sources/<S>/read/<D>/task {how}`', async () => {
+        expect(readTaskPath('S0042', ID)).toBe(`/sources/S0042/read/${ID}/task`);
+        const f = stubFetch(200, { task: 'T0418', chat: '', appended: false });
+        const r = await postReadTask(BASE, 'S0042', ID, 'queue');
+        expect(r).toEqual({ ok: true, value: { task: 'T0418', chat: '', appended: false } });
+        const { url, body } = sent(f);
+        expect(url).toContain(`${BASE}/sources/S0042/read/${ID}/task`);
+        expect(body).toEqual({ how: 'queue' });
+    });
+
+    it('a refused or bad choice is a failure; a bad id is not sent', async () => {
+        stubFetch(500, { code: 'oops' });
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        expect((await postReadTask(BASE, 'S0042', ID, 'now')).ok).toBe(false);
+        const f = stubFetch(200, {});
+        expect((await postReadTask(BASE, '../S', ID, 'now')).ok).toBe(false);
+        expect(f).not.toHaveBeenCalled();
+    });
+
+    it('the proposal\'s answer goes to its own path, with the task also for undo', async () => {
+        let f = stubFetch(200, { ok: true });
+        await postReadProposal(BASE, 'S0042', 'T0417', 'keep');
+        expect(sent(f).url).toContain(`${BASE}/sources/proposal`);
+        expect(sent(f).body).toEqual({ source: 'S0042', task: 'T0417', take: 'keep' });
+        vi.unstubAllGlobals();
+        f = stubFetch(200, { ok: true });
+        await postReadProposal(BASE, 'S0042', 'T0417', 'undo');
+        expect(sent(f).body).toEqual({ source: 'S0042', task: 'T0417', take: 'undo' });
+    });
+
+    it('409 read.decide.task: the task that holds the places, an answer (the task beside the code or in params)', async () => {
+        stubFetch(409, { code: 'read.decide.task', task: 'T0410', error: 'A task holds it.' });
+        expect(await postReadTask(BASE, 'S0042', ID, 'queue')).toEqual({ ok: true, value: { task: 'T0410', chat: '', appended: false, outcome: 'held' } });
+        vi.unstubAllGlobals();
+        stubFetch(409, { code: 'read.decide.task', params: { task: 'T0411' } });
+        expect(await postReadTask(BASE, 'S0042', ID, 'save')).toMatchObject({ ok: true, value: { task: 'T0411', outcome: 'held' } });
+        vi.unstubAllGlobals();
+        // Without a task to open: a failure as before.
+        stubFetch(409, { code: 'read.decide.task' });
+        expect((await postReadTask(BASE, 'S0042', ID, 'save')).ok).toBe(false);
+    });
+
+    it('409 read.decide.done / nothing: nothing left to decide, an answer; busy and the other refusals: failures', async () => {
+        for (const code of [READ_TASK_CODES.done, READ_TASK_CODES.nothing]) {
+            stubFetch(409, { code });
+            expect(await postReadTask(BASE, 'S0042', ID, 'now')).toEqual({ ok: true, value: { task: '', chat: '', appended: false, outcome: 'settled' } });
+            vi.unstubAllGlobals();
+        }
+        for (const [status, code] of [[503, 'research.busy'], [409, 'read.decide.confirmed'], [409, 'read.decide.declined'], [404, 'read.decide.none'], [400, 'read.decide.invalid']] as const) {
+            stubFetch(status, { code });
+            const r = await postReadTask(BASE, 'S0042', ID, 'now');
+            expect(r.ok).toBe(false);
+            vi.unstubAllGlobals();
+        }
+        expect(readTaskRefusal(400, { code: 'read.decide.done' })).toBeNull();
+    });
+
+    it('the proposal moved on meanwhile (decided, changed, nothing to undo): stale, not a failure', async () => {
+        for (const code of [READ_TASK_CODES.proposalDecided, READ_TASK_CODES.proposalChanged, READ_TASK_CODES.proposalUndo]) {
+            expect(readProposalStale(409, code)).toBe(true);
+            stubFetch(409, { code });
+            const r = await postReadProposal(BASE, 'S0042', 'T0417', 'proposal');
+            expect(r.ok === false && readProposalStale(r.failure.status, r.failure.code)).toBe(true);
+            vi.unstubAllGlobals();
+        }
+        expect(readProposalStale(409, 'proposal.archive')).toBe(false);
+        expect(readProposalStale(503, 'research.busy')).toBe(false);
+        expect(readProposalStale(400, 'proposal.decided')).toBe(false);
+    });
+});
+
+describe('uncertain places handed over on the person\'s word (spec 059 P8, read.sourceTask.unsure)', () => {
+    afterEach(() => { vi.unstubAllGlobals(); });
+
+    function stubFetch(status: number, body: unknown): ReturnType<typeof vi.fn> {
+        const f = vi.fn(async () => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }));
+        vi.stubGlobal('fetch', f);
+        return f;
+    }
+    const bodyOf = (f: ReturnType<typeof vi.fn>): Record<string, unknown> => JSON.parse(String((f.mock.calls[0] as [string, RequestInit])[1].body));
+
+    it('the feature: both read.sourceTask and read.sourceTask.unsure', () => {
+        expect(READ_SOURCE_TASK_UNSURE_FEATURE).toBe('read.sourceTask.unsure');
+        expect(readUnsureOn(null)).toBe(false);
+        expect(readUnsureOn([READ_SOURCE_TASK_FEATURE])).toBe(false);
+        expect(readUnsureOn([READ_SOURCE_TASK_UNSURE_FEATURE])).toBe(false);
+        expect(readUnsureOn([READ_SOURCE_TASK_FEATURE, READ_SOURCE_TASK_UNSURE_FEATURE])).toBe(true);
+    });
+
+    it('source.unsureOffer (and the open task) in a result: only true counts', () => {
+        const src = { id: 'S0042', agree: 'differ', task: '', taskSetting: 'ask', taskOffer: false, variants: [{ at: 'N. 4', other: 'N. 7', sure: false }] };
+        expect(sanitizeReadResult(result({ ...src, unsureOffer: true, openTask: 'T0399' }))!.source).toMatchObject({ unsureOffer: true, openTask: 'T0399' });
+        for (const v of ['true', 1, false, null, {}]) {
+            expect(sanitizeReadResult(result({ ...src, unsureOffer: v }))!.source).not.toHaveProperty('unsureOffer');
+        }
+        expect(sanitizeReadResult(result(src))!.source).not.toHaveProperty('unsureOffer');
+    });
+
+    it('/status.readAgain[S].unsureOffer: kept only with the feature, only true', () => {
+        const readAgain = {
+            S0042: { read: ID, state: 'saved', unsureOnly: true, unsureOffer: true },
+            S0043: { read: ID, state: 'task', task: 'T0417', taskFor: 'agent', taskOpen: false, unsureOffer: true },
+            S0044: { read: ID, state: 'saved', unsureOnly: true, unsureOffer: 'yes' },
+        };
+        const on = readAgainSaid(readAgain, [READ_SOURCE_TASK_FEATURE, READ_SOURCE_TASK_UNSURE_FEATURE])!;
+        expect(on.S0042).toEqual({ read: ID, state: 'saved', unsureOnly: true, unsureOffer: true });
+        expect(on.S0043.unsureOffer).toBe(true);
+        expect(on.S0044).not.toHaveProperty('unsureOffer');
+        const off = readAgainSaid(readAgain, [READ_SOURCE_TASK_FEATURE])!;
+        expect(off.S0042).toEqual({ read: ID, state: 'saved', unsureOnly: true });
+        expect(off.S0043).not.toHaveProperty('unsureOffer');
+        expect(readAgainSaid(readAgain, [READ_SOURCE_TASK_UNSURE_FEATURE])).toBeUndefined();
+        // Through the bridge's status as well.
+        const status = (features: string[]) => sanitizeLiveStatus({ tree: { id: 'R1', name: 'Vlk' }, head: 'h', features, readAgain })!;
+        expect(status([READ_SOURCE_TASK_FEATURE, READ_SOURCE_TASK_UNSURE_FEATURE]).readAgain!.S0042.unsureOffer).toBe(true);
+        expect(status([READ_SOURCE_TASK_FEATURE]).readAgain!.S0042).not.toHaveProperty('unsureOffer');
+    });
+
+    it('the body: {how: queue|review, unsure: true}; never with now or save; without unsure as before', async () => {
+        expect(readTaskBody('queue', true)).toEqual({ how: 'queue', unsure: true });
+        expect(readTaskBody('review', true)).toEqual({ how: 'review', unsure: true });
+        expect(readTaskBody('now', true)).toEqual({ how: 'now' });
+        expect(readTaskBody('save', true)).toEqual({ how: 'save' });
+        expect(readTaskBody('queue')).toEqual({ how: 'queue' });
+        let f = stubFetch(200, { ok: true, source: 'S0042', reading: ID, how: 'queue', unsure: true, task: 'T0420', taskFor: 'agent', head: 'h', parent: 'p' });
+        expect(await postReadTask(BASE, 'S0042', ID, 'queue', true)).toEqual({ ok: true, value: { task: 'T0420', chat: '', appended: false } });
+        expect(bodyOf(f)).toEqual({ how: 'queue', unsure: true });
+        vi.unstubAllGlobals();
+        f = stubFetch(200, { ok: true, how: 'queue', unsure: true, task: 'T0399', taskFor: 'agent', appended: true });
+        expect(await postReadTask(BASE, 'S0042', ID, 'queue', true)).toEqual({ ok: true, value: { task: 'T0399', chat: '', appended: true } });
+        vi.unstubAllGlobals();
+        f = stubFetch(200, { ok: true, how: 'review', unsure: true, task: 'T0421', taskFor: 'person' });
+        await postReadTask(BASE, 'S0042', ID, 'review', true);
+        expect(bodyOf(f)).toEqual({ how: 'review', unsure: true });
+    });
+
+    it('the refusals: sure, noproposal and declined are answers of the uncertain places; the rest failures', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        for (const [code, outcome] of [['read.decide.sure', 'sure'], ['read.decide.noproposal', 'noproposal'], ['read.decide.declined', 'declined'], ['read.decide.nothing', 'settled']] as const) {
+            stubFetch(409, { code });
+            expect(await postReadTask(BASE, 'S0042', ID, 'review', true)).toEqual({ ok: true, value: { task: '', chat: '', appended: false, outcome } });
+            vi.unstubAllGlobals();
+        }
+        // Without unsure the new codes stay what they were: failures.
+        for (const code of ['read.decide.sure', 'read.decide.noproposal', 'read.decide.declined']) {
+            stubFetch(409, { code });
+            expect((await postReadTask(BASE, 'S0042', ID, 'review')).ok).toBe(false);
+            vi.unstubAllGlobals();
+        }
+        for (const [status, code] of [[400, 'read.decide.invalid'], [404, 'read.decide.noreading'], [409, 'read.decide.confirmed'], [409, 'read.decide.unconfirmed'], [503, 'research.busy']] as const) {
+            stubFetch(status, { code });
+            expect((await postReadTask(BASE, 'S0042', ID, 'queue', true)).ok).toBe(false);
+            vi.unstubAllGlobals();
+        }
+        stubFetch(409, { code: 'read.decide.task', task: 'T0410' });
+        expect(await postReadTask(BASE, 'S0042', ID, 'queue', true)).toMatchObject({ ok: true, value: { task: 'T0410', outcome: 'held' } });
+        expect(readTaskRefusal(409, { code: 'read.decide.sure' })).toBeNull();
+        expect(readTaskRefusal(409, { code: 'read.decide.sure' }, true)).toMatchObject({ outcome: 'sure' });
+    });
+});

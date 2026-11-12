@@ -22,20 +22,22 @@ import {
     STROM_DATA_VERSION
 } from './types.js';
 import { strings } from './strings.js';
-import { isEncrypted, EncryptedData, CryptoSession, decrypt } from './crypto.js';
+import { isEncrypted, EncryptedData, CryptoSession, decrypt, classifyCryptoError, CryptoFailure } from './crypto.js';
 import { SettingsManager } from './settings.js';
 import { peekReloadPoint, forgetLastView } from './resume-view.js';
 import { AuditLogManager } from './audit-log.js';
 import { StorageManager } from './storage.js';
 import { createSnapshot, SnapshotResearchBase } from './snapshots.js';
-import { researchAutoState, patchResearchAutoState } from './research-device.js';
+import { researchAutoState, patchResearchAutoState, type ResearchAutoState } from './research-device.js';
 import { researchBaseKey, isHistoryKey } from './storage-keys.js';
 import { deleteHistoryStore } from './history-store.js';
 import { deleteQualityBridgeRecord } from './quality-bridge.js';
 import { deleteSurnamesBridgeRecord } from './surname-suggest-bridge.js';
 import { VIEW_LINK_KEY_PREFIXES, forgetViewLinks } from './view-links.js';
 import { unknownSexFromTie, fingerprintLike, normalizeResearchId } from './research-link.js';
-import { unknownSexInResearchCopies } from './research-copy.js';
+import { unknownSexInResearchCopies, loadResearchCopy, rebaseResearchCopies } from './research-copy.js';
+import { joinQualityOnlySources, qualityOnlySources } from './citation-quality.js';
+import { fillResearchConfirmedValues, hasUnvaluedResearchConfirmations } from './verify.js';
 import { requestPersistentStorage } from './persistence.js';
 import { newTieSendMode } from './research-sync.js';
 import { asciiSlug } from './filenames.js';
@@ -610,6 +612,10 @@ class TreeManagerClass {
                 changed = true;
             }
             if (tree?.research && 'sexU' in tree.research && !this.isTreeNewer(id)) result.data = await this.dropLegacySexU(id, tree, result.data);
+            if (!this.isTreeNewer(id) && hasUnvaluedResearchConfirmations(result.data)) await this.valueResearchConfirmations(id, result.data);
+            if (!this.isTreeNewer(id) && version < 19 && qualityOnlySources(result.data.sources).size > 0) {
+                result.data = await this.joinQualityOnlySourcesOf(id, tree, result.data);
+            }
             const count = realPersonCount(result.data);
             if (tree && tree.personCount !== count) {
                 tree.personCount = count;
@@ -651,6 +657,74 @@ class TreeManagerClass {
         // Before the tree is shown: its changes per person are read against the copy.
         await unknownSexInResearchCopies(id, sexU);
         return next ?? data;
+    }
+
+    /**
+     * Data version 19 (spec 077 K1.5): the sources an import of 3.26 made
+     * only for a citation of the same page with another QUAY join their entry
+     * again, the QUAY going to the citation (joinQualityOnlySources). A backup
+     * of the tree as it was is taken first; the tree is saved so. A tree in
+     * step with the research before stays in step (its fingerprint follows),
+     * and the kept copies of the research's version change the same way.
+     */
+    private async joinQualityOnlySourcesOf(id: TreeId, tree: TreeMetadata | undefined, data: StromData): Promise<StromData> {
+        try {
+            await createSnapshot(id, data, 'pre-migration', Date.now(), this.backupResearchBase(id, this.researchBaseOf(id)));
+        } catch (err) {
+            console.warn('The backup before the data update could not be written', err);
+        }
+        const next = structuredClone(data);
+        joinQualityOnlySources(next);
+        const link = tree?.research;
+        if (tree && link) await rebaseResearchCopies(id, this.followJoinedFingerprints(id, tree, link, data, next));
+        this.saveTreeData(id, next);
+        return next;
+    }
+
+    /**
+     * The fingerprints a tree in step with its research stands on follow its
+     * data from `before` to `after` (data version 19): the base's (in step with
+     * the version loaded) and a written send's (in step with what it wrote),
+     * with what the research's state of that send keeps of it. Returned:
+     * each fingerprint that followed, before → after, for the kept copies.
+     * A fingerprint the data no longer had (edited since) stays.
+     */
+    private followJoinedFingerprints(id: TreeId, tree: TreeMetadata, link: ResearchLink, before: StromData, after: StromData): Map<string, string> {
+        const moved = new Map<string, string>();
+        const follow = (fp: string | undefined): void => {
+            if (fp && !moved.has(fp) && fingerprintLike(before, fp) === fp) moved.set(fp, fingerprintLike(after, fp));
+        };
+        follow(link.fingerprint);
+        const sent = link.sent;
+        if (sent?.state === 'written') follow(sent.fingerprint);
+        if (moved.size === 0) return moved;
+        const next: ResearchLink = { ...link };
+        if (link.fingerprint && moved.has(link.fingerprint)) next.fingerprint = moved.get(link.fingerprint)!;
+        if (sent?.state === 'written' && moved.has(sent.fingerprint)) next.sent = { ...sent, fingerprint: moved.get(sent.fingerprint)! };
+        tree.research = next;
+        this.saveIndex();
+        const st = researchAutoState(id);
+        const patch: Partial<ResearchAutoState> = {};
+        if (st.lastWritten?.fingerprint && moved.has(st.lastWritten.fingerprint)) patch.lastWritten = { ...st.lastWritten, fingerprint: moved.get(st.lastWritten.fingerprint)! };
+        if (st.notWritten && moved.has(st.notWritten.fingerprint)) patch.notWritten = { ...st.notWritten, fingerprint: moved.get(st.notWritten.fingerprint)! };
+        if (Object.keys(patch).length > 0) patchResearchAutoState(id, patch);
+        return moved;
+    }
+
+    /**
+     * The research's confirmations of a tree stored before each kept the
+     * value it holds for (ResearchFactVerify.value): the value the fact has
+     * in the kept copy of the research's version of the tree, else (no copy)
+     * its current value — so a fact changed here since is no longer
+     * confirmed, as with a tree loaded now. Once: the tree is saved so —
+     * unless a newer state of it was handed to the queue while the copy was
+     * read (that one is written; this read's values are filled again next
+     * time).
+     */
+    private async valueResearchConfirmations(id: TreeId, data: StromData): Promise<void> {
+        const writes = this.queuedWrites.get(id) ?? 0;
+        const base = await loadResearchCopy(id);
+        if (fillResearchConfirmedValues(data, base) && (this.queuedWrites.get(id) ?? 0) === writes) this.saveTreeData(id, data);
     }
 
     /**
@@ -744,10 +818,12 @@ class TreeManagerClass {
      * normally again.
      * - 'ok': readable now (re-encrypted, or it already was readable);
      * - 'wrong-password': the password does not open this tree, nothing changed;
+     * - 'unavailable' / 'error': no Web Crypto here (insecure address) or
+     *   another failure (corrupt record) — not a password issue;
      * - 'locked': the session itself is locked — unlock it first;
      * - 'missing': no such record.
      */
-    async recoverTreeWithPassword(id: TreeId, password: string): Promise<'ok' | 'wrong-password' | 'locked' | 'missing'> {
+    async recoverTreeWithPassword(id: TreeId, password: string): Promise<'ok' | CryptoFailure | 'locked' | 'missing'> {
         const current = await this.readTreeData(id);
         if (current.status === 'ok') return 'ok';
         if (current.status === 'missing') return 'missing';
@@ -761,8 +837,9 @@ class TreeManagerClass {
                 const text = await decrypt(raw.encrypted, password);
                 const out = await unpoolJson(text, enc => decrypt(enc, password));
                 pooled = JSON.parse(out.json) as StromData;
-            } catch {
-                return 'wrong-password';
+            } catch (err) {
+                // Only an AES-GCM refusal is a wrong password (GitHub #13).
+                return classifyCryptoError(err);
             }
             // Re-saved under the session key: images get ids and encryption
             // of that key, the old ones go with the next pool cleanup.
@@ -777,8 +854,8 @@ class TreeManagerClass {
         try {
             plainText = await decrypt(raw, password);
             data = JSON.parse(plainText) as StromData;
-        } catch {
-            return 'wrong-password';
+        } catch (err) {
+            return classifyCryptoError(err);
         }
         const reencrypted = await CryptoSession.encrypt(plainText);
         await StorageManager.set('trees', id, reencrypted);
@@ -848,6 +925,11 @@ class TreeManagerClass {
 
     /** The newest state handed to the queue per tree until its write lands (see rescueUnsettledSaves). */
     private unsettledSaves = new Map<TreeId, { data: StromData; base: ResearchBase | null }>();
+    /** The research base this window last read or wrote with each tree (researchBaseKnownMatches). */
+    private storedBases = new Map<TreeId, ResearchBase & { researchId: string }>();
+
+    /** How many states were handed to the queue per tree (a read can tell a write made meanwhile). */
+    private queuedWrites = new Map<TreeId, number>();
 
     /** Rescue keys of closed windows this one stored at start, per tree, until that write lands. */
     private restoredRescues = new Map<TreeId, string>();
@@ -1006,6 +1088,7 @@ class TreeManagerClass {
 
     /** Put a state on the tree's write queue (see saveTreeData). */
     private queueWrite(id: TreeId, entry: { data: StromData; base: ResearchBase | null }): void {
+        this.queuedWrites.set(id, (this.queuedWrites.get(id) ?? 0) + 1);
         // Not stored until its write lands: a page left before that keeps it in a rescue copy (rescueUnsettledSaves).
         this.unsettledSaves.set(id, entry);
         // A write for this tree still waiting in the queue takes this newer
@@ -1101,6 +1184,7 @@ class TreeManagerClass {
             await StorageManager.set('trees', id, record);
             await StorageManager.set('trees', researchBaseKey(id), stored);
         }
+        this.storedBases.set(id, { researchId: link.id, head: base.head, fingerprint: base.fingerprint });
     }
 
     // ==================== RESEARCH BASE ====================
@@ -1164,6 +1248,10 @@ class TreeManagerClass {
     }
 
     private async reconcileResearchBase(id: TreeId): Promise<void> {
+        // This window's own writes land first: a migration on reading (data
+        // version 19) stores the tree with the base its fingerprint followed
+        // to, and the base stored before it must not take that back.
+        await this.flush(id);
         const link = this.index.trees.find(t => t.id === id)?.research;
         if (!link) return;
         let stored: StoredResearchBase | null = null;
@@ -1172,9 +1260,27 @@ class TreeManagerClass {
         } catch { return; }
         if (!stored || stored.researchId !== link.id) return;
         const base = { head: stored.head ?? '', fingerprint: stored.fingerprint ?? '' };
+        this.storedBases.set(id, { researchId: stored.researchId, ...base });
         if (sameBase(this.researchBaseOf(id), base)) return;
         console.warn('The research base stored with the tree differs from its link: taking the stored one', id);
         this.patchResearchLink(id, { head: base.head || undefined, fingerprint: base.fingerprint });
+    }
+
+    /**
+     * At once, without reading (leaving the page, audit 017 a-D1): the base
+     * this window last knew stored with the tree — the one its queued write
+     * stores, else the one read or written last — is the link's. False: the
+     * two drifted apart (a stored base taken over the window's while its own
+     * write was still on its way), and what this window holds must not go
+     * to the research. True when nothing is known.
+     */
+    researchBaseKnownMatches(id: TreeId): boolean {
+        const link = this.index.trees.find(t => t.id === id)?.research;
+        if (!link) return true;
+        const queued = this.unsettledSaves.get(id)?.base;
+        const known = queued ? { researchId: link.id, ...queued } : this.storedBases.get(id);
+        if (!known || known.researchId !== link.id) return true;
+        return sameBase(this.researchBaseOf(id), known);
     }
 
     /**

@@ -13,6 +13,8 @@ import type { PlaceGeo, StromData, PersonId } from './types.js';
 import { forEachPlaceFact, placeKey } from './places.js';
 import { sameCoords } from './place-records.js';
 import { yearOf } from './dates.js';
+import { fitBounds } from './map.js';
+import { compareAppVersions, isAppVersion } from './app-version.js';
 
 export { PLACES_GROUP } from './research-waiting.js';
 
@@ -33,11 +35,25 @@ export interface PlaceChoiceButton {
 }
 
 /**
- * The footer of a question: propose — None of them · Don't know (· Chat);
- * conflict — Move to the suggestion (when there is one) · Keep · Don't know;
- * form — Yes · No · Don't know. `chat`: a chat link goes for it.
+ * The research version from which Don't know answers a conflict and a form
+ * too (an older one refuses it there; None of them only ever answers a proposal).
  */
-export function placeQuestionChoices(w: PlaceQuestion, opts: { chat?: boolean } = {}): PlaceChoiceButton[] {
+export const PLACES_UNKNOWN_ALL_SINCE = '1.26.0-beta.7';
+
+/** Whether the research of this version takes Don't know for a conflict and a form ('' / unknown = no). */
+export function placesUnknownEverywhere(version: string | undefined): boolean {
+    return !!version && isAppVersion(version) && compareAppVersions(version, PLACES_UNKNOWN_ALL_SINCE) >= 0;
+}
+
+/**
+ * The footer of a question: propose — None of them · Don't know (· Chat);
+ * conflict — Move to the suggestion (when there is one) · Keep (· Don't know);
+ * form — Yes · No (· Don't know). `chat`: a chat link goes for it;
+ * `unknownAll`: the research takes Don't know for a conflict and a form
+ * ({@link placesUnknownEverywhere}).
+ */
+export function placeQuestionChoices(w: PlaceQuestion, opts: { chat?: boolean; unknownAll?: boolean } = {}): PlaceChoiceButton[] {
+    const unknown: PlaceChoiceButton[] = opts.unknownAll ? [{ choice: 'unknown', take: 'unknown' }] : [];
     switch (w.question) {
         case 'propose':
             return [
@@ -49,13 +65,13 @@ export function placeQuestionChoices(w: PlaceQuestion, opts: { chat?: boolean } 
             return [
                 ...(w.candidates?.length ? [{ choice: 'fix' as const, take: w.candidates[0].id }] : []),
                 { choice: 'keep', take: 'keep' },
-                { choice: 'unknown', take: 'unknown' },
+                ...unknown,
             ];
         case 'form':
             return [
                 { choice: 'yes', take: 'yes' },
                 { choice: 'no', take: 'no' },
-                { choice: 'unknown', take: 'unknown' },
+                ...unknown,
             ];
     }
 }
@@ -177,4 +193,62 @@ export function placeAreas(acceptable: readonly PlaceQuestion[]): PlaceArea[] {
     }
     const list = [...areas.values()].sort((a, b) => b.places.length - a.places.length || a.name.localeCompare(b.name));
     return list.length >= 2 ? list : [];
+}
+
+/** A question's small map never comes closer than this (about 15 km across): near points stay apart, the area is seen. */
+export const WAITING_MAP_POINTS_ZOOM = 11;
+/** The family's places alone (no point of the question): as close as the map goes. */
+export const WAITING_MAP_TREE_ZOOM = 13;
+
+/**
+ * The points a question's small map is about: a conflict's location now and
+ * its suggestion, a "where is"'s candidates (and a location now, if sent).
+ */
+export function waitingMapPoints(w: PlaceQuestion): { lat: number; lon: number }[] {
+    const cands = w.question === 'conflict' ? (w.candidates ?? []).slice(0, 1) : pickableCandidates(w);
+    return [...cands, ...(w.current ? [w.current] : [])];
+}
+
+/**
+ * The view of a question's small map: fitted to the question's own points
+ * (far apart: both in; close: not closer than WAITING_MAP_POINTS_ZOOM), the
+ * family's places only drawn where they fall in it. No point of the
+ * question: the family's places.
+ */
+export function waitingMapView(points: readonly PlaceGeo[], tree: readonly PlaceGeo[], width: number, height: number, padding = 26): { center: PlaceGeo; zoom: number } {
+    const own = points.length > 0;
+    const fit = fitBounds([...(own ? points : tree)], width, height, padding);
+    return { center: fit.center, zoom: Math.min(fit.zoom, own ? WAITING_MAP_POINTS_ZOOM : WAITING_MAP_TREE_ZOOM) };
+}
+
+/**
+ * Pins closer than `gap` px pushed apart (the location now never hidden under
+ * a candidate's letter), kept `margin` px inside the map. The same point
+ * twice: side by side, the earlier one left.
+ */
+export function spreadPins(at: readonly { x: number; y: number }[], width: number, height: number, gap = 26, margin = 11): { x: number; y: number }[] {
+    const out = at.map(p => ({ x: p.x, y: p.y }));
+    const clampIn = (p: { x: number; y: number }): void => {
+        p.x = Math.min(Math.max(p.x, margin), Math.max(margin, width - margin));
+        p.y = Math.min(Math.max(p.y, margin), Math.max(margin, height - margin));
+    };
+    for (let round = 0; round < 12; round++) {
+        let moved = false;
+        for (let i = 0; i < out.length; i++) {
+            for (let j = i + 1; j < out.length; j++) {
+                const a = out[i], b = out[j];
+                let dx = b.x - a.x, dy = b.y - a.y;
+                let d = Math.hypot(dx, dy);
+                if (d >= gap - 0.01) continue;
+                if (d < 0.01) { dx = 1; dy = 0; d = 1; }
+                const push = (gap - Math.hypot(b.x - a.x, b.y - a.y)) / 2;
+                a.x -= (dx / d) * push; a.y -= (dy / d) * push;
+                b.x += (dx / d) * push; b.y += (dy / d) * push;
+                clampIn(a); clampIn(b);
+                moved = true;
+            }
+        }
+        if (!moved) break;
+    }
+    return out;
 }

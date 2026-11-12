@@ -13,7 +13,7 @@
 import { Gender, Person, PersonId, StromData } from './types.js';
 import { parseFlexDate } from './dates.js';
 import { marriagesInOrder } from './marriage-order.js';
-import { czechRulesApply, feminineForm, surnameKey } from './surnames.js';
+import { feminineFormIn, surnameKey } from './surnames.js';
 
 export interface MarriedSurnameSuggestion {
     /** The suggested married surname ("Nováková"). */
@@ -50,21 +50,22 @@ export function suggestionHusband(data: StromData, personId: PersonId): Person |
         .map(u => ({ union: u, partner: data.persons[u.person1Id === personId ? u.person2Id : u.person1Id] }))
         .filter(e => e.partner?.gender === 'male');
     if (husbands.length === 0) return null;
-    // marriagesInOrder puts the dated ones first, chronologically.
+    // marriagesInOrder keeps the dated ones in the order of their weddings.
     const dated = husbands.filter(e => parseFlexDate(e.union.startDate));
     return (dated.length > 0 ? dated[dated.length - 1] : husbands[husbands.length - 1]).partner;
 }
 
 /**
- * A wife's form of her husband's surname: the Czech feminine form where the
- * Czech rules apply to the tree (the same gate search uses, czechRulesApply),
+ * A wife's form of her husband's surname: the feminine form where the rules
+ * apply (the same gate search uses, genderRulesApply: Novák → Nováková on a
+ * Czech tree, Jaworski → Jaworska anywhere),
  * the surname as it is otherwise (Smith, Müller) and where it is already one
  * for everybody (Kočí, Nováková).
  */
 export function wifeSurnameOf(husbandSurname: string, data: StromData): string {
     const surname = husbandSurname.trim();
     if (!surname) return '';
-    return (czechRulesApply(data) ? feminineForm(surname) : null) ?? surname;
+    return feminineFormIn(surname, data) ?? surname;
 }
 
 /** Does any of these spellings carry the surname (as a whole, or as a word of a full name)? */
