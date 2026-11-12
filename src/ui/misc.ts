@@ -1641,6 +1641,10 @@ export const miscMethods = uiModule({
         });
 
         this.installFieldHelpMarks();
+        const cur = getCurrentLanguage();
+        const isSk = cur === 'cs';
+        document.getElementById('lang-btn-sk')?.classList.toggle('active', isSk);
+        document.getElementById('lang-btn-en')?.classList.toggle('active', !isSk);
     },
 
     /**

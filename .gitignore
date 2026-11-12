@@ -8,6 +8,9 @@ test/failures-*.txt
 # Family data stays local only - never in git
 test/real-large.json
 test.ged
+tree-strom.ged
+*.ged
+/index.html
 /*.jpg
 
 # Playwright e2e

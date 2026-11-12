@@ -1,14 +1,17 @@
 {
-  "name": "strom",
+  "name": "strom-rodokmen",
   "version": "3.27.0",
   "stromDoc": "f1f6a992bb9cafaa788ee51023070309bb452997",
-  "description": "Family tree application",
+  "description": "Dvorský Family Tree - Web Viewer",
   "main": "dist/bundle.js",
   "scripts": {
-    "build": "node scripts/bundle.js",
+    "embed": "tsx scripts/embed-tree.ts",
+    "sync": "tsx scripts/sync-tree.ts",
+    "build": "tsx scripts/embed-tree.ts",
+    "build:bundle": "node scripts/bundle.js",
     "build:dev": "esbuild src/main.ts --bundle --sourcemap --outfile=dist/bundle.js",
     "watch": "esbuild src/main.ts --bundle --sourcemap --outfile=dist/bundle.js --watch",
-    "dev": "npm run build:dev && npx http-server -p 8080 -c-1",
+    "dev": "npm run embed && npx http-server -p 8080 -c-1",
     "typecheck": "tsc --noEmit --incremental --tsBuildInfoFile .tsbuildinfo",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -22,11 +25,12 @@
   },
   "keywords": [
     "family-tree",
-    "genealogy"
+    "genealogy",
+    "dvorsky"
   ],
   "author": "Milan Víšek",
   "contributors": [
-    "Claude (Anthropic)"
+    "Radovan Dvorský (Slovak translation, UI & chronicle fork adaptations)"
   ],
   "license": "AGPL-3.0-or-later",
   "type": "module",
