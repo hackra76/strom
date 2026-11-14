@@ -36,6 +36,7 @@ import {
     personIndexSort, surnameFirst, ZIP_PICK_LINES,
 } from './family-pages.js';
 import { FAMILY_PAGES_CSS, PAGE_SET_SCRIPT } from './family-pages-css.js';
+import { FamilyTogetherEvent, familyTogetherEvents, familyTogetherLineHtml, sharedIndexOf } from './shared-with-line.js';
 import { RodPickerItem, rodPickKey, rodPickerHtml, rodPickerItems } from './rod-picker.js';
 import { pluralTemplates, searchPageSetIndex } from './family-pages-search.js';
 import {
@@ -132,12 +133,17 @@ function targetSlug(set: PageSet, target: BookLinkTarget): string {
 }
 
 /** A link to a page of the set: `<a href="#slug">` in the file, a `data-sp-open` button in the window. */
-function pageLink(r: Render, slug: string, html: string, cls = 'pp-link'): string {
+function pageLink(r: Render, slug: string, html: string, cls = 'pp-link', attrs = ''): string {
     const page = r.set.bySlug.get(slug);
     if (!page) return html;
     return r.mode === 'file'
-        ? `<a class="${cls}" href="#${esc(slug)}">${html}</a>`
-        : `<button type="button" class="${cls}" data-sp-open="${esc(pageSetAppTarget(page))}">${html}</button>`;
+        ? `<a class="${cls}"${attrs} href="#${esc(slug)}">${html}</a>`
+        : `<button type="button" class="${cls}"${attrs} data-sp-open="${esc(pageSetAppTarget(page))}">${html}</button>`;
+}
+
+/** A tab's label holding the width of its bold cut (the one selection indicator, src/ui/sel-css.ts). */
+function selLabel(text: string): string {
+    return `<span class="sel-l" data-label="${esc(text)}">${esc(text)}</span>`;
 }
 
 function localDay(d: Date): string {
@@ -1037,11 +1043,33 @@ function childCardHtml(r: Render, ctx: BookCtx, c: Person): string {
         + (note ? `<span class="sp-kid-note">${note}</span>` : '') + '</div>';
 }
 
-/** The union's sources (its own and its events'), as the book lists a chapter's. */
-function familySourcesHtml(r: Render, u: Partnership): string {
+/**
+ * The family's shared events everyone of which is on this page (spec 085
+ * §2h): the couple and the children the reader may see, one line each with
+ * the ages, the given names leading to their pages.
+ */
+function familyTogetherOf(r: Render, u: Partnership, members: readonly PersonId[]): FamilyTogetherEvent[] {
+    const tree = r.set.protectedTree.tree;
+    return familyTogetherEvents(tree, sharedIndexOf(tree), members, { hidden: id => isProtectedPerson(r.set.protectedTree, id) });
+}
+
+function familyTogetherHtml(r: Render, list: readonly FamilyTogetherEvent[]): string {
+    if (!list.length) return '';
+    const nameHtml = (n: FamilyTogetherEvent['persons'][number]): string => {
+        const slug = r.set.personSlug.get(n.personId);
+        return slug ? pageLink(r, slug, esc(n.text)) : esc(n.text);
+    };
+    const rows = list.map(ft => `<p class="sp-res sp-together">${familyTogetherLineHtml(ft, r.S, r.set.options.lang, esc, nameHtml)}.</p>`);
+    return `<section class="sp-block"><h2 class="sp-h2">${esc(r.S.book.familyTogether)}</h2>${rows.join('')}</section>`;
+}
+
+/** The union's sources (its own, its events' and those of the family's shared events), as the book lists a chapter's. */
+function familySourcesHtml(r: Render, u: Partnership, together: readonly FamilyTogetherEvent[] = []): string {
     if (!r.set.options.sources) return '';
     const sources = r.set.protectedTree.tree.sources ?? {};
-    const ids = [...new Set([...(u.sourceIds ?? []), ...(u.events ?? []).flatMap(e => e.sourceIds ?? [])])].filter(id => !!sources[id]);
+    const ids = [...new Set([
+        ...(u.sourceIds ?? []), ...(u.events ?? []).flatMap(e => e.sourceIds ?? []), ...together.flatMap(ft => ft.event.sourceIds ?? []),
+    ])].filter(id => !!sources[id]);
     const rows = ids.map(id => {
         const s = sources[id];
         // The entry's place without the book (an older source: its location as it is).
@@ -1083,8 +1111,9 @@ function familyPageHtml(r: Render, page: SetPage, ctx: BookCtx): string {
     const children = kids.length
         ? `<section class="sp-block"><h2 class="sp-h2">${esc(F.fam.kidsOf(kids.length))}</h2><div class="sp-kids-grid">${kids.map(c => childCardHtml(r, ctx, c)).join('')}</div></section>`
         : '';
-    return `<div class="sp-fam-page">${head}${partners}${marriageHtml(r, ctx, u, page.slug)}${residenceHtml(r, u)}${children}`
-        + `${familyStoryHtml(r, u, ps, page.slug)}${familySourcesHtml(r, u)}</div>`;
+    const together = familyTogetherOf(r, u, [...ps.map(p => p.id), ...kids.map(c => c.id)]);
+    return `<div class="sp-fam-page">${head}${partners}${marriageHtml(r, ctx, u, page.slug)}${residenceHtml(r, u)}${familyTogetherHtml(r, together)}${children}`
+        + `${familyStoryHtml(r, u, ps, page.slug)}${familySourcesHtml(r, u, together)}</div>`;
 }
 
 // ─── The bar and the search (§3.1, §3.4) ───────────────────────────────────
@@ -1108,7 +1137,7 @@ function barHtml(r: Render, page: SetPage | null): string {
     const cur = barCurrent(page);
     const mark = (html: string, on: boolean): string => on ? html.replace(/^<(a|button) /, '<$1 aria-current="page" ') : html;
     const navLink = (slug: string, label: string, kind: 'index' | 'map'): string =>
-        slug ? mark(pageLink(r, slug, esc(label), 'sp-fbar-a').replace(/^<(a|button) /, `<$1 data-sp-nav="${kind}" `), cur === kind) : '';
+        slug ? mark(pageLink(r, slug, selLabel(label), 'sp-fbar-a sel-tab', ' data-sel-dir="down"').replace(/^<(a|button) /, `<$1 data-sp-nav="${kind}" `), cur === kind) : '';
     const idx = drawnSlug(r, set.indexSlug.persons);
     const map = drawnSlug(r, set.mapSlug);
     const home = intro ? pageLink(r, intro.slug, esc(intro.title), 'sp-fbar-home') : '';
@@ -1118,7 +1147,7 @@ function barHtml(r: Render, page: SetPage | null): string {
         [map, F.map],
     ];
     const menu = menuItems.filter(([slug]) => !!slug)
-        .map(([slug, label]) => mark(pageLink(r, slug, esc(label), 'sp-menu-a'), page?.slug === slug)).join('');
+        .map(([slug, label]) => mark(pageLink(r, slug, selLabel(label), 'sp-menu-a sel-tab', ' data-sel-dir="side"'), page?.slug === slug)).join('');
     const whole = set.spec.kind === 'tree';
     const pick = whole ? rodPickHtml(r, page) : '';
     // On a phone the choice replaces the name on the pages of a line (§2.3); the file's script marks it per page.
@@ -1244,8 +1273,8 @@ function personsIndexHtml(r: Render, page: SetPage): string {
         const val = n === null ? '' : String(n);
         const t = title ? ` title="${esc(title)}" aria-label="${esc(title)}"` : '';
         return r.mode === 'file'
-            ? `<a class="sp-letter" href="#${esc(n === null ? slug : `${slug}--pis-${n}`)}" data-sp-letter="${val}"${cur}${t}>${esc(text)}</a>`
-            : `<button type="button" class="sp-letter" data-sp-letter="${val}"${cur}${t}>${esc(text)}</button>`;
+            ? `<a class="sp-letter sel-tab" data-sel-dir="down" href="#${esc(n === null ? slug : `${slug}--pis-${n}`)}" data-sp-letter="${val}"${cur}${t}>${selLabel(text)}</a>`
+            : `<button type="button" class="sp-letter sel-tab" data-sel-dir="down" data-sp-letter="${val}"${cur}${t}>${selLabel(text)}</button>`;
     };
     // The uncertain readings' button is "?", named in full (1102).
     const letters = `<nav class="sp-letters" aria-label="${esc(F.idxLetters)}">${letter(slug, null, F.idxAll)}`
@@ -1380,11 +1409,12 @@ function letterPageHtml(r: Render, page: SetPage, body: string, meta: string | n
         // The uncertain readings' cell is "?", named in full (1102).
         const text = k === INDEX_UNCERTAIN ? k : label(k);
         if (k === INDEX_UNCERTAIN && slug && k !== page.letter) {
-            return pageLink(r, slug, esc(text), 'sp-abc-l').replace(/^<(a|button)\b/, `<$1 title="${esc(label(k))}" aria-label="${esc(label(k))}"`);
+            return pageLink(r, slug, selLabel(text), 'sp-abc-l sel-tab', ' data-sel-dir="down"').replace(/^<(a|button)\b/, `<$1 title="${esc(label(k))}" aria-label="${esc(label(k))}"`);
         }
         const named = k === INDEX_UNCERTAIN ? ` title="${esc(label(k))}" aria-label="${esc(label(k))}"` : '';
-        if (k === page.letter) return `<span class="sp-abc-l" aria-current="page"${named}>${esc(text)}</span>`;
-        return slug ? pageLink(r, slug, esc(text), 'sp-abc-l') : `<span class="sp-abc-l sp-abc-off" aria-disabled="true">${esc(text)}</span>`;
+        if (k === page.letter) return `<span class="sp-abc-l sel-tab" data-sel-dir="down" aria-current="page"${named}>${selLabel(text)}</span>`;
+        return slug ? pageLink(r, slug, selLabel(text), 'sp-abc-l sel-tab', ' data-sel-dir="down"')
+            : `<span class="sp-abc-l sp-abc-off sel-tab" data-sel-dir="down" aria-disabled="true">${selLabel(text)}</span>`;
     }).join('');
     const at = letters.findIndex(l => l.key === page.letter);
     const prev = at > 0 ? letters[at - 1] : null;
@@ -1447,7 +1477,10 @@ function indexPageHtml(r: Render, page: SetPage): string {
     const tabs = (['persons', 'families', 'surnames', 'places'] as const).map(k => {
         const slug = drawnSlug(r, r.set.indexSlug[k]);
         if (!slug) return '';
-        return k === kind ? `<span class="sp-tab" aria-current="page">${esc(F.idxTabs[k])}</span>` : pageLink(r, slug, esc(F.idxTabs[k]), 'sp-tab');
+        // The selection indicator's tab (src/ui/sel-css.ts), its label holding the bold cut's width.
+        const label = `<span class="sel-l" data-label="${esc(F.idxTabs[k])}">${esc(F.idxTabs[k])}</span>`;
+        return k === kind ? `<span class="sp-tab sel-tab" data-sel-dir="down" aria-current="page">${label}</span>`
+            : pageLink(r, slug, label, 'sp-tab sel-tab', ' data-sel-dir="down"');
     }).join('');
     let body = '';
     if (kind === 'persons') body = personsIndexHtml(r, page);
@@ -1925,7 +1958,7 @@ export async function buildPageSetFilesAsync(set: PageSet, opts: PageSetHtmlOpti
         await emit({ path, data: img.bytes });
     }
     // The styles live in the files' folder: an image is one folder up.
-    const css = `${personPageFileCss(opts.fontCss ?? '')}${FAMILY_PAGES_CSS}\n`
+    const css = `${personPageFileCss(opts.fontCss ?? '', FAMILY_PAGES_CSS)}\n`
         + set.images.css(n => files.has(n) ? `../${files.get(n)}` : '');
     await emit({ path: `${folders.files}/styl.css`, data: css });
     await emit({ path: `${folders.files}/skript.js`, data: [PERSON_PAGE_SCRIPT, PERSON_PAGE_STORY_SCRIPT, PLACES_MAP_SCRIPT, fanZoomInlineScript(), PAGE_SET_SCRIPT].join(';\n') });

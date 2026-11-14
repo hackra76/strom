@@ -58,6 +58,8 @@ export interface PlacePoint {
     eventType?: LifeEventType;
     coupleType?: CoupleEventType;
     customLabel?: string;
+    /** The person's own event (kind 'event'): its id (a shared event's "with …" line, spec 085 §2g). */
+    eventId?: string;
     /** Marriage / divorce / couple event: the partner's name. */
     partnerName?: string;
     /** A divorce of a couple that never married ("end of the relationship"). */
@@ -127,7 +129,7 @@ export function collectPersonPlacePoints(tree: StromData, personId: PersonId, op
     for (const pt of computePersonLifeline(tree, personId)) {
         const place = pt.place?.trim();
         if (!place) continue;
-        if (pt.kind === 'child' || pt.kind === 'childEvent') continue;
+        if (pt.kind === 'child' || pt.kind === 'childEvent' || pt.kind === 'participation') continue;
         const key = placeKey(place);
         if (!key) continue;
         if ((pt.kind === 'marriage' || pt.kind === 'divorce' || pt.kind === 'coupleEvent')
@@ -143,6 +145,7 @@ export function collectPersonPlacePoints(tree: StromData, personId: PersonId, op
             ...(pt.eventType ? { eventType: pt.eventType } : {}),
             ...(pt.coupleType ? { coupleType: pt.coupleType } : {}),
             ...(pt.customLabel ? { customLabel: pt.customLabel } : {}),
+            ...(pt.kind === 'event' && pt.eventId ? { eventId: pt.eventId } : {}),
             ...(pt.relatedName ? { partnerName: pt.relatedName } : {}),
             ...(pt.unmarried ? { unmarried: true } : {}),
         });
@@ -159,7 +162,7 @@ export function collectPersonPlacePoints(tree: StromData, personId: PersonId, op
     undated(person.birthDate, person.birthPlace, { kind: 'birth' });
     undated(person.deathDate, person.deathPlace, { kind: 'death' });
     for (const ev of person.events ?? []) {
-        undated(ev.date, ev.place, { kind: 'event', eventType: ev.type, ...(ev.customLabel ? { customLabel: ev.customLabel } : {}) });
+        undated(ev.date, ev.place, { kind: 'event', eventType: ev.type, eventId: ev.id, ...(ev.customLabel ? { customLabel: ev.customLabel } : {}) });
     }
     for (const unionId of person.partnerships) {
         const u = tree.partnerships[unionId];
@@ -1283,6 +1286,15 @@ export interface PlacesMapCtx {
      */
     kinds?: ReadonlySet<MapKind>;
     /**
+     * The app's window: the person's ancestors' path in Migration over time
+     * (spec 054 §1, entry 3). 'on': some ancestor has a year and a place on
+     * the map, the link "◎ Ancestors' path on the map ›" before "Open in the
+     * map ›"; 'off': ancestors in the tree, none on the map yet, the link
+     * greyed out with its sentence under the heading. None: no ancestor in the
+     * tree, no link.
+     */
+    path?: 'on' | 'off';
+    /**
      * A family line's map (spec 026 §3.7): no path between the places, no
      * switch or button, a point's size by `size` (px), the list's row after
      * the place's name from `row` (HTML), the label's years the place's
@@ -1293,6 +1305,12 @@ export interface PlacesMapCtx {
         size: (placeKey: string) => number;
         row: (placeKey: string) => string;
     };
+    /**
+     * A shared event's "with Terezie, Bohumil, Anežka" line (spec 085 §2g),
+     * HTML, by the person's event id ('' for an event of one person): under
+     * the place's row of the list. The map keeps the person's own point.
+     */
+    sharedLine?: (eventId: string) => string;
 }
 
 function esc(text: string): string {
@@ -1375,6 +1393,26 @@ function osaOf(p: PlannedPlace): string {
 }
 
 /**
+ * "◎ Ancestors' path on the map ›" (spec 054 §1, entry 3; the window only):
+ * `noteId` greys it out (aria-disabled) with the note of that id telling why.
+ */
+function mapPathButtonHtml(S: MapStrings, noteId: string | null): string {
+    return `<button type="button" class="pp-act pp-map-path" data-pp-action="map:path"`
+        + `${noteId ? ` aria-disabled="true" aria-describedby="${esc(noteId)}" title="${esc(S.map.pathNoAncestors)}"` : ''}>`
+        + `<span class="pp-map-path-mark" aria-hidden="true">◎</span> ${esc(S.map.pathFromPage)} ›</button>`;
+}
+
+/**
+ * The ancestors' path link on its own row (D2): in the window, for a person
+ * whose places make no "Places of life" section (at most one own place) but
+ * who has ancestors on the map. Stands where that section would; no heading,
+ * no entry of the contents. Greyed out or absent paths get no row.
+ */
+export function mapPathRowHtml(lang: Language): string {
+    return `<section class="pp-sec pp-sec--map-path"><div class="pp-toggles pp-map-tools">${mapPathButtonHtml(getStringsForLang(lang), null)}</div></section>`;
+}
+
+/**
  * The "Places of life" section (§1), or '' when the person has at most one
  * place (§1.5). `points` from `collectPersonPlacePoints` (protection applied
  * there), `geo` the tree's `places` (coordinates by placeKey).
@@ -1383,7 +1421,8 @@ function osaOf(p: PlannedPlace): string {
  *   - `data-pp-map-place="{placeKey}"` on points and rows: select (click / Enter);
  *   - `data-pp-osa="osa-…"` on a row: the timeline row of the place's first event;
  *   - `data-pp-switch="kidPlaces"` (app): the children's places switch, the app re-renders;
- *   - `data-pp-action="map:open"` (app): open the application map.
+ *   - `data-pp-action="map:open"` (app): open the application map;
+ *   - `data-pp-action="map:path"` (app, `ctx.path`): the ancestors' path in Migration over time.
  */
 export function placesMapHtml(points: readonly PlacePoint[], geo: Readonly<Record<string, PlaceGeo>> | undefined, ctx: PlacesMapCtx): string {
     const plan = planPlacesMap(points, geo, { kidPlaces: ctx.kidPlaces, lang: ctx.lang, ...(ctx.group ? { pointPx: ctx.group.size } : {}) });
@@ -1401,10 +1440,17 @@ export function placesMapHtml(points: readonly PlacePoint[], geo: Readonly<Recor
     if (app && mapLike && hasRel && !group) {
         tools.push(`<button type="button" class="pp-toggle" role="switch" aria-checked="${ctx.kidPlaces}" data-pp-switch="kidPlaces">${esc(M.kids)}</button>`);
     }
+    // The ancestors' path in Migration over time (spec 054 §1): greyed out while no ancestor is on the map.
+    const pathOff = ctx.path === 'off';
+    if (app && !group && ctx.path) {
+        tools.push(mapPathButtonHtml(S, pathOff ? `${ctx.id ?? 'pp-sec-places'}-path-note` : null));
+    }
     if (app && mapLike && !group) tools.push(`<button type="button" class="pp-act pp-map-open" data-pp-action="map:open">${esc(M.open)}</button>`);
     const title = group ? group.title : M.title;
-    const head = title || tools.length
-        ? `<div class="pp-sec-head">${title ? `<h2>${esc(title)}</h2>` : ''}${tools.length ? `<div class="pp-toggles pp-map-tools">${tools.join('')}</div>` : ''}</div>` : '';
+    const pathNote = app && !group && pathOff
+        ? `<p class="pp-map-path-note" id="${esc(ctx.id ?? 'pp-sec-places')}-path-note">${esc(S.map.pathNoAncestors)}</p>` : '';
+    const head = (title || tools.length
+        ? `<div class="pp-sec-head">${title ? `<h2>${esc(title)}</h2>` : ''}${tools.length ? `<div class="pp-toggles pp-map-tools">${tools.join('')}</div>` : ''}</div>` : '') + pathNote;
 
     const open = `<section class="pp-sec pp-sec--places pp-places" id="${esc(id)}"`;
     const body = (pl: MapPlan): string => placesBodyHtml(pl, S, ctx, sel);
@@ -1804,6 +1850,17 @@ function listHtml(plan: MapPlan, S: MapStrings, ctx: PlacesMapCtx, sel: string |
     const listed = plan.state === 'map' ? plan.places.filter(p => !p.rel || p.x !== undefined || p.inset) : plan.places;
     const ordered = [...listed.filter(p => !p.rel), ...listed.filter(p => p.rel)];
     const group = ctx.group;
+    // The shared events of the place: their "with …" lines under its row (spec 085 §2g).
+    const withLines = (p: PlannedPlace): string => {
+        if (!ctx.sharedLine || group || p.rel) return '';
+        const seen = new Set<string>();
+        const lines = p.points.map(pt => {
+            if (!pt.eventId || seen.has(pt.eventId)) return '';
+            seen.add(pt.eventId);
+            return ctx.sharedLine!(pt.eventId);
+        }).filter(Boolean);
+        return lines.length ? `<span class="pp-map-with">${lines.join('')}</span>` : '';
+    };
     for (const p of ordered) {
         const text = group ? '' : p.rel ? relativeEventsText(p.points, S) : ownEventsText(p.points, S, ctx.lang);
         const extra = group ? group.row(p.placeKey) : '';
@@ -1815,7 +1872,7 @@ function listHtml(plan: MapPlan, S: MapStrings, ctx: PlacesMapCtx, sel: string |
         const attrs = selectable
             ? ` tabindex="0" data-pp-map-place="${esc(p.placeKey)}"${osa ? ` data-pp-osa="${osa}"` : ''}` : osa ? ` data-pp-osa="${osa}"` : '';
         rows.push(`<li class="pp-map-row${p.rel ? ' pp-map-row--rel' : ''}${selectable && isSelected(sel, [p.placeKey]) ? ' is-sel' : ''}"${attrs}>`
-            + `${badge(p)}<span class="pp-map-rt"><b class="pp-map-name">${esc(p.full)}</b>${from}${text ? ` · <span class="pp-map-ev">${esc(text)}</span>` : ''}${extra}${plan.state !== 'map' ? ambiguous(p) : ''}</span></li>`);
+            + `${badge(p)}<span class="pp-map-rt"><b class="pp-map-name">${esc(p.full)}</b>${from}${text ? ` · <span class="pp-map-ev">${esc(text)}</span>` : ''}${extra}${plan.state !== 'map' ? ambiguous(p) : ''}${withLines(p)}</span></li>`);
     }
     if (plan.noPos.length) {
         const items = plan.noPos.map(p => {
@@ -1875,9 +1932,9 @@ function sel(root,k){root.setAttribute('data-pp-sel',k||'');var on=(k||'').split
 function act(root,el){var k=el.getAttribute('data-pp-map-place');var was=el.classList.contains('is-sel');sel(root,k);
 if(was&&el.classList.contains('pp-map-row')){var a=el.getAttribute('data-pp-osa');var t=a&&d.getElementById(a);if(t)t.scrollIntoView({block:'center'});}}
 function hit(e,s){var el=e.target.closest&&e.target.closest(s);var root=el&&el.closest('.pp-places');return root?[root,el]:null;}
-d.addEventListener('click',function(e){var h=hit(e,'[data-pp-map-place]');if(h){act(h[0],h[1]);return;}
+d.addEventListener('click',function(e){var h=hit(e,'[data-pp-map-place]');if(h&&!e.target.closest('.pp-map-with a,.pp-map-with button')){act(h[0],h[1]);return;}
 var a=e.target.closest&&e.target.closest('a[data-pp-to-place]');if(!a)return;var s=a.closest('.pp')||a.closest('section')||d;var root=s.querySelector('.pp-places');if(root)sel(root,a.getAttribute('data-pp-to-place'));});
-d.addEventListener('keydown',function(e){if(e.key!=='Enter'&&e.key!==' ')return;var h=hit(e,'li[data-pp-map-place]');if(h){e.preventDefault();act(h[0],h[1]);}});
+d.addEventListener('keydown',function(e){if(e.key!=='Enter'&&e.key!==' ')return;var h=hit(e,'li[data-pp-map-place]');if(h&&!e.target.closest('.pp-map-with a,.pp-map-with button')){e.preventDefault();act(h[0],h[1]);}});
 var ORDER=['birth','death','wedding','event'];
 function kinds(root,k){var on=(root.getAttribute('data-pp-kinds')||'').split(',').filter(Boolean);var i=on.indexOf(k);
 if(i>=0){if(on.length===1)return;on.splice(i,1);}else on.push(k);

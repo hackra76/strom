@@ -20,6 +20,7 @@ import {
     getLiveMotion, setLiveMotion,
 } from '../live-follow-prefs.js';
 import { PersonId, TreeId } from '../types.js';
+import { pressOnToast } from '../sheet-toasts.js';
 import { uiModule } from './module.js';
 import type { UIClass } from './index.js';
 import { el, livePanelSectionState } from './research-ui.js';
@@ -201,7 +202,7 @@ function refocus(host: HTMLElement, mark: ReturnType<typeof focusMark>): void {
  * An arrow moves and chooses at once (with Alt: the row moves instead).
  */
 function segment(row: SectionEditRow, labelId: string, cls: string): HTMLElement {
-    const seg = el('div', `live-sec-seg ${cls}`);
+    const seg = el('div', `live-sec-seg sel-seg ${cls}`);
     seg.setAttribute('role', 'radiogroup');
     seg.setAttribute('aria-labelledby', labelId);
     const stop = row.chosen ?? row.current ?? 'expanded';
@@ -209,8 +210,9 @@ function segment(row: SectionEditRow, labelId: string, cls: string): HTMLElement
         if (sectionPrefs()[row.key] !== v) setSectionPref(row.key, v);
     };
     SECTION_STATES.forEach((v, i) => {
-        const b = el('button', 'live-sec-seg__opt', sectionStateLabel(v));
+        const b = el('button', 'live-sec-seg__opt sel-opt', sectionStateLabel(v));
         b.type = 'button';
+        b.dataset.selForm = 'seg';
         b.setAttribute('role', 'radio');
         b.setAttribute('aria-checked', String(row.chosen === v));
         b.tabIndex = v === stop ? 0 : -1;
@@ -521,12 +523,13 @@ let motionMediaWatched = false;
  * roving tab stop, an arrow moves and chooses at once.
  */
 function choiceSegment<T extends string>(labelId: string, options: ReadonlyArray<{ value: T; label: string }>, chosen: T, pick: (v: T) => void, wide = false): HTMLElement {
-    const seg = el('div', `live-sec-seg live-sec-seg--settings${wide ? ' live-sec-seg--wide' : ''}`);
+    const seg = el('div', `live-sec-seg sel-seg live-sec-seg--settings${wide ? ' live-sec-seg--wide' : ''}`);
     seg.setAttribute('role', 'radiogroup');
     seg.setAttribute('aria-labelledby', labelId);
     options.forEach((o, i) => {
-        const b = el('button', 'live-sec-seg__opt', o.label);
+        const b = el('button', 'live-sec-seg__opt sel-opt', o.label);
         b.type = 'button';
+        b.dataset.selForm = 'seg';
         b.title = o.label;
         b.setAttribute('role', 'radio');
         b.setAttribute('aria-checked', String(o.value === chosen));
@@ -688,7 +691,8 @@ function guard(layer: () => OpenLayer | null, close: (focusBack: boolean) => voi
     const onDown = (e: Event): void => {
         const l = layer();
         const t = e.target as HTMLElement;
-        if (!l || l.root.contains(t) || opts.ignore?.(t)) return;
+        // A press on a toast over the sheet (its Undo) leaves it open (src/sheet-toasts.ts)
+        if (!l || l.root.contains(t) || opts.ignore?.(t) || pressOnToast(t)) return;
         close(true);
     };
     document.addEventListener('keydown', onKey, true);

@@ -459,10 +459,11 @@ test('two expansions: the focus bar hides both at once, every card back where it
     await expect(cardOf(page, second!).locator('.children-tab')).toHaveAttribute('aria-pressed', 'true');
     await expect(button).toHaveText('▾Hide shown · 2');
     await expect(button).toHaveAttribute('aria-label', 'Hide everything shown here (2 expansions)');
-    // The bar's order: after the depth steppers
+    // The bar's order: after the depth steppers and the switch "Children & siblings"
     expect(await page.evaluate(() => {
         const b = document.getElementById('hide-shown-children')!;
-        return b.previousElementSibling?.classList.contains('focus-depth') ?? false;
+        const bulk = b.previousElementSibling;
+        return (bulk?.classList.contains('bulk-family') ?? false) && (bulk?.previousElementSibling?.classList.contains('focus-depth') ?? false);
     })).toBe(true);
     await button.click();
     await page.mouse.move(5, 500);
@@ -691,6 +692,31 @@ test('the sibling-order pill: on the direct-line card beside its siblings, clear
     // The focus's line: born second of three, drawn at the inner end of the row
     expect(marks.map(m => [m.id, m.text])).toEqual([['focus', '2 of 3']]);
     await expect(cardOf(page, 'focus')).toHaveAttribute('aria-label', /By birth 2 of 3\./);
+});
+
+test('a narrow window with a mouse, German: "+ child" under the pointer stands clear of the sibling order "2. von 3", its label too', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await setup(page);
+    await page.evaluate(() => window.Strom.UI.setLanguage('de'));
+    await tabOf(page, ANCESTOR).click();
+    await page.evaluate(() => window.Strom.ZoomPan.centerOnPerson('focus' as never));
+    const card = cardOf(page, 'focus');
+    const pill = card.locator('.edge-bottom-right .sibling-order-pill');
+    await expect(pill.locator('.so-text')).toHaveText('2. von 3');
+    const add = card.locator('.edge-bottom-center .add-btn');
+    const clear = async () => {
+        const [a, p, c] = [await add.boundingBox(), await pill.boundingBox(), await card.boundingBox()];
+        return !!a && !!p && !!c && a.x + a.width + 2 <= p.x && a.x >= c.x;
+    };
+    await card.hover({ position: { x: 20, y: 10 } });
+    await expect(add).toBeVisible();
+    await expect(pill).toBeVisible();
+    await expect.poll(clear).toBe(true);
+    // Its label grows away from the pill.
+    await add.hover();
+    await expect(add.locator('.add-btn-label')).toHaveCSS('opacity', '1');
+    await expect.poll(clear).toBe(true);
+    await expect(pill).toBeVisible();
 });
 
 test('tablet and a phone held sideways: the chip stands below the evidence pill, not under it', async ({ page }) => {

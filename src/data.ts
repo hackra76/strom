@@ -4,7 +4,7 @@
  */
 
 import { rewriteStorySources, storySourceIds } from './story-sources.js';
-import { cleanCitationQuay, cleanTreeCitationQuay, joinQualityOnlySources, unionCitations } from './citation-quality.js';
+import { cleanCitationQuay, cleanTreeCitationQuay, joinQualityOnlySources, setCitationQuality, unionCitations } from './citation-quality.js';
 import { normalizeSingleParents, looseSingleParents, isPurePlaceholder, fillPlaceholder, tidyPlaceholders } from './single-parent.js';
 import {
     Person,
@@ -43,7 +43,7 @@ import {
     QualityDismissal,
     SurnameRejection,
 } from './types.js';
-import { isCoupleEventType } from './events.js';
+import { convertLegacyCensusEvents, isCoupleEventType } from './events.js';
 import { sanitizeGedcomDates } from './gedcom-date-form.js';
 import { strings, getCurrentLanguage, getStringsForLang, SUPPORTED_LANGUAGES } from './strings.js';
 import { TreeManager } from './tree-manager.js';
@@ -74,6 +74,16 @@ import { maxGenerations, maxGenerationsWithSiblings } from './focus-depth.js';
 import { cleanPlaceGeoMeta, sanitizePlaceRecords, sanitizePlaceRefs } from './place-records.js';
 import { addPlaceAlias, sanitizePlaceAliases } from './place-groups.js';
 import { sanitizeTableViews } from './table-views-data.js';
+import {
+    SharedEventCommon, SharedEventCommonField, SharedEventEdit, SharedEventSaveResult, SharedEventIndex, PersonSharedEvent,
+    SHARED_EVENT_COMMON_FIELDS, applyEventFields, buildSharedEventIndex, cleanEventShares, commonFieldsOf, newShareIdFor,
+    personSharedEvents, shareCopiesOf, tidyShares, MARRIAGE_EVENT_ID,
+    applyPersonMergeShares, personMergeShares, PersonMergeShareChoices, ownSameEvent, fillSameEventAddress, SameEventFields,
+    findSeparateSameEvents,
+} from './shared-events.js';
+import { eventIsShareable } from './events.js';
+import { buildPersonNameIndex, type ParticipantRef, type PersonNameIndex } from './participant-match.js';
+import { foldName } from './godparents.js';
 
 /** Extended updates for Partnership */
 
@@ -95,10 +105,43 @@ function dropUndefinedKeys(obj: object): void {
     }
 }
 
-/** What a 'strom:data-changed' event may tell: a live load from the source, with the data shown before it. */
-export interface DataChangedDetail {
-    source: 'live';
-    previous: StromData;
+/**
+ * What a 'strom:data-changed' event may tell: a live load from the source, with
+ * the data shown before it; or the tree as another window of the app sent it
+ * (spec 079: an edit made in a satellite window, or the main window's state
+ * arriving in a satellite).
+ */
+export type DataChangedDetail =
+    | { source: 'live'; previous: StromData }
+    | { source: 'window' };
+
+/**
+ * The data's fields that say where the work stands in a window, not what the
+ * tree holds: a satellite's edit never overwrites the main window's (spec 079).
+ */
+const WINDOW_STATE_KEYS = ['lastFocusPersonId', 'lastFocusDepthUp', 'lastFocusDepthDown', 'defaultPersonId', 'defaultView'] as const satisfies readonly (keyof StromData)[];
+
+/**
+ * Where a satellite window's edits go instead of storage and the undo history
+ * (spec 079 §0): the main window saves them. DataManager calls it; the
+ * satellite client (src/windows/satellite.ts) implements it.
+ */
+export interface WindowEditSink {
+    /**
+     * An undoable mutation was committed here (already applied to this copy);
+     * `label` names the step, `context` is what the editor said about it
+     * (runWithEditContext: what to bring back if the main window refuses it).
+     */
+    edit(label: string, context?: unknown): void;
+    /** Undo / redo run in the main window, from its history. */
+    undo(): void;
+    redo(): void;
+    canUndo(): boolean;
+    canRedo(): boolean;
+    /** The copy may not be edited (the main window follows a research, the tree is locked there, or it is closed). */
+    readOnly(): boolean;
+    /** A staged dialog ended (committed or rolled back): data held back meanwhile may come in. */
+    sessionEnded(): void;
 }
 
 /** Import action types for view mode */
@@ -249,6 +292,11 @@ export function migrateData(data: unknown): StromData {
     // the citation; then only valid own QUAY of citations still cited stay.
     if ((typeof d.version === 'number' ? d.version : 1) < 19) joinQualityOnlySources(result);
     cleanTreeCitationQuay(result);
+    // v20 (spec 085): a person's custom event named only "Census" (an older
+    // import's `1 CENS`) is a census; then only valid shares of events shared
+    // by two copies or more, valid roles at another's event; nothing is joined.
+    if ((typeof d.version === 'number' ? d.version : 1) < 20) convertLegacyCensusEvents(result);
+    cleanEventShares(result);
 
     // Photos/attachments/excerpts must be image (or PDF) data URLs — anything
     // else (data:text/html…) from a crafted file is dropped before it can be
@@ -419,6 +467,14 @@ class DataManagerClass {
      * updates arrive through replaceWithSourceData().
      */
     private liveTreeId: TreeId | null = null;
+    /**
+     * Set in a satellite window (spec 079): the tree comes from the main
+     * window, and every save goes back to it as an edit — never to storage,
+     * the tree index or the undo history of this window.
+     */
+    private windowSink: WindowEditSink | null = null;
+    /** Called after every save of the open tree (and every undo/redo); see onTreeSaved(). */
+    private saveListeners = new Set<() => void>();
     private embeddedEnvelope: EmbeddedDataEnvelope | null = null;
     /** Trees this window already kept a backup of when another window saved over them. */
     private otherWindowSnapshots = new Set<TreeId>();
@@ -613,6 +669,7 @@ class DataManagerClass {
      * Check if the active tree is locked
      */
     isTreeLocked(): boolean {
+        if (this.windowSink?.readOnly()) return true;
         if (this.liveTreeId !== null && this.liveTreeId === this.currentTreeId) return true;
         if (this.isNewerData()) return true;
         const meta = TreeManager.getActiveTreeMetadata();
@@ -1187,12 +1244,17 @@ class DataManagerClass {
     /** An edit of the user's reached storage: the tree now differs from its last file copy. */
     private noteUserChange(): void {
         if (this.isReadOnly() || this.editSession || !this.currentTreeId) return;
+        if (this.windowSink) {
+            // A satellite keeps no tree index: only the signal (the table's "saved" mark).
+            if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('strom:user-change', { detail: { treeId: this.currentTreeId } }));
+            return;
+        }
         TreeManager.noteUserChange(this.currentTreeId);
     }
 
     /** Store the open tree again as it is (its research base changed: they are stored together). */
     resaveCurrent(): void {
-        this.save();
+        this.save('state');
     }
 
     /**
@@ -1202,13 +1264,33 @@ class DataManagerClass {
      */
     private revision = 0;
 
+    /**
+     * Content revision: bumped like `revision`, except by saves that change
+     * no content of the tree — where the work stands (the last focus), the
+     * default person, the default view, a store of the same data. The main
+     * window's registry reads it (spec 079): such a save is no change a
+     * satellite window's edit could conflict with.
+     */
+    private contentRevision = 0;
+
     /** Current data revision (see `revision`). */
     getRevision(): number {
         return this.revision;
     }
 
-    private save(): void {
+    /** Current content revision (see `contentRevision`). */
+    getContentRevision(): number {
+        return this.contentRevision;
+    }
+
+    /** `state`: a save that changes no content of the tree (see `contentRevision`). */
+    private save(kind: 'content' | 'state' = 'content'): void {
         this.revision++;
+        if (kind === 'content') this.contentRevision++;
+        // A satellite window never stores: its undoable edits go to the main
+        // window (commitMutation); a save that is no user's edit (the focus
+        // remembered, a rollback to the main window's state) stays here.
+        if (this.windowSink) return;
         // Never save in view mode (read-only), over locked data (the
         // in-memory tree is a stand-in) or over a newer app's tree
         // (TreeManager would refuse both anyway).
@@ -1218,7 +1300,118 @@ class DataManagerClass {
 
         if (this.currentTreeId) {
             TreeManager.saveTreeData(this.currentTreeId, this.data);
+            this.notifySaved();
         }
+    }
+
+    /**
+     * Listen to every save of the open tree and every undo/redo (the main
+     * window's registry of satellite windows: their copies follow). Returns
+     * the unsubscribe.
+     */
+    onTreeSaved(cb: () => void): () => void {
+        this.saveListeners.add(cb);
+        return () => { this.saveListeners.delete(cb); };
+    }
+
+    private notifySaved(): void {
+        for (const cb of [...this.saveListeners]) {
+            try { cb(); } catch (err) { console.error('save listener failed', err); }
+        }
+    }
+
+    // ==================== WINDOWS (spec 079) ====================
+
+    /** Turn this DataManager into a satellite window's copy (null: back to a normal window). */
+    setWindowSink(sink: WindowEditSink | null): void {
+        this.windowSink = sink;
+    }
+
+    private windowEditContext: unknown = null;
+
+    /**
+     * Satellite: the edits `fn` commits carry `context` to the window sink —
+     * what an editor needs to bring the user's text back when the main window
+     * refuses the edit (spec 079 §3.4: a cell's draft, the person dialog's fields).
+     */
+    runWithEditContext<T>(context: unknown, fn: () => T): T {
+        const prev = this.windowEditContext;
+        this.windowEditContext = context;
+        try {
+            return fn();
+        } finally {
+            this.windowEditContext = prev;
+        }
+    }
+
+    /** This window is a satellite: its tree is a copy of the main window's. */
+    isWindowCopy(): boolean {
+        return this.windowSink !== null;
+    }
+
+    /**
+     * Satellite: take the tree as the main window sent it (a JSON string of
+     * the whole data). No storage is read or written; the undo history stays
+     * the main window's. A staged dialog is not overwritten — the caller
+     * holds the data back until it ends (isEditSessionActive()).
+     */
+    loadFromWindow(treeId: TreeId, json: string): void {
+        this.currentTreeId = treeId;
+        this.data = migrateData(JSON.parse(json) as StromData);
+        this.pendingBefore = null;
+        this.revision++;
+        this.contentRevision++;
+        CrossTree.invalidateCacheForTree(treeId);
+        if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent<DataChangedDetail>('strom:data-changed', { detail: { source: 'window' } }));
+        }
+    }
+
+    /** The open tree's data as one JSON string (what a satellite sends with an edit). */
+    windowDataJson(): string {
+        return JSON.stringify(this.data);
+    }
+
+    /**
+     * Main window: the open tree as stored, as one JSON string (what the
+     * satellites get). A staged dialog's changes are not stored yet: its
+     * starting state is sent instead.
+     */
+    storedDataJson(): string {
+        return JSON.stringify(this.editSession ? this.editSession.before : this.data);
+    }
+
+    /**
+     * Main window: an edit made in a satellite window (spec 079 §2): the
+     * tree's whole data as the satellite has it after the edit. Saved as an
+     * edit of this window — one undo step named `label`, stored, logged — so
+     * Undo here (or from any satellite) takes it back. Refused (false) when
+     * nothing may be edited now or a staged dialog is open here. Where the
+     * work stands here (the last focus, the default person and view) stays
+     * this window's: the satellite's copy may hold an older one.
+     */
+    applyWindowEdit(json: string, label: string): boolean {
+        if (this.windowSink || this.isReadOnly() || !this.currentTreeId) return false;
+        if (this.isTreeLocked() || this.editSession || this.batchActive) return false;
+        let next: StromData;
+        try {
+            next = migrateData(JSON.parse(json) as StromData);
+        } catch {
+            return false;
+        }
+        for (const key of WINDOW_STATE_KEYS) {
+            if (this.data[key] === undefined) delete next[key];
+            else (next as unknown as Record<string, unknown>)[key] = this.data[key];
+        }
+        this.beginMutation();
+        this.data = next;
+        this.commitMutation(label, true);
+        AuditLogManager.log(this.currentTreeId, 'window.edit', label);
+        CrossTree.invalidateCacheForTree(this.currentTreeId);
+        if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent<DataChangedDetail>('strom:data-changed', { detail: { source: 'window' } }));
+        }
+        return true;
     }
 
     // ==================== UNDO / REDO ====================
@@ -1232,7 +1425,8 @@ class DataManagerClass {
         // changed here: refuse before anything changes (defense in depth —
         // the UI hides every edit entry point).
         if (this.isLocked() || this.isNewerData()) throw new DataLockedError();
-        if (this.viewMode) return;
+        // A satellite keeps no undo history (the main window does).
+        if (this.viewMode || this.windowSink) return;
         // Inside a batch the pre-state was captured once by beginBatch; the inner
         // mutations must not re-snapshot (that would split the batch into steps).
         if (this.batchActive) return;
@@ -1249,6 +1443,16 @@ class DataManagerClass {
         if (this.batchActive) {
             this.batchDirty = true;
             if (this.batchFirstDescription === null) this.batchFirstDescription = description;
+            return;
+        }
+        if (this.windowSink) {
+            // A satellite: the main window saves the edit and keeps its undo step.
+            this.pendingBefore = null;
+            this.save();
+            this.noteUserChange();
+            this.windowSink.edit(description, this.windowEditContext ?? undefined);
+            this.onUndoRedoChanged?.();
+            if (!silent) this.onMutationCommitted?.(description);
             return;
         }
         UndoManager.setActiveTree(this.currentTreeId);
@@ -1402,6 +1606,7 @@ class DataManagerClass {
         AuditLogManager.flushHold();
         this.batchDepth = 1;   // an operation left unbalanced must not keep it open
         this.commitBatch(description, false);
+        this.windowSink?.sessionEnded();
     }
 
     /**
@@ -1415,11 +1620,14 @@ class DataManagerClass {
         this.editSession = null;
         this.resetBatchState();
         AuditLogManager.dropHold();
-        if (this.currentTreeId !== s.treeId) return false;
-        if (JSON.stringify(this.data) === JSON.stringify(s.before)) return false;
+        if (this.currentTreeId !== s.treeId || JSON.stringify(this.data) === JSON.stringify(s.before)) {
+            this.windowSink?.sessionEnded();
+            return false;
+        }
         this.data = s.before;
         this.save();
         if (this.currentTreeId) CrossTree.invalidateCacheForTree(this.currentTreeId);
+        this.windowSink?.sessionEnded();
         return true;
     }
 
@@ -1520,12 +1728,14 @@ class DataManagerClass {
     }
 
     canUndo(): boolean {
+        if (this.windowSink) return this.windowSink.canUndo();
         if (this.isLocked() || this.isNewerData()) return false;
         UndoManager.setActiveTree(this.currentTreeId);
         return UndoManager.canUndo();
     }
 
     canRedo(): boolean {
+        if (this.windowSink) return this.windowSink.canRedo();
         if (this.isLocked() || this.isNewerData()) return false;
         UndoManager.setActiveTree(this.currentTreeId);
         return UndoManager.canRedo();
@@ -1536,6 +1746,11 @@ class DataManagerClass {
      * description (for the toast), or null when there is nothing to undo.
      */
     undo(): { description: string } | null {
+        // A satellite: the main window undoes from its history; the result comes back as its data.
+        if (this.windowSink) {
+            if (!this.editSession) this.windowSink.undo();
+            return null;
+        }
         if (this.isReadOnly() || !this.currentTreeId) return null;
         // A staged dialog is open: its own Save/Discard settle the data.
         if (this.editSession) return null;
@@ -1551,6 +1766,10 @@ class DataManagerClass {
 
     /** Replay the last undone snapshot. Symmetric to undo(). */
     redo(): { description: string } | null {
+        if (this.windowSink) {
+            if (!this.editSession) this.windowSink.redo();
+            return null;
+        }
         if (this.isReadOnly() || !this.currentTreeId) return null;
         // A staged dialog is open: its own Save/Discard settle the data.
         if (this.editSession) return null;
@@ -1573,6 +1792,7 @@ class DataManagerClass {
             TreeManager.saveTreeData(this.currentTreeId, this.data);
             CrossTree.invalidateCacheForTree(this.currentTreeId);
             this.noteUserChange();
+            this.notifySaved();
         }
     }
 
@@ -2348,6 +2568,13 @@ class DataManagerClass {
         return newEvent;
     }
 
+    /**
+     * Change a person's event. A shared event (spec 085 §4, "edit from
+     * anywhere") takes the common fields given (type, date, place, house,
+     * note, sources, citations) into every copy and the rest (age, role,
+     * participants…) into this copy alone, as one undo step; refused when a
+     * copy's person is locked or the type cannot be shared.
+     */
     updateLifeEvent(personId: PersonId, eventId: string, updates: Partial<Omit<LifeEvent, 'id'>>): boolean {
         const person = this.data.persons[personId];
         if (!person?.events) return false;
@@ -2358,8 +2585,20 @@ class DataManagerClass {
         if (nextType === 'birth' || nextType === 'death') return false;
         const nextLabel = updates.customLabel ?? ev.customLabel;
         if (nextType === 'custom' && !nextLabel?.trim()) return false;
+        const others = ev.shareId ? shareCopiesOf(this.data, ev.shareId).filter(c => c.event !== ev) : [];
+        if (others.length > 0) {
+            if (!eventIsShareable(nextType)) return false;
+            if (others.some(c => this.isPersonLocked(c.personId))) return false;
+        }
 
         this.beginMutation();
+        if (others.length > 0) {
+            const common: SharedEventCommon = {};
+            for (const f of SHARED_EVENT_COMMON_FIELDS) {
+                if (f in updates) (common as Record<string, unknown>)[f] = updates[f];
+            }
+            for (const c of others) applyEventFields(c.event, common);
+        }
         Object.assign(ev, updates);
         // An explicit undefined means "field emptied" — drop the key, or the
         // old value would survive the save (Object.assign never removes keys).
@@ -2378,14 +2617,337 @@ class DataManagerClass {
         const person = this.data.persons[personId];
         if (!person?.events) return false;
         if (this.isPersonLocked(personId)) return false;
-        if (!person.events.some(e => e.id === eventId)) return false;
+        const gone = person.events.find(e => e.id === eventId);
+        if (!gone) return false;
 
         this.beginMutation();
         person.events = person.events.filter(e => e.id !== eventId);
         if (person.events.length === 0) delete person.events;
+        // The last other copy of a shared event is an ordinary event again (spec 085 §3).
+        if (gone.shareId) tidyShares(this.data, [gone.shareId]);
         this.commitMutation(strings.undo.removeEvent(auditPersonName(person)));
         AuditLogManager.log(this.currentTreeId, 'event.remove', strings.auditLog.removedEvent(auditPersonName(person)));
         return true;
+    }
+
+    // ==================== SHARED EVENTS (spec 085) ====================
+
+    private sharedIndexCache: { data: StromData; revision: number; index: SharedEventIndex } | null = null;
+
+    /**
+     * The index of shared events and linked participants of the open tree
+     * (src/shared-events.ts), built once per state of the data: when the
+     * tree is read or changed, never per drawing.
+     */
+    getSharedEventIndex(): SharedEventIndex {
+        const c = this.sharedIndexCache;
+        if (c && c.data === this.data && c.revision === this.revision) return c.index;
+        const index = buildSharedEventIndex(this.data);
+        this.sharedIndexCache = { data: this.data, revision: this.revision, index };
+        return index;
+    }
+
+    private nameIndexCache: { data: StromData; revision: number; index: PersonNameIndex } | null = null;
+
+    /** The tree's persons by their folded names (src/participant-match.ts), built once per state of the data. */
+    getPersonNameIndex(): PersonNameIndex {
+        const c = this.nameIndexCache;
+        if (c && c.data === this.data && c.revision === this.revision) return c.index;
+        const index = buildPersonNameIndex(this.data);
+        this.nameIndexCache = { data: this.data, revision: this.revision, index };
+        return index;
+    }
+
+    /** A new share id no event of the open tree carries (`[A-Za-z0-9]{8}`, opaque). */
+    newShareId(): string {
+        return newShareIdFor(this.data);
+    }
+
+    /**
+     * Add a new event to a person's life shared at once with others (spec 085
+     * §1): the event and every copy saveSharedEvent makes of it in ONE undo
+     * step, or nothing at all when that edit is refused (no ordinary event is
+     * left behind).
+     */
+    addSharedEvent(personId: PersonId, event: Omit<LifeEvent, 'id'>, edit: SharedEventEdit): { event: LifeEvent; result: SharedEventSaveResult } | null {
+        const person = this.data.persons[personId];
+        if (!person || this.isReadOnly() || this.isPersonLocked(personId)) return null;
+        this.beginBatch();
+        const newEvent: LifeEvent = { ...event, id: generateLifeEventId() };
+        let result: SharedEventSaveResult | null = null;
+        try {
+            // Into the life without a step of its own: saveSharedEvent records
+            // the one step (from the batch's state before the event) or nothing.
+            (person.events ??= []).push(newEvent);
+            result = this.saveSharedEvent(personId, newEvent.id, edit);
+        } finally {
+            if (!result) {
+                person.events = (person.events ?? []).filter(e => e !== newEvent);
+                if (person.events.length === 0) delete person.events;
+            }
+            this.commitBatch(null, false);
+        }
+        if (!result) return null;
+        AuditLogManager.log(this.currentTreeId, 'event.add', strings.auditLog.addedEvent(auditPersonName(person)));
+        return { event: newEvent, result };
+    }
+
+    /** A person's events shared with others (type, year, the other persons): the delete confirmation lists them. */
+    personSharedEvents(personId: PersonId): PersonSharedEvent[] {
+        return personSharedEvents(this.data, this.getSharedEventIndex(), personId);
+    }
+
+    /** The copies an event stands for: every copy of its share, else itself. */
+    private eventCopies(personId: PersonId, eventId: string): { personId: PersonId; event: LifeEvent }[] | null {
+        const ev = this.data.persons[personId]?.events?.find(e => e.id === eventId);
+        if (!ev) return null;
+        return ev.shareId ? shareCopiesOf(this.data, ev.shareId) : [{ personId, event: ev }];
+    }
+
+    /** Take copies out of the persons' events (by identity). */
+    private dropEventCopies(copies: readonly { personId: PersonId; event: LifeEvent }[]): void {
+        for (const c of copies) {
+            const person = this.data.persons[c.personId];
+            if (!person?.events) continue;
+            person.events = person.events.filter(e => e !== c.event);
+            if (person.events.length === 0) delete person.events;
+        }
+    }
+
+    /**
+     * Save an event edited with the persons it is shared with (spec 085 §1,
+     * §3), as ONE undo step. `common` goes to every copy kept (only the
+     * fields given: a field another copy has otherwise is not overwritten
+     * unless given); `own` to each person's copy (age, role…). Each person of
+     * `add` gets a new copy (a new event id, no research status, no origin:
+     * entered by hand) with the common fields as the edited copy has them;
+     * the copy of each person of `remove` is deleted; the copy of each person
+     * of `separate` loses the share and keeps its values from before this
+     * edit. A person of `add` who has the same event of their own already
+     * (ownSameEvent, spec 085 K1.6 a) gets no new copy: that record joins
+     * the share with its own common fields (a difference stays until Unify,
+     * only a house written at some records alone reaches the others) and the
+     * values `own` gives written to it (an empty one keeps the record's). An event not shared yet gets a new share id when a person is
+     * added; a share left with one copy is gone (an ordinary event).
+     *
+     * Refused (null): no such event, a birth or death, a custom event without
+     * a label, a type that cannot be shared for two copies or more, a locked
+     * person among those it would change.
+     */
+    saveSharedEvent(viewerPersonId: PersonId, eventId: string, edit: SharedEventEdit): SharedEventSaveResult | null {
+        const viewer = this.data.persons[viewerPersonId];
+        const group = this.eventCopies(viewerPersonId, eventId);
+        if (!viewer || !group) return null;
+        const viewerCopy = group.find(c => c.personId === viewerPersonId && c.event.id === eventId)!;
+        const removeSet = new Set(edit.remove ?? []);
+        const separateSet = new Set((edit.separate ?? []).filter(pid => !removeSet.has(pid)));
+        const removed = group.filter(c => removeSet.has(c.personId));
+        const separated = group.filter(c => separateSet.has(c.personId));
+        const kept = group.filter(c => !removeSet.has(c.personId) && !separateSet.has(c.personId));
+        const inGroup = new Set(group.map(c => c.personId));
+        const added: PersonId[] = [];
+        for (const pid of edit.add ?? []) {
+            if (!this.data.persons[pid] || inGroup.has(pid) || removeSet.has(pid) || added.includes(pid)) continue;
+            added.push(pid);
+        }
+
+        const nextType = edit.common.type ?? viewerCopy.event.type;
+        if (nextType === 'birth' || nextType === 'death') return null;
+        const nextLabel = 'customLabel' in edit.common ? edit.common.customLabel : viewerCopy.event.customLabel;
+        if (nextType === 'custom' && !nextLabel?.trim()) return null;
+        if (kept.length + added.length >= 2 && !eventIsShareable(nextType)) return null;
+        const touched = new Set<PersonId>([...group.map(c => c.personId), ...added]);
+        for (const pid of touched) if (this.isPersonLocked(pid)) return null;
+
+        this.beginMutation();
+        this.dropEventCopies(removed);
+        for (const c of separated) {
+            delete c.event.shareId;
+            delete c.event.shareRole;
+        }
+        for (const c of kept) {
+            applyEventFields(c.event, edit.common);
+            const own = edit.own?.get(c.personId);
+            if (own) applyEventFields(c.event, own);
+        }
+        const base = kept.find(c => c === viewerCopy) ?? kept[0];
+        const common = base ? commonFieldsOf(base.event) : { ...commonFieldsOf(viewerCopy.event), ...edit.common };
+        const final: { personId: PersonId; event: LifeEvent }[] = [...kept];
+        const attached: PersonId[] = [];
+        const sameAs: SameEventFields = { ...common, type: nextType };
+        for (const pid of added) {
+            const person = this.data.persons[pid];
+            const own = edit.own?.get(pid);
+            // K1.6 a: the same event already in their life joins (its common
+            // fields stay as they are: a difference is for Unify), no new copy;
+            // its own fields (age, role…) stay unless the edit gives a value.
+            const same = ownSameEvent(person, sameAs);
+            if (same) {
+                if (own) applyEventFields(same, Object.fromEntries(Object.entries(own).filter(([, v]) => v !== undefined)));
+                final.push({ personId: pid, event: same });
+                attached.push(pid);
+                continue;
+            }
+            const event: LifeEvent = { id: generateLifeEventId(), type: nextType };
+            applyEventFields(event, common);
+            if (own) applyEventFields(event, own);
+            (person.events ??= []).push(event);
+            final.push({ personId: pid, event });
+        }
+        // A house written at some of the joined records only reaches the others (as a person merge does).
+        if (attached.length > 0) fillSameEventAddress(final.map(c => c.event));
+        let shareId: string | null = null;
+        if (final.length >= 2) {
+            shareId = viewerCopy.event.shareId ?? final.find(c => c.event.shareId)?.event.shareId ?? newShareIdFor(this.data);
+            for (const c of final) c.event.shareId = shareId;
+        } else {
+            for (const c of final) {
+                delete c.event.shareId;
+                delete c.event.shareRole;
+            }
+        }
+        this.commitMutation(strings.undo.editEvent(auditPersonName(viewer)));
+        AuditLogManager.log(this.currentTreeId, 'event.update', strings.auditLog.updatedEvent(auditPersonName(viewer)));
+        const personIds: PersonId[] = [];
+        for (const c of final) if (!personIds.includes(c.personId)) personIds.push(c.personId);
+        return { shareId, personIds, attached };
+    }
+
+    /**
+     * Join an event recorded separately at several persons (Data quality,
+     * spec 085 K1.6 b): the group of findSeparateSameEvents with this key, as
+     * the tree has it now, becomes one shared event — its records get one
+     * share id (the share there already, else a new one), each keeping its
+     * age and own fields; common fields that differ stay for Unify, only a
+     * house written at some records alone reaches the others. One undo step
+     * (saveSharedEvent). Null: no such group now, or the save was refused (a
+     * locked person).
+     */
+    joinSeparateSameEvent(key: string): SharedEventSaveResult | null {
+        const group = findSeparateSameEvents(this.data).find(g => g.key === key);
+        if (!group) return null;
+        return this.saveSharedEvent(group.target.personId, group.target.event.id, {
+            common: {}, add: group.records.map(r => r.personId),
+        });
+    }
+
+    /**
+     * Take a person's copy out of its shared event (spec 085 §3 "Separate"):
+     * it stays the person's ordinary event, with `ownEdits` (the editor's
+     * unsaved changes) written to it alone. A share left with one copy is
+     * gone. One undo step; false when there is no such event or the person
+     * is locked.
+     */
+    separateFromShared(personId: PersonId, eventId: string, ownEdits?: Partial<Omit<LifeEvent, 'id' | 'shareId'>>): boolean {
+        const person = this.data.persons[personId];
+        const ev = person?.events?.find(e => e.id === eventId);
+        if (!person || !ev || this.isPersonLocked(personId)) return false;
+        const nextType = ownEdits?.type ?? ev.type;
+        if (nextType === 'birth' || nextType === 'death') return false;
+        const nextLabel = ownEdits && 'customLabel' in ownEdits ? ownEdits.customLabel : ev.customLabel;
+        if (nextType === 'custom' && !nextLabel?.trim()) return false;
+        const shareId = ev.shareId;
+        this.beginMutation();
+        delete ev.shareId;
+        delete ev.shareRole;
+        if (ownEdits) applyEventFields(ev, ownEdits);
+        if (shareId) tidyShares(this.data, [shareId]);
+        this.commitMutation(strings.undo.editEvent(auditPersonName(person)));
+        AuditLogManager.log(this.currentTreeId, 'event.update', strings.auditLog.updatedEvent(auditPersonName(person)));
+        return true;
+    }
+
+    /**
+     * Delete a person's copy of a shared event (spec 085 §3 "Remove"); the
+     * other copies stay as they are, a share left with one copy is gone.
+     * One undo step.
+     */
+    removeFromShared(personId: PersonId, eventId: string): boolean {
+        const person = this.data.persons[personId];
+        const ev = person?.events?.find(e => e.id === eventId);
+        if (!person || !ev || this.isPersonLocked(personId)) return false;
+        const shareId = ev.shareId;
+        this.beginMutation();
+        this.dropEventCopies([{ personId, event: ev }]);
+        if (shareId) tidyShares(this.data, [shareId]);
+        this.commitMutation(strings.undo.removeEvent(auditPersonName(person)));
+        AuditLogManager.log(this.currentTreeId, 'event.remove', strings.auditLog.removedEvent(auditPersonName(person)));
+        return true;
+    }
+
+    /** Delete every copy of a shared event (spec 085 §3 "Delete for all"); one undo step, the number of copies deleted. */
+    deleteSharedForAll(shareId: string): number {
+        const copies = shareCopiesOf(this.data, shareId);
+        if (copies.length === 0 || copies.some(c => this.isPersonLocked(c.personId))) return 0;
+        const first = this.data.persons[copies[0].personId];
+        this.beginMutation();
+        this.dropEventCopies(copies);
+        this.commitMutation(strings.undo.removeEvent(auditPersonName(first)));
+        AuditLogManager.log(this.currentTreeId, 'event.remove', strings.auditLog.removedEvent(auditPersonName(first)));
+        return copies.length;
+    }
+
+    /**
+     * Make the copies of a shared event the same again (spec 085 §4
+     * "Unify"): `values` (the common fields chosen) are written to every
+     * copy. One undo step; the number of copies, 0 when refused.
+     */
+    unifySharedCopies(shareId: string, values: SharedEventCommon): number {
+        const copies = shareCopiesOf(this.data, shareId);
+        if (copies.length === 0 || copies.some(c => this.isPersonLocked(c.personId))) return 0;
+        if (values.type !== undefined && (values.type === 'birth' || values.type === 'death' || !eventIsShareable(values.type))) return 0;
+        const first = this.data.persons[copies[0].personId];
+        this.beginMutation();
+        for (const c of copies) applyEventFields(c.event, values);
+        this.commitMutation(strings.undo.editEvent(auditPersonName(first)));
+        AuditLogManager.log(this.currentTreeId, 'event.update', strings.auditLog.updatedEvent(auditPersonName(first)));
+        return copies.length;
+    }
+
+    /**
+     * Take the copies of these persons out of a shared event (spec 085 §4
+     * "Separate copies"): each stays its person's ordinary event as it is;
+     * a share left with one copy is gone. One undo step; the number of
+     * copies separated.
+     */
+    separateCopies(shareId: string, personIds: readonly PersonId[]): number {
+        const ids = new Set(personIds);
+        const copies = shareCopiesOf(this.data, shareId).filter(c => ids.has(c.personId));
+        if (copies.length === 0 || copies.some(c => this.isPersonLocked(c.personId))) return 0;
+        const first = this.data.persons[copies[0].personId];
+        this.beginMutation();
+        for (const c of copies) {
+            delete c.event.shareId;
+            delete c.event.shareRole;
+        }
+        tidyShares(this.data, [shareId]);
+        this.commitMutation(strings.undo.editEvent(auditPersonName(first)));
+        AuditLogManager.log(this.currentTreeId, 'event.update', strings.auditLog.updatedEvent(auditPersonName(first)));
+        return copies.length;
+    }
+
+    /**
+     * Write one common field of a person's event (a Table cell, a quick
+     * edit): to every copy when it is shared, else to that event alone. One
+     * undo step; the number of copies written, 0 when refused (a type that
+     * cannot be shared for a shared event, a custom event without a label…).
+     */
+    updateSharedCommonField<F extends SharedEventCommonField>(personId: PersonId, eventId: string, field: F, value: LifeEvent[F] | undefined): number {
+        const person = this.data.persons[personId];
+        const copies = this.eventCopies(personId, eventId);
+        if (!person || !copies) return 0;
+        if (copies.some(c => this.isPersonLocked(c.personId))) return 0;
+        const ev = copies.find(c => c.personId === personId && c.event.id === eventId)!.event;
+        const nextType = field === 'type' ? value as LifeEvent['type'] | undefined : ev.type;
+        if (!nextType || nextType === 'birth' || nextType === 'death') return 0;
+        if (copies.length >= 2 && !eventIsShareable(nextType)) return 0;
+        const nextLabel = field === 'customLabel' ? value as string | undefined : ev.customLabel;
+        if (nextType === 'custom' && !nextLabel?.trim()) return 0;
+        this.beginMutation();
+        for (const c of copies) applyEventFields(c.event, { [field]: value } as SharedEventCommon);
+        this.commitMutation(strings.undo.editEvent(auditPersonName(person)));
+        AuditLogManager.log(this.currentTreeId, 'event.update', strings.auditLog.updatedEvent(auditPersonName(person)));
+        return copies.length;
     }
 
     // ==================== FACT CONFIRMATION (spec 065) ====================
@@ -2730,6 +3292,7 @@ class DataManagerClass {
                 ...(p.personId ? { personId: p.personId } : {}),
                 ...(p.name?.trim() ? { name: p.name.trim() } : {}),
                 ...(p.note?.trim() ? { note: p.note.trim() } : {}),
+                ...(!p.personId && p.linkRejected?.length ? { linkRejected: [...p.linkRejected] } : {}),
             }));
         if (JSON.stringify(next) === JSON.stringify(partnership.participants ?? [])) return false;
 
@@ -2741,6 +3304,81 @@ class DataManagerClass {
         this.commitMutation(strings.undo.editPartnership(p1, p2));
         AuditLogManager.log(this.currentTreeId, 'partnership.update',
             strings.auditLog.updatedPartnership(p1, p2));
+        return true;
+    }
+
+    /**
+     * The copies of one participant recorded by name (spec 085 §6): at a
+     * person's event (every copy of a shared event, matched by the
+     * participant's id, else by its role and name), at a couple's event or
+     * among a wedding's witnesses. Null when the event or its holder cannot
+     * be changed (a locked person, a locked tree).
+     */
+    private namedParticipantCopies(ref: ParticipantRef): { parts: EventParticipant[]; undo: string } | null {
+        if (ref.ownerPersonId) {
+            const person = this.data.persons[ref.ownerPersonId];
+            const ev = person?.events?.find(e => e.id === ref.eventId);
+            const part = ev?.participants?.find(p => p.id === ref.participantId);
+            if (!person || !ev || !part || this.isPersonLocked(person.id)) return null;
+            const parts = [part];
+            if (ev.shareId) {
+                const same = (p: EventParticipant): boolean => p.id === part.id
+                    || (!p.personId && p.role === part.role && foldName(p.name ?? '') === foldName(part.name ?? ''));
+                for (const c of shareCopiesOf(this.data, ev.shareId)) {
+                    if (c.event === ev) continue;
+                    if (this.isPersonLocked(c.personId)) return null;
+                    const other = c.event.participants?.find(same);
+                    if (other) parts.push(other);
+                }
+            }
+            return { parts, undo: strings.undo.editEvent(auditPersonName(person)) };
+        }
+        const union = ref.partnershipId ? this.data.partnerships[ref.partnershipId] : undefined;
+        if (!union || this.isTreeLocked()) return null;
+        const list = ref.eventId === MARRIAGE_EVENT_ID ? union.participants : union.events?.find(e => e.id === ref.eventId)?.participants;
+        const part = list?.find(p => p.id === ref.participantId);
+        if (!part) return null;
+        return { parts: [part], undo: ref.eventId === MARRIAGE_EVENT_ID
+            ? strings.undo.editPartnership(auditPersonName(this.data.persons[union.person1Id]), auditPersonName(this.data.persons[union.person2Id]))
+            : strings.undo.editEvent(this.partnershipNames(union)) };
+    }
+
+    /**
+     * Link a participant recorded by name to a person of the tree (spec 085
+     * §6, K1.4): the name as written stays beside the link. One undo step.
+     */
+    linkNamedParticipant(ref: ParticipantRef, personId: PersonId): boolean {
+        if (!this.data.persons[personId]) return false;
+        const found = this.namedParticipantCopies(ref);
+        if (!found || found.parts.every(p => p.personId)) return false;
+        this.beginMutation();
+        for (const part of found.parts) {
+            if (part.personId) continue;
+            part.personId = personId;
+            delete part.linkRejected;
+        }
+        this.commitMutation(found.undo);
+        return true;
+    }
+
+    /**
+     * "Not this person" / "None of them" (spec 085 §6): the participant
+     * recorded by name is not these persons, and they are not offered again.
+     */
+    rejectNamedParticipant(ref: ParticipantRef, personIds: readonly PersonId[]): boolean {
+        const found = this.namedParticipantCopies(ref);
+        if (!found || personIds.length === 0) return false;
+        const add = (part: EventParticipant): boolean => {
+            const next = [...new Set([...(part.linkRejected ?? []), ...personIds])];
+            return next.length !== (part.linkRejected?.length ?? 0);
+        };
+        if (!found.parts.some(p => !p.personId && add(p))) return false;
+        this.beginMutation();
+        for (const part of found.parts) {
+            if (part.personId) continue;
+            part.linkRejected = [...new Set([...(part.linkRejected ?? []), ...personIds])];
+        }
+        this.commitMutation(found.undo);
         return true;
     }
 
@@ -2768,7 +3406,11 @@ class DataManagerClass {
             .join(' & ');
     }
 
-    /** Add a citation of `sourceId` on a person's life event. */
+    /**
+     * Add a citation of `sourceId` on a person's life event. Sources are
+     * common to a shared event (spec 085): every copy of its share gets the
+     * citation (a locked person's copy is left as it is).
+     */
     citeEvent(personId: PersonId, eventId: string, sourceId: string): boolean {
         const person = this.data.persons[personId];
         const ev = person?.events?.find(e => e.id === eventId);
@@ -2777,14 +3419,17 @@ class DataManagerClass {
         if (ev.sourceIds?.includes(sourceId)) return false;
 
         this.beginMutation();
-        if (!ev.sourceIds) ev.sourceIds = [];
-        ev.sourceIds.push(sourceId);
+        for (const c of this.eventCopies(personId, eventId) ?? [{ personId, event: ev }]) {
+            if (c.event !== ev && this.isPersonLocked(c.personId)) continue;
+            if (c.event.sourceIds?.includes(sourceId)) continue;
+            (c.event.sourceIds ??= []).push(sourceId);
+        }
         this.commitMutation(strings.undo.cite(auditPersonName(person)));
         AuditLogManager.log(this.currentTreeId, 'source.cite', strings.auditLog.citedSource(auditPersonName(person)));
         return true;
     }
 
-    /** Remove a citation of `sourceId` from a person's life event. */
+    /** Remove a citation of `sourceId` from a person's life event (from every copy of a shared one, as citeEvent). */
     unciteEvent(personId: PersonId, eventId: string, sourceId: string): boolean {
         const person = this.data.persons[personId];
         const ev = person?.events?.find(e => e.id === eventId);
@@ -2792,11 +3437,38 @@ class DataManagerClass {
         if (this.isPersonLocked(personId)) return false;
 
         this.beginMutation();
-        ev.sourceIds = ev.sourceIds.filter(id => id !== sourceId);
-        if (ev.sourceIds.length === 0) delete ev.sourceIds;
-        cleanCitationQuay(ev, ['sourceIds']);
+        for (const c of this.eventCopies(personId, eventId) ?? [{ personId, event: ev }]) {
+            if (c.event !== ev && this.isPersonLocked(c.personId)) continue;
+            if (!c.event.sourceIds?.includes(sourceId)) continue;
+            c.event.sourceIds = c.event.sourceIds.filter(id => id !== sourceId);
+            if (c.event.sourceIds.length === 0) delete c.event.sourceIds;
+            cleanCitationQuay(c.event, ['sourceIds']);
+        }
         this.commitMutation(strings.undo.uncite(auditPersonName(person)));
         AuditLogManager.log(this.currentTreeId, 'source.uncite', strings.auditLog.uncitedSource(auditPersonName(person)));
+        return true;
+    }
+
+    /**
+     * Set the quality (QUAY 0–3, undefined: none given) of the citation of
+     * `sourceId` on a person's life event. Citations are common to a shared
+     * event (spec 085): every copy citing the source gets the same quality,
+     * in one undo step (a locked person's copy is left as it is, as citeEvent).
+     */
+    setEventCitationQuality(personId: PersonId, eventId: string, sourceId: string, quay: number | undefined): boolean {
+        const person = this.data.persons[personId];
+        const ev = person?.events?.find(e => e.id === eventId);
+        if (!person || !ev?.sourceIds?.includes(sourceId)) return false;
+        if (this.isPersonLocked(personId)) return false;
+        if (quay !== undefined && !(Number.isInteger(quay) && quay >= 0 && quay <= 3)) return false;
+
+        this.beginMutation();
+        for (const c of this.eventCopies(personId, eventId) ?? [{ personId, event: ev }]) {
+            if (c.event !== ev && this.isPersonLocked(c.personId)) continue;
+            if (!c.event.sourceIds?.includes(sourceId)) continue;
+            setCitationQuality(c.event, 'sourceIds', sourceId, quay, this.data.sources);
+        }
+        this.commitMutation(strings.undo.cite(auditPersonName(person)));
         return true;
     }
 
@@ -3029,9 +3701,14 @@ class DataManagerClass {
             for (const part of partnershipParticipants(union)) unlinkParticipant(part);
         }
 
+        // Its copies of shared events go with it; a share left with one copy
+        // is an ordinary event again (spec 085 §3).
+        const shareIds = (person.events ?? []).flatMap(e => e.shareId ? [e.shareId] : []);
         delete this.data.persons[id];
         // A stand-in left with nothing to stand for goes; a child left with one real parent gets its "?" family.
         tidyPlaceholders(this.data, others);
+        // …and the own records of a part at another's event lose the link to it.
+        tidyShares(this.data, shareIds);
         this.commitMutation(strings.undo.deletePerson(deletedName));
         // Audit log
         AuditLogManager.log(this.currentTreeId, 'person.delete', strings.auditLog.deletedPerson(deletedName));
@@ -3624,7 +4301,7 @@ class DataManagerClass {
             this.data.defaultPersonId = value;
         }
 
-        this.save();
+        this.save('state');
     }
 
     /**
@@ -3642,7 +4319,7 @@ class DataManagerClass {
         if (!this.currentTreeId || this.isLocked() || this.isNewerData()) return;
         if (value === undefined) delete this.data.defaultView;
         else this.data.defaultView = value;
-        this.save();
+        this.save('state');
     }
 
     /** The view the current tree opens in (undefined = the family view). */
@@ -3661,7 +4338,7 @@ class DataManagerClass {
             this.data.lastFocusPersonId = personId;
             this.data.lastFocusDepthUp = depthUp;
             this.data.lastFocusDepthDown = depthDown;
-            this.save();
+            this.save('state');
         }
     }
 
@@ -3938,7 +4615,8 @@ class DataManagerClass {
         keepId: PersonId,
         removeId: PersonId,
         resolvedFields: { [key: string]: string | undefined },
-        partnershipResolutions: Map<PartnershipId, 'merge' | 'keep_both'>
+        partnershipResolutions: Map<PartnershipId, 'merge' | 'keep_both'>,
+        sharedChoices: PersonMergeShareChoices = {},
     ): boolean {
         const keepPerson = this.data.persons[keepId];
         const removePerson = this.data.persons[removeId];
@@ -3946,6 +4624,9 @@ class DataManagerClass {
         if (!keepPerson || !removePerson || keepId === removeId) {
             return false;
         }
+        // Shared events both are in, or one is in while the other has the same
+        // event of its own (spec 085 §7) — read before anything moves.
+        const shareRows = personMergeShares(this.data, keepId, removeId);
 
         this.beginMutation();
 
@@ -4181,6 +4862,9 @@ class DataManagerClass {
                 if (!seen.has(ev.id)) keepPerson.events.push(ev);
             }
         }
+        // The merged person is in a shared event once; an own record of the
+        // same event joins it unless the merge was told to keep it apart.
+        const touchedShares = applyPersonMergeShares(this.data, keepPerson, shareRows, sharedChoices);
         // A citation only the removed person had keeps its own QUAY.
         for (const field of PERSON_CITATION_FIELDS) unionCitations(keepPerson, removePerson, field);
         if (removePerson.attachments && removePerson.attachments.length > 0) {
@@ -4212,6 +4896,11 @@ class DataManagerClass {
         ];
         for (const parts of participantLists) {
             if (!parts) continue;
+            for (const part of parts) {
+                if (part.linkRejected?.includes(removeId)) {
+                    part.linkRejected = [...new Set(part.linkRejected.map(pid => pid === removeId ? keepId : pid))];
+                }
+            }
             for (let i = parts.length - 1; i >= 0; i--) {
                 if (parts[i].personId !== removeId) continue;
                 const dupe = parts.some((q, j) =>
@@ -4219,6 +4908,12 @@ class DataManagerClass {
                 if (dupe) parts.splice(i, 1);
                 else parts[i].personId = keepId;
             }
+        }
+
+        // An own record of a part at the removed person's event (spec 085 §6)
+        // now points at the kept one; a link to a couple merged away goes.
+        for (const p of Object.values(this.data.persons)) {
+            for (const ev of p.events ?? []) if (ev.roleAt?.personId === removeId) ev.roleAt.personId = keepId;
         }
 
         // 6d. Origin from a GEDCOM import (spec 066): facts and parent links
@@ -4241,6 +4936,10 @@ class DataManagerClass {
 
         // 7. Delete the removed person
         delete this.data.persons[removeId];
+        // A link of an own record of a part at a couple's event merged away goes (spec 085).
+        // A share the merge left with one copy (the two persons were its only
+        // ones) is an ordinary event.
+        tidyShares(this.data, touchedShares);
 
         // Person merge has its own completion toast — no Undo toast.
         this.commitMutation(strings.undo.mergePersons(keptName), true);

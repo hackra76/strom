@@ -302,7 +302,9 @@ async function probeFit(page: Page) {
         const pill = document.querySelector('.toolbar .tree-switcher-btn') as HTMLElement;
         const pr = pill.getBoundingClientRect();
         const sw = (document.querySelector('.toolbar .tree-switcher') as HTMLElement).getBoundingClientRect();
-        const search = (document.querySelector('.toolbar .search-container') as HTMLElement).getBoundingClientRect();
+        // The search field, or the magnifier it folded into (toolbar-squeeze-3; e.g. de with ⧉ for windows).
+        const folded = tb.classList.contains('toolbar-squeeze-3');
+        const search = (document.querySelector(folded ? '.toolbar .search-open-btn' : '.toolbar .search-container') as HTMLElement).getBoundingClientRect();
         return {
             // The toolbar holds its content: nothing scrolls past its edge.
             overflow: tb.scrollWidth - tb.clientWidth,
@@ -459,6 +461,89 @@ test.describe('the tree switcher\'s name in a tight toolbar (de-DE)', () => {
     });
 });
 
+/**
+ * The search field of a tree without a research (de: the widest view tabs).
+ * The view tabs' labels take the 500 cut (the chosen one's bold cut is drawn
+ * over its label and takes no room) and the search funnel keeps a 1px chip
+ * edge; the tabs' side padding and the funnel's give that room back, so the
+ * search input is no narrower than with the earlier tabs (400 cut, 14 px sides)
+ * and the edgeless funnel. The earlier look is put back with an injected style
+ * and measured in the same page. A machine that draws the bold cut wider (CI's
+ * Linux, 2-4 px a label) changes no tab's width.
+ */
+test.describe('the search field beside the view tabs (de-DE, no research)', () => {
+    test.use({ locale: 'de-DE' });
+    const EARLIER_LOOK = `
+        .view-mode-segment .sel-tab { padding-left: 14px !important; padding-right: 14px !important; }
+        .view-mode-segment .sel-tab:not(.active) { font-weight: 400 !important; }
+        .view-mode-segment .sel-l::after { content: none !important; }
+        .view-mode-segment .sel-tab.active > .sel-l { font-weight: 600 !important; -webkit-text-fill-color: currentColor !important; }
+        .toolbar .search-filter-toggle { border: 0 !important; padding-left: 14px !important; padding-right: 14px !important; }`;
+
+    async function searchRoom(page: Page) {
+        await settleLayout(page, '#toolbar-search-picker', '#view-mode-segment');
+        return page.evaluate(() => {
+            const input = document.querySelector('#toolbar-search-picker .person-picker-input') as HTMLElement;
+            const tabs = Array.from(document.querySelectorAll<HTMLElement>('#view-mode-segment button'));
+            return {
+                search: input.getBoundingClientRect().width,
+                steps: (document.querySelector('.toolbar') as HTMLElement).className,
+                tabsWhole: tabs.every(t => t.scrollWidth <= t.clientWidth + 0.5),
+            };
+        });
+    }
+
+    test('1440 and 1300 px, the sample and a long tree name: the search input keeps the earlier width', async ({ page }) => {
+        await page.setViewportSize({ width: 1440, height: 900 });
+        await openApp(page);
+        await page.evaluate(() => window.Strom.UI.loadDemoTree());
+        await expect(page.locator('.person-card').first()).toBeVisible();
+        for (const name of [null, 'Familie Großmann aus Oberbayern']) {
+            if (name) {
+                await page.evaluate(() => window.Strom.UI.showRenameTreeDialog(window.Strom.TreeManager.getActiveTreeId()!));
+                await page.locator('#rename-tree-name').fill(name);
+                await page.locator('#rename-tree-modal .buttons .primary').click();
+                await expect(page.locator('#current-tree-name')).toHaveText(name);
+            }
+            for (const width of [1440, 1300]) {
+                await page.setViewportSize({ width, height: 900 });
+                const now = await searchRoom(page);
+                const earlier = await page.addStyleTag({ content: EARLIER_LOOK });
+                const before = await searchRoom(page);
+                await earlier.evaluate(el => el.remove());
+                const at = `${name ?? 'sample'} @${width}px`;
+                expect(now.tabsWhole, `${at}: no view tab cuts its label`).toBe(true);
+                expect(now.steps, `${at}: the same fit steps as with the earlier tabs`).toBe(before.steps);
+                expect(now.search, `${at}: the search input (${now.search}) keeps the earlier width (${before.search})`)
+                    .toBeGreaterThanOrEqual(before.search - 0.5);
+            }
+        }
+    });
+
+    test('a wider bold cut (as a Linux rasteriser draws it) changes no view tab\'s width', async ({ page }) => {
+        await page.setViewportSize({ width: 1440, height: 900 });
+        await openApp(page);
+        await page.evaluate(() => window.Strom.UI.loadDemoTree());
+        await expect(page.locator('.person-card').first()).toBeVisible();
+        const tabs = () => page.locator('#view-mode-segment button').evaluateAll(els => els.map(e => e.getBoundingClientRect().width));
+        await settleLayout(page, '#view-mode-segment');
+        const regular = await tabs();
+        // Every 600 cut 3 px wider a label: the reserve of the bold cut grew with it (CI 1440 px: search 53 -> 30).
+        const wide = await page.addStyleTag({ content: `
+            .view-mode-segment .sel-l::after { letter-spacing: .45px !important; }` });
+        await settleLayout(page, '#view-mode-segment');
+        const widened = await tabs();
+        for (let i = 0; i < regular.length; i++) expect(widened[i], `tab ${i}`).toBeCloseTo(regular[i], 1);
+        // The chosen label is drawn whole in the bold cut, inside its tab.
+        const drawn = await page.locator('#view-mode-family').evaluate(btn => {
+            const after = getComputedStyle(btn.querySelector('.sel-l')!, '::after');
+            return { visibility: after.visibility, weight: after.fontWeight, tabWhole: btn.scrollWidth <= btn.clientWidth + 0.5 };
+        });
+        expect(drawn).toEqual({ visibility: 'visible', weight: '600', tabWhole: true });
+        await wide.evaluate(el => el.remove());
+    });
+});
+
 test.describe('the 1280 fold boundary', () => {
     test('no toolbar ⚙ at any width: Settings is the last ⋯ Actions row on both sides of 1280; the Actions label folds at 1280', async ({ page }) => {
         await openApp(page);
@@ -475,5 +560,100 @@ test.describe('the 1280 fold boundary', () => {
             await expect(last).toHaveText('Settings');
             await page.keyboard.press('Escape');
         }
+    });
+});
+
+/**
+ * The sample tree's toolbar carries the person in the centre with both depth
+ * steppers, the family line picker ("Stammlinien ▾", spec 039) and ⧉ (spec
+ * 079). In de at 1024 px the steppers ran out of the person's group under the
+ * line picker ("Nachkommen − 6 +" half covered), the person's name squeezed
+ * away: the tablet toolbar was not measured. Every language, the tablet band
+ * and the desktop, the Family and the Descendants view, in the app's fonts
+ * and in a wide one (CI's fonts are wider than a Mac's): no two of the
+ * toolbar's controls overlap, none runs out of the toolbar, the steppers'
+ * buttons take a click where they are drawn.
+ */
+test.describe('the sample tree\'s toolbar with the line picker and ⧉', () => {
+    const WIDE_FONT = '* { font-family: Verdana, "DejaVu Sans", sans-serif !important; }';
+    const FIT_WIDTHS = [1440, 1100, 1024, 960, 900, 800, 700, 641];
+    /** The line picker's "all lines" label: the language is the one asked for. */
+    const ALL_LINES: Record<string, string> = { 'de-DE': 'Stammlinien', 'cs-CZ': 'Rody', 'en-US': 'Lines', 'pl-PL': 'Rody' };
+
+    async function toolbarAudit(page: Page) {
+        return page.evaluate(() => {
+            const tb = document.querySelector('.toolbar') as HTMLElement;
+            const tr = tb.getBoundingClientRect();
+            const visible = (el: Element): boolean => {
+                const r = el.getBoundingClientRect();
+                return r.width >= 1 && r.height >= 1 && el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+            };
+            const label = (el: Element): string =>
+                `${el.id ? `#${el.id}` : `.${String((el as HTMLElement).className).split(' ')[0] || el.tagName}`}"${(el.textContent ?? '').trim().slice(0, 16)}"`;
+            // The controls a person sees: buttons and fields whole, the texts beside them.
+            const controls = Array.from(tb.querySelectorAll('button, summary, input, strong, .focus-count, .depth-stepper-label, .depth-stepper-value, .app-wordmark'))
+                .filter(el => !el.parentElement?.closest('button, summary'))
+                .filter(el => !el.closest('.sp-rodpick-pop, #view-window-menu, .person-picker-dropdown, .tree-switcher-dropdown'))
+                .filter(visible);
+            const overlaps: string[] = [];
+            for (let i = 0; i < controls.length; i++) {
+                for (let j = i + 1; j < controls.length; j++) {
+                    if (controls[i].contains(controls[j]) || controls[j].contains(controls[i])) continue;
+                    const a = controls[i].getBoundingClientRect();
+                    const b = controls[j].getBoundingClientRect();
+                    if (a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1) {
+                        overlaps.push(`${label(controls[i])} × ${label(controls[j])}`);
+                    }
+                }
+            }
+            const outside = controls.filter(el => {
+                const r = el.getBoundingClientRect();
+                return r.left < tr.left - 1 || r.right > tr.right + 1;
+            }).map(label);
+            // A stepper's buttons take the click where they are drawn (the
+            // toolbar's on a tablet, the descendants badge's in that view).
+            const covered = Array.from(document.querySelectorAll('.depth-stepper-btn')).filter(visible).filter(btn => {
+                const r = btn.getBoundingClientRect();
+                const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+                return !top || !(top === btn || btn.contains(top));
+            }).map(btn => `${btn.closest('.depth-stepper')?.querySelector('.depth-stepper-label')?.textContent?.trim() ?? ''} ${btn.textContent}`);
+            const name = document.getElementById('toolbar-focus-name') as HTMLElement;
+            const nameShown = !visible(name.parentElement!) || name.getBoundingClientRect().width + 1 >= Math.min(name.scrollWidth, 60);
+            return {
+                overlaps, outside, covered, nameShown,
+                overflow: tb.scrollWidth - tb.clientWidth,
+                linePicker: visible(document.getElementById('view-rod-picker')!),
+            };
+        });
+    }
+
+    for (const locale of ['de-DE', 'cs-CZ', 'en-US', 'pl-PL']) test.describe(locale, () => {
+        test.use({ locale });
+        test('nothing overlaps or runs over from 1440 to 641 px', async ({ page }) => {
+            test.setTimeout(90_000);
+            await page.setViewportSize({ width: 1024, height: 800 });
+            await openApp(page);
+            await page.evaluate(() => window.Strom.UI.loadDemoTree());
+            await expect(page.locator('.person-card').first()).toBeVisible();
+            await expect(page.locator('#view-rod-picker .sp-rodpick-btn')).toContainText(ALL_LINES[locale]);
+            for (const font of ['app', 'wide']) {
+                if (font === 'wide') await page.addStyleTag({ content: WIDE_FONT });
+                for (const view of ['family', 'descendants'] as const) {
+                    await page.evaluate((v) => window.Strom.UI.setDisplayViewMode(v), view);
+                    for (const width of FIT_WIDTHS) {
+                        await page.setViewportSize({ width, height: 800 });
+                        await settleLayout(page, '.toolbar-focus', '#view-rod-picker');
+                        const a = await toolbarAudit(page);
+                        const at = `${locale} ${font} font, ${view} @${width}px`;
+                        expect(a.linePicker, `${at}: the line picker is in the toolbar`).toBe(true);
+                        expect(a.overlaps, `${at}: no two controls overlap`).toEqual([]);
+                        expect(a.outside, `${at}: no control runs out of the toolbar`).toEqual([]);
+                        expect(a.overflow, `${at}: the toolbar does not overflow`).toBeLessThanOrEqual(0);
+                        expect(a.covered, `${at}: the steppers take their clicks`).toEqual([]);
+                        expect(a.nameShown, `${at}: the person's name is not squeezed away`).toBe(true);
+                    }
+                }
+            }
+        });
     });
 });

@@ -28,18 +28,30 @@ import {
     stopAcceptBatch, toggleAcceptSelection, waitingHypothesisPlan,
 } from '../research-hypothesis-waiting.js';
 import { researchActionLabel, setResearchActionLabel } from './research-open-mark.js';
+import type { SearchHit } from '../section-search-match.js';
+import { bulkBoxState, selectedOutside } from '../section-search-filter.js';
 import { el, liveSession, markWaitingFocus } from './research-ui.js';
 import { lastBridgeStatus } from './research-sync-ui.js';
 import { uiModule } from './module.js';
 import type { UIClass } from './index.js';
 
-type Mode = 'docked' | 'overlay' | 'sheet';
+type Mode = 'docked' | 'overlay' | 'sheet' | 'window';
 
 /** One hypothesis of a list that accepts proposals at once. */
 export interface HypothesisAcceptEntry {
     id: string;
     h: ResearchHypothesis | undefined;
     box: HypothesisAcceptBox;
+}
+
+/**
+ * A list of hypotheses while its section is searched (spec 083 §1, §2): the
+ * hypotheses the search shows in the section (the picked ones outside it stay
+ * picked, the foot says how many) and what matched each by its number.
+ */
+export interface HypothesisListSearch {
+    found: ReadonlySet<string>;
+    hitOf?: (id: string) => SearchHit | undefined;
 }
 
 /** How long the notice of a list accepted stays. */
@@ -186,10 +198,13 @@ export const hypothesisWaitingMethods = uiModule({
     /**
      * Above a list (DEV §10): while a list asked at once waits, its block
      * ("Waiting for confirmation in the research · 3 hypotheses", Open again,
-     * Stop waiting); else "Select all with a proposal" while one can still be
-     * picked. Null when neither.
+     * Stop waiting); else "Select all with a proposal" ("Select found with a
+     * proposal (n)" while searching) with its box: empty, – or ✓ over the
+     * ones with a proposal it is about. Null when none has one, or when the
+     * most taken at once is reached and some of them are not picked.
      */
-    hypothesisAcceptHeadEl(rid: string, entries: readonly HypothesisAcceptEntry[], where: string): HTMLElement | null {
+    hypothesisAcceptHeadEl(rid: string, entries: readonly HypothesisAcceptEntry[], where: string,
+        search: HypothesisListSearch | null = null): HTMLElement | null {
         const r = strings.research;
         const b = acceptBatch(rid);
         const waiting = b ? acceptBatchWaitingCount(b, id => !!pendingHypothesis(rid, id)) : 0;
@@ -213,18 +228,29 @@ export const hypothesisWaitingMethods = uiModule({
             actions.append(again, stop);
             return block;
         }
-        const sel = acceptSelection(rid);
-        const free = entries.filter(e => e.box === 'on' && !sel.has(e.id));
-        if (free.length === 0 || acceptSelectionFull(rid)) return null;
+        // The ones with a proposal the list shows (while searching: the found ones); its box counts only them.
+        const ids = entries.filter(e => e.box === 'on').map(e => e.id);
+        if (ids.length === 0) return null;
+        const state = bulkBoxState(ids, acceptSelection(rid));
+        // The most taken at once reached: no more can be picked from here (each box still drops its own).
+        if (state !== 'all' && acceptSelectionFull(rid)) return null;
         const head = el('div', 'hp2-head');
-        const all = el('button', 'link-button hp2-all', r.hypoSelectAll);
-        all.type = 'button';
-        all.dataset.focusKey = `hp2:${where}:all`;
-        all.onclick = () => {
-            selectAllAccept(rid, entries.filter(e => e.box === 'on').map(e => e.id));
+        // Searching (spec 083 §2): "Select found with a proposal (n)", the ones the search shows.
+        const all = el('label', `hp2-all${search ? ' hp2-all--found' : ''}`);
+        const box = el('input', 'hp2-all-box');
+        box.type = 'checkbox';
+        box.checked = state === 'all';
+        box.indeterminate = state === 'some';
+        box.setAttribute('aria-checked', state === 'some' ? 'mixed' : String(state === 'all'));
+        box.dataset.focusKey = `hp2:${where}:all`;
+        box.onchange = () => {
+            // All of them picked: the box drops them; else it picks the rest.
+            if (state === 'all') for (const id of ids) toggleAcceptSelection(rid, id, false);
+            else selectAllAccept(rid, ids);
             this.renderResearchOverview();
-            refocus(`hp2:${where}:accept`);
+            refocus(state === 'all' ? `hp2:${where}:all` : `hp2:${where}:accept`);
         };
+        all.append(box, el('span', 'hp2-all-text', search ? strings.live.bulkSelectFound(ids.length) : r.hypoSelectAll));
         head.appendChild(all);
         return head;
     },
@@ -235,7 +261,7 @@ export const hypothesisWaitingMethods = uiModule({
      * once." at the limit, and "Accept proposals (n)" into the research's
      * terminal. Null otherwise.
      */
-    hypothesisAcceptFootEl(rid: string, where: string): HTMLElement | null {
+    hypothesisAcceptFootEl(rid: string, where: string, search: HypothesisListSearch | null = null): HTMLElement | null {
         const r = strings.research;
         if (this.hypothesisAcceptLocked(rid)) return null;
         const ids = [...acceptSelection(rid)];
@@ -243,9 +269,27 @@ export const hypothesisWaitingMethods = uiModule({
         const hyps = researchHypotheses(DataManager.getData());
         const foot = el('div', 'hp2-foot');
         const sum = foot.appendChild(el('p', 'hp2-sum'));
-        sum.append(r.hypoSelected(ids.length));
+        // Searching (spec 083): the picked ones the search hides stay picked; said in amber, with the way to drop them.
+        const outside = search ? selectedOutside(ids, search.found) : [];
+        if (outside.length > 0) {
+            sum.classList.add('research-overview__bulk-hidden');
+            sum.append(strings.live.bulkSelectedHidden(ids.length, outside.length));
+        } else {
+            sum.append(r.hypoSelected(ids.length));
+        }
         for (const big of acceptBigJoins(ids.map(id => ({ id, h: hyps.get(id) })))) sum.append(` ${r.hypoBigSum(big.id, big.variant, big.people)}`);
         if (acceptSelectionFull(rid)) sum.append(` ${r.hypoAcceptMax}`);
+        if (outside.length > 0) {
+            const drop = el('button', 'link-button hp2-drop-outside', strings.live.bulkDeselectHidden);
+            drop.type = 'button';
+            drop.dataset.focusKey = `hp2:${where}:outside`;
+            drop.onclick = () => {
+                for (const id of outside) toggleAcceptSelection(rid, id, false);
+                this.renderResearchOverview();
+                refocus(`hp2:${where}:accept`);
+            };
+            sum.append(' ', drop);
+        }
         const btn = el('button', 'primary hp2-accept');
         btn.type = 'button';
         btn.innerHTML = researchActionLabel(r.hypoAcceptMany(ids.length), researchLinkMark('hypotheses'));
@@ -333,7 +377,7 @@ export const hypothesisWaitingMethods = uiModule({
      * for the research's confirmation, "More ›". `accept`: the list accepts
      * proposals at once (its box before the row).
      */
-    hypothesisWaitingRow(w: LiveWaiting, mode: Mode, accept: HypothesisAcceptEntry | null): HTMLElement {
+    hypothesisWaitingRow(w: LiveWaiting, mode: Mode, accept: HypothesisAcceptEntry | null, hit?: SearchHit): HTMLElement {
         const r = strings.research;
         listen(this);
         const rid = this.activeResearchId() ?? '';
@@ -346,6 +390,8 @@ export const hypothesisWaitingMethods = uiModule({
         const li = el('li', 'research-overview__waiting-item hwr-item');
         li.dataset.id = w.id;
         li.dataset.plan = plan.kind;
+        // The first row ↓ of the section's search reaches.
+        li.dataset.row = '';
         if (liveSession()?.waitingView.fresh.has(w.id)) li.classList.add('is-fresh');
         markWaitingFocus(li, w);
         const [personId] = hypothesisPersonIds(w.id, w.person);
@@ -356,7 +402,8 @@ export const hypothesisWaitingMethods = uiModule({
         if (accept) li.appendChild(this.hypothesisAcceptBoxEl(rid, accept, 'waiting'));
         const main = li.appendChild(el('div', 'hwr-main'));
         const what = main.appendChild(el('p', 'hwr-what'));
-        what.appendChild(el('strong', 'hwr-id', w.id));
+        // Its number matched by the section's search: amber, as in the Queue's.
+        what.appendChild(el('strong', `hwr-id${hit?.h ? ' research-overview__hit' : ''}`, w.id));
         what.append(` · ${w.what || h?.title || ''}`);
         // Why its box cannot be ticked; a row whose sentence says where it is decided needs no second one.
         const note = accept && !(plan.text && accept.box === 'only-research') ? this.hypothesisAcceptNote(accept) : null;
@@ -441,7 +488,7 @@ export const hypothesisWaitingMethods = uiModule({
      * accepting proposals at once (where offered): its head, the rows with
      * their boxes, its foot.
      */
-    hypothesisWaitingList(items: readonly LiveWaiting[], mode: Mode, rows: HTMLElement): HTMLElement {
+    hypothesisWaitingList(items: readonly LiveWaiting[], mode: Mode, rows: HTMLElement, search: HypothesisListSearch | null = null): HTMLElement {
         const rid = this.activeResearchId();
         const hypoItems = items.filter(w => w.kind === 'hypothesis');
         if (!rid || hypoItems.length === 0 || !this.hypothesesAcceptAvailable()) return rows;
@@ -453,14 +500,14 @@ export const hypothesisWaitingMethods = uiModule({
             const e = byId.get(li.dataset.id ?? '');
             const w = hypoItems.find(x => x.id === li.dataset.id);
             if (!e || !w) continue;
-            li.replaceWith(this.hypothesisWaitingRow(w, mode, e));
+            li.replaceWith(this.hypothesisWaitingRow(w, mode, e, search?.hitOf?.(w.id)));
         }
         rows.classList.add('has-accept');
         const wrap = el('div', 'hp2-list hp2-list--waiting');
-        const head = this.hypothesisAcceptHeadEl(rid, entries, 'waiting');
+        const head = this.hypothesisAcceptHeadEl(rid, entries, 'waiting', search);
         if (head) wrap.appendChild(head);
         wrap.appendChild(rows);
-        const foot = this.hypothesisAcceptFootEl(rid, 'waiting');
+        const foot = this.hypothesisAcceptFootEl(rid, 'waiting', search);
         if (foot) wrap.appendChild(foot);
         return wrap;
     },
@@ -499,9 +546,10 @@ export const hypothesisWaitingMethods = uiModule({
     /**
      * The hypotheses' rows of "What the research knows" with the list for
      * accepting proposals at once (where offered): which rows get a box, the
-     * list's head and foot. Null entries: no list.
+     * list's head and foot. Null entries: no list. `search`: the section is
+     * searched (`ids` are the found ones; the foot says the picked ones outside).
      */
-    hypothesisKnowsAccept(ids: readonly string[], mode: Mode): { entries: Map<string, HypothesisAcceptEntry>; head: HTMLElement | null; foot: HTMLElement | null } | null {
+    hypothesisKnowsAccept(ids: readonly string[], mode: Mode, search: HypothesisListSearch | null = null): { entries: Map<string, HypothesisAcceptEntry>; head: HTMLElement | null; foot: HTMLElement | null } | null {
         const rid = this.activeResearchId();
         if (!rid || !this.hypothesesAcceptAvailable()) return null;
         listen(this);
@@ -510,8 +558,8 @@ export const hypothesisWaitingMethods = uiModule({
         if (!entries.some(e => e.box !== 'none')) return null;
         return {
             entries: new Map(entries.map(e => [e.id, e])),
-            head: this.hypothesisAcceptHeadEl(rid, entries, 'knows'),
-            foot: this.hypothesisAcceptFootEl(rid, 'knows'),
+            head: this.hypothesisAcceptHeadEl(rid, entries, 'knows', search),
+            foot: this.hypothesisAcceptFootEl(rid, 'knows', search),
         };
     },
 });

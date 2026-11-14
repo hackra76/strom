@@ -7,7 +7,7 @@ const notWrittenPl = (n: number): string =>
 /** Polish past-tense ending by sex: '' (man), 'a' (woman), '(a)' (not given). */
 const sexEndPl = (sex: string | undefined): string => sex === 'female' ? 'a' : sex === 'male' ? '' : '(a)';
 
-export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' | 'attachments' | 'duplicates' | 'minimap'
+export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' | 'attachments' | 'duplicates' | 'minimap' | 'legend' | 'bulk'
     | 'name' | 'person' | 'titles' | 'spacing' | 'marriageOrder' | 'genLabels' | 'branchColors' | 'tour' | 'anniversaries' | 'releaseNotes'
     | 'familyWizard' | 'pwa' | 'fileAccess' | 'sync' | 'researchUpdate' | 'researchImages' | 'treeSettings' | 'media'
     | 'mediaQueue' | 'batch'> = {
@@ -71,9 +71,34 @@ export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' 
 
     // Overview minimap
     minimap: {
-        title: 'Minimapa przeglądowa',
+        title: 'Minimapa',
+        collapse: 'Zwiń minimapę',
+        expand: 'Rozwiń minimapę',
         settingLabel: 'Minimapa',
         settingHint: 'Minimapa przeglądowa przy dużych drzewach',
+    },
+
+    // The tree legend folded into a chip and back
+    legend: {
+        title: 'Legenda',
+        collapse: 'Zwiń legendę',
+        expand: 'Rozwiń legendę',
+        newMark: 'nowy znak',
+    },
+
+    bulk: {
+        tree: 'Dzieci i rodzeństwo',
+        treeTip: 'Pokaż dzieci osoby w centrum oraz rodzeństwo jej i przodków w widoku',
+        treeNone: 'Wszystkie dzieci i rodzeństwo są już widoczne',
+        treeAria: (n: number) => `Dzieci i rodzeństwo, dojdzie ${nPl(n, 'osoba', 'osoby', 'osób')}`,
+        menu: 'Rozwiń dzieci i rodzeństwo',
+        menuOff: 'Zwiń dzieci i rodzeństwo',
+        menuSub: 'dzieci osoby, rodzeństwo osoby i jej przodków',
+        menuAria: (n: number) => `Rozwiń dzieci i rodzeństwo, dojdzie ${nPl(n, 'osoba', 'osoby', 'osób')}`,
+        bigTitle: (n: number) => `${plPl(n, 'Dojdzie', 'Dojdą', 'Dojdzie')} ${nPl(n, 'osoba', 'osoby', 'osób')}`,
+        bigBody: (k: number) => `Drzewo poszerzy się do ok. ${nPl(k, 'szerokości', 'szerokości', 'szerokości')} ekranu. Powiększenie się nie zmienia.`,
+        go: (n: number) => `Rozwiń +${n}`,
+        two: (m: number) => `Tylko 2 pokolenia przodków +${m}`,
     },
 
     // A name's birth-surname note after the married surname: "Bronisława Zaremba (z d. Kowalik)".
@@ -85,6 +110,7 @@ export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' 
 
     // The person editor's married surname (Person.marriedSurname) and its suggestion from the husband's surname.
     person: {
+        deleteShared: 'Wspólne wydarzenia zostaną u pozostałych:',
         marriedSurname: 'Nazwisko po ślubie',
         addMarriedSurname: '+ nazwisko po ślubie',
         suggestion: (surname: string) => `Propozycja: ${surname}`,
@@ -151,7 +177,7 @@ export const plPart2: Pick<StringsType, 'crop' | 'importImages' | 'imageViewer' 
         step3: 'Tutaj dodaje się nową osobę. Całą rodzinę naraz (rodziców, partnera, dzieci) dodaje menu karty: Dodaj → Rodzinę…',
         step4: 'Panel centrum pokazuje, na kim skupia się drzewo i ile pokoleń przodków (↑) i potomków (↓) jest widocznych; − i + to zmieniają.',
         step5: 'Przełączanie widoków: Rodzina, Potomkowie, Oś czasu, Wachlarz przodków lub Mapa.',
-        step5Bar: 'Przełączanie widoków: Rodzina, Potomkowie i Oś czasu są tutaj; Wachlarz przodków i Mapa są w Więcej.',
+        step5Bar: 'Przełączanie widoków: Rodzina, Potomkowie i Tabela są tutaj; Wachlarz przodków, Mapa i Oś czasu są w Więcej.',
         step6: 'Powiększanie, pomniejszanie, widok domyślny lub całe drzewo na ekranie – obszar drzewa można też przeciągać myszą i powiększać kółkiem; klawisz 0 przywraca widok domyślny.',
         step6Touch: 'Powiększanie, pomniejszanie, widok domyślny lub całe drzewo na ekranie – obszar drzewa można też przesuwać palcem i powiększać, rozsuwając dwa palce.',
         step7: 'Wyszukiwanie dowolnej osoby po imieniu i nazwisku; lejek filtruje według nazwiska, miejsca, lat urodzenia, płci lub statusu żyjący/zmarły.',

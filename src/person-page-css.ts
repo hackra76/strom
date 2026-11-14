@@ -7,6 +7,7 @@
  */
 
 import { PERSON_PAGE_VIZ_CSS, PERSON_PAGE_VIZ_LIGHT_TOKENS } from './person-page-viz-css.js';
+import { SEL_LIGHT_DECLS, SEL_RULES_CSS } from './ui/sel-css.js';
 
 /** The light ("paper") values of the app tokens the page uses — the file's :root and print. */
 export const PERSON_PAGE_LIGHT_TOKENS = [
@@ -17,6 +18,7 @@ export const PERSON_PAGE_LIGHT_TOKENS = [
     '--accent-text: #8a5528', '--hover-bg: #f3eee2',
     '--hist-bg: #f5f1e7', '--hist-mark: #746c5c', '--hist-place: #3d7a8c', '--hist-local: #b5772a',
     '--hist-text: #5c5546', '--hist-place-text: #245868', '--hist-local-text: #7f5500',
+    '--r-sm: 4px', '--r-md: 6px', '--r-lg: 8px', '--r-tag: 3px',
 ].join('; ') + ';';
 
 /** The font stacks of the app (the file falls back to Georgia / the system sans without the embedded faces). */
@@ -32,12 +34,12 @@ const FONT_STACKS = "--font-serif: 'Strom Serif', Georgia, 'Times New Roman', se
  */
 const PERSON_PAGE_FAN_CSS = `
 .pp-anc-meta { font-size: 13px; color: var(--text-faint); font-weight: 400; font-family: var(--font-sans); }
-.pp-anc-fan { position: relative; height: calc(380px + var(--fan-grow, 0px)); margin-top: 8px; border-radius: 10px; background: var(--surface-2); overflow: hidden; outline: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.pp-anc-fan { position: relative; height: calc(380px + var(--fan-grow, 0px)); margin-top: 8px; border-radius: var(--r-lg, 8px); background: var(--surface-2); overflow: hidden; outline: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 .pp-anc-fan:focus-visible { box-shadow: inset 0 0 0 2px var(--primary); }
 .pp-anc-fan .fan-svg { display: block; width: 100%; height: 100%; }
 .pp-anc-fan a { cursor: pointer; }
 .pp-anc-fan--links .fan-sector[data-fan-kind="anc"] { cursor: pointer; }
-.pp-anc-zoom { position: absolute; right: 14px; bottom: 14px; z-index: 2; display: flex; gap: 4px; padding: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow-sm, 0 1px 3px rgba(43, 40, 34, 0.12)); }
+.pp-anc-zoom { position: absolute; right: 14px; bottom: 14px; z-index: 2; display: flex; gap: 4px; padding: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg, 8px); box-shadow: var(--shadow-sm, 0 1px 3px rgba(43, 40, 34, 0.12)); }
 .pp .pp-anc-zbtn { width: 40px; height: 40px; padding: 0; margin: 0; border: 0; border-radius: 8px; background: transparent; color: var(--text-light); font-family: var(--font-sans); font-size: 20px; line-height: 1; cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 .pp .pp-anc-zbtn:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
 .pp-anc-hint { position: absolute; left: 50%; bottom: 14px; z-index: 3; transform: translateX(-50%); max-width: calc(100% - 28px); padding: 6px 12px; border-radius: 8px; background: rgba(43, 40, 34, 0.88); color: #fffdf8; font-family: var(--font-sans); font-size: 13px; line-height: 1.35; text-align: center; pointer-events: none; }
@@ -59,7 +61,7 @@ const PERSON_PAGE_FAN_CSS = `
   .pp-anc-fan { height: calc(236px + var(--fan-grow, 0px)); margin-inline: -16px; border-radius: 0; }
 }
 @media (max-width: 1024px) and (max-height: 500px) and (orientation: landscape) {
-  .pp-anc-fan { height: calc(260px + var(--fan-grow, 0px)); margin-inline: 0; border-radius: 10px; }
+  .pp-anc-fan { height: calc(260px + var(--fan-grow, 0px)); margin-inline: 0; border-radius: var(--r-lg, 8px); }
 }
 @media print {
   #pp-sec-ancestors { break-inside: avoid; }
@@ -85,7 +87,7 @@ export const PERSON_PAGE_CSS = `
 .pp .pp-eyebrow, .pp .pp-kicker { font-family: var(--font-sans); font-size: 11.5px; line-height: 1.4; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent-text); }
 .pp-hero { display: flex; gap: 18px; align-items: flex-start; }
 /* The portrait (§3.1): a rounded square, a click shows it large; without a photo the initials. */
-.pp-portrait { position: relative; flex: 0 0 auto; display: block; width: 128px; height: 128px; padding: 0; border: 1px solid var(--border); border-radius: 14px; overflow: hidden; background-color: var(--surface-2); cursor: zoom-in; }
+.pp-portrait { position: relative; flex: 0 0 auto; display: block; width: 128px; height: 128px; padding: 0; border: 1px solid var(--border); border-radius: var(--r-md, 6px); overflow: hidden; background-color: var(--surface-2); cursor: zoom-in; }
 span.pp-portrait { cursor: default; }
 .pp-portrait .pp-photo { display: block; width: 100%; height: 100%; object-fit: cover; background-size: cover; background-position: center; background-repeat: no-repeat; }
 .pp-portrait-zoom { position: absolute; right: 6px; bottom: 6px; display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; background: rgba(255, 253, 248, 0.92); color: #2b2822; font-size: 13px; line-height: 1; }
@@ -103,7 +105,7 @@ span.pp-portrait { cursor: default; }
 /* The family line (spec 1031 §3): in the window the names lead to the overview; a file and print say it as text. */
 .pp .pp-rod-link { color: var(--primary); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
 .pp-fact-rod:has(.pp-rod-link) .pp-rod-join { color: var(--text-light); }
-.pp-differs { display: inline-block; margin-left: 6px; padding: 0 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); color: var(--accent-text); font: inherit; font-size: 12px; line-height: 20px; text-decoration: none; cursor: pointer; white-space: nowrap; }
+.pp-differs { display: inline-block; margin-left: 6px; padding: 1px 6px; border: 1px solid var(--border); border-radius: var(--r-tag, 3px); background: var(--surface-2); color: var(--accent-text); font: inherit; font-size: 11.5px; font-weight: 600; line-height: 18px; text-decoration: none; cursor: pointer; white-space: nowrap; }
 .pp-link { display: inline; padding: 0; border: 0; background: none; font: inherit; color: inherit; text-align: inherit; text-decoration: underline dotted; text-underline-offset: 3px; cursor: pointer; }
 a.pp-link { color: inherit; }
 .pp-pdf-name { font-size: 14.5px; font-weight: 600; color: var(--primary); text-align: left; overflow-wrap: anywhere; }
@@ -113,14 +115,14 @@ span.pp-pdf-name { color: var(--text); }
 .pp { --pp-bg: var(--surface); }
 .pp-body .pp { --pp-bg: var(--surface-modal); }
 /* In brief (§0.3): under the header, 3 or 4 cells. */
-.pp-sum { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin-top: -8px; background: var(--divider); border: 1px solid var(--divider); border-radius: 12px; overflow: hidden; }
+.pp-sum { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin-top: -8px; background: var(--divider); border: 1px solid var(--divider); border-radius: var(--r-lg, 8px); overflow: hidden; }
 .pp-sum--3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .pp-sum-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 12px 14px; background: var(--surface); }
 .pp-sum-big { font-family: var(--font-serif); font-size: 21px; font-weight: 600; line-height: 1.2; overflow-wrap: anywhere; }
 .pp-sum-lab { font-size: 12.5px; line-height: 1.35; color: var(--text-light); overflow-wrap: anywhere; }
 /* The open question (§0.4). */
 .pp > section.pp-sec--question { border-top: 0; padding-top: 0; }
-.pp-question { padding: 16px 18px; border: 1px dashed var(--border); border-radius: 12px; }
+.pp-question { padding: 16px 18px; border: 1px dashed var(--border); border-radius: var(--r-lg, 8px); }
 .pp-question-text { margin-top: 6px; font-family: var(--font-serif); font-size: 17px; line-height: 1.55; white-space: pre-line; overflow-wrap: anywhere; }
 /* People around (§0.5). */
 .pp-people { display: flex; flex-direction: column; gap: 10px; margin: 12px 0 0; }
@@ -150,7 +152,7 @@ span.pp-pdf-name { color: var(--text); }
 @container pp-ft (max-width: 496px) { .pp-ft-story-l { display: none; } .pp-ft-story-s { display: inline; } }
 .pp-rail-story { white-space: nowrap; }
 .pp-ft-nokids { color: var(--text-faint); }
-.pp-ft-card { display: flex; flex-direction: column; justify-content: center; min-width: 0; margin: 0; padding: 4px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: inherit; font: inherit; text-align: left; text-decoration: none; overflow: hidden; }
+.pp-ft-card { display: flex; flex-direction: column; justify-content: center; min-width: 0; margin: 0; padding: 4px 10px; border: 1px solid var(--border); border-radius: var(--r-lg, 8px); background: var(--surface); color: inherit; font: inherit; text-align: left; text-decoration: none; overflow: hidden; }
 .pp-ft .pp-ft-card, .pp-ft9 .pp-ft-card { position: absolute; z-index: 2; }
 button.pp-ft-card, a.pp-ft-card { cursor: pointer; }
 .pp-ft-name { font-size: 13.5px; font-weight: 600; line-height: 1.25; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -178,7 +180,7 @@ button.pp-ft-card, a.pp-ft-card { cursor: pointer; }
 .pp-ft-row--open { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; min-height: 48px; }
 .pp-ft-row-h { font-size: 13.5px; font-weight: 600; color: var(--text-light); }
 .pp-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0 6px; }
-.pp-chip { display: inline-flex; align-items: baseline; gap: 4px; min-height: 30px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: inherit; font: inherit; font-size: 13px; text-decoration: none; }
+.pp-chip { display: inline-flex; align-items: baseline; gap: 4px; min-height: 30px; padding: 4px 10px; border: 1px solid var(--border); border-radius: var(--sel-r, 4px); background: var(--surface); color: inherit; font: inherit; font-size: 13px; text-decoration: none; }
 button.pp-chip, a.pp-chip { cursor: pointer; }
 .pp-chip-name { font-weight: 600; }
 .pp-chip-link .pp-chip-name { color: var(--primary); }
@@ -199,7 +201,7 @@ button.pp-chip, a.pp-chip { cursor: pointer; }
 .pp-coll > summary > .pp-fold-h { display: flex; flex: 1 1 auto; min-width: 0; }
 .pp-coll > summary > .pp-peek { flex: 0 0 100%; margin-top: -4px; }
 .pp-sum-main { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; flex: 1 1 auto; min-width: 0; }
-.pp .pp-draft-tag { display: inline-block; font-family: var(--font-sans); font-weight: 500; margin-left: 8px; padding: 0 8px; border-radius: 999px; background: var(--surface-2); color: var(--text-light); font-size: 11px; line-height: 18px; letter-spacing: 0; text-transform: none; vertical-align: 1px; }
+.pp .pp-draft-tag { display: inline-block; font-family: var(--font-sans); font-weight: 600; margin-left: 8px; padding: 1px 6px; border-radius: var(--r-tag, 3px); background: var(--surface-2); color: var(--text-light); font-size: 11.5px; line-height: 16px; letter-spacing: 0; text-transform: none; vertical-align: 1px; }
 .pp .pp-story-title { font-size: clamp(21px, 3.6cqi, 26px); line-height: 1.25; margin: 6px 0 12px; overflow-wrap: anywhere; hyphens: auto; }
 /* A couple's story under the person's own (Partnership.story). */
 .pp .pp-couple-story { margin-top: 24px; }
@@ -220,7 +222,7 @@ button.pp-chip, a.pp-chip { cursor: pointer; }
 .pp-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-faint); margin-left: 4px; white-space: nowrap; }
 .pp .pp-notes-text { margin-top: 8px; font-size: 15px; white-space: pre-line; overflow-wrap: anywhere; }
 .pp-toggles { display: flex; flex-wrap: wrap; gap: 8px; }
-.pp-toggle { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 0 12px; border: 1.5px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--text); font: inherit; font-size: 13.5px; white-space: nowrap; cursor: pointer; }
+.pp-toggle { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 0 12px; border: 1.5px solid var(--border); border-radius: var(--sel-r, 4px); background: var(--surface); color: var(--text); font: inherit; font-size: 13.5px; white-space: nowrap; cursor: pointer; }
 .pp-toggle::before { content: ''; width: 14px; height: 14px; border: 1.5px solid var(--border); border-radius: 3px; background: var(--surface); }
 .pp-toggle[aria-checked="true"] { border-color: var(--primary); background: color-mix(in oklab, var(--primary) 12%, var(--surface)); }
 .pp-toggle[aria-checked="true"]::before { content: '\\2713'; display: flex; align-items: center; justify-content: center; border-color: var(--primary); background: var(--primary); color: var(--on-primary); font-size: 11px; line-height: 1; }
@@ -243,6 +245,15 @@ button.pp-chip, a.pp-chip { cursor: pointer; }
 .pp-t { min-width: 0; padding: 6px 0 10px; font-size: 15.5px; overflow-wrap: anywhere; }
 .pp-place { color: var(--text-light); }
 .pp-dt { display: block; margin-top: 2px; font-size: 13.5px; color: var(--text-light); overflow-wrap: anywhere; }
+/* A shared event's "with …" line (spec 085 §2b): the circles, the given names as links (the whole name in the title). */
+.pp .shared-line { display: flex; align-items: baseline; gap: 6px; margin-top: 3px; font-size: 13.5px; line-height: 1.45; color: var(--text-light); }
+.pp .shared-line--open { cursor: pointer; }
+.pp .shared-line-mark { flex: none; display: inline-flex; color: var(--primary); transform: translateY(1px); }
+.pp .shared-line-mark svg { display: block; }
+.pp .shared-line-text { min-width: 0; overflow-wrap: anywhere; }
+.pp .shared-line .pp-link { color: var(--primary); font-weight: 500; text-decoration: none; }
+.pp .shared-line button.pp-link { white-space: nowrap; max-width: calc(100% - 6px); overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; text-align: start; }
+.pp .shared-line-item:has(> button) { white-space: nowrap; }
 .pp-dtx > summary { display: block; list-style: none; cursor: pointer; }
 .pp-dtx .pp-dt { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .pp-dtx[open] .pp-dt { display: block; overflow: visible; }
@@ -283,6 +294,13 @@ button.pp-chip, a.pp-chip { cursor: pointer; }
 .pp-row--kid .pp-y { font-size: 13px; font-weight: 400; color: var(--text-light); }
 .pp-row--kid .pp-mk { font-size: 15px; color: var(--text-faint); }
 .pp-row--kid .pp-t { font-size: 14px; color: var(--text-light); }
+/* A part at another's event (spec 085 §5): the chain, the role muted, a dashed line under it, no marks. */
+.pp-row--part .pp-y { font-weight: 400; color: var(--text-faint); }
+.pp-row--part .pp-mk { color: var(--text-faint); }
+.pp-row--part .pp-t { border-bottom: 1px dashed var(--border); }
+.pp-part-role { font-weight: 500; color: var(--text-light); }
+.pp .pp-part-open { font: inherit; font-weight: 500; color: var(--text-light); background: none; border: 0; padding: 0; cursor: pointer; text-align: left; text-decoration: underline dotted; text-underline-offset: 3px; }
+@media (hover: hover) { .pp .pp-part-open:hover { color: var(--primary); } }
 .pp-no-history .pp-row--hist, .pp-no-history .pp-legend, .pp-no-history .pp-legend-kinds, .pp-no-kids .pp-row--kid { display: none; }
 .pp-no-kids .pp-seg:not(.pp-seg--own):not(.pp-seg--hist), .pp-no-history .pp-seg:not(.pp-seg--own):not(.pp-seg--kid),
 .pp-no-history.pp-no-kids .pp-seg:not(.pp-seg--own) { display: none; }
@@ -314,7 +332,7 @@ span.pp-gal-thumb { cursor: default; }
 .pp-gal-more .pp-fold-body > .pp-gal { margin-top: 6px; }
 .pp-sec-head .pp-gal-open { margin-top: 0; }
 .pp-pdfs { display: flex; flex-direction: column; gap: 8px; margin: 16px 0 0; padding: 0; list-style: none; }
-.pp-pdf { display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.pp-pdf { display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--r-lg, 8px); background: var(--surface); }
 .pp-pdf-ic { flex: 0 0 auto; display: flex; align-items: center; justify-content: center; width: 34px; height: 40px; border-radius: 4px; background: var(--surface-2); color: var(--accent-text); font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em; }
 .pp-pdf-main { display: flex; flex-direction: column; min-width: 0; }
 .pp-pdf-meta { font-size: 12px; color: var(--text-light); }
@@ -330,7 +348,7 @@ span.pp-gal-thumb { cursor: default; }
 .pp-act { display: inline-block; margin-top: 8px; padding: 0; border: 0; background: none; color: var(--primary); font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer; }
 .pp .pp-src-intro { margin: 4px 0 12px; font-size: 14px; color: var(--text-light); }
 .pp-src-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
-.pp-src { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); padding: 0 14px; }
+.pp-src { border: 1px solid var(--border); border-radius: var(--r-lg, 8px); background: var(--surface); padding: 0 14px; }
 .pp-src .pp-disc { min-height: 48px; flex-wrap: nowrap; align-items: flex-start; padding: 10px 0; }
 .pp-src-lines { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .pp-src-title { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
@@ -397,6 +415,7 @@ span.pp-gal-thumb { cursor: default; }
   .pp-src > .pp-disc:hover, .pp-src > summary:hover { background: var(--hover-bg); }
   .pp-toggle:hover { border-color: var(--primary); }
   .pp-link:hover, .pp-act:hover { text-decoration-style: solid; }
+  .pp .shared-line .pp-link:hover { text-decoration: underline; }
 }
 @media (pointer: coarse) {
   .pp-toggle, .pp-disc--inline, .pp-chip { min-height: 44px; }
@@ -450,6 +469,7 @@ span.pp-gal-thumb { cursor: default; }
   .pp-ft-card--me { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .pp-body { overflow: visible !important; height: auto !important; }
   .pp { font-size: 11pt; gap: 18pt; max-width: none; }
+  .pp .shared-line { font-size: 10pt; }
   .pp-aka, .pp-dt, .pp-hist-meta, .pp-src-sup, .pp-src-ref, .pp-foot, .pp-fig figcaption, .pp-fig-scan { font-size: 10pt; }
   #pp-sec-timeline { break-before: page; }
   .pp-ft-link .pp-ft-name, .pp-chip-link .pp-chip-name { color: var(--text); }
@@ -469,7 +489,7 @@ span.pp-gal-thumb { cursor: default; }
    a single chapter has neither. Print: everything unfolded, the tinted
    surface a thin frame. */
 .pp .pp-couple-story { margin-top: 20px; scroll-margin-top: 16px; outline: none; }
-.pp .pp-couple-story--tint { padding: 20px 22px; border-radius: 14px; background: var(--card-bg-2); }
+.pp .pp-couple-story--tint { padding: 20px 22px; border-radius: var(--r-lg, 8px); background: var(--card-bg-2); }
 .pp .pp-story-kicker + .pp-couple-story, .pp .pp-story-title + .pp-couple-story { margin-top: 8px; }
 .pp .pp-couple-story:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .pp-ch-head { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
@@ -537,15 +557,15 @@ body { margin: 0; background: var(--surface); color: var(--text); font-family: v
 }
 .pp-toc-h { font-size: 11px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent-text); margin: 4px 0 10px 10px; }
 .pp-toc ol, .pp-toc-m ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
-.pp-toc-link { display: block; padding: 5px 10px; border-radius: 6px; font-size: 13.5px; color: var(--text-light); text-decoration: none; overflow-wrap: anywhere; }
-.pp-toc-link:focus-visible, .pp-toc-m-link:focus-visible, .pp-toc-m summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.pp-toc-link { display: block; padding: 5px 10px; font-size: 13.5px; text-decoration: none; overflow-wrap: anywhere; }
+.pp-toc-m-link:focus-visible, .pp-toc-m summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
 .pp-file .pp-sec:target > h2, .pp-file .pp-sec:target > .pp-sec-head h2 { color: var(--accent-text); }
-@media (hover: hover) { .pp-toc-link:hover, .pp-toc-m-link:hover { color: var(--text); background: var(--surface-2); } }
+@media (hover: hover) { .pp-toc-m-link:hover { color: var(--text); background: var(--surface-2); } }
 @media (max-width: 899px) {
   .pp-file-layout { display: block; padding: 0; }
   .pp-file-layout > .pp-toc { display: none; }
   .pp-file-layout > .pp-file { margin: 0 auto; }
-  .pp-toc-m { display: block; border: 1px solid var(--border); border-radius: 10px; background: var(--pp-bg); }
+  .pp-toc-m { display: block; border: 1px solid var(--border); border-radius: var(--r-lg, 8px); background: var(--pp-bg); }
   .pp-toc-m summary { display: flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 14px; box-sizing: border-box; cursor: pointer; list-style: none; font-size: 14px; font-weight: 600; color: var(--text); }
   .pp-toc-m summary::-webkit-details-marker { display: none; }
   .pp-toc-m-arr { color: var(--text-light); transition: transform .15s; }
@@ -561,12 +581,14 @@ html.no-js .pp-fig { max-width: 100%; }
 /**
  * The whole <style> content of the saved file: the embedded font faces (as the
  * app supplies them; empty = the fallback fonts), the light tokens on :root
- * (no prefers-color-scheme: the file is always "paper"), the frame and the page.
+ * (no prefers-color-scheme: the file is always "paper"), the frame and the page,
+ * the rules a file adds (`moreCss`: the family pages'), then the selection
+ * indicator's rules last (src/ui/sel-css.ts; in the app they come from index.html).
  */
-export function personPageFileCss(fontCss = ''): string {
+export function personPageFileCss(fontCss = '', moreCss = ''): string {
     // A font face never ends the <style> element early.
     const fonts = fontCss.replace(/<\//g, '<\\/');
-    return `${fonts}\n:root { ${PERSON_PAGE_LIGHT_TOKENS} ${PERSON_PAGE_VIZ_LIGHT_TOKENS} ${FONT_STACKS} color-scheme: light; }\n${FILE_FRAME_CSS}${PERSON_PAGE_CSS}`;
+    return `${fonts}\n:root { ${PERSON_PAGE_LIGHT_TOKENS} ${PERSON_PAGE_VIZ_LIGHT_TOKENS} ${FONT_STACKS} ${SEL_LIGHT_DECLS} color-scheme: light; }\n${FILE_FRAME_CSS}${PERSON_PAGE_CSS}${moreCss}${SEL_RULES_CSS}`;
 }
 
 /**

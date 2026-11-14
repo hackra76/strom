@@ -28,7 +28,7 @@ import { ViewMode, STANDALONE_VIEWS, ResearchEdgeMode, ResearchEdgeHypo } from '
 import { cardLines, CardLine, cardLineHtml, cardYears, CardLineStyle, cardDateReferences, cardAge, formatAge, isFieldCardDensity } from './card-fields.js';
 import {
     CustomCardMetrics, CardLineRows, CardHead, customCardMetrics, customCardRows, customCardViewHeight, customCardSpouseLineY,
-    measureCardTexts, cardFontsPending, CARD_HEAD_HEIGHT, CARD_EDGE_PILL_ROOM, CARD_EDGE_PILL_LEFT, CARD_STATUS_MARK_ROOM, bottomRightPillsRoom,
+    measureCardTexts, cardFontsPending, CARD_HEAD_HEIGHT, CARD_EDGE_PILL_ROOM, CARD_STATUS_MARK_ROOM,
     cardNameMaxRows, normalCardHeights, normalCardNameRows, rowSeparators, NormalCardName, CARD_LOCK_NAME_ROOM,
 } from './card-width.js';
 import { checkRecordedAge, ageBirthDate } from './recorded-age.js';
@@ -41,6 +41,7 @@ import {
     computeLayout,
     StromLayoutEngine,
     LayoutRequest,
+    PipelineInput,
     Connection,
     SpouseLine,
     OmittedEdge,
@@ -87,7 +88,8 @@ import {
     siblingsTabState, SiblingsTabState, newlyShownSiblingIds, siblingGroups, ShownChildrenContext, HiddenRelativesTab, unionChildIdSet, branchTabsInOrder,
     offeredPartners, OfferedPartner, childrenByUnion, childrenComeWithPartners, otherFamilyChildrenElsewhere, marriagesInOrder,
 } from './marriage-order.js';
-import { partnerIdsShownInPlace } from './layout/pipeline/1-select-subgraph.js';
+import { BulkFamily, bulkAddedKeys, bulkBroughtInByParent, bulkNewIds, bulkParents, collectBulkFamily } from './bulk-family.js';
+import { partnerIdsShownInPlace, selectSubgraph } from './layout/pipeline/1-select-subgraph.js';
 import { measureUnionOrderPills, applyUnionOrderGlyphLift, measureTabRows, rowKey, unionOrderPillKey, unionOrderPillPartsHtml, pillFontsPending, branchTabRestHtml, tabsForm, tabsFormClass, bubblePlacement, bubbleBox, touchBubbleBox, touchBubbleBounds, touchBubbleSide, bubbleOpensBelow, BUBBLE_WINDOW_MARGIN, BUBBLE_LOW_WINDOW_NAMES, BUBBLE_LOW_WINDOW_HEIGHT, bubbleNameCounts, bubbleNamesToFit } from './union-order-measure.js';
 import { prepareBubble, showBubble, hideBubble, closeOpenBubble, openBubble, openBubbleOwner } from './bubble-layer.js';
 import { LiveDiff, diffLive, liveChangeCount } from './live-diff.js';
@@ -96,6 +98,7 @@ import { LIVE, edgeNotchSpot, EdgeSide, liveMotionOn, cardTrailOpacity } from '.
 import { getLiveMotion } from './live-follow-prefs.js';
 import { announceLive } from './ui/live-announce.js';
 import { MOBILE_MAX, MQ_PHONE_LANDSCAPE } from './breakpoints.js';
+import { updateBulkFamilySwitches } from './ui/bulk-family-ui.js';
 import { pillUnderFinger } from './card-tap.js';
 import { showFocusToast, hideFocusToast } from './focus-toast.js';
 import { openCardMenuFromKeyboard } from './ui/keyboard-access.js';
@@ -111,7 +114,7 @@ import {
 } from './children-transition.js';
 import type { LayoutViewLayer, ViewLineFlag } from './layout/index.js';
 import { buildViewLayer } from './layout/index.js';
-import { ViewHistory, ViewHistoryEntry, ViewTransform, ViewStandIn, ShownChildrenSnapshot, emptyViewHistory, pushViewStep, stepViewHistory, sameShown, samePartnerUnions, shownKey, sameTransform, historyView } from './view-history.js';
+import { ViewHistory, ViewHistoryEntry, ViewTransform, ViewStandIn, ShownChildrenSnapshot, BulkStep, emptyViewHistory, pushViewStep, stepViewHistory, sameShown, samePartnerUnions, shownKey, sameTransform, historyView } from './view-history.js';
 
 /** A group of names in a tab's bubble: its own lines (a group label) before its names (nameGroupsHtml). */
 interface BubbleNameGroup {
@@ -147,12 +150,10 @@ interface CustomCardsMeasure {
     heads: Map<PersonId, CardHead>;
     wrapped: boolean;
     style: CardLineStyle;
-    /** The cards measured with room for the pills on their bottom edge. */
+    /** The cards measured with room for the pills on their bottom edge (below their text, in either height). */
     edgeRoomIds: Set<PersonId>;
-    /** The cards of one height whose last line was wrapped clear of the ⇄ pill (CARD_EDGE_PILL_RIGHT). */
-    edgeRightIds: Set<PersonId>;
-    /** The cards of one height whose last line was wrapped clear of the ∞ pill (CARD_EDGE_PILL_LEFT). */
-    edgeLeftIds: Set<PersonId>;
+    /** How much the view's one card height grew for that room (0 with the height by content). */
+    viewEdgeRoom: number;
     /** The cards whose last line was wrapped clear of the status mark (CARD_STATUS_MARK_ROOM) and of no pill. */
     statusRoomIds: Set<PersonId>;
 }
@@ -207,6 +208,9 @@ const VIEW_LABEL_LINE_ENDS = 24;
  * + 4 + 15 (the line) = 77, and 11 clear above the next row's cards.
  */
 const VIEW_LINK_ISLAND_ROOM = 88;
+/** The "+ child" tab at rest (a 22 px square) and its gap to the bottom-right pills (index.html .card-edge). */
+const CHILD_ADD_TAB = 22;
+const CHILD_ADD_GAP = 4;
 /** How long the cards of children just shown (or one glided to) glow (ms). */
 const CHILDREN_GLOW_MS = 1600;
 /** The "▾ children" bubble stays this long after the pointer left it (ms), so the pointer can reach its rows. */
@@ -353,7 +357,9 @@ function readFanSetting<T>(key: string, parse: (v: string) => T | null, fallback
     } catch { return fallback; }
 }
 
+/** A fan setting kept on the device; a satellite window keeps its own in its memory only (spec 079 §0). */
 function writeFanSetting(key: string, value: string): void {
+    if (DataManager.isWindowCopy()) return;
     try { localStorage.setItem(key, value); } catch { /* ignore */ }
 }
 
@@ -383,14 +389,16 @@ class TreeRendererClass {
     private customHeads = new Map<PersonId, CardHead>();
     /**
      * The cards measured with room for pills on their bottom edge (a card of
-     * details as tall as its content grows by CARD_EDGE_PILL_ROOM, so the
-     * pills cover no text); the image export draws no pills and leaves it out.
+     * details as tall as its content grows by CARD_EDGE_PILL_ROOM, a view of
+     * one height makes that room below its text, so the pills cover no text);
+     * the image export draws no pills and leaves it out.
      */
     private edgeRoomIds = new Set<PersonId>();
-    /** The cards of one height whose last line was wrapped clear of the ⇄ pill (CARD_EDGE_PILL_RIGHT). */
-    private edgeRightIds = new Set<PersonId>();
-    /** The cards of one height whose last line was wrapped clear of the ∞ pill (CARD_EDGE_PILL_LEFT). */
-    private edgeLeftIds = new Set<PersonId>();
+    /**
+     * How much taller the view's one card height was made for the pills on
+     * bottom edges (the outputs leave it out; 0 with the height by content).
+     */
+    private viewEdgeRoom = 0;
     /** The cards whose last line was wrapped clear of the status mark alone (CARD_STATUS_MARK_ROOM). */
     private statusRoomIds = new Set<PersonId>();
     /** The other trees the last cards were matched against (the ⇄ pill); the next measure reads them. */
@@ -458,6 +466,8 @@ class TreeRendererClass {
     private viewStandIn: ViewStandIn | null = null;
     /** Search highlight: hits get 'search-hit', everyone else 'search-dim'. */
     private highlightIds: Set<PersonId> | null = null;
+    /** The person selected in another window (spec 079 §2): their card's ring, the focus unchanged. */
+    private windowSelectedId: PersonId | null = null;
     /** What a live load tells the rest of the app (setLiveHooks). */
     private liveHooks: LiveRenderHooks = {};
     /** Each card's content as drawn (cardSignature): a live load keeps a card whose content is the same. */
@@ -494,6 +504,8 @@ class TreeRendererClass {
      * localStorage.
      */
     private viewMode: ViewMode = 'family';
+    /** A satellite window's one view (setWindowView), else null. */
+    private windowView: ViewMode | null = null;
 
     /**
      * Descendants view: show partners' whole families (their other unions and
@@ -527,6 +539,20 @@ class TreeRendererClass {
      * tab's look and the step; the layout knows the parents alone.
      */
     private siblingsShownFor = new Map<PersonId, PersonId[]>();
+    /**
+     * Children and siblings at once (src/bulk-family.ts): each person whose
+     * children such a step showed → the step. The persons of one step make
+     * one step of "Hide shown · n" and of the history; each still closes on
+     * its own (its tab, a new step), leaving the rest of the step shown.
+     */
+    private bulkShownFor = new Map<PersonId, BulkStep>();
+    /** The last step of children and siblings at once (BulkStep.seq). */
+    private bulkSeq = 0;
+    /** The plans of children and siblings at once worked out for the view as drawn (bulkFamilyPlan), by person and generations. */
+    private bulkPlanCache: { positions: ReadonlyMap<PersonId, Position>; request: LayoutRequest | null; shown: readonly PersonId[];
+        plans: Map<string, { family: BulkFamily; parents: PersonId[]; newIds: PersonId[] }> } | null = null;
+    /** The request of the screen's last layout (computeTreeLayout): a step's count lays out the same view with it. */
+    private screenLayoutRequest: LayoutRequest | null = null;
     /**
      * Parents shown in place beyond the depth (§4, the "▸ parents" of an
      * ancestor at the edge of the depth, PipelineInput.extraDepthFor): the
@@ -878,8 +904,7 @@ class TreeRendererClass {
                 });
             } else this.normalHeights = null;
             this.edgeRoomIds.clear();
-            this.edgeRightIds.clear();
-            this.edgeLeftIds.clear();
+            this.viewEdgeRoom = 0;
             this.statusRoomIds.clear();
             this.customLines.clear();
             this.customRows.clear();
@@ -1202,6 +1227,9 @@ class TreeRendererClass {
                 ? { showPartnerUnions: this.partnersShownIds.flatMap(id => this.partnersShownUnions.get(id) ?? []) } : {}),
         };
 
+        // The screen's own layout: a step of children and siblings at once counts with it
+        if (debug) this.screenLayoutRequest = request;
+
         // Use debug pipeline if debug mode is enabled
         if (debug && this.debugOptions?.enabled) {
             const debugResult = runLayoutPipelineWithDebug(
@@ -1339,9 +1367,9 @@ class TreeRendererClass {
         const own = spacing === this.getLayoutSpacing();
         if (!this.focusPersonId || this.positions.size === 0 || (own && !this.viewLayer && !this.config.roomBelow)) {
             return {
-                positions: this.positions, connections: this.withoutEdgeRoom(this.connections, this.edgeRoomIds),
+                positions: this.positions, connections: this.withoutEdgeRoom(this.connections, this.config, this.edgeRoomIds, this.viewEdgeRoom),
                 spouseLines: this.spouseLines, omittedEdges: this.omittedEdges,
-                box: this.posterBox(this.config, this.edgeRoomIds), custom: this.customMetrics,
+                box: this.posterBox(this.config, this.edgeRoomIds, this.viewEdgeRoom), custom: this.customMetrics,
             };
         }
         const cached = this.outputLayoutCache.get(spacing);
@@ -1355,10 +1383,12 @@ class TreeRendererClass {
         let result = this.computeTreeLayout(descendantsOnly, [], false, config);
         let custom: CustomCardMetrics | null = null;
         let edgeRoomIds = new Set<PersonId>();
+        let viewEdgeRoom = 0;
         if (!this.viewLayer) {
             // No view link: the screen's people, their cards as the screen measured them.
             custom = this.customMetrics;
             edgeRoomIds = new Set(this.edgeRoomIds);
+            viewEdgeRoom = this.viewEdgeRoom;
         } else if (this.customMetrics) {
             const measured = this.customCardsOf(result.positions);
             const next: LayoutConfig = {
@@ -1370,26 +1400,35 @@ class TreeRendererClass {
             config = next;
             custom = measured.metrics;
             edgeRoomIds = measured.edgeRoomIds;
+            viewEdgeRoom = measured.viewEdgeRoom;
         }
         const output: OutputLayout = {
-            positions: result.positions, connections: this.withoutEdgeRoom(result.connections, edgeRoomIds),
-            spouseLines: result.spouseLines, omittedEdges: result.omittedEdges ?? [], box: this.posterBox(config, edgeRoomIds), custom,
+            positions: result.positions, connections: this.withoutEdgeRoom(result.connections, config, edgeRoomIds, viewEdgeRoom),
+            spouseLines: result.spouseLines, omittedEdges: result.omittedEdges ?? [], box: this.posterBox(config, edgeRoomIds, viewEdgeRoom), custom,
         };
         this.outputLayoutCache.set(spacing, { seq: this.renderSeq, output });
         return output;
     }
 
-    /** A line that starts at the bottom of a card drawn without its pills' room starts that much higher. */
-    private withoutEdgeRoom(connections: Connection[], edgeRoomIds: ReadonlySet<PersonId>): Connection[] {
-        return edgeRoomIds.size === 0 ? connections : connections.map(c =>
-            c.stemPersonId && edgeRoomIds.has(c.stemPersonId) ? { ...c, stemTopY: c.stemTopY - CARD_EDGE_PILL_ROOM } : c);
+    /**
+     * A line that starts at the bottom of a card drawn without its pills' room
+     * starts that much higher: by content the cards measured with it, with one
+     * height for the view every card (the view's height grew for them).
+     */
+    private withoutEdgeRoom(connections: Connection[], config: LayoutConfig, edgeRoomIds: ReadonlySet<PersonId>, viewEdgeRoom: number): Connection[] {
+        const room = (id: PersonId): number => config.personHeights ? (edgeRoomIds.has(id) ? CARD_EDGE_PILL_ROOM : 0) : viewEdgeRoom;
+        return edgeRoomIds.size === 0 ? connections : connections.map(c => {
+            const r = c.stemPersonId ? room(c.stemPersonId) : 0;
+            return r ? { ...c, stemTopY: c.stemTopY - r } : c;
+        });
     }
 
     /** The card box of a layout as the image export draws it: without the room kept for the pills on a bottom edge. */
-    private posterBox(config: LayoutConfig, edgeRoomIds: ReadonlySet<PersonId>): CardBox {
+    private posterBox(config: LayoutConfig, edgeRoomIds: ReadonlySet<PersonId>, viewEdgeRoom: number): CardBox {
         const { cardWidth, cardHeight, personHeights, spouseLineY } = config;
         const box: CardBox = { cardWidth, cardHeight, ...(personHeights ? { personHeights } : {}), ...(spouseLineY !== undefined ? { spouseLineY } : {}) };
-        if (!personHeights || edgeRoomIds.size === 0) return box;
+        if (!personHeights) return viewEdgeRoom > 0 ? { ...box, cardHeight: cardHeight - viewEdgeRoom } : box;
+        if (edgeRoomIds.size === 0) return box;
         const heights = new Map(personHeights);
         for (const id of edgeRoomIds) {
             const h = heights.get(id);
@@ -1450,8 +1489,7 @@ class TreeRendererClass {
         this.customStyle = measured.style;
         this.customHeads = measured.heads;
         this.edgeRoomIds = measured.edgeRoomIds;
-        this.edgeRightIds = measured.edgeRightIds;
-        this.edgeLeftIds = measured.edgeLeftIds;
+        this.viewEdgeRoom = measured.viewEdgeRoom;
         this.statusRoomIds = measured.statusRoomIds;
         return measured.metrics;
     }
@@ -1467,13 +1505,12 @@ class TreeRendererClass {
         const lines = new Map<PersonId, CardLine[]>();
         const ids: PersonId[] = [];
         const entries = [];
-        // A card of one height for the view keeps its last line clear of the ⇄ pill
-        // (index.html .has-edge-br) and the ∞ pill (.edge-bl-room): its rows are
-        // wrapped that much narrower.
-        const edgeRightIds = new Set<PersonId>();
-        const edgeLeftIds = new Set<PersonId>();
+        // A card with pills on its bottom edge (∞ on the left, ⇄ and the sibling
+        // order on the right) keeps their room below its text, in either height
+        // (index.html .has-edge-room): its lines keep the card's whole width.
+        const edgeRoomIds = new Set<PersonId>();
         // The status mark in the bottom-right corner (spec 066 P4 §2): a last line
-        // that may reach its height keeps 22px clear of it (pills keep more).
+        // that may reach its height keeps 22px clear of it (the pills' room covers it).
         const statusRoomIds = new Set<PersonId>();
         const signalCtx = this.signalContext();
         const visible = (pid: PersonId) => positions.has(pid);
@@ -1488,14 +1525,10 @@ class TreeRendererClass {
             const crossPill = this.hasCrossTreePill(person, this.lastCrossTrees);
             const siblingPill = this.siblingOrderCandidate(id);
             const partnersPill = this.partnersPillOf(id, visible) !== null;
-            const reserve = fields.height !== 'content' && personLines.length > 0 && (crossPill || siblingPill || partnersPill);
-            if (reserve && (crossPill || siblingPill)) edgeRightIds.add(id);
-            if (reserve && partnersPill) edgeLeftIds.add(id);
-            // The status mark: unless the pills' room already covers it (a card of one height
-            // keeps theirs on the last line; a card as tall as its content grows below its text).
-            const pillsGrow = fields.height === 'content' && (crossPill || siblingPill || partnersPill);
-            const statusRoom = personLines.length > 0 && !(reserve && (crossPill || siblingPill)) && !pillsGrow
-                && cardSignalInfo(person, signalCtx).showStatus;
+            const pills = crossPill || siblingPill || partnersPill;
+            if (pills) edgeRoomIds.add(id);
+            // The status mark: unless the pills' room below the text already covers it.
+            const statusRoom = personLines.length > 0 && !pills && cardSignalInfo(person, signalCtx).showStatus;
             if (statusRoom) statusRoomIds.add(id);
             // The birth surname under the name (src/person-name.ts): its row never widens the card.
             const birth = birthNoteText(shownNameParts(person, '?').birthNote);
@@ -1506,8 +1539,7 @@ class TreeRendererClass {
                 // A whole name on rows ends before the lock of a locked card (index.html, 5px).
                 ...(nameRows === 0 && DataManager.isPersonLocked(id) ? { nameReserve: CARD_LOCK_NAME_ROOM } : {}),
                 ...(presumed ? { years: cardYears(person, presumed.has(id)) } : {}),
-                ...(reserve || statusRoom ? { lastLineReserve: (reserve ? bottomRightPillsRoom(crossPill, siblingPill)
-                    + (partnersPill ? CARD_EDGE_PILL_LEFT : 0) : 0) + (statusRoom ? CARD_STATUS_MARK_ROOM : 0) } : {}),
+                ...(statusRoom ? { lastLineReserve: CARD_STATUS_MARK_ROOM } : {}),
             });
         }
         // The chosen width's cap (narrow / medium / wide); the poster takes this width too.
@@ -1517,24 +1549,28 @@ class TreeRendererClass {
         const { rows, heights, heads } = customCardRows(entries, metrics, measureCardTexts, fields.lines, fields.style, nameRows);
         const measured = {
             lines, rows, wrapped: fields.lines !== 1, style: fields.style,
-            heads: new Map(ids.map((id, i) => [id, heads[i]])), edgeRoomIds: new Set<PersonId>(), edgeRightIds, edgeLeftIds, statusRoomIds,
+            heads: new Map(ids.map((id, i) => [id, heads[i]])), edgeRoomIds, statusRoomIds,
         };
+        // A card with pills on its bottom edge needs CARD_EDGE_PILL_ROOM more below its text, so they cover none.
+        const withRoom = (h: number, i: number): number => edgeRoomIds.has(ids[i]) ? h + CARD_EDGE_PILL_ROOM : h;
         if (fields.height === 'content') {
             // Each card as tall as its own content; the view's height is its tallest
-            // (a band with no card, the CSS default). A card with pills on its
-            // bottom edge grows by their room, so they cover no text.
-            ids.forEach((id, i) => {
-                const pills = this.bottomEdgePills(id, visible, this.lastCrossTrees);
-                if (pills.left || pills.right) {
-                    measured.edgeRoomIds.add(id);
-                    heights[i] += CARD_EDGE_PILL_ROOM;
-                }
-            });
+            // (a band with no card, the CSS default).
+            const own = heights.map(withRoom);
             let tallest = CARD_HEAD_HEIGHT;
-            for (const h of heights) tallest = Math.max(tallest, h);
-            return { ...measured, metrics: { ...metrics, cardHeight: tallest, personHeights: new Map(ids.map((id, i) => [id, heights[i]])) } };
+            for (const h of own) tallest = Math.max(tallest, h);
+            return { ...measured, viewEdgeRoom: 0, metrics: { ...metrics, cardHeight: tallest, personHeights: new Map(ids.map((id, i) => [id, own[i]])) } };
         }
-        return { ...measured, metrics: { ...metrics, cardHeight: customCardViewHeight(fields.on.length, fields.lines, heights, fields.years, anyBirth) } };
+        // One height for the view: as tall as the tallest card with its pills' room
+        // (a one-row card is as tall as every detail on: it grows when any card has pills).
+        const plain = customCardViewHeight(fields.on.length, fields.lines, heights, fields.years, anyBirth);
+        const cardHeight = fields.lines === 1
+            ? plain + (edgeRoomIds.size > 0 ? CARD_EDGE_PILL_ROOM : 0)
+            : customCardViewHeight(fields.on.length, fields.lines, heights.map(withRoom), fields.years, anyBirth);
+        // The outputs draw no pills: without the room, unless the partner line runs
+        // through the card's middle (one row a detail), which then stays there.
+        const viewEdgeRoom = fields.lines === 1 ? 0 : cardHeight - plain;
+        return { ...measured, viewEdgeRoom, metrics: { ...metrics, cardHeight } };
     }
 
     /**
@@ -1656,19 +1692,6 @@ class TreeRendererClass {
     }
 
     /**
-     * Whether a card carries pills on its bottom edge: on the left ∞ other
-     * partners (the family view, partnersPillOf), on the right ⇄ the person
-     * in other trees or the sibling-order pill's room.
-     */
-    private bottomEdgePills(id: PersonId, visible: (pid: PersonId) => boolean,
-        crossTrees: Map<TreeId, { name: string; data: StromData }> | null): { left: boolean; right: boolean } {
-        const person = DataManager.getPerson(id);
-        if (!person) return { left: false, right: false };
-        const left = this.partnersPillOf(id, visible) !== null;
-        return { left, right: this.hasCrossTreePill(person, crossTrees) || this.siblingOrderCandidate(id) };
-    }
-
-    /**
      * Match the people of these cards to the other trees at once (one
      * matching pass for all of them, cached): asked card by card, each would
      * work out every tree's surname rules again.
@@ -1725,8 +1748,9 @@ class TreeRendererClass {
         this.loadViewModeForCurrentTree();
 
         // A reload in this tab keeps the tree, the view and the person (1101);
-        // only the first tree load after the page start may use it.
-        const reload = takeReloadPoint();
+        // only the first tree load after the page start may use it. A
+        // satellite window's copy of its opener's point is not its own.
+        const reload = DataManager.isWindowCopy() ? null : takeReloadPoint();
 
         const persons = DataManager.getAllPersons();
 
@@ -1800,11 +1824,16 @@ class TreeRendererClass {
 
         // Children shown in place belong to the view they were shown in
         // (a focus from the history brings back the ones it had)
-        if (this.focusPersonId !== personId) this.resetChildrenShown();
+        const focusChanged = this.focusPersonId !== personId;
+        if (focusChanged) this.resetChildrenShown();
         const pendingShown = this.pendingShown;
         this.pendingShown = null;
         if (pendingShown && this.viewMode === 'family') this.applyShownSnapshot(pendingShown);
         this.focusPersonId = personId;
+        // Other windows follow the person chosen here (spec 079 §2).
+        if (focusChanged && personId && typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('strom:focus-changed', { detail: { personId } }));
+        }
 
         // Set default depth to max available when focusing on a new person
         if (personId) {
@@ -1847,6 +1876,7 @@ class TreeRendererClass {
         this.childrenUnshowable.clear();
         this.childrenBroughtIn.clear();
         this.siblingsShownFor.clear();
+        this.bulkShownFor.clear();
         this.childrenShownDrift.clear();
         this.childrenZoom.clear();
         this.childrenAnchorScreen.clear();
@@ -2274,8 +2304,12 @@ class TreeRendererClass {
      * the children it promised is left out again (the safety net,
      * childrenUnshowable); when none is left, the view comes back and no
      * step is made. After the transition the children in view glow.
+     * `bulk` (children and siblings at once, showBulkFamily): the parents
+     * make that one step; the zoom stays, and each parent keeps the cards
+     * its own children brought (it closes alone).
      */
-    private async showChildrenOf(parents: readonly PersonId[], anchorId: PersonId, siblingsOf: PersonId | null): Promise<void> {
+    private async showChildrenOf(parents: readonly PersonId[], anchorId: PersonId, siblingsOf: PersonId | null,
+        bulk: BulkStep | null = null): Promise<void> {
         this.finishChildrenTransition();
         const historyBefore = this.currentHistoryEntry();
         const scene = this.captureChildrenScene();
@@ -2289,6 +2323,7 @@ class TreeRendererClass {
         for (const q of parents) this.childrenVisibleBefore.set(q, visible.get(q)!);
         // One step (the focus bar's count) from the first render on
         if (siblingsOf) this.siblingsShownFor.set(siblingsOf, [...parents]);
+        if (bulk) for (const q of parents) this.bulkShownFor.set(q, bulk);
         this.shownStepBefore = beforeAll;
         await this.renderInternal();
         const failed = parents.filter(q => !promised.get(q)!.some(inView));
@@ -2298,6 +2333,7 @@ class TreeRendererClass {
             for (const q of failed) {
                 this.childrenVisibleBefore.delete(q);
                 this.childrenUnshowable.add(q);
+                this.bulkShownFor.delete(q);
             }
             if (siblingsOf && shown.length > 0) this.siblingsShownFor.set(siblingsOf, shown);
             else if (siblingsOf) this.siblingsShownFor.delete(siblingsOf);
@@ -2312,20 +2348,158 @@ class TreeRendererClass {
         if (historyBefore) this.pushHistoryStep({ ...historyBefore, anchorId });
         const broughtIn = new Set([...this.positions.keys()].filter(id => !beforeAll.has(id)));
         this.shownStepBefore = null;
+        const ownBroughtIn = bulk ? bulkBroughtInByParent(data, shown, broughtIn) : null;
         for (const q of shown) {
-            this.childrenBroughtIn.set(q, broughtIn);
+            this.childrenBroughtIn.set(q, ownBroughtIn?.get(q) ?? broughtIn);
             const at = screenBefore.get(q);
             if (at) this.childrenAnchorScreen.set(q, at);
         }
         const shift = this.keepCardInPlace(anchorId, beforeAll, false);
-        // §5: zoom out around the card as far as the new children need (desktop)
+        // §5: zoom out around the card as far as the new children need (desktop); never for a bulk step
         const scaleBefore = ZoomPan.getScale();
         const kids = shown.flatMap(q => newlyShownChildIds(data, q, inView, visible.get(q)!)).filter(id => id !== anchorId);
-        const zoomTo = this.childrenZoomOut(anchorId, kids);
+        const zoomTo = bulk ? null : this.childrenZoomOut(anchorId, kids);
         if (zoomTo !== null) this.childrenZoom.set(shown[0], { before: scaleBefore, after: zoomTo });
         // §6: the children in view, of every marriage, glow once the cards stand (§1: and the active tabs)
         const glow = () => this.glowShown(shown, siblingsOf);
-        this.playChildrenTransition(scene, 'open', anchorId, shift, new Map(shown.map(q => [q, broughtIn] as const)), zoomTo, glow);
+        this.playChildrenTransition(scene, 'open', anchorId, shift, new Map(shown.map(q => [q, ownBroughtIn?.get(q) ?? broughtIn] as const)), zoomTo, glow);
+    }
+
+    // ---------- children and siblings at once (src/bulk-family.ts) ----------
+
+    /** The depth a bulk step belongs to (BulkStep.depth). */
+    private bulkDepthKey(): string {
+        return `${this.focusDepthUp}/${this.focusDepthDown}`;
+    }
+
+    /**
+     * What a step of children and siblings at once for `personId` would do
+     * in this view (none outside the family view or for a card not drawn):
+     * who (collectBulkFamily), the persons whose children it shows (the ones
+     * shown already and the safety net's left out), the people it adds (the
+     * cards the view would draw then and does not now, bulkNewIds: the
+     * screen's own layout request with the step's children shown, worked
+     * out once per drawing). `maxGeneration`: only the siblings up to that
+     * many generations above (bulk.two).
+     */
+    bulkFamilyPlan(personId: PersonId, maxGeneration = Infinity): { family: BulkFamily; parents: PersonId[]; newIds: PersonId[] } {
+        const empty = { family: { childrenOf: new Set<PersonId>(), siblingsOf: new Set<PersonId>() }, parents: [], newIds: [] };
+        if (this.viewMode !== 'family' || !this.positions.has(personId)) return empty;
+        const cache = this.bulkPlanCache;
+        if (!cache || cache.positions !== this.positions || cache.request !== this.screenLayoutRequest || cache.shown !== this.childrenShownIds) {
+            this.bulkPlanCache = { positions: this.positions, request: this.screenLayoutRequest, shown: this.childrenShownIds, plans: new Map() };
+        }
+        const key = `${personId}\u0000${maxGeneration}`;
+        const cached = this.bulkPlanCache!.plans.get(key);
+        if (cached) return cached;
+        const data = DataManager.getData();
+        const inView = (id: PersonId) => this.positions.has(id);
+        const family = collectBulkFamily(data, personId, inView, maxGeneration);
+        const parents = bulkParents(data, family, inView, q => !this.childrenShownIds.includes(q) && !this.childrenUnshowable.has(q));
+        const input = this.bulkLayoutInput(parents);
+        const plan = { family, parents, newIds: input ? bulkNewIds(input, parents, new Set(this.positions.keys())) : [] };
+        this.bulkPlanCache!.plans.set(key, plan);
+        return plan;
+    }
+
+    /**
+     * The screen's layout input with the children of `parents` shown too
+     * (null without a screen layout or parents). The view's folds stand,
+     * except the ancestors of a person whose parents show their children
+     * (never folded then, planShownChildrenFolding); `withFolds` false: none
+     * (the planner decides them, as a step's own layout does).
+     */
+    private bulkLayoutInput(parents: readonly PersonId[], withFolds = true): PipelineInput | null {
+        const request = this.screenLayoutRequest;
+        if (!request || parents.length === 0) return null;
+        const shown = [...(request.expandChildrenOf ?? []), ...parents];
+        const folds = withFolds ? [...this.foldedFor.keys()].filter(id =>
+            !(request.data.persons[id]?.parentIds ?? []).some(q => shown.includes(q))) : [];
+        const { foldAncestorsOf: _none, ...input } = pipelineInputFromRequest(request);
+        return { ...input, expandChildrenOf: shown, ...(folds.length > 0 ? { foldAncestorsOf: folds } : {}) };
+    }
+
+    /** How many people a step of children and siblings at once for `personId` adds (the menu row's and the switch's "+n"). */
+    bulkFamilyCount(personId: PersonId, maxGeneration = Infinity): number {
+        return this.bulkFamilyPlan(personId, maxGeneration).newIds.length;
+    }
+
+    /**
+     * The person's step of children and siblings at once that still stands
+     * (the latest, made at this depth; a family of it closed alone leaves
+     * the rest of it standing), or null. (a) and (b) share it: the focus's
+     * menu row and the switch read the same step.
+     */
+    bulkStepOf(personId: PersonId): BulkStep | null {
+        let out: BulkStep | null = null;
+        const depth = this.bulkDepthKey();
+        for (const b of this.bulkShownFor.values()) {
+            if (b.personId === personId && b.depth === depth && (!out || b.seq > out.seq)) out = b;
+        }
+        return this.viewMode === 'family' ? out : null;
+    }
+
+    /**
+     * The state of children and siblings at once for `personId` (the focus
+     * bar's switch with the focus, the person menu's row): 'offer' with n
+     * people to add; 'on' with nothing to add while its step stands (a click
+     * takes the step back, undoBulkFamily); 'none' otherwise (nothing to add,
+     * no step; outside the family view too).
+     */
+    bulkFamilyState(personId: PersonId): { state: 'offer' | 'on' | 'none'; n: number; step: BulkStep | null } {
+        const n = this.bulkFamilyCount(personId);
+        const step = this.bulkStepOf(personId);
+        return { state: n > 0 ? 'offer' : step ? 'on' : 'none', n, step };
+    }
+
+    /**
+     * How wide the view grows with a step (the bubble over 150): the step's
+     * own layout worked out (no drawing; rare, a step over 150 people), its
+     * width in screen widths at today's zoom, rounded up.
+     */
+    bulkFamilyScreens(personId: PersonId, maxGeneration = Infinity): number {
+        const input = this.bulkLayoutInput(this.bulkFamilyPlan(personId, maxGeneration).parents, false);
+        const canvas = document.getElementById('tree-container')?.clientWidth || window.innerWidth || 1;
+        if (!input) return 1;
+        const { positions } = planShownChildrenFolding(input).result;
+        let left = Infinity, right = -Infinity;
+        for (const pos of positions.values()) {
+            left = Math.min(left, pos.x);
+            right = Math.max(right, pos.x + this.config.cardWidth);
+        }
+        const width = right > left ? (right - left) * ZoomPan.getScale() : 0;
+        return Math.max(1, Math.ceil(width / canvas));
+    }
+
+    /**
+     * Children and siblings at once for `personId` (source 'a' the person
+     * menu, 'b' the focus bar's switch): the children of every person of
+     * the plan in one layout, one render and one step of the history and
+     * of "Hide shown · n". The focus, the depth and the zoom stay; the
+     * person's card keeps its place on the screen. `maxGeneration`: bulk.two.
+     */
+    async showBulkFamily(personId: PersonId, source: 'a' | 'b', maxGeneration = Infinity): Promise<void> {
+        const { family, parents } = this.bulkFamilyPlan(personId, maxGeneration);
+        if (parents.length === 0) return;
+        const inView = (id: PersonId) => this.positions.has(id);
+        const step: BulkStep = {
+            seq: ++this.bulkSeq, source, personId, depth: this.bulkDepthKey(),
+            added: bulkAddedKeys(DataManager.getData(), family, parents, inView),
+        };
+        await this.showChildrenOf(parents, personId, null, step);
+    }
+
+    /**
+     * Take the person's standing step of children and siblings at once back
+     * (the switch "on", the menu's "Collapse children and siblings"): its
+     * families close in one render, a new step of the history; the card
+     * keeps its place.
+     */
+    async undoBulkFamily(personId: PersonId): Promise<void> {
+        const step = this.bulkStepOf(personId);
+        if (!step) return;
+        const ids = [...this.bulkShownFor].filter(([, b]) => b.seq === step.seq).map(([id]) => id);
+        await this.closeChildrenShown(ids, personId);
     }
 
     /**
@@ -2442,32 +2616,8 @@ class TreeRendererClass {
             for (const [q, b] of this.parentsInvolved(p, this.parentsBroughtIn.get(p) ?? new Set())) if (!involved.has(q)) involved.set(q, b);
         }
         for (const p of closingPartners) if (!involved.has(p)) involved.set(p, this.partnersBroughtIn.get(p) ?? new Set());
-        this.childrenShownIds = this.childrenShownIds.filter(id => !closing.has(id));
-        for (const id of closing) {
-            this.childrenVisibleBefore.delete(id);
-            this.childrenBroughtIn.delete(id);
-            this.childrenZoom.delete(id);
-        }
-        for (const [p, parents] of this.siblingsShownFor) {
-            if (parents.some(q => closing.has(q))) this.siblingsShownFor.delete(p);
-        }
         const anchorScreen = this.childrenAnchorScreen.get(anchorId) ?? this.parentsAnchorScreen.get(anchorId) ?? this.partnersAnchorScreen.get(anchorId);
-        for (const id of closing) this.childrenAnchorScreen.delete(id);
-        this.parentsShownIds = this.parentsShownIds.filter(id => !closingParents.has(id));
-        for (const id of closingParents) {
-            this.parentsBroughtIn.delete(id);
-            this.parentsWithSiblings.delete(id);
-            this.parentsZoom.delete(id);
-            this.parentsAnchorScreen.delete(id);
-        }
-        this.partnersShownIds = this.partnersShownIds.filter(id => !closingPartners.has(id));
-        for (const id of closingPartners) {
-            this.partnersBroughtIn.delete(id);
-            this.partnersZoom.delete(id);
-            this.partnersAnchorScreen.delete(id);
-            this.partnersShownUnions.delete(id);
-            this.partnersOffered.delete(id);
-        }
+        this.forgetShown(closing, closingParents, closingPartners);
         await this.renderInternal();
         const shift = this.keepCardInPlace(anchorId, beforeAll, restoreView);
         // §5: the scale before the first of these clicks, when the last one's zoom still stands
@@ -2476,6 +2626,54 @@ class TreeRendererClass {
         // (zooms around other cards moved it on the screen; the pivot that lands it there)
         const pivot = restoreView && zoomTo !== null && anchorScreen ? this.landingPivot(anchorId, anchorScreen, zoomTo) : null;
         this.playChildrenTransition(scene, 'close', anchorId, shift, involved, zoomTo, undefined, pivot);
+    }
+
+    /**
+     * Leave out the children shown for `children`, the parents shown for
+     * `parents` and the other partners shown for `partners` (no render, no
+     * step of the history): what closing them (closeShown) or another depth
+     * (forgetBulkSteps) does to the view's state.
+     */
+    private forgetShown(children: ReadonlySet<PersonId>, parents: ReadonlySet<PersonId>, partners: ReadonlySet<PersonId>): void {
+        this.childrenShownIds = this.childrenShownIds.filter(id => !children.has(id));
+        for (const id of children) {
+            this.childrenVisibleBefore.delete(id);
+            this.childrenBroughtIn.delete(id);
+            this.childrenZoom.delete(id);
+            this.childrenAnchorScreen.delete(id);
+            this.bulkShownFor.delete(id);
+        }
+        for (const [p, qs] of this.siblingsShownFor) {
+            if (qs.some(q => children.has(q))) this.siblingsShownFor.delete(p);
+        }
+        this.parentsShownIds = this.parentsShownIds.filter(id => !parents.has(id));
+        for (const id of parents) {
+            this.parentsBroughtIn.delete(id);
+            this.parentsWithSiblings.delete(id);
+            this.parentsZoom.delete(id);
+            this.parentsAnchorScreen.delete(id);
+        }
+        this.partnersShownIds = this.partnersShownIds.filter(id => !partners.has(id));
+        for (const id of partners) {
+            this.partnersBroughtIn.delete(id);
+            this.partnersZoom.delete(id);
+            this.partnersAnchorScreen.delete(id);
+            this.partnersShownUnions.delete(id);
+            this.partnersOffered.delete(id);
+        }
+    }
+
+    /**
+     * Another depth (decision 5: a step of children and siblings at once is
+     * one-off, a new focus or another depth ends it): every such step, (a)
+     * and (b), goes with what closes with it (the expansions on the cards it
+     * brought, shownClosing); the families shown card by card stay. No step
+     * of the history (the history does not keep the depth).
+     */
+    private forgetBulkSteps(): void {
+        if (this.bulkShownFor.size === 0) return;
+        const { children, parents, partners } = this.shownClosing([...this.bulkShownFor.keys()], []);
+        this.forgetShown(children, parents, partners);
     }
 
     /**
@@ -2494,6 +2692,8 @@ class TreeRendererClass {
             if (text) text.textContent = strings.focus.hideAllShown(n);
             el.setAttribute('aria-label', strings.focus.hideAllShownAria(n));
         }
+        // The focus bar's switch "Children & siblings" counts again after every render
+        updateBulkFamilySwitches();
     }
 
     /**
@@ -2504,7 +2704,9 @@ class TreeRendererClass {
      */
     shownChildrenCount(): number {
         const grouped = new Set([...this.siblingsShownFor.values()].flat());
-        return this.childrenShownIds.filter(id => !grouped.has(id)).length + this.siblingsShownFor.size
+        for (const id of this.bulkShownFor.keys()) grouped.add(id);
+        const bulkSteps = new Set([...this.bulkShownFor.values()].map(b => b.seq)).size;
+        return this.childrenShownIds.filter(id => !grouped.has(id)).length + this.siblingsShownFor.size + bulkSteps
             + this.parentsShownIds.filter(id => !this.parentsWithSiblings.has(id)).length
             + this.partnersShownIds.length;
     }
@@ -3184,7 +3386,7 @@ class TreeRendererClass {
         const inView = (id: PersonId) => this.positions.has(id);
         const elsewhere = this.siblingsElsewhereOf(personId);
         const aria = (shown ? strings.focus.siblingsTabHideAria : strings.focus.siblingsTabShowAria)(fullTitle);
-        const tabHtml = `<button type="button" class="branch-tab siblings-tab kind-place${shown ? ' active' : ''}" data-action="toggle-siblings" aria-pressed="${shown}" aria-label="${this.escapeHtml(aria)}">`
+        const tabHtml = `<button type="button" class="branch-tab sel-tab siblings-tab kind-place${shown ? ' active' : ''}" data-sel-dir="down" data-action="toggle-siblings" aria-pressed="${shown}" aria-label="${this.escapeHtml(aria)}">`
             + branchTabRestHtml(shown ? 'siblingsShown' : 'siblingsHere');
         if (!shown) {
             const state = siblingsTabState(data, personId, inView, unionChildIds, this.childrenShownSet(), this.childrenUnshowable, this.shownChildrenContext());
@@ -3218,7 +3420,7 @@ class TreeRendererClass {
             .filter((p): p is Person => p !== null && !p.isPlaceholder)
             .map(p => this.bubbleItemHtml(p)) }]);
         const aria = (shown ? strings.focus.parentsTabHideAria : strings.focus.parentsTabShowAria)(fullTitle);
-        const button = `<button type="button" class="branch-tab parents-tab kind-place${shown ? ' active' : ''}" data-action="toggle-parents" aria-pressed="${shown}" aria-label="${this.escapeHtml(aria)}">`
+        const button = `<button type="button" class="branch-tab sel-tab parents-tab kind-place${shown ? ' active' : ''}" data-sel-dir="down" data-action="toggle-parents" aria-pressed="${shown}" aria-label="${this.escapeHtml(aria)}">`
             + branchTabRestHtml(shown ? 'parentsShown' : 'parentsHere');
         const body = `<div class="badge-tooltip-header">${shown ? strings.focus.parentsShownTooltip : strings.focus.hiddenParentsTooltip}</div>${items}`;
         const action = `<div class="badge-tooltip-action">${shown ? strings.focus.placeHideHint : strings.focus.placeShowHint}</div>`;
@@ -3644,6 +3846,7 @@ class TreeRendererClass {
     }
 
     setFocusDepth(up: number, down: number): void {
+        if (up !== this.focusDepthUp || down !== this.focusDepthDown) this.forgetBulkSteps();
         this.focusDepthUp = up;
         this.focusDepthDown = down;
 
@@ -3686,9 +3889,39 @@ class TreeRendererClass {
      */
     presetViewMode(mode: ViewMode): void {
         if (this.viewMode === mode) return;
+        if (this.windowView) this.windowView = mode;
         this.viewMode = mode;
         this.resetChildrenShown();
         this.persistViewMode();
+    }
+
+    /**
+     * A satellite window's view (spec 079 §2): every tree load opens it, and
+     * nothing of it is remembered (the main window's last view stays). A
+     * switch of the view in the window (setViewMode) becomes its view.
+     */
+    setWindowView(mode: ViewMode): void {
+        this.windowView = mode;
+        this.viewMode = mode;
+    }
+
+    /**
+     * A satellite window's start (spec 079 §1): the person in the centre and
+     * the generations the main window had, before the first drawing. Nothing
+     * is stored and the view history stays empty (the window's own from now).
+     */
+    setWindowStart(personId: PersonId, up: number, down: number): void {
+        this.focusPersonId = personId;
+        this.focusDepthUp = up;
+        this.focusDepthDown = down;
+    }
+
+    /** A satellite window's start: the fan as the main window had it, kept in this window only (nothing stored). */
+    setWindowFan(fan: { generations: number; descGenerations: number; shape: string; colorMode: string }): void {
+        if (Number.isFinite(fan.generations)) this.fanGenerations = Math.max(FAN_MIN_GENERATIONS, Math.min(FAN_MAX_GENERATIONS, Math.floor(fan.generations)));
+        if (Number.isFinite(fan.descGenerations)) this.fanDescGenerations = Math.max(FAN_MIN_DESC_GENERATIONS, Math.min(FAN_MAX_DESC_GENERATIONS, Math.floor(fan.descGenerations)));
+        if ((FAN_SHAPES as readonly string[]).includes(fan.shape)) this.fanShape = fan.shape as FanShape;
+        if ((FAN_COLOR_MODES as readonly string[]).includes(fan.colorMode)) this.fanColorMode = fan.colorMode as FanColorMode;
     }
 
     /** Switch the display view mode and re-render. Persisted per tree. */
@@ -3698,6 +3931,8 @@ class TreeRendererClass {
         // the table's active row's person goes along, and the table opens at the focus.
         const fromTable = this.viewMode === 'table' ? UI.tableFocusPerson?.(this.focusPersonId) ?? null : null;
         if (mode === 'table') UI.tableTakeFocus?.(this.focusPersonId);
+        // A satellite window's view is switched in its header (spec 079 §2 K2): another tree opens in it too.
+        if (this.windowView) this.windowView = mode;
         this.viewMode = mode;
         this.resetChildrenShown();
         this.persistViewMode();
@@ -3737,7 +3972,7 @@ class TreeRendererClass {
      */
     private persistViewMode(): void {
         const treeId = DataManager.getCurrentTreeId();
-        if (!treeId || DataManager.isViewMode()) return;
+        if (!treeId || DataManager.isViewMode() || DataManager.isWindowCopy()) return;
         recordLastView(treeId, this.viewMode);
         this.recordReload();
     }
@@ -3749,6 +3984,10 @@ class TreeRendererClass {
      * from the tree's default person (restoreFromSession).
      */
     loadViewModeForCurrentTree(): void {
+        if (this.windowView) {
+            this.viewMode = this.windowView;
+            return;
+        }
         const treeId = DataManager.getCurrentTreeId();
         this.viewMode = chooseStartView(DataManager.getData().defaultView, treeId ? readLastView(treeId) : null);
     }
@@ -3756,7 +3995,7 @@ class TreeRendererClass {
     /** Note where the work in this tab stands, for a reload of the page (1101). */
     private recordReload(): void {
         const treeId = DataManager.getCurrentTreeId();
-        if (!treeId || !this.focusPersonId || DataManager.isViewMode()) return;
+        if (!treeId || !this.focusPersonId || DataManager.isViewMode() || DataManager.isWindowCopy()) return;
         recordReloadPoint({
             tree: treeId, person: this.focusPersonId, view: this.viewMode,
             up: this.focusDepthUp, down: this.focusDepthDown,
@@ -3811,6 +4050,7 @@ class TreeRendererClass {
             shown: this.childrenShownIds.map(id => {
                 const zoom = this.childrenZoom.get(id), anchorScreen = this.childrenAnchorScreen.get(id);
                 const siblingsOf = [...this.siblingsShownFor].find(([, parents]) => parents.includes(id))?.[0];
+                const bulk = this.bulkShownFor.get(id);
                 return {
                     id,
                     visibleBefore: this.childrenVisibleBefore.get(id) ?? new Set<PersonId>(),
@@ -3818,6 +4058,7 @@ class TreeRendererClass {
                     ...(zoom ? { zoom } : {}),
                     ...(anchorScreen ? { anchorScreen } : {}),
                     ...(siblingsOf ? { siblingsOf } : {}),
+                    ...(bulk ? { bulk } : {}),
                 };
             }).concat(this.parentsShownIds.map(id => {
                 const zoom = this.parentsZoom.get(id), anchorScreen = this.parentsAnchorScreen.get(id);
@@ -3886,6 +4127,7 @@ class TreeRendererClass {
         for (const s of shown) {
             if (s.siblingsOf) this.siblingsShownFor.set(s.siblingsOf, [...(this.siblingsShownFor.get(s.siblingsOf) ?? []), s.id]);
         }
+        this.bulkShownFor = new Map(shown.filter(s => s.bulk).map(s => [s.id, s.bulk!] as const));
         if (all.length === 0) this.childrenShownDrift.clear();
     }
 
@@ -4147,6 +4389,59 @@ class TreeRendererClass {
     }
 
     /**
+     * The person selected in another window (null: none), marked now and at
+     * every draw: their card's ring, their sectors of the Fan, their row of
+     * the Timeline, their places on the Map.
+     */
+    setWindowSelected(id: PersonId | null): void {
+        const changed = id !== this.windowSelectedId;
+        this.windowSelectedId = id;
+        document.querySelectorAll<HTMLElement>('.person-card').forEach(card => {
+            card.classList.toggle('window-selected', !!id && card.dataset.id === id);
+        });
+        this.markTimelineWindowSelected();
+        if (!changed) return;
+        if (this.viewMode === 'fan') this.fanView?.redraw();
+        if (this.viewMode === 'map') UI.revealMapPerson(null);
+    }
+
+    /** The Timeline's row of the person selected in another window. */
+    private markTimelineWindowSelected(): SVGGElement | null {
+        const id = this.windowSelectedId;
+        let row: SVGGElement | null = null;
+        document.querySelectorAll<SVGGElement>('#timeline-container .timeline-bar[data-person-id]').forEach(g => {
+            const on = !!id && g.dataset.personId === id;
+            g.classList.toggle('window-selected', on);
+            if (on) row = g;
+        });
+        return row;
+    }
+
+    /**
+     * Another window's selection in the Fan, the Timeline or the Map (spec
+     * 079 §2): marked, and the view moves (its zoom kept) only when the mark
+     * is out of view; the focus never changes.
+     */
+    revealWindowSelected(id: PersonId): void {
+        if (this.viewMode === 'fan') {
+            this.fanView?.revealPerson(id);
+        } else if (this.viewMode === 'timeline') {
+            const row = this.markTimelineWindowSelected();
+            const box = document.getElementById('timeline-container');
+            if (!row || !box) return;
+            const r = row.getBoundingClientRect(), c = box.getBoundingClientRect();
+            if (r.top < c.top) box.scrollBy({ top: r.top - c.top - 8, behavior: 'smooth' });
+            else if (r.bottom > c.bottom) box.scrollBy({ top: r.bottom - c.bottom + 8, behavior: 'smooth' });
+        } else if (this.viewMode === 'map') {
+            UI.revealMapPerson(id);
+        }
+    }
+
+    getWindowSelected(): PersonId | null {
+        return this.windowSelectedId;
+    }
+
+    /**
      * Highlight a set of persons in the tree (search results): matched cards get
      * 'search-hit', all others 'search-dim'. Pass null to clear. Pure DOM class
      * toggling — the layout is never recomputed.
@@ -4246,6 +4541,9 @@ class TreeRendererClass {
             if (toolbarFocus) toolbarFocus.style.display = 'none';
             if (toolbarFocusName) toolbarFocusName.textContent = '';
             if (toolbarFocusCount) toolbarFocusCount.textContent = '';
+            // No name of a tree gone from view stays behind (a locked tree's copy in a satellite).
+            if (focusName) focusName.textContent = '';
+            if (focusCount) focusCount.textContent = '';
             return;
         }
 
@@ -4363,7 +4661,7 @@ class TreeRendererClass {
         }
         return {
             positions: this.positions,
-            connections: this.withoutEdgeRoom(this.connections, this.edgeRoomIds),
+            connections: this.withoutEdgeRoom(this.connections, this.config, this.edgeRoomIds, this.viewEdgeRoom),
             spouseLines: this.spouseLines,
             omittedEdges: this.omittedEdges,
         };
@@ -4483,10 +4781,10 @@ class TreeRendererClass {
         const cardFields = SettingsManager.getEffectiveCardFields();
         // The next measure reads the other trees the cards are matched against now (the ⇄ pill).
         this.lastCrossTrees = allTrees;
-        // Cards of details as tall as their content were measured with room for
-        // the pills on their bottom edge; a card whose pills came out otherwise
-        // (the other trees were not read yet) asks for one more render.
-        const measuresEdgeRoom = !!this.customMetrics?.personHeights;
+        // Cards of details were measured with room for the pills on their bottom
+        // edge; a card whose pills came out otherwise (the other trees were not
+        // read yet) asks for one more render.
+        const measuresEdgeRoom = !!this.customMetrics;
         let edgeRoomStale = false;
         // Marriage-order pills (T13): one per union, at most one per card, at
         // the corner pointing to the person whose marriages it counts; laid
@@ -4520,6 +4818,7 @@ class TreeRendererClass {
             if (this.focusPersonId && id === this.focusPersonId) {
                 classes += ' focused';
             }
+            if (this.windowSelectedId && id === this.windowSelectedId) classes += ' window-selected';
             // Add locked class if person is locked
             if (DataManager.isPersonLocked(id)) {
                 classes += ' locked';
@@ -4678,7 +4977,7 @@ class TreeRendererClass {
                 const foldedByPerson = foldedBy ? DataManager.getPerson(foldedBy) : null;
                 if (foldedBy && foldedByPerson) {
                     const byName = shownNameFull(foldedByPerson, '?');
-                    tabHtml.set('parentsFolded', `<button type="button" class="branch-tab kind-place folded" data-action="unfold-parents" data-shown-id="${this.escapeHtml(foldedBy)}" aria-label="${this.escapeHtml(strings.focus.parentsFoldedAria(byName))}">`
+                    tabHtml.set('parentsFolded', `<button type="button" class="branch-tab sel-tab kind-place folded" data-sel-dir="down" data-action="unfold-parents" data-shown-id="${this.escapeHtml(foldedBy)}" aria-label="${this.escapeHtml(strings.focus.parentsFoldedAria(byName))}">`
                         + branchTabRestHtml('parentsFolded')
                         + `<div class="badge-tooltip"><div class="badge-tooltip-header">${strings.focus.parentsFoldedHeader}</div>`
                         + `<div class="badge-tooltip-body">${this.escapeHtml(strings.focus.parentsFoldedBody(byName))}</div>`
@@ -4712,7 +5011,7 @@ class TreeRendererClass {
                     // before the click; after it, rows that glide to them
                     const elsewhere = this.childrenElsewhereOf(id);
                     const kind = childrenShown ? 'childrenShown' : 'children';
-                    const button = `<button type="button" class="branch-tab children-tab kind-place${childrenShown ? ' active' : ''}" data-action="toggle-children" aria-pressed="${childrenShown}" aria-label="${this.escapeHtml(aria)}">`
+                    const button = `<button type="button" class="branch-tab sel-tab children-tab kind-place${childrenShown ? ' active' : ''}" data-sel-dir="down" data-action="toggle-children" aria-pressed="${childrenShown}" aria-label="${this.escapeHtml(aria)}">`
                         + branchTabRestHtml(kind);
                     if (!childrenShown) {
                         const elsewhereLine = elsewhere.length ? `<div class="badge-tooltip-elsewhere">${this.escapeHtml(strings.focus.childrenElsewhereCount(elsewhere.length))}</div>` : '';
@@ -4923,8 +5222,6 @@ class TreeRendererClass {
                 // The pills reach 9 px into the card: a card of details is measured taller for them.
                 card.classList.add('has-edge-bl');
             }
-            // A card of one height wrapped its last line clear of the ∞ pill (index.html .edge-bl-room)
-            if (this.edgeLeftIds.has(id)) card.classList.add('edge-bl-room');
             // The sibling-order pill (§3): the direct-line card out of its birth place among the shown siblings
             const siblingOrder = this.siblingOrderOf(id);
             const siblingOrderHtml = siblingOrder
@@ -4941,20 +5238,12 @@ class TreeRendererClass {
                 // The pills reach 9 px into the card, 40 px before its corner (the status mark stays there).
                 card.classList.add('has-edge-br');
             }
-            // The room on the card: where the pill stands, or where a card of one height was wrapped for it
-            if (siblingOrderHtml || (siblingRoom && this.edgeRightIds.has(id))) {
-                card.classList.add('has-edge-br');
-                card.style.setProperty('--edge-br-room', `${bottomRightPillsRoom(!!crossTreeHtml, true)}px`);
-            }
             const rightPills = !!crossTreeHtml || siblingRoom;
             // A card of details measured with the pills' room keeps its text above them (index.html .has-edge-room).
             if (this.edgeRoomIds.has(id)) card.classList.add('has-edge-room');
             // Its last line wrapped clear of the status mark alone (index.html .has-status-room).
             if (this.statusRoomIds.has(id)) card.classList.add('has-status-room');
             if (measuresEdgeRoom && this.edgeRoomIds.has(id) !== !!(hiddenIndicatorsHtml || rightPills)) edgeRoomStale = true;
-            // A card of one height: its last line wrapped clear of the ⇄ pill exactly when the pill is there.
-            if (customLines?.length && !measuresEdgeRoom && this.edgeRightIds.has(id) !== rightPills) edgeRoomStale = true;
-            if (customLines?.length && !measuresEdgeRoom && this.edgeLeftIds.has(id) !== !!hiddenIndicatorsHtml) edgeRoomStale = true;
             // The research edge above the card (a stub, or a label by the dashed line to the parents).
             const edge = this.edgeViews.get(id);
             if (edge) {
@@ -5180,6 +5469,8 @@ class TreeRendererClass {
             });
 
             // Attach event listeners to add buttons
+            // "+ child" placed clear of the bottom-right pills when the pointer comes (it shows only then).
+            if (childAddHtml && card.classList.contains('has-edge-br')) card.addEventListener('pointerenter', () => this.placeChildAddTab(card));
             card.querySelectorAll('.add-btn').forEach(btn => {
                 btn.addEventListener('click', (e) => {
                     e.stopPropagation();
@@ -5232,6 +5523,28 @@ class TreeRendererClass {
             if (!pill || !left) continue;
             if (left.getBoundingClientRect().right + 4 > pill.getBoundingClientRect().left) card.classList.add('so-retreat');
         }
+    }
+
+    /**
+     * The "+ child" tab in the middle of a card's bottom edge, shown under a
+     * mouse: when the bottom-right pills (the sibling order "2 of 6", ⇄ N)
+     * reach the middle, it stands just left of them, anchored by its right
+     * side so its label grows away from them (the ∞ pills on the left give
+     * way while it is pointed at). Read when the pointer comes onto the card,
+     * so a render never waits for the layout.
+     */
+    private placeChildAddTab(card: HTMLElement): void {
+        const add = card.querySelector<HTMLElement>(':scope > .edge-bottom-center');
+        const pills = card.querySelector<HTMLElement>(':scope > .edge-bottom-right');
+        if (!add) return;
+        add.classList.remove('is-beside');
+        add.style.removeProperty('right');
+        if (!pills || !pills.offsetWidth) return;
+        const width = card.clientWidth;
+        const end = pills.offsetLeft - CHILD_ADD_GAP;
+        if (width / 2 + CHILD_ADD_TAB / 2 <= end) return;
+        add.classList.add('is-beside');
+        add.style.right = `${Math.round(width - end)}px`;
     }
 
     /**
@@ -5299,6 +5612,54 @@ class TreeRendererClass {
         // Fitted in the fallback font before the card fonts were in: fit again
         // once they are (the serif name is wider, it would end up clipped).
         cardFontsPending()?.then(() => { if (canvas.isConnected) this.fitCardNames(canvas); });
+        // Fitted as at 100 %, whatever the zoom: far out (.zoom-far) the rows
+        // the grown status mark reaches end before it, a matter of the zoom
+        // the CSS applies on top. Fitted against that room, a name rendered
+        // far out stayed shrunk or on two lines after zooming back in. No
+        // frame is painted between the two class changes.
+        const far = canvas.classList.contains('zoom-far');
+        if (far) canvas.classList.remove('zoom-far');
+        try {
+            this.fitCardNamesNow(canvas, only);
+            this.markGapRows(canvas, only);
+        } finally {
+            if (far) canvas.classList.add('zoom-far');
+        }
+    }
+
+    /**
+     * How far above the status mark's bottom edge each row of a card with
+     * the mark ends (--mark-gap, layout px). Far out the mark grows from
+     * that edge (12px × 0.85 / zoom); the CSS (#tree-canvas.zoom-far,
+     * --far-step) keeps only the rows it reaches clear of it, so a name above
+     * the mark stays whole at every zoom.
+     */
+    private markGapRows(canvas: HTMLElement, only?: readonly HTMLElement[]): void {
+        const cards = only
+            ? only.filter(c => c.isConnected && c.classList.contains('has-status'))
+            : [...canvas.querySelectorAll<HTMLElement>('.person-card.has-status')];
+        const gaps: Array<[HTMLElement, number]> = [];
+        for (const card of cards) {
+            const mark = card.querySelector<HTMLElement>(':scope > .card-status-mark');
+            if (!mark) continue;
+            const markBottom = mark.offsetTop + mark.offsetHeight;
+            const rows = card.querySelectorAll<HTMLElement>(
+                '.card-body:not(.card-body--custom) > *, .name-fit-2lines .name-surname, .name-fit-2lines .name-surname > .name-row');
+            for (const row of rows) {
+                let top = 0;
+                let e: HTMLElement | null = row;
+                while (e && e !== card) {
+                    top += e.offsetTop;
+                    e = e.offsetParent as HTMLElement | null;
+                }
+                if (e !== card) continue;
+                gaps.push([row, markBottom - (top + row.offsetHeight)]);
+            }
+        }
+        for (const [row, gap] of gaps) row.style.setProperty('--mark-gap', String(Math.round(gap * 100) / 100));
+    }
+
+    private fitCardNamesNow(canvas: HTMLElement, only?: readonly HTMLElement[]): void {
         // `only`: these cards (a live load's new ones), the rest stay as fitted.
         const names = only
             ? only.filter(c => c.isConnected).flatMap(c => [...c.querySelectorAll<HTMLElement>('.name')])
@@ -6563,6 +6924,8 @@ class TreeRendererClass {
                     { divider: true, rows: [{ label: strings.fan.menuCancel, run: () => { /* closes */ }, id: 'fan-menu-cancel' }] },
                 ], { subtitle: menu.sub, overlayClass: 'fan-menu-sheet', onClose }),
                 hideMenuSheet: () => UI.hideBottomSheet(),
+                remembersPrefs: () => !DataManager.isWindowCopy(),
+                windowSelected: () => this.windowSelectedId,
             });
         }
         this.fanView.render(container);
@@ -6570,6 +6933,17 @@ class TreeRendererClass {
 
     /** The timeline's last markup (a redraw with nothing new leaves the DOM alone). */
     private timelineHtml = '';
+    private timelineMeasureCtx: CanvasRenderingContext2D | null | undefined;
+
+    /** A shared mark's label width in the timeline's own font (semibold 11.5 px), for placing it beside other marks. */
+    private timelineLabelMeasure(container: HTMLElement): ((text: string) => number) | undefined {
+        if (this.timelineMeasureCtx === undefined) this.timelineMeasureCtx = document.createElement('canvas').getContext('2d');
+        const ctx = this.timelineMeasureCtx;
+        if (!ctx) return undefined;
+        ctx.font = `600 11.5px ${getComputedStyle(container).fontFamily || 'sans-serif'}`;
+        // A pixel more than measured: the label's halo and a rounding of the drawn text.
+        return (text) => Math.ceil(ctx.measureText(text).width) + 1;
+    }
 
     private renderTimeline(container: HTMLElement): void {
         // Delegate bar clicks once (safe against odd person ids in JSON imports).
@@ -6635,6 +7009,7 @@ class TreeRendererClass {
             femaleColor: 'var(--female)',
             unknownColor: 'var(--unknown)',
             narrow: isMobile,
+            measureLabel: this.timelineLabelMeasure(container),
         });
 
         // Nothing changed (a status that brought nothing new for the row): the DOM stays.
@@ -6644,6 +7019,7 @@ class TreeRendererClass {
         // A redraw keeps the keyboard on the history cluster it was on.
         const focusedCluster = (document.activeElement as Element | null)?.closest?.('#timeline-container .tl-hist')?.getAttribute('data-hist-ids');
         container.innerHTML = html;
+        this.markTimelineWindowSelected();
         if (focusedCluster) {
             container.querySelector<SVGGElement>(`.tl-hist[data-hist-ids="${CSS.escape(focusedCluster)}"]`)?.focus({ preventScroll: true });
         }
@@ -6776,7 +7152,7 @@ class TreeRendererClass {
         const name = self ? shownNameFull(self, '?') : '?';
         const label = (kind === 'linkParents' ? strings.focus.linkParentsAria
             : kind === 'linkChild' ? strings.focus.linkChildAria : strings.focus.linkChildrenAria)(name);
-        return `<button type="button" class="branch-tab line-link kind-jump" data-action="${toParents ? 'jump-parents' : 'jump-child'}" aria-label="${this.escapeHtml(label)}">`
+        return `<button type="button" class="branch-tab sel-tab line-link kind-jump" data-sel-dir="down" data-action="${toParents ? 'jump-parents' : 'jump-child'}" aria-label="${this.escapeHtml(label)}">`
             + `${branchTabRestHtml(kind)}<div class="badge-tooltip" aria-hidden="true"><div class="badge-tooltip-header">${this.escapeHtml(header)}</div>${items}`
             + `<div class="badge-tooltip-action">${this.escapeHtml(strings.focus.jumpHint(people.length))}</div></div></button>`;
     }
@@ -6853,7 +7229,7 @@ class TreeRendererClass {
                 : offered.length > 1 ? strings.focus.partnersPickHint : strings.focus.placeShowHint;
         const aria = (partial ? strings.focus.partnersTabRestAria : pill.shown ? strings.focus.partnersTabHideAria : strings.focus.partnersTabShowAria)(fullTitle);
         const active = pill.shown && !partial;
-        const button = `<button type="button" class="hidden-partners-btn kind-place${active ? ' active' : ''}${partial ? ' partial' : ''}" data-action="toggle-partners"`
+        const button = `<button type="button" class="hidden-partners-btn sel-tab kind-place${active ? ' active' : ''}${partial ? ' partial' : ''}" data-sel-dir="up" data-action="toggle-partners"`
             + ` aria-pressed="${partial ? 'mixed' : active}" aria-label="${this.escapeHtml(aria)}">`
             + `<span class="pill-glyph">${active ? '▾' : '▸'}</span><span class="pill-glyph">∞</span><span class="pill-count">${partial ? offered.length : pill.ids.length}</span>`;
         const body = `<div class="badge-tooltip-header">${this.escapeHtml(header)}</div>${items}`;
@@ -6901,7 +7277,7 @@ class TreeRendererClass {
         } else {
             body = `<div class="badge-tooltip-header">${strings.focus.hiddenSiblingsTooltip}</div>${this.siblingGroupsHtml(personId, siblingIds)}`;
         }
-                return `<button type="button" class="branch-tab kind-focus" data-action="focus-person" data-tab="${kind}" aria-label="${this.escapeHtml(strings.focus.focusTabAria(name))}">`
+                return `<button type="button" class="branch-tab sel-tab kind-focus" data-sel-dir="down" data-action="focus-person" data-tab="${kind}" aria-label="${this.escapeHtml(strings.focus.focusTabAria(name))}">`
             + branchTabRestHtml(kind)
             + `<div class="badge-tooltip" aria-hidden="true">${body}`
             + `<div class="badge-tooltip-body">${this.escapeHtml(strings.focus.familyOfOrigin)}</div>`

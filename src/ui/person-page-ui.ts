@@ -10,7 +10,7 @@
 import { DataManager } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { strings, getCurrentLanguage } from '../strings.js';
-import { PersonId, StromData, Attachment } from '../types.js';
+import { PersonId, PartnershipId, StromData, Attachment } from '../types.js';
 import { buildLineages, type RodId } from '../lineage.js';
 import { windowFamilyPages } from '../family-pages.js';
 import { ensureFamilyPagesAppCss } from '../family-pages-css.js';
@@ -386,7 +386,7 @@ export const personPageMethods = uiModule({
         const tocItems = personPageTocItems(body, lang);
         const toc = tocItems.length
             ? `<nav class="pp-toc" aria-label="${esc(P.toc)}"><div class="pp-toc-h">${esc(P.toc)}</div><ol>`
-                + tocItems.map(s => `<li><a class="pp-toc-link" href="#${esc(s.id)}" data-pp-toc="${esc(s.id)}">${esc(s.label)}</a></li>`).join('')
+                + tocItems.map(s => `<li><a class="pp-toc-link sel-tab" data-sel-dir="side" href="#${esc(s.id)}" data-pp-toc="${esc(s.id)}"><span class="sel-l" data-label="${esc(s.label)}">${esc(s.label)}</span></a></li>`).join('')
                 + '</ol></nav>'
             : '';
 
@@ -490,7 +490,7 @@ export const personPageMethods = uiModule({
 
     /** The options of the window's page (mode 'app') or the file's (mode 'file'). */
     personPageOptions(personId: PersonId, over: Partial<PersonPageOptions>): PersonPageOptions {
-        return {
+        const opts: PersonPageOptions = {
             personId,
             lang: getCurrentLanguage(),
             mode: 'app',
@@ -504,6 +504,21 @@ export const personPageMethods = uiModule({
             mapKinds: SettingsManager.getMapKinds(),
             ...over,
         };
+        // The window's link to the ancestors' path on the map (a saved page has none).
+        if (opts.mode === 'app' && opts.mapPath === undefined) {
+            const path = this.personPageMapPath(personId);
+            if (path) opts.mapPath = path;
+        }
+        return opts;
+    },
+
+    /** The ancestors' path of a person on the map: 'on', 'off' (ancestors, none on the map yet), null (no ancestor). */
+    personPageMapPath(personId: PersonId): 'on' | 'off' | null {
+        const person = DataManager.getPerson(personId);
+        if (!person || person.isPlaceholder) return null;
+        const model = this.mapPathModelOf(personId);
+        if (model.onMapCount > 0) return 'on';
+        return model.ancestors.length > 0 ? 'off' : null;
     },
 
     /** What the page reads from the app around the data: history layer, waiting tasks, last change, read-only. */
@@ -641,7 +656,8 @@ export const personPageMethods = uiModule({
         }
         // A row of the places list: Enter / Space as a click.
         const row = (e.key === 'Enter' || e.key === ' ') ? (e.target as HTMLElement).closest?.<HTMLElement>('li[data-pp-map-place]') : null;
-        if (row) {
+        // A name of a shared event's line in the row is a link of its own (spec 085 §2g).
+        if (row && !(e.target as HTMLElement).closest('.pp-map-with a, .pp-map-with button')) {
             e.preventDefault();
             this.pickPersonPageMapPlace(row);
         }
@@ -681,7 +697,8 @@ export const personPageMethods = uiModule({
         // The places map (§1.4): a point or a row selects; the selected row again leads to the timeline.
         const mapPlace = target.closest<HTMLElement>('.pp-places [data-pp-map-place]');
         // A person in a row of the family pages' map of places opens the person (spec 026 §3.7).
-        if (mapPlace && !target.closest('[data-sp-open]')) { this.pickPersonPageMapPlace(mapPlace); return; }
+        // A name of a shared event's line under a row goes to that person (spec 085 §2g).
+        if (mapPlace && !target.closest('[data-sp-open], .pp-map-with [data-pp-person]')) { this.pickPersonPageMapPlace(mapPlace); return; }
         // The life chart (§2.1): a period, mark or line leads to its timeline row.
         const osa = target.closest<HTMLElement>('.pp-chart [data-pp-osa]');
         if (osa) { e.preventDefault(); this.scrollPersonPageOsa(osa.dataset.ppOsa ?? ''); return; }
@@ -782,6 +799,10 @@ export const personPageMethods = uiModule({
     runPersonPageAction(action: string, el: HTMLElement): void {
         if (!state) return;
         if (action === 'map:open') { this.openPersonPageMap(); return; }
+        if (action === 'map:path') {
+            if (el.getAttribute('aria-disabled') !== 'true') this.openPersonPageMapPath();
+            return;
+        }
         const personId = state.current.personId;
         const person = DataManager.getPerson(personId);
         if (action === 'source') {
@@ -790,6 +811,24 @@ export const personPageMethods = uiModule({
             const row = personSourceRows(DataManager.getData(), personId, strings).find(r => r.source.id === id);
             // Over the window, which stays open under the viewer.
             this.showSourceViewer(id, row?.cites[0]?.ctx ?? null);
+            return;
+        }
+        if (action === 'shared-event') {
+            // A shared event's "with …" line (spec 085 §2b): its editor from this person's side.
+            const eventId = el.dataset.ppEvent ?? '';
+            if (!person?.events?.some(e => e.id === eventId)) return;
+            this.closePersonPage({ focus: false });
+            this.openEventEditorFor(personId, eventId);
+            return;
+        }
+        if (action === 'derived-event') {
+            // A part at another's event (spec 085 §5): that event where it is kept.
+            const eventId = el.dataset.ppEvent ?? '';
+            const owner = el.dataset.ppOwner as PersonId | undefined;
+            const union = el.dataset.ppUnion as PartnershipId | undefined;
+            if (!eventId || (!owner && !union)) return;
+            this.closePersonPage({ focus: false });
+            this.openDerivedEvent(owner ? { ownerPersonId: owner, eventId } : { partnershipId: union, eventId });
             return;
         }
         if (action === 'materials') {
@@ -865,6 +904,34 @@ export const personPageMethods = uiModule({
         const pick = (selected ? pagePlaces.find(p => p.placeKey === selected) : undefined)
             ?? ordered.find(p => !!geo[p.placeKey]) ?? ordered[0];
         if (pick) this.openPersonPagePlace(pick.place);
+    },
+
+    /**
+     * "◎ Ancestors' path on the map ›" (spec 054 §1, entry 3): the window
+     * closes, the map opens in Migration over time with the person's path at
+     * its first year, framed once on the path; the toast brings the page back
+     * (on a phone at the top, under the map's chips).
+     */
+    openPersonPageMapPath(): void {
+        if (!state) return;
+        const personId = state.current.personId;
+        const person = DataManager.getPerson(personId);
+        if (!person || this.mapPathModelOf(personId).onMapCount === 0) return;
+        this.snapshotPersonPage();
+        const parked: PageState = { origin: state.origin, current: cloneEntry(state.current), back: state.back.map(cloneEntry) };
+        this.closePersonPage({ focus: false });
+        void this.openMapPathFor(personId).then(() => {
+            this.showToast(shownName(person), 10000, {
+                kind: 'map-path-back',
+                closable: true,
+                action: {
+                    label: `‹ ${strings.map.pathBackToPage}`,
+                    run: () => {
+                        if (DataManager.getPerson(parked.current.personId)) this.openPersonPageState(parked);
+                    },
+                },
+            });
+        });
     },
 
     /** A place: the window closes, the map (or the places manager) opens; the toast brings the page back. */
@@ -1026,8 +1093,8 @@ export const personPageMethods = uiModule({
         const privacyHtml = living ? `
             <div class="ppx-sec">
                 <div class="ppx-label" id="ppx-privacy-h">${esc(X.privacy)}</div>
-                <div class="ppx-privacy" role="radiogroup" aria-labelledby="ppx-privacy-h">
-                    ${PRIVACY_MODES.map(m => `<button type="button" class="segment-btn" role="radio" data-ppx-privacy="${m}" aria-checked="false">${esc(modeLabel[m])}</button>`).join('')}
+                <div class="ppx-privacy sel-seg" role="radiogroup" aria-labelledby="ppx-privacy-h">
+                    ${PRIVACY_MODES.map(m => `<button type="button" class="segment-btn sel-opt" data-sel-form="seg" role="radio" data-ppx-privacy="${m}" aria-checked="false">${esc(modeLabel[m])}</button>`).join('')}
                 </div>
                 <p class="ppx-note">${esc(X.privacyWho(personPageLivingNames(full, DataManager.getData()).join(', ')))}</p>
             </div>` : '';

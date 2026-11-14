@@ -10,6 +10,9 @@ import { godparentLeads } from './godparents.js';
 import { strings } from './strings.js';
 import { shownNameOrEmpty } from './person-name.js';
 import { readRecordedAge, recordedAgeGap } from './recorded-age.js';
+import { findDivergentShares, findSeparateSameEvents } from './shared-events.js';
+import { divergenceSentence, divergentPersons } from './shared-divergence.js';
+import { nameLinkLeads, type ParticipantRef } from './participant-match.js';
 
 // ==================== ISSUE TYPES ====================
 
@@ -46,6 +49,10 @@ export interface ValidationIssue {
     year?: number;
     /** The fact the finding is about where the type does not say it (IssueField). */
     field?: IssueField;
+    /** sharedCopiesDiffer: the shared event (spec 085 §4) whose copies went apart. */
+    shareId?: string;
+    /** nameLink: the participant recorded by name who matches persons of the tree (spec 085 §6). */
+    participant?: ParticipantRef;
 }
 
 export interface ValidationResult {
@@ -75,7 +82,7 @@ export function validateTreeData(data: StromData): ValidationResult {
         partnershipIds?: PartnershipId[],
         detail?: string,
         subject?: string,
-        extra?: Pick<ValidationIssue, 'year' | 'field'>
+        extra?: Pick<ValidationIssue, 'year' | 'field' | 'shareId' | 'participant'>
     ) => {
         issues.push({
             id: `issue_${++issueId}`,
@@ -87,7 +94,9 @@ export function validateTreeData(data: StromData): ValidationResult {
             ...(detail ? { detail } : {}),
             ...(subject ? { subject } : {}),
             ...(extra?.year !== undefined ? { year: extra.year } : {}),
-            ...(extra?.field ? { field: extra.field } : {})
+            ...(extra?.field ? { field: extra.field } : {}),
+            ...(extra?.shareId ? { shareId: extra.shareId } : {}),
+            ...(extra?.participant ? { participant: extra.participant } : {})
         });
     };
 
@@ -110,6 +119,9 @@ export function validateTreeData(data: StromData): ValidationResult {
     checkPossibleDuplicates(data, addIssue);
     checkPlaceSpellings(data, addIssue);
     checkRecurringGodparents(data, addIssue);
+    checkSharedCopies(data, addIssue);
+    checkNameLinks(data, addIssue);
+    checkSeparateSameEvents(data, addIssue);
     checkImportMerges(data, addIssue);
 
     const stats = {
@@ -930,7 +942,7 @@ function checkPhotoData(data: StromData, addIssue: AddIssue): void {
 type AddIssue = (
     s: IssueSeverity, t: string, m: string,
     p?: PersonId[], pp?: PartnershipId[], detail?: string, subject?: string,
-    extra?: Pick<ValidationIssue, 'year' | 'field'>
+    extra?: Pick<ValidationIssue, 'year' | 'field' | 'shareId' | 'participant'>
 ) => void;
 
 /**
@@ -1161,6 +1173,20 @@ function checkSourceIntegrity(data: StromData, addIssue: AddIssue): void {
  * and auto-fixable — the fix rewrites every use to the most-used spelling.
  * `detail` carries the normalized key so the repair knows what to unify.
  */
+/**
+ * A shared event whose copies went apart (spec 085 §4, 4c): a warning per
+ * share, about the persons of the differing copies. The age, the role, the
+ * research's status and the verification are each copy's own and never
+ * compared (findDivergentShares). The message is the English sentence; the
+ * Data quality dialog says it in the UI's language.
+ */
+function checkSharedCopies(data: StromData, addIssue: AddIssue): void {
+    for (const d of findDivergentShares(data)) {
+        addIssue('warning', 'sharedCopiesDiffer', divergenceSentence(data, d, 'en'), divergentPersons(d),
+            undefined, undefined, undefined, { shareId: d.shareId });
+    }
+}
+
 function checkPlaceSpellings(
     data: StromData,
     addIssue: AddIssue
@@ -1384,6 +1410,34 @@ function checkRecurringGodparents(data: StromData, addIssue: AddIssue): void {
     }
 }
 
+/**
+ * A godparent or a witness recorded by name whom persons of the tree match
+ * (spec 085 §6, K1.4): a lead, never linked by itself. One finding for each
+ * such participant; those whose candidates were all turned down are none.
+ */
+function checkNameLinks(data: StromData, addIssue: AddIssue): void {
+    for (const lead of nameLinkLeads(data)) {
+        addIssue('info', 'nameLink',
+            `${lead.name} recorded by name matches ${lead.candidates.length} person(s) of the tree`,
+            lead.subjects, lead.ref.partnershipId ? [lead.ref.partnershipId] : undefined, undefined, lead.name,
+            { participant: lead.ref });
+    }
+}
+
+/**
+ * The same event recorded separately at several persons (spec 085 K1.6 b):
+ * a lead, one finding for each group of findSeparateSameEvents, never joined
+ * by itself (Data quality offers Join into one event).
+ */
+function checkSeparateSameEvents(data: StromData, addIssue: AddIssue): void {
+    for (const g of findSeparateSameEvents(data)) {
+        const ev = g.target.event;
+        addIssue('info', 'separateSameEvent',
+            `${ev.type === 'custom' ? ev.customLabel ?? '' : ev.type} ${ev.date ?? ''}, ${ev.place ?? ''} is recorded separately for ${g.persons.length} persons`,
+            g.persons);
+    }
+}
+
 function getPersonName(person: Person | undefined): string {
     if (!person) return '(unknown)';
     return shownNameOrEmpty(person) || '(unnamed)';
@@ -1447,6 +1501,9 @@ const VALIDATION_TYPE_KEYS: Record<string, string> = {
     'possibleDuplicate': 'valPossibleDuplicate',
     'placeSpelling': 'valPlaceSpelling',
     'recurringGodparent': 'valRecurringGodparent',
+    'sharedCopiesDiffer': 'valSharedCopiesDiffer',
+    'nameLink': 'valNameLink',
+    'separateSameEvent': 'valSeparateSameEvent',
     'photoUnsafeData': 'valPhotoUnsafeData',
     'importMerge': 'valImportMerge',
 };
@@ -1575,6 +1632,9 @@ export function qualityFinding(issue: ValidationIssue): { kind: string; persons:
     } else if (issue.type === 'recordedAgeMismatch') {
         // The fact, and the wedding's year: a person's ages at two weddings and at the death are three findings.
         subject = [issue.field ?? '', issue.year !== undefined ? String(issue.year).padStart(4, '0') : ''].filter(Boolean).join(' ') || undefined;
+    } else if (issue.type === 'sharedCopiesDiffer') {
+        // The share itself: "Not an error" stays while its copies differ in whatever way.
+        subject = issue.shareId;
     } else if (issue.type !== 'possibleDuplicate') {
         subject = issue.subject?.normalize('NFC').trim() || undefined;
     }

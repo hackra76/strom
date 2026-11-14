@@ -15,6 +15,7 @@ import { PERSON_PAGE_LIGHT_TOKENS } from './person-page-css.js';
 import { PERSON_PAGE_VIZ_LIGHT_TOKENS } from './person-page-viz-css.js';
 import { PAGE_SET_SEARCH_JS } from './family-pages-search.js';
 import { rodTimelineScript } from './rod-timeline-wire.js';
+import { SEL_DARK_DECLS } from './ui/sel-css.js';
 
 /** The lineage bars' colour (light / dark), next to the person page's tokens. */
 const LIGHT_EXTRA = '--rod-bar: #9fb8a6; --sp-frame: #d0c6b2; --tint: #f1ece1; --hist: #f3e3cf;';
@@ -34,10 +35,10 @@ const DARK_TOKENS = [
     '--rod-bar: #6f8f78', '--sp-frame: #575143', '--tint: #35322a', '--hist: #4d3d2a',
 ].join('; ') + ';';
 
-/** The file's tokens: the lineage bars and the frame, the system's dark scheme. */
+/** The file's tokens: the lineage bars and the frame, the system's dark scheme (the selection indicator's dark tokens too). */
 const ROOT_CSS = `
 :root { ${LIGHT_EXTRA} }
-@media screen and (prefers-color-scheme: dark) { :root { ${DARK_TOKENS} color-scheme: dark; } }
+@media screen and (prefers-color-scheme: dark) { :root { ${DARK_TOKENS} ${SEL_DARK_DECLS} color-scheme: dark; } }
 `;
 
 /** Paper's tokens in print (the file only: the app keeps its own). */
@@ -53,7 +54,7 @@ export const FAMILY_PAGES_BODY_CSS = `.pp-file.sp-file { max-width: 960px; paddi
 html:not(.sp-on) .sp-page + .sp-page { margin-top: 40px; }
 html:not(.sp-on) .sp-page + .sp-page::before { content: "#" attr(id); display: block; margin-bottom: 24px; padding-top: 8px; border-top: 1px solid var(--border); font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--text-faint); text-align: center; overflow-wrap: anywhere; }
 .sp-toc-file { display: none; }
-html:not(.sp-on) .sp-toc-file { display: block; margin-bottom: 32px; padding: 18px 20px; border: 1px solid var(--border); border-radius: 12px; }
+html:not(.sp-on) .sp-toc-file { display: block; margin-bottom: 32px; padding: 18px 20px; border: 1px solid var(--border); border-radius: var(--r-lg, 8px); }
 .no-js:not(.sp-zip) .sp-fbar, .no-js .sp-map { display: none !important; }
 .no-js .sp-search, .no-js .sp-fbar-nav, .no-js .sp-fbar-lupa, .no-js .sp-fbar-menu, .no-js .sp-fbar-cancel { display: none !important; }
 .sp-toc-h { margin: 0 0 8px; font-family: var(--font-serif); font-size: 20px; font-weight: 600; }
@@ -118,12 +119,12 @@ html:not(.sp-on) .sp-toc-file { display: block; margin-bottom: 32px; padding: 18
 .sp-kids > summary { display: inline-flex; align-items: center; min-height: 28px; color: var(--text-light); cursor: pointer; }
 .sp-kid-list { margin: 2px 0; font-size: 13.5px; }
 .sp-kid { white-space: normal; }
-.sp-teaser { display: flex; flex-direction: column; gap: 10px; padding: 16px 18px; border-radius: 12px; background: var(--surface-2); }
+.sp-teaser { display: flex; flex-direction: column; gap: 10px; padding: 16px 18px; border-radius: var(--r-lg, 8px); background: var(--surface-2); }
 .sp-teaser-h { margin: 0; font-family: var(--font-serif); font-size: 18px; font-weight: 600; }
 .sp-btns { display: flex; flex-wrap: wrap; gap: 8px; }
 .sp-btn { min-height: 40px; display: inline-flex; align-items: center; padding: 0 14px; border-radius: 8px; border: 1px solid var(--sp-frame); background: var(--surface); color: var(--text); font: inherit; font-size: 14px; text-decoration: none; cursor: pointer; }
 .sp-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
-.sp-card { display: flex; flex-direction: column; gap: 8px; padding: 16px 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); font: inherit; text-align: left; text-decoration: none; cursor: pointer; min-width: 0; }
+.sp-card { display: flex; flex-direction: column; gap: 8px; padding: 16px 18px; border: 1px solid var(--border); border-radius: var(--r-lg, 8px); background: var(--surface); color: var(--text); font: inherit; text-align: left; text-decoration: none; cursor: pointer; min-width: 0; }
 .sp-card-t { font-family: var(--font-serif); font-size: 21px; font-weight: 600; overflow-wrap: anywhere; }
 .sp-card-f { font-size: 13.5px; color: var(--text-light); overflow-wrap: anywhere; }
 .sp-card-m { font-size: 13px; color: var(--text-faint); }
@@ -133,11 +134,11 @@ html:not(.sp-on) .sp-toc-file { display: block; margin-bottom: 32px; padding: 18
 .sp-cross-row { display: flex; flex-wrap: wrap; gap: 0 10px; align-items: baseline; padding: 8px 0; border-bottom: 1px solid var(--divider); font-size: 14.5px; overflow-wrap: anywhere; }
 .sp-cross-rods { font-size: 13px; color: var(--text-faint); }
 .sp-partners { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
-.sp-partner { display: flex; flex-direction: column; gap: 4px; padding: 16px 18px; border: 1px solid var(--border); border-radius: 12px; min-width: 0; }
+.sp-partner { display: flex; flex-direction: column; gap: 4px; padding: 16px 18px; border: 1px solid var(--border); border-radius: var(--r-lg, 8px); min-width: 0; }
 .sp-partner-name { font-family: var(--font-serif); font-size: 20px; font-weight: 600; line-height: 1.25; overflow-wrap: anywhere; }
 .sp-fam-page { display: flex; flex-direction: column; gap: 30px; }
 .sp-sym { color: var(--accent-text); font-weight: 400; }
-.sp-other { display: flex; flex-wrap: wrap; gap: 0 8px; align-items: baseline; padding: 10px 14px; border-radius: 10px; background: var(--card-bg-2); font-size: 14px; overflow-wrap: anywhere; }
+.sp-other { display: flex; flex-wrap: wrap; gap: 0 8px; align-items: baseline; padding: 10px 14px; border-radius: var(--r-lg, 8px); background: var(--card-bg-2); font-size: 14px; overflow-wrap: anywhere; }
 .sp-other-pre { color: var(--text-light); }
 .sp-partner { gap: 10px; }
 .sp-partner-top { display: flex; gap: 14px; align-items: flex-start; }
@@ -160,18 +161,18 @@ button.sp-clip { margin: 0; padding: 0; border: 0; background: none; font: inher
 .sp-res, .sp-src { margin: 0; font-size: 15px; overflow-wrap: anywhere; }
 .sp-src { font-size: 14px; color: var(--text-light); }
 .sp-kids-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
-.sp-kidcard { display: flex; flex-direction: column; gap: 2px; padding: 11px 13px; border: 1px solid var(--divider); border-radius: 10px; min-width: 0; overflow-wrap: anywhere; }
+.sp-kidcard { display: flex; flex-direction: column; gap: 2px; padding: 11px 13px; border: 1px solid var(--divider); border-radius: var(--r-lg, 8px); min-width: 0; overflow-wrap: anywhere; }
 .sp-kidcard--young { background: var(--card-bg-2); color: var(--text-light); }
 .sp-kid-name { font-size: 15px; font-weight: 600; }
 .sp-kid-note { font-size: 13px; color: var(--text-light); }
 .sp-story .pp-couple-story { margin: 0; }
 .sp-pfam { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
 .sp-pfam-none { margin: 0; font-size: 14px; color: var(--text-light); }
-.sp-famcard { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; width: 100%; box-sizing: border-box; padding: 12px 16px; border: 1px solid var(--border); border-radius: 10px; background: none; font: inherit; color: var(--text); text-align: left; text-decoration: none; cursor: pointer; overflow-wrap: anywhere; }
+.sp-famcard { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; width: 100%; box-sizing: border-box; padding: 12px 16px; border: 1px solid var(--border); border-radius: var(--r-lg, 8px); background: none; font: inherit; color: var(--text); text-align: left; text-decoration: none; cursor: pointer; overflow-wrap: anywhere; }
 .sp-famcard-t { font-size: 15px; font-weight: 600; }
 .sp-famcard-m { font-size: 13.5px; color: var(--text-light); }
 .sp-famcard-go { margin-left: auto; font-size: 13.5px; font-weight: 600; color: var(--primary); }
-.sp-oddil { display: flex; flex-direction: column; gap: 4px; padding: 12px 16px; border-radius: 10px; background: var(--card-bg-2); }
+.sp-oddil { display: flex; flex-direction: column; gap: 4px; padding: 12px 16px; border-radius: var(--r-lg, 8px); background: var(--card-bg-2); }
 .sp-oddil-k { font-size: 12px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.06em; }
 .sp-oddil-t { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
 .sp-oddil-l { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; font-size: 14px; overflow-wrap: anywhere; }
@@ -259,7 +260,7 @@ button.sp-clip { margin: 0; padding: 0; border: 0; background: none; font: inher
 .sp-rods, .sp-pairs, .sp-idx { display: flex; flex-direction: column; gap: 12px; }
 .sp-rods-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; }
 .sp-rods-head .sp-h2 { margin: 0; }
-.sp-sort { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 3px; border-radius: 9px; background: var(--tint, var(--surface-2)); }
+.sp-sort { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 3px; border-radius: var(--r-lg, 8px); background: var(--tint, var(--surface-2)); }
 .sp-sort button { min-height: 32px; margin: 0; padding: 6px 10px; border: 0; border-radius: 7px; background: none; font: inherit; font-size: 13.5px; color: var(--text-light); cursor: pointer; }
 .sp-sort button[aria-checked="true"] { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 2px rgba(0, 0, 0, .12); }
 .sp-rods .sp-cards { grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); }
@@ -306,7 +307,7 @@ button.sp-clip { margin: 0; padding: 0; border: 0; background: none; font: inher
 .sp-rodpick-btn::-webkit-details-marker { display: none; }
 .sp-rodpick-v { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .sp-rodpick-chev { color: var(--text-faint); }
-.sp-rodpick-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; box-sizing: border-box; width: 380px; max-width: calc(100vw - 32px); padding: 8px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); box-shadow: 0 16px 40px rgba(20, 16, 8, .18); }
+.sp-rodpick-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; box-sizing: border-box; width: 380px; max-width: calc(100vw - 32px); padding: 8px; border: 1px solid var(--border); border-radius: var(--r-lg, 8px); background: var(--surface); color: var(--text); box-shadow: var(--shadow-lg, 0 4px 14px rgba(20, 16, 8, .14)); }
 .sp-rodpick-q { box-sizing: border-box; width: 100%; height: 40px; margin: 0 0 6px; padding: 0 10px; font: inherit; font-size: 16px; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; -webkit-appearance: none; appearance: none; }
 .sp-rodpick-q:focus { outline: 2px solid var(--primary); outline-offset: -1px; border-color: var(--primary); }
 .sp-rodpick-list { margin: 0; padding: 0; list-style: none; max-height: 360px; overflow-y: auto; overscroll-behavior: contain; }
@@ -319,12 +320,12 @@ button.sp-clip { margin: 0; padding: 0; border: 0; background: none; font: inher
 .sp-rodpick-bar { position: relative; height: 6px; border-radius: 3px; background: var(--tint, var(--surface-2)); }
 .sp-rodpick-bar > span { position: absolute; top: 0; bottom: 0; border-radius: 3px; background: var(--rod-bar); }
 .sp-rodpick-c { text-align: right; font-size: 13px; color: var(--text-light); font-variant-numeric: tabular-nums; }
-.sp-rodpick li[aria-current] > .sp-rodpick-a { background: var(--tint, var(--surface-2)); font-weight: 600; }
+/* A line's row is a .sel-opt row (src/ui/sel-css.ts) on its <li>: the current one has the fill and the line under it. */
 .sp-rodpick-none { margin: 8px; font-size: 14px; color: var(--text-light); }
 .sp-rodpick-none[hidden] { display: none; }
 .sp-rodpick-btn:focus-visible, .sp-rodpick-a:focus-visible, .sp-sort button:focus-visible, .sp-pair-s:focus-visible, .sp-rrow-a:focus-visible, .sp-orow:focus-visible, .sp-rrows-all:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 @media (hover: hover) {
-  .sp-rodpick-a:hover, .sp-rrow-a:hover, .sp-orow:hover { background: var(--hover-bg); }
+  .sp-rrow-a:hover, .sp-orow:hover { background: var(--hover-bg); }
   .sp-rodpick-btn:hover { border-color: var(--primary); }
   .sp-pair-s:hover, .sp-rrows-all:hover { color: var(--primary); }
 }
@@ -334,7 +335,7 @@ button.sp-clip { margin: 0; padding: 0; border: 0; background: none; font: inher
   .sp-fbar--rod .sp-rodpick-btn { width: 100%; max-width: none; min-height: 40px; }
   .sp-rodpick { position: static; }
   .sp-rodpick-btn { max-width: 150px; }
-  .sp-rodpick-pop { top: 100%; left: 0; right: 0; width: auto; max-width: none; border-width: 1px 0; border-radius: 0 0 12px 12px; }
+  .sp-rodpick-pop { top: 100%; left: 0; right: 0; width: auto; max-width: none; border-width: 1px 0; border-radius: 0 0 var(--r-lg, 8px) var(--r-lg, 8px); }
   .sp-fbar--q .sp-rodpick { display: none; }
   .sp-raxis { display: none; }
   .sp-rrow-a { grid-template-columns: minmax(0, 1fr) auto; gap: 6px 12px; }
@@ -370,7 +371,6 @@ html.sp-on main section.sp-page[id] { scroll-margin-top: 100vh; }
 .sp-ico::after { content: ""; position: absolute; right: -5px; bottom: -4px; width: 2px; height: 6px; background: currentColor; border-radius: 1px; transform: rotate(-45deg); }
 .sp-fbar-nav { display: flex; align-items: center; gap: 16px; }
 .sp-fbar-a { display: inline-flex; align-items: center; min-height: 36px; white-space: nowrap; font-size: 14px; color: var(--text-light); text-decoration: none; }
-.sp-fbar-a[aria-current] { color: var(--text); font-weight: 600; }
 .sp-fbar-cancel, .sp-fbar-lupa, .sp-fbar-menu { display: none; align-items: center; justify-content: center; flex: none; min-height: 44px; margin: 0; padding: 0 8px; font: inherit; font-size: 14px; color: var(--primary); background: none; border: 0; border-radius: 8px; cursor: pointer; }
 .sp-fbar--has .sp-fbar-cancel { display: inline-flex; }
 .sp-menu { display: none; }
@@ -391,12 +391,12 @@ html.sp-on main section.sp-page[id] { scroll-margin-top: 100vh; }
 .sp-results .pp-link, .sp-results a { color: var(--primary); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
 /* The indexes (§3.5): the tabs, the alphabet, the rows, the folds. */
 .sp-tabs { display: flex; flex-wrap: wrap; gap: 0 4px; margin-top: -16px; border-bottom: 1px solid var(--border); }
-.sp-tab { display: inline-flex; align-items: center; min-height: 40px; margin-bottom: -1px; padding: 0 14px; font-size: 14.5px; color: var(--text-light); text-decoration: none; border-bottom: 2px solid transparent; }
-.sp-tab[aria-current] { color: var(--text); font-weight: 600; border-bottom-color: var(--primary); }
+.sp-tab { display: inline-flex; align-items: center; min-height: 40px; margin-bottom: -1px; padding: 0 14px; font-size: 14.5px; color: var(--text-light); text-decoration: none; }
 .sp-ix { margin-top: -12px; }
 .sp-letters { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 20px; }
 .sp-letter { box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; min-width: 32px; height: 32px; padding: 0 7px; font-size: 14px; color: var(--primary); text-decoration: none; border: 1px solid var(--border); border-radius: 6px; }
-.sp-letter[aria-current] { color: var(--text); font-weight: 600; background: var(--primary-soft); border-color: var(--primary); }
+/* The index's letters are tabs of the one selection indicator (src/ui/sel-css.ts): no frame, the line under the chosen one. */
+.sp-letter.sel-tab { border-color: transparent; color: var(--text-light); }
 .sp-ix-group + .sp-ix-group { margin-top: 20px; }
 .sp-ix-letter { margin: 0 0 4px; padding-bottom: 4px; font-family: var(--font-serif); font-size: 20px; font-weight: 600; border-bottom: 1px solid var(--divider); }
 .sp-ix-h2 { margin: 28px 0 8px; font-family: var(--font-serif); font-size: 18px; font-weight: 600; }
@@ -413,9 +413,7 @@ html.sp-on main section.sp-page[id] { scroll-margin-top: 100vh; }
 .sp-ix-sub { padding: 0 0 10px 16px; font-size: 14.5px; line-height: 1.8; }
 /* 1102 §7.4: an index split by letters - the alphabet (a letter without rows muted), the count, the groups by surname, "‹ K · M ›". */
 .sp-abc { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 12px; }
-.sp-abc-l { box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; min-width: 32px; height: 32px; padding: 0 6px; font-size: 14px; color: var(--primary); text-decoration: none; border: 1px solid var(--border); border-radius: 6px; }
-.sp-abc-l[aria-current] { color: var(--text); font-weight: 600; background: var(--primary-soft); border-color: var(--primary); }
-.sp-abc-off { color: var(--text-faint); border-color: transparent; }
+.sp-abc-l { box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; min-width: 32px; height: 32px; padding: 0 6px; font-size: 14px; text-decoration: none; }
 .sp-abc-meta { margin: 0 0 16px; font-size: 13.5px; color: var(--text-light); }
 .sp-ix-forms { margin-left: 8px; font-family: var(--font-sans, inherit); font-size: 13px; font-weight: 400; color: var(--text-light); }
 .sp-abc-pager { display: flex; align-items: center; gap: 12px; margin-top: 28px; padding-top: 12px; border-top: 1px solid var(--divider); font-size: 14.5px; }
@@ -423,16 +421,17 @@ html.sp-on main section.sp-page[id] { scroll-margin-top: 100vh; }
 .sp-abc-next { text-align: right; }
 .sp-abc-hint { flex: 1 1 auto; text-align: center; font-size: 13px; color: var(--text-faint); }
 .sp-abc-l:focus-visible, .sp-abc-step:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
-@media (hover: hover) { a.sp-abc-l:hover, button.sp-abc-l:hover { background: var(--hover-bg); } a.sp-abc-step:hover, button.sp-abc-step:hover { text-decoration: underline; } }
+@media (hover: hover) { a.sp-abc-step:hover, button.sp-abc-step:hover { text-decoration: underline; } }
 @media (max-width: 640px) { .sp-abc-hint { display: none; } .sp-abc-pager { justify-content: space-between; } }
 @media (pointer: coarse) { .sp-abc-l { min-width: 44px; height: 44px; } .sp-abc-step { display: inline-flex; align-items: center; min-height: 44px; } .sp-abc-next { justify-content: flex-end; } }
 .sp-app button.sp-abc-l, .sp-app button.sp-abc-step { font: inherit; font-size: 14px; background: none; margin: 0; cursor: pointer; }
+.sp-app button.sp-abc-l { border: 0; }
 .sp-app button.sp-abc-step { border: 0; padding: 0; color: var(--primary); }
 .sp-fbar-a:focus-visible, .sp-fbar-home:focus-visible, .sp-fbar-cancel:focus-visible, .sp-fbar-lupa:focus-visible, .sp-fbar-menu:focus-visible, .sp-menu-a:focus-visible,
 .sp-tab:focus-visible, .sp-letter:focus-visible, .sp-ix-sum:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 @media (hover: hover) {
-  .sp-fbar-a:hover, .sp-fbar-home:hover, .sp-tab:hover { color: var(--text); }
-  .sp-letter:hover, .sp-menu-a:hover, .sp-fbar-lupa:hover, .sp-fbar-menu:hover, .sp-fbar-cancel:hover { background: var(--hover-bg); }
+  .sp-fbar-home:hover, .sp-tab:hover { color: var(--text); }
+  .sp-letter:not(.sel-tab):hover, .sp-fbar-lupa:hover, .sp-fbar-menu:hover, .sp-fbar-cancel:hover { background: var(--hover-bg); }
   .sp-ix-sum:hover { color: var(--primary); }
 }
 @media (min-width: 641px) and (max-width: 1024px) { .sp-fbar-in { max-width: 1016px; padding: 0 28px; } }
@@ -450,8 +449,7 @@ html.sp-on main section.sp-page[id] { scroll-margin-top: 100vh; }
   .sp-fbar--q .sp-fbar-cancel { display: inline-flex; }
   .sp-q { height: 40px; font-size: 16px; }
   .sp-menu:not([hidden]) { display: block; padding: 4px 0 8px; background: var(--surface); border-top: 1px solid var(--divider); box-shadow: 0 8px 16px rgba(0, 0, 0, .08); }
-  .sp-menu-a { box-sizing: border-box; display: flex; align-items: center; width: 100%; min-height: 48px; padding: 0 16px; font-size: 16px; color: var(--text); text-decoration: none; }
-  .sp-menu-a[aria-current] { font-weight: 600; color: var(--primary); }
+  .sp-menu-a { box-sizing: border-box; display: flex; align-items: center; width: 100%; min-height: 48px; padding: 0 16px; font-size: 16px; text-decoration: none; }
   .sp-tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
   .sp-tab { flex: none; padding: 0 12px; }
 }
@@ -483,7 +481,7 @@ html.sp-lb-open { overflow: hidden; }
 .sp-tl { display: flex; flex-direction: column; gap: 28px; }
 .sp-tl-ctl { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
 .sp-tl-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.sp-tl-chip { display: inline-flex; align-items: center; gap: 6px; min-height: 34px; margin: 0; padding: 0 12px; border: 1px solid var(--primary); border-radius: 17px; background: var(--tint, var(--surface-2)); font: inherit; font-size: 13.5px; color: var(--text); cursor: pointer; }
+.sp-tl-chip { display: inline-flex; align-items: center; gap: 6px; min-height: 34px; margin: 0; padding: 0 12px; border: 1px solid var(--primary); border-radius: var(--sel-r, 4px); background: var(--tint, var(--surface-2)); font: inherit; font-size: 13.5px; color: var(--text); cursor: pointer; }
 .sp-tl-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--primary); }
 .sp-tl-chip[data-tl-k="hist"] .sp-tl-dot { background: var(--accent-text); }
 .sp-tl-chip[aria-pressed="false"] { border-color: var(--sp-frame, var(--border)); background: transparent; color: var(--text-light); }
@@ -622,13 +620,12 @@ export const FAMILY_PAGES_APP_CSS = FAMILY_PAGES_BODY_CSS.replace(PRINT_ROOT_CSS
 }
 .sp-appset .sp-fbar button.sp-fbar-home { padding: 0; border: 0; font-family: var(--font-serif); font-size: 17px; font-weight: 600; color: var(--text); }
 .sp-appset .sp-fbar button.sp-fbar-a { padding: 0; border: 0; font-size: 14px; color: var(--text-light); }
-.sp-appset .sp-fbar button.sp-fbar-a[aria-current] { color: var(--text); font-weight: 600; }
-.sp-appset button.sp-menu-a { border: 0; font-size: 16px; color: var(--text); }
-.sp-appset button.sp-menu-a[aria-current] { font-weight: 600; color: var(--primary); }
-.sp-app button.sp-tab { border: 0; border-bottom: 2px solid transparent; font-size: 14.5px; color: var(--text-light); }
-.sp-app button.sp-tab[aria-current] { color: var(--text); font-weight: 600; border-bottom-color: var(--primary); }
-.sp-app button.sp-letter { font-size: 14px; color: var(--primary); }
-.sp-app button.sp-letter[aria-current] { color: var(--text); font-weight: 600; background: var(--primary-soft); border-color: var(--primary); }
+/* font: inherit above outweighs the indicator's cut and colour: the chosen one keeps them. */
+.sp-appset .sp-fbar button.sp-fbar-a[aria-current] { color: var(--sel-fg); font-weight: 600; }
+.sp-appset button.sp-menu-a { border: 0; font-size: 16px; }
+.sp-app button.sp-tab { border: 0; font-size: 14.5px; font-weight: 500; color: var(--text-light); }
+.sp-app button.sp-letter { font-size: 14px; }
+.sp-app button.sp-letter:not(.sel-tab) { color: var(--primary); }
 /* The window's bar over the page's column (.sp-app: 960 px, its own margins), its name where the page starts. */
 .sp-appset .sp-fbar-in { max-width: 960px; padding: 0 32px; }
 @media (min-width: 641px) and (max-width: 1024px) { .sp-appset .sp-fbar-in { padding: 0 24px; } }
@@ -646,7 +643,7 @@ export const FAMILY_PAGES_APP_CSS = FAMILY_PAGES_BODY_CSS.replace(PRINT_ROOT_CSS
 .sp-app .sp-rods-s input.sp-q { width: 100%; height: 40px; padding: 0 10px 0 33px; font-size: 14px; border: 1px solid var(--border); border-radius: 8px; transition: none; }
 @media (pointer: coarse) { .sp-appset .sp-fbar input.sp-rodpick-q, .sp-app .sp-rods-s input.sp-q { height: 44px; } }
 /* The window's preparing state of a large tree (§3.3): a sliding bar and the skeleton of the cards. */
-.sp-prep { display: flex; flex-direction: column; gap: 8px; padding: 16px 18px; border-radius: 12px; background: var(--surface-2); }
+.sp-prep { display: flex; flex-direction: column; gap: 8px; padding: 16px 18px; border-radius: var(--r-lg, 8px); background: var(--surface-2); }
 .sp-prep-t { font-weight: 600; }
 .sp-prep-bar { position: relative; height: 6px; overflow: hidden; border-radius: 3px; background: var(--border); }
 .sp-prep-bar::after { content: ""; position: absolute; top: 0; bottom: 0; left: 0; width: 35%; border-radius: 3px; background: var(--primary); animation: sp-prep 1.4s ease-in-out infinite; }
@@ -654,7 +651,7 @@ export const FAMILY_PAGES_APP_CSS = FAMILY_PAGES_BODY_CSS.replace(PRINT_ROOT_CSS
 @media (prefers-reduced-motion: reduce) { .sp-prep-bar::after { animation: none; width: 100%; opacity: .4; } }
 .sp-prep-note { margin: 0; font-size: 13.5px; color: var(--text-light); }
 .sp-skel { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; }
-.sp-skel > span { height: 112px; border-radius: 12px; background: var(--surface-2); }
+.sp-skel > span { height: 112px; border-radius: var(--r-lg, 8px); background: var(--surface-2); }
 /* The dialog's own label and field rules (.modal label / input) must not reach the bar's search:
    it keeps its row, its magnifier inside the field and, on a phone, stays folded until the magnifier. */
 .sp-appset .sp-fbar label.sp-search { display: flex; margin: 0; font-size: inherit; font-weight: inherit; color: var(--text-light); }

@@ -18,7 +18,8 @@ import { Person, PersonId } from '../types.js';
 import { LiveDirection, LiveDirectionKind, LiveWorker, ResearchDirectionDo, researchLinkMark } from '../research-link.js';
 import { uiModule } from './module.js';
 import { MQ_PHONE_BAR } from '../breakpoints.js';
-import { LiveFold, LiveSession, el, liveSection, researchSession, pausedText, timeEl, workingNumberBadge } from './research-ui.js';
+import { LiveFold, LiveSession, el, liveSection, researchSession, pausedText, timeEl, workingNumberBadge, lightsGroup } from './research-ui.js';
+import type { OverviewLinesState } from '../windows/overview-window.js';
 import { shownName, fitNameHtml } from '../person-name.js';
 import {
     orderDirections, withPendingOrder, moveInOrder, dropInOrder, sameOrder, DirectionOrderWriter, DirectionMove, withBusyRetry,
@@ -26,7 +27,7 @@ import {
 } from '../research-directions.js';
 import { DirectionStateDo, DirectionWriteRefused, directionRetryHelps, setDirectionState, writeDirectionOrder } from '../research-directions-write.js';
 
-type Mode = 'docked' | 'overlay' | 'sheet';
+type Mode = 'docked' | 'overlay' | 'sheet' | 'window';
 
 /** The direction whose detail is open (one at a time). */
 let expanded: string | null = null;
@@ -111,13 +112,28 @@ export function setQueueDirectionFilter(id: string): void {
  * queue pill): the focused one is focused again afterwards, on the same
  * direction, so a second Enter drops a selection made from the keyboard.
  * All directions, gone with the selection, hands focus to the line it
- * dropped. Returns the step to run after the redraw (focus moved
- * elsewhere meanwhile is left alone).
+ * dropped. A control of a direction's row in the overview (its ⋯, its
+ * head, its handle, an action of the row) is focused again in the row drawn
+ * anew: a status read after a write draws the overview again a second or
+ * more later, and took the focus away from the ⋯ it went back to. Returns
+ * the step to run after the redraw (focus moved elsewhere meanwhile is left
+ * alone).
  */
 export function keepLineFocus(): () => void {
     const a = document.activeElement as HTMLElement | null;
-    const id = a?.dataset.direction;
-    if (!a || !id) return () => {};
+    if (!a) return () => {};
+    const row = a.closest<HTMLElement>('#research-overview .research-direction[data-direction]');
+    if (row && row !== a && (a.dataset.do || a.dataset.move || a.matches('.research-direction__handle, .research-direction__more, .research-direction__head'))) {
+        const rowId = row.dataset.direction!;
+        const control = focusSelector(a);
+        return () => {
+            const now = document.activeElement;
+            if (now && now !== document.body && now.isConnected) return;
+            focusDirectionControl(rowId, control);
+        };
+    }
+    const id = a.dataset.direction;
+    if (!id) return () => {};
     const sel = a.matches('#live-panel button.live-line, #live-panel .live-lines-all') ? '#live-panel button.live-line'
         : a.matches('#research-overview .research-overview__queue-filters .research-overview__filter')
             ? '#research-overview .research-overview__queue-filters .research-overview__filter' : null;
@@ -256,6 +272,52 @@ let dragging: string | null = null;
 let redrawAfterDrag = false;
 /** The end confirmation's cleanup (null: none open). */
 let endPopoverCleanup: (() => void) | null = null;
+
+/**
+ * The lines' state this window holds, for the Research overview in its own
+ * window (K3): the selection, an order on its way, writes under way and
+ * refused, an archive said (nothing of the bridge's address).
+ */
+export function directionsWindowState(s: LiveSession | null): OverviewLinesState {
+    const base = s?.bridge.base ?? '';
+    return {
+        selected: queueDirectionFilter(s),
+        pendingOrder: pendingOrder && base && pendingOrder.base === base ? [...pendingOrder.order] : null,
+        orderSaving,
+        busy: [...rowsBusy],
+        problems: [...rowProblems].map(([id, p]) => ({ id, text: p.text, tone: p.tone, retry: !!p.retry })),
+        archive: !!base && archiveSaid === base,
+    };
+}
+
+/**
+ * The overview's own window (K3): the lines' state as the main window said it
+ * (the selection, an order on its way, rows waiting or refused). Its "Try
+ * again" asks the main window (`retry`); the bridge's address is never here,
+ * so what was said for it stands for the window's empty one.
+ */
+export function applyDirectionsWindowState(st: OverviewLinesState, s: LiveSession | null, retry: (id: string) => void): void {
+    queueFilter = st.selected || 'all';
+    queueFilterTree = queueFilter === 'all' ? null : s?.treeId ?? null;
+    const base = s?.bridge.base ?? '';
+    pendingOrder = st.pendingOrder ? { base, order: [...st.pendingOrder], moved: pendingOrder?.moved ?? '' } : null;
+    orderSaving = st.orderSaving;
+    rowsBusy.clear();
+    for (const id of st.busy) rowsBusy.add(id);
+    rowProblems.clear();
+    for (const p of st.problems) {
+        rowProblems.set(p.id, { text: p.text, tone: p.tone, ...(p.retry ? { retry: () => retry(p.id) } : {}) });
+    }
+    archiveSaid = st.archive ? base : null;
+}
+
+/** "Try again" at a line whose write was refused (asked from the overview's window); false: nothing to try. */
+export function retryDirectionProblem(id: string): boolean {
+    const retry = rowProblems.get(id)?.retry;
+    if (!retry) return false;
+    retry();
+    return true;
+}
 
 /** Directions just created from the form: lit for 2 s (§2.7). */
 const freshDirections = new Set<string>();
@@ -515,11 +577,12 @@ export const researchDirectionsMethods = uiModule({
         const o = strings.otherResearch;
         const li = el('li', 'live-line-item');
         const name = g.direction?.name ?? strings.live.dirOutside;
-        const row = g.id ? el('button', 'live-line') : el('div', 'live-line live-line--outside');
+        const row = g.id ? el('button', 'live-line sel-opt') : el('div', 'live-line live-line--outside');
         if (g.id) {
             const id = g.id;
             const btn = row as HTMLButtonElement;
             btn.type = 'button';
+            btn.dataset.selForm = 'row';
             btn.dataset.direction = id;
             btn.setAttribute('aria-pressed', String(selected));
             btn.onclick = () => this.selectWorkingLine(id);
@@ -910,11 +973,8 @@ export const researchDirectionsMethods = uiModule({
                     const link = el('button', 'live-person-link', L.dirFoundPersons(found.persons));
                     link.type = 'button';
                     link.dataset.do = 'found-people';
-                    link.onclick = () => {
-                        if (mode === 'sheet') this.closeResearchOverview();
-                        selectionLit = false;
-                        this.startPersonHighlight('direction-found', d.name, people, null);
-                    };
+                    link.onclick = () => { this.showDirectionFoundInTree(d, mode); };
+                    lightsGroup(link, 'direction-found', d.name);
                     parts.appendChild(link);
                 } else {
                     const text = part === 'sessions' ? L.dirFoundSessions(found.sessions)
@@ -970,6 +1030,7 @@ export const researchDirectionsMethods = uiModule({
             btn.type = 'button';
             btn.dataset.do = 'show';
             btn.onclick = () => this.showDirectionInTree(d, mode);
+            lightsGroup(btn, 'direction', d.name);
             actions.appendChild(btn);
         }
         if (sheet && !view.readOnly) {
@@ -1216,7 +1277,7 @@ export const researchDirectionsMethods = uiModule({
                 action: { label: L.dirUndo, run: () => void this.changeDirectionState(next, backTo, { undo: true, ...(before.reason ? { reason: before.reason } : {}) }) },
             });
         }
-        this.liveStatusSoon(s);
+        this.researchStatusAfterWrite(s);
         return true;
     },
 
@@ -1262,7 +1323,7 @@ export const researchDirectionsMethods = uiModule({
                 const said = r.order.length > 0 ? r.order : order;
                 s.researches = s.researches.map(x => said.includes(x.id) ? { ...x, order: said.indexOf(x.id) + 1 } : x);
                 if (!writer.waiting && pendingOrder && sameOrder(pendingOrder.order, order)) pendingOrder = null;
-                this.liveStatusSoon(s);
+                this.researchStatusAfterWrite(s);
             } else if (!writer.waiting) {
                 // The order of the last status again; the box at the row moved last tries the same order again.
                 pendingOrder = null;
@@ -1565,10 +1626,24 @@ export const researchDirectionsMethods = uiModule({
             btn.type = 'button';
             btn.dataset.do = 'show';
             btn.onclick = () => this.showDirectionInTree(d, mode);
+            lightsGroup(btn, 'direction', d.name);
             actions.appendChild(btn);
         }
         if (actions.childElementCount > 0) detail.appendChild(actions);
         return detail;
+    },
+
+    /**
+     * The people of what a direction found lit up in the tree, named by the
+     * direction (false: none of them is in the tree).
+     */
+    showDirectionFoundInTree(d: LiveDirection, mode: Mode): boolean {
+        const people = (d.found?.people ?? []).map(personByRefn).filter((p): p is Person => !!p).map(p => p.id);
+        if (people.length === 0) return false;
+        if (mode === 'sheet') this.closeResearchOverview();
+        selectionLit = false;
+        this.startPersonHighlight('direction-found', d.name, people, null);
+        return true;
     },
 
     /** The direction's people lit up in the tree, named by the direction. */

@@ -26,7 +26,7 @@ import { TreeRenderer } from '../../renderer.js';
 import { isPhoneBar, isTabletOrMobile } from '../../breakpoints.js';
 import { strings, getCurrentLanguage, type Language } from '../../strings.js';
 import { uiModule } from '../module.js';
-import { cellOf, columnById, columnLabel, columnNote, dateCell, eventPersons, eventTypeLabel, setResearchOffer, type SortSpec } from './table-columns.js';
+import { cellOf, columnById, columnLabel, columnNote, dateCell, eventPersons, eventTypeLabel, setResearchOffer, sharedAgeRows, type SortSpec } from './table-columns.js';
 import {
     applyResearch, isResearchChipId, researchChipCounts, researchChipOffer, researchColumnLiveOff, researchConflictWhat, researchOffer,
     researchAgentRow, researchOpenConflicts, researchTableEnv, type ResearchChipId, type ResearchColumnId, type ResearchNewWindow, type ResearchTableEnv, type ResearchTableInput,
@@ -49,11 +49,16 @@ import {
     type CellName, type CellValue, type EventRow, type RowType, type SourceRow, type TableModel, type TableRow,
 } from './table-model.js';
 import { eventEditTarget } from './table-events.js';
+import { shareCopiesOf } from '../../shared-events.js';
+import { sharedEventTitle } from '../../shared-event-editor.js';
 import { TableGrid, type CellEditSpec, type GridCellRef, type RowAction } from './table-grid.js';
 import { editChangeOf, editOptionsOf, editTargetOf, editValueOf, type EditTarget } from './table-edit.js';
 import { cellChoices, copyPlainText } from './table-cell.js';
 import { fanZoomModifier } from '../../fan-zoom.js';
-import { createBar, createStatus, updateBar, updateResearchStatus, updateStatus } from './table-bar.js';
+import { createBar, createStatus, createWindowButton, updateBar, updateResearchStatus, updateStatus } from './table-bar.js';
+import { applyTableWindowState, readTableWindowState, tableWindowStateOf, type TableWindowState } from './table-window-state.js';
+import { canOpenWindows, openInNewWindow } from '../../windows/window-open.js';
+import { getWindowRole } from '../../windows/window-role.js';
 import {
     canMoveColumn, canPinColumn, catalogColumns, displayColumns, hideColumn, lockedColumn, moveColumnBy, moveColumnRun, moveColumnTo,
     filterChanged, normalizeColumns, pinColumn, resetColumns, setColumnWidth, setGroupCollapsed, setGroupShown, showColumn, sortAdd, sortClick,
@@ -82,7 +87,8 @@ import {
 } from './table-checks.js';
 import { conflictScope } from '../person-research-ui.js';
 import { lineCell, lineKey, type GridLine } from './table-subrows.js';
-import { cellText, markHtml, type CellConflictMark, type CellIssueMark } from './table-grid.js';
+import { cellDraft, type CellDraft } from '../../windows/window-drafts.js';
+import { cellText, isMouseLikePointer, markHtml, type CellConflictMark, type CellIssueMark } from './table-grid.js';
 import { bubbleHeading, bubbleHtml, citesHtml, closeTableBubble, legendHtml, openBubblePanel, sheetElement, type BubbleCite } from './table-bubble.js';
 import { bridgeChanges, changedKeys, familyKeys, keepOrder, namesList, rowKeysFor, watchEdit } from './table-refresh.js';
 import type { DataChangedDetail } from '../../data.js';
@@ -93,6 +99,8 @@ import { shownNameOrEmpty as personName } from '../../person-name.js';
 import { emptyStateHtml } from '../empty-state.js';
 import { tableEmptyState, type TableEmptyState } from './table-empty.js';
 import { sourcePlaceLine } from '../../source-location.js';
+import { shareDivergence } from '../../shared-events.js';
+import { divergenceSentence, divergentPersons } from '../../shared-divergence.js';
 
 interface Mounted {
     container: HTMLElement;
@@ -116,6 +124,8 @@ interface Mounted {
     views: ViewBar;
     /** The bar's Export button (§11.1). */
     exportBtn: HTMLButtonElement;
+    /** ⧉ "Open in a new window" (spec 079 §1; hidden where windows are not offered). */
+    windowBtn: HTMLButtonElement;
     /** The state drawn in place of the grid (§13a, 13e–13g). */
     empty: HTMLElement;
     /** Its kind as last drawn (the content changes only with it). */
@@ -182,7 +192,7 @@ let view: {
 } | null = null;
 
 /** An edit opened from the table (§10.3): what it edits (the toast's name) and the records the edit may change, as stored before. */
-let watching: { tree: string; name: () => string; keys: Map<string, string> } | null = null;
+let watching: { tree: string; name: () => string; keys: Map<string, string>; message?: string } | null = null;
 
 /** A person's name for "Saved: {name}", read when the edit is saved. */
 function personNameOf(personId: PersonId): () => string {
@@ -193,6 +203,25 @@ function personNameOf(personId: PersonId): () => string {
 }
 /** The person in focus when the table was entered (spec 073 U9): the next draw makes their row the active one. */
 let focusOnEnter: { tree: string; person: PersonId } | null = null;
+/**
+ * A window opened from another window's Table (spec 079 §1): the state it
+ * carried, taken over when this tree's table state is first read; then its
+ * selected row is scrolled to at the next draw (`revealOnDraw`, the tree).
+ */
+let windowStart: { tree: string; state: TableWindowState } | null = null;
+let revealOnDraw: string | null = null;
+
+/**
+ * The selection shared with other windows (spec 079 §2): whether it is
+ * shared now (the selected row's look) and who hears this window's choice.
+ */
+export interface TableSelectionShare {
+    active(): boolean;
+    announce(personId: PersonId): void;
+}
+let selectionShare: TableSelectionShare | null = null;
+/** Another window's selection that came during a cell's edit: taken when the edit ends. */
+let pendingShared: { person: PersonId | null } | null = null;
 
 /** The people a row is about, the main one first: a person; a union's partners; an event's people; a source none. */
 function rowPeople(row: TableRow): PersonId[] {
@@ -209,8 +238,9 @@ let mounted: Mounted | null = null;
 /** The coverage row's cells (§6.1) for the rows last drawn; computed when a column is first drawn. */
 let coverage: { rows: readonly TableRow[]; cells: Map<string, CoverageCell> } | null = null;
 
-function coverageOf(m: TableModel, type: RowType, rows: readonly TableRow[], col: ColumnDef, pass: UnionPredicate | null): CoverageCell {
-    if (col.id === lockedColumn(type)) return coverageLabel();
+/** A column's coverage cell; the first drawn column (`firstId`, whichever it is; spec 082 K2.1) carries the row's label. */
+function coverageOf(m: TableModel, rows: readonly TableRow[], col: ColumnDef, pass: UnionPredicate | null, firstId: string | undefined): CoverageCell {
+    if (col.id === firstId) return coverageLabel();
     // §16.2: the research's signals are not facts to fill in.
     if (col.group === 'research') return { text: '–', low: false, title: strings.table.na };
     if (!coverage || coverage.rows !== rows) coverage = { rows, cells: new Map() };
@@ -364,6 +394,19 @@ function researchCellOpens(line: GridLine, col: ColumnDef, value: CellValue): bo
     return !!r && !value.na && !r.liveOff && (r.parts.length > 0 || r.count !== undefined || !!r.signal);
 }
 
+/**
+ * A shared event whose copies differ (spec 085 4b): its sentence as the
+ * detail ("Census 1921 · Zbyhněv Hurdálek: date differs …") and the label of
+ * Separate; nothing for other findings or when the copies agree by now.
+ */
+function sharedFinding(issue: ValidationIssue, data: StromData): { detail: string; shared: { separateLabel: string } } | null {
+    const d = issue.type === 'sharedCopiesDiffer' && issue.shareId ? shareDivergence(data, issue.shareId) : null;
+    if (!d) return null;
+    const off = divergentPersons(d).length;
+    const v = strings.validation;
+    return { detail: divergenceSentence(data, d), shared: { separateLabel: off === 1 ? v.separateCopy : v.separateCopies(off) } };
+}
+
 /** Whom or what a finding is about, as Data quality names it: the subject (a place, a godparent), else its people. */
 function findingAbout(issue: ValidationIssue, data: StromData): string {
     if (issue.subject) return issue.subject;
@@ -383,7 +426,17 @@ function storedViews(): readonly TableView[] | undefined {
 function stateOf(tree: string): TableState {
     const state = tableStateFor(tree);
     if (!state.restored) restoreTableState(state, tree ? readTableWork(tree) : null, storedViews());
+    if (windowStart && windowStart.tree === tree) takeWindowStart(state);
     return state;
+}
+
+/** The state another window's Table carried (spec 079 §1), over this tree's table as it was left. */
+function takeWindowStart(state: TableState): void {
+    const start = windowStart;
+    if (!start) return;
+    windowStart = null;
+    applyTableWindowState(state, start.state, storedViews());
+    revealOnDraw = start.tree;
 }
 
 /** The working state last written, so a draw writes only a change. */
@@ -391,7 +444,8 @@ let keptWork = '';
 
 /** Keep the tree's table for the next visit (§9.1); a read-only tree's views are for this opening only. */
 function keepWork(tree: string, state: TableState): void {
-    if (!tree || DataManager.isReadOnly()) return;
+    // A satellite window reads the main window's table state, never writes it: its filters and sort stay in it (spec 079).
+    if (!tree || DataManager.isReadOnly() || DataManager.isWindowCopy()) return;
     const work = tableWorkOf(state, storedViews());
     const key = `${tree}|${JSON.stringify(work)}`;
     if (key === keptWork) return;
@@ -430,6 +484,14 @@ function viewRows(
     const result: ShownRows = kept ? { rows: kept.rows, pass: f.pass, stale: kept.stale } : { rows, pass: f.pass, stale: NONE };
     view = { tree, model: m, type, key, checks: checksVersion, research: researchNow, kept: !!kept, result };
     return result;
+}
+
+/**
+ * ⌖ Show in tree leaves the Table for the family chart: a satellite window
+ * shows one view (spec 079 §2, K1), so it has no such action.
+ */
+function treeActionOffered(): boolean {
+    return getWindowRole() !== 'satellite';
 }
 
 /** The row's person (a union row: its first partner). */
@@ -616,15 +678,29 @@ export const tableMethods = uiModule({
                     s.types[s.rowType].top = top;
                     s.types[s.rowType].left = left;
                 },
-                onSelect: (key) => {
+                onSelect: (key, row) => {
                     const s = stateOf(treeKey());
                     s.types[s.rowType].selected = key;
+                    // Another window's selection waiting for an edit is older than this one.
+                    pendingShared = null;
                     this.renderTableView(container);
+                    const person = row ? personOfRow(row) : null;
+                    if (person) selectionShare?.announce(person);
                 },
-                onRowClick: (line, cell) => { if (isPhoneBar() || isCoarsePointer()) this.showTableRowSheet(line, cell); },
-                // §6.2 by touch: the completeness bubble on a tap of its cell (a mouse has its title).
-                onComp: (line, col, cell) => {
-                    if (!isPhoneBar() && !isCoarsePointer()) return false;
+                onEditClosed: () => {
+                    // After the editor's own steps (Tab opens the next one: the selection keeps waiting).
+                    queueMicrotask(() => {
+                        if (!pendingShared || mounted?.grid.isEditing()) return;
+                        this.tableSharedSelect(pendingShared.person);
+                    });
+                },
+                // A tap opens the row's sheet; a mouse or a pen only selects, on any device (its menu is the right button's).
+                onRowClick: (line, cell, pointer) => {
+                    if (!isMouseLikePointer(pointer) && (isPhoneBar() || isCoarsePointer())) this.showTableRowSheet(line, cell);
+                },
+                // §6.2 by touch: the completeness bubble on a tap of its cell (a mouse or a pen has its title).
+                onComp: (line, col, cell, pointer) => {
+                    if (isMouseLikePointer(pointer) || (!isPhoneBar() && !isCoarsePointer())) return false;
                     this.showTableCompleteness(line, col, cell);
                     return true;
                 },
@@ -632,6 +708,7 @@ export const tableMethods = uiModule({
                 onEditCell: (line, cell) => this.tableEditCell(line, cell.col),
                 onName: (line, _col, name, anchor) => this.tableNameAction(line, name, anchor),
                 onMoreCites: (_line, _col, ids, anchor) => this.showTableCites(ids, anchor),
+                onSharedAges: (line, anchor) => { if (line.kind !== 'more' && line.row.kind === 'event') this.showTableSharedAges(line.row, anchor); },
                 onRowMenu: (line, anchor, cell) => this.showTableRowMenu(line, anchor, cell),
                 onIssue: (line, col, cell) => this.showTableFinding(line, col, cell),
                 onFindings: (line, col, cell) => this.showTablePersonFindings(line, col, cell),
@@ -723,6 +800,9 @@ export const tableMethods = uiModule({
             exportBtn.innerHTML = `${strings.table.export}<span class="tv-export-caret" aria-hidden="true">▾</span>`;
             exportBtn.addEventListener('click', () => this.showTableExport());
             bar.querySelector('.tv-slot-export')!.appendChild(exportBtn);
+            // ⧉ (spec 079 §1, 1c): the Table with its state in a new window; this window stays on the Table.
+            const windowBtn = createWindowButton(() => { openInNewWindow('table', this.tableWindowState()); });
+            bar.querySelector('.tv-slot-window')!.appendChild(windowBtn);
             const empty = document.createElement('div');
             empty.className = 'tv-empty';
             empty.hidden = true;
@@ -748,13 +828,14 @@ export const tableMethods = uiModule({
             }) : null;
             barWatch?.observe(bar);
             mounted = {
-                container, lang, bar, bulk, grid, status, colsBtn, drawn: '', display: null, filters, filterState: null, views, exportBtn,
+                container, lang, bar, bulk, grid, status, colsBtn, drawn: '', display: null, filters, filterState: null, views, exportBtn, windowBtn,
                 empty, emptyKey: '', unionsButton: null,
             };
         }
 
         const counts = rowCounts(m);
         const phone = isPhoneBar();
+        mounted.windowBtn.hidden = !canOpenWindows();
         normalizeColumns(type, st);
         const display = displayColumns(type, st, phone);
         mounted.display = display;
@@ -772,6 +853,11 @@ export const tableMethods = uiModule({
                 st.selected = row ? rowKey(row) : null;
                 revealFocus = st.selected;
             }
+        }
+        // A window opened with another window's Table: its selected row in view.
+        if (revealOnDraw === tree) {
+            revealOnDraw = null;
+            if (!revealFocus && st.selected && rows.some(r => rowKey(r) === st.selected)) revealFocus = st.selected;
         }
         const persons = type === 'persons';
         const lines = persons ? buildLines(rows, { collapse: st.unions, pass, revealed: new Set(st.revealedUnions) }) : undefined;
@@ -820,13 +906,14 @@ export const tableMethods = uiModule({
                 ? { title: strings.table.noMatch, text: strings.table.applies(summary), action: strings.table.clearFilters }
                 : null,
             lines, subRows: persons, unionsButton, stale,
-            actions: phone ? null : { edit: !tableReadOnly() },
+            actions: phone ? null : { edit: !tableReadOnly(), tree: treeActionOffered() },
             editableAt: !phone && this.tableInlineEdit() ? (line, col) => !!this.tableEditTarget(line, col) : undefined,
             liveOff: research ? new Set(display.columns
                 .filter(c => c.group === 'research' && (c.id === 'rTasks' || c.id === 'rAgent') && researchColumnLiveOff(research, c.id as ResearchColumnId))
                 .map(c => c.id)) : undefined,
-            coverage: st.coverageRow ? (col) => coverageOf(m, type, rows, col, pass) : undefined,
+            coverage: st.coverageRow ? (col) => coverageOf(m, rows, col, pass, display.columns[0]?.id) : undefined,
             selected: st.selected,
+            selectedShared: !!selectionShare?.active(),
             label: `${strings.viewModeSwitch.table} – ${strings.table.rows[type]}`,
             conflictAt: research ? (line, col, value) => conflictMarkAt(research, m, line, col, value) : undefined,
             researchAt: research ? researchCellOpens : undefined,
@@ -1004,16 +1091,28 @@ export const tableMethods = uiModule({
         const findCell = (): HTMLElement | null => [...grid.el.querySelectorAll<HTMLElement>('.tv-row[data-key]')]
             .find(r => r.dataset.key === cellKey)?.querySelector<HTMLElement>(`[aria-colindex="${colPos + 1}"]`) ?? null;
         const data = DataManager.getData();
-        const shown = list.map(f => ({
-            severity: f.severity, title: translateValidationType(f.issue.type), detail: f.issue.detail ?? '',
-            ...(about ? { about: findingAbout(f.issue, data) } : {}),
-        }));
+        const shown = list.map(f => {
+            const shared = sharedFinding(f.issue, data);
+            return {
+                severity: f.severity, title: translateValidationType(f.issue.type), detail: shared?.detail ?? f.issue.detail ?? '',
+                ...(about ? { about: findingAbout(f.issue, data) } : {}),
+                ...(shared ? { shared: shared.shared } : {}),
+            };
+        });
         const act = (what: string, i: number): void => {
             const f = list[i];
             if (!f) return;
             if (what === 'dismiss') this.dismissTableFinding(f, treeId);
             else if (what === 'restore') this.restoreTableFinding(f, treeId);
-            else if (what === 'quality') {
+            else if (what === 'unify' && f.issue.shareId) {
+                const opener = this.divergentCopyOf(f.issue.shareId)?.personId ?? null;
+                this.showSharedUnify(f.issue.shareId, opener, () => this.remapTableChecks());
+            } else if (what === 'separate' && f.issue.shareId) {
+                if (this.separateDivergentShared(f.issue.shareId)) this.remapTableChecks();
+            } else if (what === 'open' && f.issue.shareId) {
+                const copy = this.divergentCopyOf(f.issue.shareId);
+                if (copy) this.openEventEditorFor(copy.personId, copy.eventId);
+            } else if (what === 'quality') {
                 void this.showTreeValidationDialog(treeId, undefined, {
                     focus: { type: f.issue.type, category: issueCategory(f.issue), dismissed: f.dismissed },
                 });
@@ -1365,6 +1464,32 @@ export const tableMethods = uiModule({
         return people[0] ?? null;
     },
 
+    /** The Table's state for a new window (spec 079 §1): row type, view, filters, sort, search, selected row. */
+    tableWindowState(): TableWindowState {
+        return tableWindowStateOf(stateOf(treeKey()), storedViews());
+    },
+
+    /**
+     * This window was opened with another window's Table state (spec 079 §1,
+     * the satellite's `init`): taken over when the tree's table is first
+     * read, or now (drawn again) when it was read already.
+     */
+    setTableWindowStart(treeId: string, raw: unknown): void {
+        const state = readTableWindowState(raw);
+        if (!state || !treeId) return;
+        windowStart = { tree: treeId, state };
+        if (!tableStateFor(treeId).restored) return;
+        if (treeKey() !== treeId) return;
+        stateOf(treeId);
+        const el = document.getElementById('table-container');
+        if (el && TreeRenderer.getViewMode() === 'table') this.renderTableView(el);
+    },
+
+    /** ⧉ in the Table's bar follows whether windows are offered (a resize). */
+    syncTableWindowButton(): void {
+        if (mounted) mounted.windowBtn.hidden = !canOpenWindows();
+    },
+
     /**
      * The table is being entered (spec 073 U9): the next draw makes the row
      * of the person in focus the active one and scrolls to it. The filter
@@ -1389,6 +1514,45 @@ export const tableMethods = uiModule({
         mounted?.grid.revealKey(key);
     },
 
+    /** Who shares the Table's selection with other windows (spec 079 §2); null: no one. */
+    setTableSelectionShare(share: TableSelectionShare | null): void {
+        selectionShare = share;
+    },
+
+    /**
+     * A person selected in another window (spec 079 §2): their row here is
+     * the selected one (the row kept if it is theirs), scrolled to only when
+     * out of view. During a cell's edit it waits for the edit's end; a person
+     * the view leaves out: no row is selected, nothing said.
+     */
+    tableSharedSelect(personId: string | null): void {
+        if (mounted?.grid.isEditing()) {
+            pendingShared = { person: personId as PersonId | null };
+            return;
+        }
+        pendingShared = null;
+        if (!personId) return;
+        const pid = personId as PersonId;
+        const tree = treeKey();
+        const state = stateOf(tree);
+        const type = state.rowType;
+        // Sources are about no one: their table keeps its row.
+        if (type === 'sources') return;
+        const st = state.types[type];
+        const el = document.getElementById('table-container');
+        const shown = el && TreeRenderer.getViewMode() === 'table' && view && view.tree === tree && view.type === type;
+        if (!shown) {
+            if (type === 'persons') st.selected = `p:${pid}`;
+            return;
+        }
+        const rows = view!.result.rows;
+        const current = st.selected ? rows.find(r => rowKey(r) === st.selected) : undefined;
+        const row = current && rowPeople(current).includes(pid) ? current : rows.find(r => rowPeople(r).includes(pid));
+        st.selected = row ? rowKey(row) : null;
+        this.renderTableView(el!);
+        if (row) mounted?.grid.revealKeyNearest(rowKey(row));
+    },
+
     // -----------------------------------------------------------------------
     // The row's actions (§10)
 
@@ -1403,6 +1567,7 @@ export const tableMethods = uiModule({
         if (!personId || !DataManager.getPerson(personId)) return;
         closeHeadMenu();
         if (action === 'tree') {
+            if (!treeActionOffered()) return;
             // The only action that leaves the table: the family diagram with the person in the middle (as the search does).
             TreeRenderer.presetViewMode('family');
             TreeRenderer.setFocus(personId);
@@ -1479,6 +1644,55 @@ export const tableMethods = uiModule({
             rect: anchor.getBoundingClientRect(), label: t.citesTitle, kind: 'cites', html: citesHtml(cites),
             focusBack: () => (anchor.isConnected ? anchor : null), scroller: mounted?.grid.el,
             onAction: (act, i) => { if (act === 'source' && list[i]) this.openTableSourceId(list[i]); },
+        });
+    },
+
+    /**
+     * A shared event's ages (spec 085 §4, 4a): a field per person with the
+     * age written in that person's copy (the computed one as its hint).
+     * Enter saves the changed ones in one undo step, Escape closes; a
+     * read-only table, an archive or a locked person shows them only.
+     */
+    showTableSharedAges(row: EventRow, anchor: HTMLElement): void {
+        closeHeadMenu();
+        const ctx = model?.ctx;
+        if (!ctx) return;
+        const rows = sharedAgeRows(ctx, row);
+        if (!rows.length) return;
+        const editable = !tableReadOnly() && !this.activeResearchArchive() && !rows.some(r => DataManager.isPersonLocked(r.personId));
+        const t = strings.table;
+        const html = `<div class="tv-ages-title">${escHtml(t.agePerPerson)}</div><div class="tv-ages-list">`
+            + rows.map((r, i) => {
+                const id = `tv-age-${i}`;
+                const value = editable
+                    ? `<input id="${id}" class="tv-ages-input" type="text" inputmode="numeric" autocomplete="off" maxlength="40" data-i="${i}"`
+                        + ` value="${escHtml(r.recorded)}" placeholder="${escHtml(r.computed)}">`
+                    : `<span class="tv-ages-value">${escHtml(r.recorded || r.computed || '–')}</span>`;
+                return `<label class="tv-ages-row" for="${id}"><span class="tv-ages-name">${escHtml(r.name)}</span>${value}</label>`;
+            }).join('') + '</div>';
+        const el = openBubblePanel({
+            rect: anchor.getBoundingClientRect(), label: t.agePerPerson, kind: 'ages', html,
+            focusBack: () => (anchor.isConnected ? anchor : null), scroller: mounted?.grid.el,
+        });
+        if (!editable) return;
+        el.querySelector<HTMLInputElement>('.tv-ages-input')?.focus({ preventScroll: true });
+        el.addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter' || !(e.target as Element).closest?.('.tv-ages-input')) return;
+            e.preventDefault();
+            const own = new Map<PersonId, { age: string | undefined }>();
+            for (const input of el.querySelectorAll<HTMLInputElement>('.tv-ages-input')) {
+                const r = rows[Number(input.dataset.i)];
+                const v = input.value.trim();
+                if (r && v !== r.recorded) own.set(r.personId, { age: v || undefined });
+            }
+            closeTableBubble(true);
+            if (!own.size) return;
+            const first = rows[0];
+            const data = DataManager.getData();
+            watching = { tree: treeKey(), name: personNameOf(first.personId), keys: watchEdit(data, rows.flatMap(r => familyKeys(data, r.personId))) };
+            if (!DataManager.saveSharedEvent(first.personId, first.eventId, { common: {}, own })) { watching = null; return; }
+            TreeRenderer.render();
+            this.refreshSearch();
         });
     },
 
@@ -1599,10 +1813,8 @@ export const tableMethods = uiModule({
         const entries: MenuEntry[] = cellPart.length ? [...cellPart, SEP] : [];
         if (src) entries.push({ id: 'open', label: t.act.openSource, icon: '▤', hint: 'Enter', run: run('open') });
         else {
-            entries.push(
-                { id: 'tree', label: t.act.tree, icon: '⌖', run: run('tree') },
-                { id: 'open', label: t.act.open, icon: '▤', hint: 'Enter', run: run('open') },
-            );
+            if (treeActionOffered()) entries.push({ id: 'tree', label: t.act.tree, icon: '⌖', run: run('tree') });
+            entries.push({ id: 'open', label: t.act.open, icon: '▤', hint: 'Enter', run: run('open') });
         }
         if (!tableReadOnly()) entries.push({ id: 'edit', label: t.act.edit, icon: '✎', hint: t.dblClickHint, run: run('edit') });
         if (line.kind === 'row' && line.expanded !== null) {
@@ -1634,7 +1846,7 @@ export const tableMethods = uiModule({
         const ro = tableReadOnly();
         const run = (a: RowAction, l: GridLine = line) => () => this.tableRowAction(a, l);
         const rows = [
-            { label: t.act.tree, icon: '⌖', run: run('tree') },
+            ...(treeActionOffered() ? [{ label: t.act.tree, icon: '⌖', run: run('tree') }] : []),
             { label: t.act.open, icon: '▤', run: run('open') },
         ];
         if (!ro) rows.push({ label: t.act.edit, icon: '✎', run: run('edit') });
@@ -1712,8 +1924,29 @@ export const tableMethods = uiModule({
             label: strings.table.cell.editLabel(columnLabel(col)),
             ...(t.input === 'place' ? { list: 'places-datalist' } : {}),
             ...(t.input === 'select' ? { options: editOptionsOf(t) ?? [] } : {}),
-            save: (text) => this.tableSaveCell(t, text),
+            // A satellite's edit carries the cell and its text: refused by the main window, the draft comes back (spec 079 §3.4).
+            save: (text) => DataManager.runWithEditContext(
+                DataManager.isWindowCopy() ? cellDraft(treeKey(), stateOf(treeKey()).rowType, lineKey(line), col.id, text) : null,
+                () => this.tableSaveCell(t, text),
+            ),
         };
+    },
+
+    /**
+     * A cell's edit the main window refused (spec 079 §3.4, 3d): the fresh tree
+     * is in; the editor opens again over that cell with the text typed, as a
+     * kept draft (Enter saves it on the fresh tree, Esc drops it). An editor
+     * open meanwhile stays and is framed. False when the cell is not shown.
+     */
+    tableReopenDraft(draft: CellDraft): boolean {
+        if (TreeRenderer.getViewMode() !== 'table' || !mounted || treeKey() !== draft.tree) return false;
+        if (stateOf(draft.tree).rowType !== draft.rowType) return false;
+        return mounted.grid.reopenDraft(draft.key, draft.colId, draft.text, strings.win.draftKept);
+    },
+
+    /** A cell's editor open when the fresh tree came after a refused edit: it stays, framed as a draft (§3.4). */
+    tableMarkOpenDraft(): boolean {
+        return !!mounted && mounted.grid.markOpenDraft(strings.win.draftKept);
     },
 
     /**
@@ -1741,6 +1974,22 @@ export const tableMethods = uiModule({
             DataManager.runBatch(t2.editPartnership(auditPersonName(a), auditPersonName(b)), () => {
                 DataManager.updatePartnership(change.unionId, change.updates);
             });
+        } else if (change.kind === 'lifeEvent') {
+            // A shared event's common field goes to every copy (spec 085 §4), in one undo step.
+            const id = change.personId;
+            const ev = DataManager.getPerson(id)?.events?.find(e => e.id === change.eventId);
+            if (!ev) return null;
+            const copies = ev.shareId ? shareCopiesOf(data, ev.shareId) : [];
+            const ids = copies.length ? copies.map(c => c.personId) : [id];
+            watching = { tree: treeKey(), name: personNameOf(id), keys: watchEdit(data, ids.flatMap(p => familyKeys(data, p))) };
+            if (ids.length >= 2) {
+                // The toast of the save says for how many ("Date: changed for 4 people (Census 1921)."), not "Saved: {name}".
+                const title = sharedEventTitle(ev, strings.events.types[ev.type]);
+                const word = strings.validation.sharedFields[change.field];
+                watching.message = strings.events.sharedCellChanged(word.charAt(0).toLocaleUpperCase() + word.slice(1), title, ids.length);
+            }
+            const n = DataManager.updateSharedCommonField(id, change.eventId, change.field, change.value);
+            if (n === 0) { watching = null; return null; }
         } else {
             const id = change.personId;
             watching = { tree: treeKey(), name: personNameOf(id), keys: watchEdit(data, familyKeys(data, id)) };
@@ -1764,7 +2013,7 @@ export const tableMethods = uiModule({
         const changed = changedKeys(DataManager.getData(), w.keys);
         if (!changed.length) return;
         flashNext = { tree: w.tree, keys: changed };
-        this.showToast(strings.table.savedToast(w.name()));
+        this.showToast(w.message ?? strings.table.savedToast(w.name()));
     },
 
     /** A load from the research's bridge (§10.3, 10d): its rows lit and a toast whose Show selects the first. True when the table shows it. */

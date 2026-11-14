@@ -88,11 +88,13 @@ export async function stubPersistence(page: Page, granted: boolean): Promise<voi
  * "On this day" card is off unless `{ onThisDay: true }` — the fixtures and
  * the sample tree have anniversaries, and on those dates the card (shown once
  * the tree is idle) would cover the controls a suite taps, so a suite would
- * fail only on those days.
+ * fail only on those days. The one-time offer of Migration over time on the
+ * map counts as spent unless `{ mapTimeTip: true }` — it stands left of the
+ * map's controls over the points a suite presses.
  */
 export async function openApp(
     page: Page,
-    opts: { researchPromo?: boolean; fileCopyReminders?: boolean; tourOffer?: boolean; whatsNew?: boolean; onThisDay?: boolean } = {},
+    opts: { researchPromo?: boolean; fileCopyReminders?: boolean; tourOffer?: boolean; whatsNew?: boolean; onThisDay?: boolean; mapTimeTip?: boolean } = {},
 ): Promise<void> {
     if (!opts.researchPromo) await seedResearchPromoSeen(page);
     if (!opts.whatsNew) await seedWhatsNewSeen(page);
@@ -105,11 +107,30 @@ export async function openApp(
             } catch { /* no storage: nothing to seed */ }
         });
     }
+    if (!opts.mapTimeTip) {
+        await page.addInitScript(() => {
+            try {
+                if (localStorage.getItem('strom.map.timeTipSeen') === null) localStorage.setItem('strom.map.timeTipSeen', '1');
+            } catch { /* no storage: nothing to seed */ }
+        });
+    }
     await page.goto('/strom.html');
     await expect(page.locator('.toolbar')).toBeVisible();
     // The toolbar is static HTML: wait until the startup tree is read and
     // editing is allowed (html.app-loading, main.ts).
     await expect(page.locator('html')).not.toHaveClass(/app-loading/);
+}
+
+/**
+ * A page opened beside the app's main window as a whole app of its own: a
+ * browser without Web Locks (no window roles, every tab loads and saves the
+ * trees; another tab's save is told over tab-sync). Without it, another tab
+ * of the app is "already open" and loads nothing. Call before its goto.
+ */
+export async function asWindowlessTab(page: Page): Promise<void> {
+    await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'locks', { configurable: true, value: undefined });
+    });
 }
 
 /**
@@ -457,4 +478,17 @@ export async function openTreeStructure(page: Page, scope?: Locator): Promise<Lo
     const group = page.locator(`[id="${await toggle.getAttribute('aria-controls')}"]`);
     await expect(group).toBeVisible();
     return group;
+}
+
+/** A satellite's "Follow selection" mode (spec 079 K2.1): switch, mark or off. */
+export function followModeOf(page: Page): Promise<string | null> {
+    return page.locator('.sat-follow').getAttribute('data-mode');
+}
+
+/** Choose a satellite's "Follow selection" mode in its header's menu. */
+export async function setFollowMode(page: Page, mode: 'switch' | 'mark' | 'off'): Promise<void> {
+    if (await followModeOf(page) === mode) return;
+    await page.locator('.sat-follow').click();
+    await page.locator(`.sat-follow-menu [role="menuitemradio"][data-mode="${mode}"]`).click();
+    await expect(page.locator('.sat-follow')).toHaveAttribute('data-mode', mode);
 }

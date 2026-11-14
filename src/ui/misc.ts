@@ -3,10 +3,12 @@
  * see src/ui/module.ts for the composition pattern.
  */
 
+import { refreshWindowControls } from '../windows/window-open.js';
 import { initDialogFocus } from './dialog-focus.js';
 import { initClosedPopups } from './closed-popups.js';
 import { initSheetSlide } from './sheet-slide.js';
 import { initKeyboardAccess } from './keyboard-access.js';
+import { syncTreeLegendLift } from './legend-lift.js';
 import { DataManager, auditPersonName } from '../data.js';
 import { announcedResearchLinks, researchLinksEnabled, setResearchLinksEnabled } from '../research-device.js';
 import { TreeManager } from '../tree-manager.js';
@@ -491,6 +493,8 @@ export const miscMethods = uiModule({
     // ==================== DISPLAY VIEW MODE (family / descendants) ====================
 
     setDisplayViewMode(mode: ViewMode): void {
+        // The Research overview open without following closes with a switch, as by its ⤡.
+        if (mode !== TreeRenderer.getViewMode()) this.researchOverviewViewSwitched();
         TreeRenderer.setViewMode(mode); // re-renders + calls updateViewModeUI
     },
 
@@ -519,12 +523,14 @@ export const miscMethods = uiModule({
         for (const m of ['family', 'descendants', 'timeline', 'fan', 'map', 'table']) {
             document.getElementById(`view-mode-${m}`)?.classList.toggle('active', mode === m);
         }
+        // ⧉ and its menu ("this view", the Table tab's tooltip in the language now; spec 079 §1).
+        refreshWindowControls();
         // Mobile bottom bar: three primary view tabs plus "More" (fan, map and
-        // table live in the More sheet, so More lights up while one is active).
+        // timeline live in the More sheet, so More lights up while one is active; spec 082 K1.1).
         document.getElementById('bb-view-family')?.classList.toggle('active', mode === 'family');
         document.getElementById('bb-view-descendants')?.classList.toggle('active', mode === 'descendants');
-        document.getElementById('bb-view-timeline')?.classList.toggle('active', mode === 'timeline');
-        document.getElementById('bb-view-more')?.classList.toggle('active', mode === 'fan' || mode === 'map' || mode === 'table');
+        document.getElementById('bb-view-table')?.classList.toggle('active', mode === 'table');
+        document.getElementById('bb-view-more')?.classList.toggle('active', mode === 'fan' || mode === 'map' || mode === 'timeline');
 
         const badge = document.getElementById('descendants-badge');
         const text = document.getElementById('descendants-badge-text');
@@ -589,8 +595,9 @@ export const miscMethods = uiModule({
         const treeLegend = document.getElementById('tree-legend');
         if (treeLegend) {
             const hasPersons = DataManager.getAllPersons().length > 0;
-            treeLegend.style.display = (cardsShown && hasPersons
-                && SettingsManager.isBranchLegendEnabled()) ? 'flex' : 'none';
+            const shown = cardsShown && hasPersons && SettingsManager.isBranchLegendEnabled();
+            treeLegend.style.display = shown ? 'flex' : 'none';
+            syncTreeLegendLift(treeLegend, shown);
         }
         // The ring of an unknown sex is explained only when such a person is in view.
         const unknownItem = document.getElementById('legend-unknown');
@@ -602,7 +609,10 @@ export const miscMethods = uiModule({
             legend.style.display = (cardsShown && SettingsManager.isBranchColorsEnabled()
                 && SettingsManager.isBranchLegendEnabled()) ? 'flex' : 'none';
         }
-        if (treeLegend) this.updateLegendMarks(treeLegend);
+        if (treeLegend) {
+            this.updateLegendMarks(treeLegend);
+            this.syncTreeLegendFold(treeLegend);
+        }
     },
 
     /**
@@ -615,15 +625,19 @@ export const miscMethods = uiModule({
         const has = (sel: string): boolean => !!document.querySelector(`#tree-canvas .person-card ${sel}`);
         const l = strings.card.legend;
         const rows: [string, string][] = [];
+        // The kind of each row, for the folded legend's "new mark" dot (src/ui/tree-legend.ts).
+        const kinds: string[] = [];
         for (const cls of CARD_STATUS_CLASSES) {
             if (has(`> .card-status-mark.${cls}`)) {
                 rows.push([statusMarkHtml({ cls, source: 'evidence', facts: [] }, { className: 'card-status-mark--inline' }), cardStatusLegendLabel(cls)]);
+                kinds.push(cls);
             }
         }
-        if (has('> .card-story:not(.couple):not(.draft)')) rows.push([storyFoldHtml({ kind: 'own', final: true }, true), l.storyOwn]);
-        if (has('> .card-story:is(.couple, .draft)')) rows.push([storyFoldHtml({ kind: 'couple', final: true }, true), l.storyOther]);
-        if (has(':is(.card-signal, .card-signal-stack)')) rows.push(['<span class="menu-signal-glyph" aria-hidden="true">≠</span>', l.action]);
-        if (has('.cross-tree-badge')) rows.push(['<span class="legend-cross" aria-hidden="true">⇄ 1</span>', l.cross]);
+        if (has('> .card-story:not(.couple):not(.draft)')) { rows.push([storyFoldHtml({ kind: 'own', final: true }, true), l.storyOwn]); kinds.push('story-own'); }
+        if (has('> .card-story:is(.couple, .draft)')) { rows.push([storyFoldHtml({ kind: 'couple', final: true }, true), l.storyOther]); kinds.push('story-other'); }
+        if (has(':is(.card-signal, .card-signal-stack)')) { rows.push(['<span class="menu-signal-glyph" aria-hidden="true">≠</span>', l.action]); kinds.push('action'); }
+        if (has('.cross-tree-badge')) { rows.push(['<span class="legend-cross" aria-hidden="true">⇄ 1</span>', l.cross]); kinds.push('cross'); }
+        treeLegend.dataset.marks = kinds.join(' ');
         treeLegend.classList.toggle('has-marks', rows.length > 0);
         if (rows.length === 0) { part?.remove(); return; }
         if (!part) {
@@ -1206,6 +1220,18 @@ export const miscMethods = uiModule({
                         return;
                     }
 
+                    // The Unify dialog of a shared event: close only itself.
+                    if (currentDialog === 'shared-unify-modal') {
+                        this.closeSharedUnify();
+                        return;
+                    }
+
+                    // The shared event's person picker: close only itself.
+                    if (currentDialog === 'shared-picker-modal') {
+                        this.closeSharedPicker();
+                        return;
+                    }
+
                     // Wedding witnesses: close only itself (asking about edited
                     // rows), leaving the relationships panel underneath.
                     if (currentDialog === 'wedding-witnesses-modal') {
@@ -1227,6 +1253,8 @@ export const miscMethods = uiModule({
                             confirmModal.classList.remove('active');
                             return;
                         }
+                        // A shared-event menu open: Escape closes only the menu.
+                        if (this.closeSharedMenus()) return;
                         this.closeEventEditor();
                         return;
                     }
@@ -1613,6 +1641,8 @@ export const miscMethods = uiModule({
             const key = el.getAttribute('data-i18n');
             if (key) {
                 el.textContent = getString(key);
+                // A tab's label holds the width of its bold cut (src/ui/sel-css.ts).
+                if (el.classList.contains('sel-l')) el.setAttribute('data-label', el.textContent);
             }
         });
 

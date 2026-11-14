@@ -796,7 +796,7 @@ class MergerUIClass {
                     </button>
                     ${resolveBtn}
                     <button class="merge-btn-preview" data-action="compare" title="${strings.treePreview.comparePersons}" aria-label="${strings.treePreview.comparePersons}">
-                        👁
+                        ${strings.treePreview.comparePersons}
                     </button>
                 </div>
             </div>
@@ -834,7 +834,7 @@ class MergerUIClass {
                         ${isSkipped ? strings.merge.unskip : strings.merge.skip}
                     </button>
                     <button class="merge-btn-preview" data-action="preview" title="${strings.treePreview.preview}" aria-label="${strings.treePreview.preview}">
-                        👁
+                        ${strings.treePreview.preview}
                     </button>
                 </div>
             </div>
@@ -1209,14 +1209,14 @@ class MergerUIClass {
                     ${strings.labels[conflict.field as keyof typeof strings.labels] || conflict.field}
                 </div>
                 <div class="conflict-options">
-                    <label class="conflict-option">
+                    <label class="conflict-option sel-opt" data-sel-form="tile">
                         <input type="radio" name="conflict-${conflict.field}" value="keep_existing"
                             ${conflict.resolution === 'keep_existing' ? 'checked' : ''}>
                         <span class="conflict-value existing">${this.conflictValueHtml(conflict.field, conflict.existingValue)}</span>
                         <span class="conflict-badge existing">${strings.merge.keepExisting}</span>
                         ${conflict.resolution === 'keep_existing' ? suggestedLabel(conflict) : ''}
                     </label>
-                    <label class="conflict-option">
+                    <label class="conflict-option sel-opt" data-sel-form="tile">
                         <input type="radio" name="conflict-${conflict.field}" value="use_incoming"
                             ${conflict.resolution === 'use_incoming' ? 'checked' : ''}>
                         <span class="conflict-value incoming">${this.conflictValueHtml(conflict.field, conflict.incomingValue)}</span>
@@ -1318,13 +1318,13 @@ class MergerUIClass {
                     ${this.escapeHtml(this.partnershipFieldLabel(conflict.field))}
                 </div>
                 <div class="conflict-options">
-                    <label class="conflict-option">
+                    <label class="conflict-option sel-opt" data-sel-form="tile">
                         <input type="radio" name="conflict-${conflict.field}" value="keep_existing"
                             ${conflict.resolution === 'keep_existing' ? 'checked' : ''}>
                         <span class="conflict-value existing">${this.partnershipValueHtml(conflict.field, conflict.existingValue)}</span>
                         <span class="conflict-badge existing">${strings.merge.keepExisting}</span>
                     </label>
-                    <label class="conflict-option">
+                    <label class="conflict-option sel-opt" data-sel-form="tile">
                         <input type="radio" name="conflict-${conflict.field}" value="use_incoming"
                             ${conflict.resolution === 'use_incoming' ? 'checked' : ''}>
                         <span class="conflict-value incoming">${this.partnershipValueHtml(conflict.field, conflict.incomingValue)}</span>
@@ -1499,7 +1499,8 @@ class MergerUIClass {
 
             // Show success message and offer to switch to new tree
             const stats = strings.merge.stats(result.stats.merged, result.stats.added)
-                + (result.stats.skipped > 0 ? `\n${strings.merge.skippedCount(result.stats.skipped)}` : '');
+                + (result.stats.skipped > 0 ? `\n${strings.merge.skippedCount(result.stats.skipped)}` : '')
+                + ((result.stats.sharedJoined ?? 0) > 0 ? `\n${strings.merge.sharedJoined(result.stats.sharedJoined!)}` : '');
 
             // Dispatch event to update tree list
             window.dispatchEvent(new CustomEvent('strom:merge-session-changed'));

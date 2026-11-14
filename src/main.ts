@@ -12,6 +12,7 @@ import { installCardTapTarget } from './card-tap.js';
 import { AppExporter } from './export.js';
 import { MergerUI } from './merge/index.js';
 import { SettingsManager } from './settings.js';
+import { guardOverviewWindowNetwork, startOverviewWindowView } from './ui/overview-window-view.js';
 import { AuditLogManager } from './audit-log.js';
 import { TreePreview, TreeCompare } from './tree-preview.js';
 import { initModalSkeleton } from './ui/modal-skeleton.js';
@@ -21,7 +22,7 @@ import { initToolbarFit } from './ui/toolbar-fit.js';
 import { DebugOptions, DebugStep, DebugPhase } from './layout/pipeline/debug-types.js';
 import { CryptoSession } from './crypto.js';
 import { AppMode, APP_VERSION, TreeId } from './types.js';
-import { strings } from './strings.js';
+import { strings, getCurrentLanguage } from './strings.js';
 import { onTreeSavedElsewhere } from './tab-sync.js';
 import { StorageManager } from './storage.js';
 import { PERSISTENCE_EVENT } from './persistence.js';
@@ -31,6 +32,20 @@ import { collectPoolGarbage } from './media-pool.js';
 import { keepLifelineChipsFor } from './lifeline-view.js';
 import { parseDeepLink, deepLinkTreeMatches, stripDeepLinkParams } from './deep-link.js';
 import { shouldRegisterServiceWorker, registerServiceWorker, linkManifest, isBetaBuild, appModeFor, captureInstallPrompt, INSTALL_AVAILABILITY_EVENT, isSafariOnComputer, safariAppName } from './pwa.js';
+import { decideWindowRole, getWindowRole, setWindowRole, satelliteViewMode, tryBecomeMain, type SatelliteKind, type SatelliteParams } from './windows/window-role.js';
+import { startMainWindow, startSatelliteClient, startSatelliteSelection, forwardSatelliteLaunches, showSecondTab, openLinksFromOtherWindows, makeSatelliteMain, openMainWindow, wireSatelliteViewStart, keptSatelliteState, keepSatelliteState } from './windows/window-start.js';
+import { mountSatStates } from './windows/sat-states.js';
+import { wireWindowDrafts } from './windows/window-drafts.js';
+import { peekBecomeMainMark, retryBecomeMain, takeBecomeMainMark } from './windows/become-main.js';
+import { formatLiveClock } from './live-time.js';
+import { startedAgainAsMain } from './resume-view.js';
+import { initWindowControls } from './windows/window-controls.js';
+import { windowTitle } from './windows/window-title.js';
+import { mountSatHeader, SAT_VIEWS } from './windows/sat-header.js';
+import { followSatelliteView, openAnotherWindow } from './windows/sat-views.js';
+import { currentSystem, isDesktopSystem, setWindowControlsRefresher } from './windows/window-open.js';
+import type { SatelliteClient } from './windows/satellite.js';
+import type { WindowRegistry } from './windows/window-registry.js';
 
 // Make modules available globally for HTML event handlers
 declare global {
@@ -46,6 +61,8 @@ declare global {
             SettingsManager: typeof SettingsManager;
             TreePreview: typeof TreePreview;
             TreeCompare: typeof TreeCompare;
+            /** The main window's registry of its satellite windows (spec 079; absent in other windows). */
+            Windows?: WindowRegistry;
         };
     }
 }
@@ -245,7 +262,8 @@ function registerAppListeners(): void {
         });
     });
 
-    onTreeSavedElsewhere((treeId) => {
+    // A satellite window's tree is the main window's: its saves are this window's data coming in.
+    if (getWindowRole() !== 'satellite') onTreeSavedElsewhere((treeId) => {
         if (DataManager.isViewMode() || treeId !== DataManager.getCurrentTreeId()) return;
         // What this window holds is kept as a backup, once: another window — an older app too, which
         // knows no stale-copy guard — may have saved over this window's saved work (N2).
@@ -263,39 +281,258 @@ function registerAppListeners(): void {
     UI.syncLockedState();
 }
 
-/** IndexedDB could not be opened: say so instead of a blank page (S22). */
-function showStartupError(err: unknown): void {
-    console.error('Startup failed', err);
-    document.documentElement.classList.remove('app-booting', 'app-loading');
-    void UI.showAlert(strings.storageSafety.storageInitFailed, 'error');
+/** The satellite's client (null in any other window). */
+let satelliteClient: SatelliteClient | null = null;
+let satelliteKind: SatelliteParams['kind'] | null = null;
+/** "● " before the title for a while: the main window could not bring this window forward (§4, 4c). */
+let titleMark = false;
+let titleMarkTimer: ReturnType<typeof setTimeout> | null = null;
+/** How long the mark stands. */
+const TITLE_MARK_MS = 3000;
+
+function markWindowTitle(): void {
+    titleMark = true;
+    if (titleMarkTimer) clearTimeout(titleMarkTimer);
+    titleMarkTimer = setTimeout(() => { titleMark = false; titleMarkTimer = null; updateWindowTitle(); }, TITLE_MARK_MS);
+    updateWindowTitle();
 }
 
-// Initialize on DOM ready
-document.addEventListener('DOMContentLoaded', async () => {
-    // The welcome stays hidden until the first render (renderer.ts); a safety
-    // net in case startup stops short of one (a password prompt left open).
-    setTimeout(() => document.documentElement.classList.remove('app-booting'), 10000);
-    // Opening a research from outside (?import-url= / ?live=): keep the canvas
-    // blank until that tree is in, instead of flashing the last-opened tree.
-    // Cleared by UI.initExternalOpen when the open settles (with a safety net).
-    try {
-        const params = new URLSearchParams(window.location.search);
-        let resumingLive = false;
-        try {
-            resumingLive = !!sessionStorage.getItem('strom.live');
-        } catch { /* no storage */ }
-        if (params.has('import-url') || params.has('live') || resumingLive) {
-            document.documentElement.classList.add('external-opening');
-            setTimeout(() => document.documentElement.classList.remove('external-opening'), 20000);
+/** The window's title by its role, its tree (and a satellite's view); again at every switch or rename. */
+function updateWindowTitle(): void {
+    const role = getWindowRole();
+    let treeName = '';
+    if (role === 'satellite') {
+        treeName = satelliteClient?.hasTree ? satelliteClient.treeName : '';
+    } else if (role === 'main') {
+        // An empty tree (the first start's) is no tree yet: the app's name alone.
+        const id = DataManager.getCurrentTreeId();
+        let hasPeople = false;
+        for (const _ in DataManager.getData().persons) { hasPeople = true; break; }
+        treeName = id && hasPeople ? TreeManager.getTreeMetadata(id)?.name ?? '' : '';
+    }
+    const title = windowTitle({ role, kind: satelliteKind, treeName, beta: isBetaBuild(APP_MODE) });
+    document.title = titleMark ? `● ${title}` : title;
+}
+
+/**
+ * A satellite window (spec 079 §2): the view of the main window's tree. No
+ * storage is read or written here — no tree, no tree index, no settings, no
+ * last view or reload point; the research, links from outside, the welcome
+ * and "What's new" are the main window's. The tree comes with the client's
+ * first `tree` message; until then the view stays empty.
+ */
+function startSatelliteWindow(params: SatelliteParams, debugOptions: DebugOptions): void {
+    document.documentElement.classList.add('window-satellite');
+    satelliteKind = params.kind;
+    TreeRenderer.setWindowView(satelliteViewMode(params.kind));
+    const client = startSatelliteClient(params);
+    satelliteClient = client;
+    // The header in place of the toolbar (§2): the toolbar and the bottom bar are not mounted.
+    const header = mountSatHeader(document, client, {
+        kind: () => client.kind,
+        // K2: the view switcher (this window only) and ⧉ "Open another window" on a computer's system (§1).
+        ...(SAT_VIEWS.includes(params.kind) ? { switchView: (kind: SatelliteKind) => TreeRenderer.setViewMode(satelliteViewMode(kind)) } : {}),
+        ...(isDesktopSystem(currentSystem()) ? {
+            openAnother: () => openAnotherWindow(client),
+            // Without the main window (§3.3) no window can join: its tooltip says why.
+            anotherBlocked: () => {
+                if (client.connection === 'main-closed') return strings.win.mainClosed(formatLiveClock(client.lastHeardAt, Date.now(), getCurrentLanguage()));
+                return client.connection === 'connected' && client.hasTree ? '' : strings.win.openAnother;
+            },
+        } : {}),
+        undo: () => UI.performUndo(),
+        redo: () => UI.performRedo(),
+        refreshUndoRedo: () => UI.refreshUndoRedoToolbar(),
+        // The selected row's shared look follows the switch.
+        onFollowChange: () => {
+            const table = document.getElementById('table-container');
+            if (table && TreeRenderer.getViewMode() === 'table') UI.renderTableView(table);
+        },
+    });
+    startSatelliteSelection(client);
+    // A refused edit was not applied: its Undo pill (standing or waiting) goes before the toast says so.
+    client.on('conflict', () => UI.dismissUndoToast());
+    // Its states under the header or in place of the view (§3).
+    const states = mountSatStates(document, client, {
+        goToMain: () => { void client.requestMainFocus(); },
+        openStrom: () => openMainWindow(),
+        makeMain: () => { void makeSatelliteMain(client, client.kind); },
+        closeWindow: () => window.close(),
+        toast: (message, ms) => UI.showToast(message, ms),
+        formatTime: (ts) => formatLiveClock(ts, Date.now(), getCurrentLanguage()),
+        content: () => document.getElementById('tree-container'),
+    });
+    // A refused edit's draft comes back once the fresh tree is in (§3.4, 3d).
+    wireWindowDrafts(client, {
+        reopenCell: (draft) => UI.tableReopenDraft(draft),
+        reopenPerson: (draft) => UI.reopenPersonDraft(draft),
+        markOpenCell: () => UI.tableMarkOpenDraft(),
+    });
+
+    // The shell (as in the main window, without the tree switcher, files, research and the app's offers).
+    ZoomPan.init();
+    installCardTapTarget();
+    UI.installStatusTipHost();
+    UI.initMinimap();
+    UI.initTreeLegend();
+    UI.initGenLabels();
+    setTreeRendererGetter(() => TreeRenderer);
+    UI.initHasFallback();
+    UI.initKeyboard();
+    UI.initSearch();
+    UI.initHistoryManage();
+    if (debugOptions.enabled) TreeRenderer.setDebugOptions(debugOptions);
+
+    // The view switched in this window (K2): its address, the main window's list, the header and the title follow.
+    setWindowControlsRefresher(followSatelliteView(client, (kind) => {
+        satelliteKind = kind;
+        header.refresh();
+        updateWindowTitle();
+    }));
+
+    // The view's state carried from the main window (§1): its person, generations, zoom, the map's frame.
+    // F5 of this window: the state it kept for itself (its sessionStorage), unless the main window sends one.
+    const kept = keptSatelliteState(params.windowId, params.kind);
+    if (kept?.kind === 'table') UI.setTableWindowStart(kept.tree, kept.state);
+    const applyViewStart = wireSatelliteViewStart(client, kept);
+    keepSatelliteState(client);
+    // Another tree (the first one, a switch in the main window): the window's state or the main window's person,
+    // before the drawing below (the tree's default person only when neither is there).
+    let shownTree: TreeId | null = null;
+    window.addEventListener('strom:data-changed', () => {
+        const treeId = DataManager.getCurrentTreeId();
+        if (treeId === shownTree) return;
+        shownTree = treeId;
+        TreeRenderer.restoreFromSession();
+        applyViewStart();
+    });
+    registerAppListeners();
+    UI.initOnlineIndicator();
+
+    // The settings are the main window's: what it stores shows here too.
+    SettingsManager.watchOtherWindows(({ languageBefore }) => {
+        if (SettingsManager.getLanguage() !== languageBefore) UI.setLanguage(SettingsManager.getLanguage());
+        else TreeRenderer.render();
+        header.refresh();
+        states.refresh();
+        updateWindowTitle();
+    });
+
+    client.on('tree', () => {
+        document.documentElement.classList.remove('app-loading');
+        updateWindowTitle();
+    });
+    client.on('tree-gone', () => updateWindowTitle());
+    client.on('renamed', () => updateWindowTitle());
+    // The Table's state carried from the main window (§1): its row type, view, filters, sort, search and row.
+    client.on('init', ({ kind, state }) => {
+        if (kind === 'table') UI.setTableWindowStart(client.requestedTreeId ?? '', state);
+    });
+    // Asked forward without getting the focus: the title is marked for a while, to be found among the windows.
+    client.on('attention', () => markWindowTitle());
+    // Whether anything may be edited here follows the connection and the main window's status (§3).
+    let readOnly = client.readOnly();
+    const followReadOnly = (): void => {
+        if (client.readOnly() === readOnly) return;
+        readOnly = client.readOnly();
+        UI.syncLockedState();
+        if (client.hasTree) TreeRenderer.render();
+    };
+    client.on('status', followReadOnly);
+    client.on('connection', followReadOnly);
+    client.start();
+    forwardSatelliteLaunches(client, window.location.search);
+    updateWindowTitle();
+    console.log(`Strom v${APP_VERSION} initialized (window ${params.windowId})`);
+}
+
+/**
+ * The Research overview in a window of its own (spec 079 K3, §6): no tree
+ * view, no header of the views, only the overview drawn over the main
+ * window's snapshot (`research-state`). Its research actions go to the main
+ * window; it never follows the research, asks its bridge or writes the
+ * tree's storage (only "⋯ Edit panel" keeps its choice, as everywhere).
+ */
+function startOverviewWindow(params: SatelliteParams): void {
+    document.documentElement.classList.add('window-satellite', 'window-overview');
+    satelliteKind = params.kind;
+    guardOverviewWindowNetwork();
+    const client = startSatelliteClient(params);
+    satelliteClient = client;
+    const view = startOverviewWindowView(UI, {
+        send: (action, args) => client.researchAction(action, args),
+        ask: (action, args, waitMs) => client.researchActionResult(action, args, waitMs),
+        focusMain: () => { void client.requestMainFocus(); },
+    }, () => (client.hasTree ? client.treeName : ''), {
+        connection: () => client.connection,
+        lastHeardAt: () => client.lastHeardAt,
+        treeGone: () => client.treeGone,
+        locked: () => !!client.status?.locked,
+        makeMain: () => { void makeSatelliteMain(client, client.kind); },
+        openStrom: () => openMainWindow(),
+        closeWindow: () => window.close(),
+        goToMain: () => { void client.requestMainFocus(); },
+        formatTime: (ts) => formatLiveClock(ts, Date.now(), getCurrentLanguage()),
+    });
+    client.on('research-state', (raw) => {
+        if (view.apply(raw)) document.documentElement.classList.remove('app-loading');
+    });
+    // The main window closed (§3.3: the strip, the last state frozen, every action greyed) or back (live again).
+    client.on('connection', () => {
+        document.documentElement.classList.remove('app-loading');
+        view.render();
+    });
+    // The tree's people and sources (What the research knows, the tiles) and its name in the head.
+    window.addEventListener('strom:data-changed', () => view.render());
+    client.on('tree', () => {
+        document.documentElement.classList.remove('app-loading');
+        updateWindowTitle();
+        // After the tree was deleted: another tree of the main window, its overview again.
+        view.render();
+    });
+    // The tree deleted (§3.5b) or locked (§3.6) in the main window: the window says so in place of the overview.
+    client.on('tree-gone', () => {
+        updateWindowTitle();
+        view.render();
+    });
+    let wasLocked = false;
+    client.on('status', () => {
+        const locked = !!client.status?.locked;
+        if (locked === wasLocked) return;
+        wasLocked = locked;
+        document.documentElement.classList.remove('app-loading');
+        view.render();
+    });
+    client.on('renamed', () => {
+        updateWindowTitle();
+        view.render();
+    });
+    client.on('attention', () => markWindowTitle());
+    // One, two or three columns by the width: the overview moves its sections itself (spec 083 §4), nothing drawn anew.
+    UI.installStatusTipHost();
+    // The settings are the main window's: its language and theme show here too.
+    SettingsManager.watchOtherWindows(({ languageBefore }) => {
+        if (SettingsManager.getLanguage() !== languageBefore) {
+            SettingsManager.setLanguage(SettingsManager.getLanguage());
+            UI.initializeStrings();
         }
-    } catch { /* no URLSearchParams: nothing to hide */ }
+        view.render();
+        updateWindowTitle();
+    });
+    client.start();
+    // Before the main window's first state: the head and the skeleton (its label after 300 ms).
+    view.render();
+    forwardSatelliteLaunches(client, window.location.search);
+    updateWindowTitle();
+    console.log(`Strom v${APP_VERSION} initialized (overview window ${params.windowId})`);
+}
 
-    // Initialize settings (theme) early for smooth loading
-    SettingsManager.init();
-
-    // Initialize audit log (reads enabled state from settings)
-    AuditLogManager.init();
-
+/**
+ * What every window that shows the app needs before its views: the UI's
+ * strings, the dialogs' skeleton, the modules on window.Strom (the password
+ * prompt's buttons). Returns the debug options of the address.
+ */
+function initShell(): DebugOptions {
     // Initialize UI strings from strings.ts
     UI.initializeStrings();
 
@@ -318,14 +555,91 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
 
     // Parse debug options from URL
-    const debugOptions = parseDebugOptions();
+    return parseDebugOptions();
+}
+
+/** IndexedDB could not be opened: say so instead of a blank page (S22). */
+function showStartupError(err: unknown): void {
+    console.error('Startup failed', err);
+    document.documentElement.classList.remove('app-booting', 'app-loading');
+    void UI.showAlert(strings.storageSafety.storageInitFailed, 'error');
+}
+
+// Initialize on DOM ready
+document.addEventListener('DOMContentLoaded', async () => {
+    // The welcome stays hidden until the first render (renderer.ts); a safety
+    // net in case startup stops short of one (a password prompt left open).
+    setTimeout(() => document.documentElement.classList.remove('app-booting'), 10000);
+
+    // Check if we have embedded data (from exported HTML)
+    const hasEmbeddedData = !!(window as Window & { STROM_EMBEDDED_DATA?: unknown }).STROM_EMBEDDED_DATA;
+
+    // The window's role, before anything is read or stored (spec 079 §0): a
+    // satellite and a second tab never write the settings, the tree index or a tree.
+    // A satellite or a second tab starting again as the main window (spec 079 §3.3, §5): the lock
+    // its previous page released may not be free yet at this moment.
+    const becomeMark = hasEmbeddedData ? null : peekBecomeMainMark();
+    // Its view and person as before (the reload point it wrote).
+    if (becomeMark) startedAgainAsMain();
+    let role = await decideWindowRole({ embedded: hasEmbeddedData });
+    if (role.role === 'second-tab' && becomeMark) {
+        const lock = await retryBecomeMain(() => tryBecomeMain());
+        if (lock) role = { role: 'main', lock };
+    }
+    setWindowRole(role.role);
+    const satellite = role.role === 'satellite' ? role.satellite ?? null : null;
+    if (role.role === 'satellite' || role.role === 'second-tab') SettingsManager.setReadOnly(true);
+    if (role.role === 'second-tab') {
+        SettingsManager.init();
+        updateWindowTitle();
+        // "Open as another window": this tab starts as a satellite, without a reload.
+        showSecondTab((params) => {
+            setWindowRole('satellite');
+            const debug = initShell();
+            if (params.kind === 'overview') startOverviewWindow(params);
+            else startSatelliteWindow(params, debug);
+        });
+        console.log(`Strom v${APP_VERSION}: open in another window`);
+        return;
+    }
+
+    // Opening a research from outside (?import-url= / ?live=): keep the canvas
+    // blank until that tree is in, instead of flashing the last-opened tree.
+    // Cleared by UI.initExternalOpen when the open settles (with a safety net).
+    // A satellite opens nothing from outside (its copy of the opener's session is not its own).
+    if (!satellite) try {
+        const params = new URLSearchParams(window.location.search);
+        let resumingLive = false;
+        try {
+            resumingLive = !!sessionStorage.getItem('strom.live');
+        } catch { /* no storage */ }
+        if (params.has('import-url') || params.has('live') || resumingLive) {
+            document.documentElement.classList.add('external-opening');
+            setTimeout(() => document.documentElement.classList.remove('external-opening'), 20000);
+        }
+    } catch { /* no URLSearchParams: nothing to hide */ }
+
+    // Initialize settings (theme) early for smooth loading
+    SettingsManager.init();
+
+    // Initialize audit log (reads enabled state from settings). A satellite
+    // keeps none: the main window logs the edits it saves for it.
+    if (!satellite) AuditLogManager.init();
+
+    const debugOptions = initShell();
+
+    if (satellite?.kind === 'overview') {
+        startOverviewWindow(satellite);
+        return;
+    }
+    if (satellite) {
+        startSatelliteWindow(satellite, debugOptions);
+        return;
+    }
 
     // A link beyond the tree (?person= / ?show=waiting): read before anything rewrites the address.
     const startParams = new URLSearchParams(window.location.search);
     const startDeepLink = parseDeepLink(startParams);
-
-    // Check if we have embedded data (from exported HTML)
-    const hasEmbeddedData = !!(window as Window & { STROM_EMBEDDED_DATA?: unknown }).STROM_EMBEDDED_DATA;
 
     // Storage connection problems (registered before init: onblocked can
     // fire while the database is opening).
@@ -355,6 +669,25 @@ document.addEventListener('DOMContentLoaded', async () => {
         showStartupError(err);
         return;
     }
+    // A satellite that became the main window keeps its Table's state (§3.3; its view: the reload point).
+    const becameMain = takeBecomeMainMark();
+    if (role.role === 'main' && becameMain?.tree && becameMain.table !== undefined && DataManager.getCurrentTreeId() === becameMain.tree) {
+        UI.setTableWindowStart(becameMain.tree, becameMain.table);
+    }
+    // The main window: the satellites get their tree from here (spec 079 §0).
+    // ⧉ after the view tabs, the indicator of open windows, the Table tab's shortcuts (§1, §4).
+    if (role.role === 'main') {
+        const windows = startMainWindow();
+        window.Strom.Windows = windows;
+        initWindowControls(windows);
+    }
+    // Its title names the open tree, as switched or renamed.
+    updateWindowTitle();
+    if (role.role === 'main') {
+        window.addEventListener('strom:tree-switched', updateWindowTitle);
+        window.addEventListener('strom:tree-renamed', updateWindowTitle);
+        window.addEventListener('strom:data-changed', updateWindowTitle);
+    }
     // "What's new": whether this browser held trees before anything can be added.
     UI.captureReleaseNotesStart();
     // "How Strom works" compares a rule's version with the research connected to the tree.
@@ -379,6 +712,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Overview minimap (wires ZoomPan.onChange + canvas handlers)
     UI.initMinimap();
+    UI.initTreeLegend();
 
     // Sticky generation labels (wires ZoomPan.onChange + resize)
     UI.initGenLabels();
@@ -425,8 +759,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     // The pre-release test build (/beta/) says so next to the wordmark.
     if (isBetaBuild(APP_MODE)) {
-        // The window title too (as the installed app's name, "Strom Beta").
-        document.title = 'Strom Beta';
+        // The window title says "Strom Beta" too (as the installed app's name): updateWindowTitle.
         // The phone's More sheet shows "BETA · version" by About (no badge room there).
         document.body.classList.add('beta-build');
         const logo = document.querySelector('.app-wordmark');
@@ -509,6 +842,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             );
             void UI.openDeepLink(startDeepLink, matches);
         }
+        // Links other windows passed on (a second tab's ?person=, a satellite's launch): from now on, as this window's own.
+        openLinksFromOtherWindows();
 
         // Strom Research: light the "New" marker, maybe the one-time 3.0 card.
         UI.researchPromoAfterFirstRender();

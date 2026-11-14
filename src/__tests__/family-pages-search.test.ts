@@ -119,7 +119,7 @@ describe('the bar (§3.1)', LOADED_TIMEOUT, () => {
         expect(bar).toContain('class="sp-fbar-home" href="#uvod"');
         expect(bar).toContain('placeholder="Hledat jméno…"');
         expect(bar).toContain('data-sp-nav="index"');
-        expect(bar).toContain('data-sp-nav="map" class="sp-fbar-a" href="#mapa-obci"');
+        expect(bar).toContain('data-sp-nav="map" class="sp-fbar-a sel-tab" data-sel-dir="down" href="#mapa-obci"');
         expect(bar).toContain('href="#rejstrik-osoby"');
         expect(bar).toContain('href="#rejstrik-obce"');
         expect(bar).toContain('>Menu</button>');
@@ -147,8 +147,8 @@ describe('the indexes (§3.5)', LOADED_TIMEOUT, () => {
         const html = buildPageSetHtml(set);
         for (const slug of ['rejstrik-osoby', 'rejstrik-rodiny', 'rejstrik-prijmeni', 'rejstrik-obce']) {
             const sec = section(html, slug);
-            expect(sec.match(/class="sp-tab"/g), slug).toHaveLength(4);
-            expect(sec).toContain(`<span class="sp-tab" aria-current="page">`);
+            expect(sec.match(/class="sp-tab sel-tab"/g), slug).toHaveLength(4);
+            expect(sec).toContain(`<span class="sp-tab sel-tab" data-sel-dir="down" aria-current="page"><span class="sel-l" data-label=`);
         }
         const rod = section(html, 'rod-fisek');
         for (const slug of ['rejstrik-osoby', 'rejstrik-rodiny', 'rejstrik-prijmeni', 'rejstrik-obce']) expect(rod).toContain(`href="#${slug}"`);

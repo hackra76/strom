@@ -119,9 +119,9 @@ function samplePreview(density: CardPresetKey | 'custom', viewWidth: number | un
 function lookSegment(name: string, label: string, options: { value: string; label: string; active: boolean }[]): string {
     const id = `card-look-${name}-label`;
     const buttons = options.map(o =>
-        `<button type="button" class="segment-btn${o.active ? ' active' : ''}" data-value="${esc(o.value)}" aria-pressed="${o.active}">${esc(o.label)}</button>`).join('');
+        `<button type="button" class="segment-btn sel-opt${o.active ? ' active' : ''}" data-sel-form="seg" data-value="${esc(o.value)}" aria-pressed="${o.active}">${esc(o.label)}</button>`).join('');
     return `<span class="card-look-label" id="${id}">${esc(label)}</span>
-        <div class="segment card-look-segment card-look-${name}" role="group" aria-labelledby="${id}">${buttons}</div>`;
+        <div class="segment sel-seg card-look-segment card-look-${name}" role="group" aria-labelledby="${id}">${buttons}</div>`;
 }
 
 /**
@@ -272,7 +272,7 @@ export const cardFieldsUiMethods = uiModule({
         const current = SettingsManager.getCardDensity();
         const tiles = CARD_DENSITIES.map(density => {
             const on = density === current;
-            return `<button type="button" class="card-type-tile${on ? ' is-selected' : ''}" role="radio" aria-checked="${on}" tabindex="${on ? 0 : -1}" data-density="${density}">
+            return `<button type="button" class="card-type-tile sel-opt${on ? ' is-selected' : ''}" data-sel-form="tile" role="radio" aria-checked="${on}" tabindex="${on ? 0 : -1}" data-density="${density}">
                 <span class="card-type-thumb" aria-hidden="true">${thumbHtml(density)}</span>
                 <span class="card-type-name">${esc(typeName(density))}</span>
             </button>`;
@@ -373,7 +373,7 @@ export const cardFieldsUiMethods = uiModule({
         const d = strings.cardDensity;
         const s = SettingsManager.getCardFields();
         const chip = (key: CardFieldKey, opt: string, label: string, pressed: boolean) =>
-            `<button type="button" class="card-field-chip" data-key="${key}" data-opt="${opt}" aria-pressed="${pressed}">${esc(label)}</button>`;
+            `<button type="button" class="card-field-chip sel-opt" data-key="${key}" data-opt="${opt}" aria-pressed="${pressed}">${esc(label)}</button>`;
         const rows = s.order.map((key, i) => {
             const on = s.on.includes(key);
             const chips = !on ? [] : [
@@ -401,9 +401,9 @@ export const cardFieldsUiMethods = uiModule({
         host.innerHTML = `
             <div class="card-fields-head">
                 <span class="settings-name">${esc(d.fieldsTitle)}</span>
-                <div class="segment card-fields-date" role="group" aria-label="${esc(d.fieldsTitle)}">
-                    <button type="button" class="segment-btn${s.fullDate ? '' : ' active'}" data-full="0" aria-pressed="${!s.fullDate}">${esc(d.yearOnly)}</button>
-                    <button type="button" class="segment-btn${s.fullDate ? ' active' : ''}" data-full="1" aria-pressed="${s.fullDate}">${esc(d.fullDate)}</button>
+                <div class="segment sel-seg card-fields-date" role="group" aria-label="${esc(d.fieldsTitle)}">
+                    <button type="button" class="segment-btn sel-opt${s.fullDate ? '' : ' active'}" data-sel-form="seg" data-full="0" aria-pressed="${!s.fullDate}">${esc(d.yearOnly)}</button>
+                    <button type="button" class="segment-btn sel-opt${s.fullDate ? ' active' : ''}" data-sel-form="seg" data-full="1" aria-pressed="${s.fullDate}">${esc(d.fullDate)}</button>
                 </div>
             </div>
             <div class="card-fields-list">${rows}</div>

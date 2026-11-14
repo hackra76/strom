@@ -17,12 +17,13 @@ import { extraParticipantRole } from '../godparents.js';
 import { strings } from '../strings.js';
 import { SettingsManager } from '../settings.js';
 import { SELECTABLE_EVENT_TYPES, orderLifeList, eventTakesParticipants, eventValueIsOnTag } from '../events.js';
-import { formatFlexDate, normalizeDateInput, formatDateForInput } from '../dates.js';
+import { formatFlexDate, normalizeDateInput, formatDateForInput, yearOf, yearFraction } from '../dates.js';
 import { chainLinkSvg, iconSvg } from '../icons.js';
 import { uiModule } from './module.js';
 import { autoGrowAll } from './autogrow.js';
 import { DETAIL_KEYS, offeredDetails, refreshDetailGroup, resetDetailGroup, renderAgeCheck, ageBirthDate, eventDetailLine } from './event-details-ui.js';
 import { shownNameOrEmpty, fitNameHtml } from '../person-name.js';
+import { sharedWith } from '../shared-events.js';
 
 /** HTML-escape a user string for safe innerHTML insertion. */
 function esc(text: string): string {
@@ -101,7 +102,22 @@ export const personEventsMethods = uiModule({
             hasBirth ? { date: person.birthDate } : null,
             hasDeath ? { date: person.deathDate } : null,
             person.events ?? []);
+        // A part at another's event (spec 085 §5) stands among the own rows by its date, undated ones last.
+        const derived = this.derivedRowsOf(this.currentId);
+        let nextDerived = 0;
+        const derivedBefore = (key: number | null): void => {
+            while (nextDerived < derived.length && (key === null || derived[nextDerived].sortKey < key)) {
+                rows.push(this.derivedRowHtml(derived[nextDerived], nextDerived, person.gender));
+                nextDerived++;
+            }
+        };
+        const keyOf = (date: string | undefined): number | null => {
+            const y = yearOf(date);
+            return y === null ? null : y + yearFraction(date);
+        };
         for (const entry of entries) {
+            const key = keyOf(entry.kind === 'birth' ? person.birthDate : entry.kind === 'death' ? person.deathDate : entry.event.date);
+            if (key !== null) derivedBefore(key);
             if (entry.kind === 'birth') {
                 rows.push(this.eventRowHtml(strings.events.types.birth,
                     eventMeta(person.birthDate, person.birthPlace), null, '',
@@ -115,9 +131,12 @@ export const personEventsMethods = uiModule({
                 rows.push(this.eventRowHtml(eventTypeLabel(event),
                     eventMeta(event.date, event.place, eventOwnSubject(event)),
                     locked ? null : event.id,
-                    this.participantsSummary(event), eventDetailLine(event), this.personFactMarkHtml(marks, `event:${event.id}`), origin(`event:${event.id}`)));
+                    this.participantsSummary(event), eventDetailLine(event), this.personFactMarkHtml(marks, `event:${event.id}`), origin(`event:${event.id}`),
+                    this.sharedLineHtml(this.currentId, event, !locked) + this.refLineHtml(event)));
             }
         }
+
+        derivedBefore(null);
 
         if (rows.length === 0) {
             container.innerHTML = `<div class="events-empty">${esc(strings.events.empty)}</div>`;
@@ -131,6 +150,8 @@ export const personEventsMethods = uiModule({
             container.querySelectorAll<HTMLElement>('.event-delete-btn[data-event-id]').forEach(btn => {
                 btn.addEventListener('click', () => { void this.deleteEvent(btn.dataset.eventId ?? ''); });
             });
+            this.bindSharedLines(container);
+            this.bindDerivedRows(container, derived);
         }
 
         // Add button visibility follows the lock state.
@@ -156,8 +177,11 @@ export const personEventsMethods = uiModule({
         }).join('  ·  ');
     },
 
-    /** `participantsHtml`: participantsSummary's HTML (escaped already); `belowHtml`: the fact's origin rows (HTML, escaped already). */
-    eventRowHtml(typeLabel: string, meta: string, eventId: string | null, participantsHtml = '', details = '', markHtml = '', belowHtml = ''): string {
+    /**
+     * `participantsHtml`: participantsSummary's HTML (escaped already); `belowHtml`: the fact's origin rows (HTML, escaped already);
+     * `sharedHtml`: the "with …" line of a shared event (sharedLineHtml), right under the date and place.
+     */
+    eventRowHtml(typeLabel: string, meta: string, eventId: string | null, participantsHtml = '', details = '', markHtml = '', belowHtml = '', sharedHtml = ''): string {
         const actions = eventId === null ? '' : `
             <div class="event-actions">
                 <button type="button" class="event-edit-btn" title="${esc(strings.events.edit)}" aria-label="${esc(strings.events.edit)}"
@@ -174,6 +198,7 @@ export const personEventsMethods = uiModule({
             <div class="event-row${eventId === null ? ' readonly' : ''}">
                 <div class="event-main">
                     <div><span class="event-type">${esc(typeLabel)}</span>${metaHtml}${markHtml}</div>
+                    ${sharedHtml}
                     ${belowHtml}
                     ${detailsHtml}
                     ${peopleHtml}
@@ -262,12 +287,19 @@ export const personEventsMethods = uiModule({
                     <input type="text" class="participant-note" value="${esc(noteShown)}"
                            placeholder="${esc(strings.events.participantNote)}"
                            aria-label="${esc(strings.events.participantNote)}">
-                    <button type="button" class="participant-btn secondary participant-link${linked ? ' linked' : ''}"
-                            title="${esc(linked ? strings.events.participantUnlink : strings.events.participantLink)}">
-                        ${chainLinkSvg({ stroke: 'currentColor', size: 11, strokeWidth: 2 })}${linked ? ` ${esc(strings.events.participantInTree)}` : ''}
-                    </button>
+                    ${linked
+                        // Linked: a chip with a menu (open the person, record the part as their own, unlink; spec 085 6b).
+                        ? `<button type="button" class="participant-btn participant-link linked" aria-haspopup="menu" aria-expanded="false"
+                            title="${esc(strings.events.participantInTree)}" aria-label="${esc(`${strings.events.participantInTree}: ${nameShown}`)}">
+                        ${chainLinkSvg({ stroke: 'currentColor', size: 11, strokeWidth: 2 })}<span class="participant-link-text">${esc(strings.events.participantInTree)}</span><span class="participant-link-caret" aria-hidden="true">▾</span>
+                    </button>`
+                        : `<button type="button" class="participant-btn secondary participant-link"
+                            title="${esc(strings.events.participantLink)}" aria-label="${esc(strings.events.participantLink)}">
+                        ${chainLinkSvg({ stroke: 'currentColor', size: 11, strokeWidth: 2 })}
+                    </button>`}
                     <button type="button" class="participant-btn secondary participant-del"
                             title="${esc(strings.events.delete)}" aria-label="${esc(strings.events.delete)}">${iconSvg('trash')}</button>
+                    ${linked ? '' : this.participantOfferHtml(i)}
                 </div>`;
         }).join('');
 
@@ -285,7 +317,10 @@ export const personEventsMethods = uiModule({
                 }
             };
             (row.querySelector('.participant-name') as HTMLInputElement).oninput = (e) => {
-                this.eventParticipants[i].name = (e.target as HTMLInputElement).value;
+                const p = this.eventParticipants[i];
+                p.name = (e.target as HTMLInputElement).value;
+                // Persons of the tree this name may be (spec 085 §6): the bar follows the typing.
+                if (!p.personId) this.refreshParticipantOffer(row, i);
             };
             (row.querySelector('.participant-note') as HTMLInputElement).oninput = (e) => {
                 const value = (e.target as HTMLInputElement).value;
@@ -293,12 +328,18 @@ export const personEventsMethods = uiModule({
                 // The file's role word stays in front ("Midwife — …"), as the research reads it.
                 p.note = extra && p.role === 'other' ? (value.trim() ? `${extra.word} — ${value}` : extra.word) : value;
             };
-            (row.querySelector('.participant-link') as HTMLButtonElement).onclick = () => this.toggleParticipantLink(i);
+            const link = row.querySelector('.participant-link') as HTMLButtonElement;
+            link.onclick = () => {
+                if (this.eventParticipants[i]?.personId) this.openParticipantChipMenu(link, i);
+                else void this.toggleParticipantLink(i);
+            };
             (row.querySelector('.participant-del') as HTMLButtonElement).onclick = () => {
                 this.eventParticipants.splice(i, 1);
                 this.renderEventParticipants();
             };
+            this.bindParticipantOffer(row, i);
         });
+        this.wireParticipantOfferDate();
 
         // An event that names someone shows the field whatever its type is —
         // re-check here, because the rows are what decides it.
@@ -354,6 +395,8 @@ export const personEventsMethods = uiModule({
                 ...(p.personId ? { personId: p.personId } : {}),
                 ...(p.name?.trim() ? { name: p.name.trim() } : {}),
                 ...(p.note?.trim() ? { note: p.note.trim() } : {}),
+                // "Not this person" stays with the name, so the offer is not made again (spec 085 §6).
+                ...(!p.personId && p.linkRejected?.length ? { linkRejected: [...p.linkRejected] } : {}),
             }))
             .filter(p => p.personId || p.name);
     },
@@ -416,6 +459,7 @@ export const personEventsMethods = uiModule({
     showAddEventModal(): void {
         if (!this.currentId) return;
         if (DataManager.isPersonLocked(this.currentId)) return;
+        this.resetRecordOwnEditor();
         this.coupleEventPartnershipId = null;
         this.setCoupleEditorMode(null);
         this.editingEventId = null;
@@ -424,6 +468,7 @@ export const personEventsMethods = uiModule({
         this.populateEventTypeSelect();
         this.setEventEditorFields('baptism', '', '', '', '');
         this.renderEventParticipants();
+        this.sharedEventInit(null);
         // Citations need a saved event id — hide the section while adding.
         const src = document.getElementById('event-sources-section');
         if (src) src.style.display = 'none';
@@ -436,6 +481,7 @@ export const personEventsMethods = uiModule({
         const person = DataManager.getPerson(this.currentId);
         const event = person?.events?.find(e => e.id === eventId);
         if (!event) return;
+        this.resetRecordOwnEditor();
         this.coupleEventPartnershipId = null;
         this.setCoupleEditorMode(null);
         this.editingEventId = eventId;
@@ -446,6 +492,7 @@ export const personEventsMethods = uiModule({
         this.setEventEditorFields(event.type, event.customLabel ?? '',
             formatDateForInput(event.date), event.place ?? '', event.note ?? '', event);
         this.renderEventParticipants();
+        this.sharedEventInit(event);
         // Citations available for an existing event — but they are a research
         // field, so the same rule as everywhere: only when asked for, unless this
         // event already cites something.
@@ -455,6 +502,8 @@ export const personEventsMethods = uiModule({
                 ? '' : 'none';
         }
         this.renderEventSourcesChips();
+        // An own record of a part at another's event: whose event it belongs to, read only (spec 085 6c).
+        this.renderRoleAtField(event.roleAt);
         this.openEventEditor(strings.events.editTitle);
     },
 
@@ -465,6 +514,7 @@ export const personEventsMethods = uiModule({
         select.innerHTML = SELECTABLE_EVENT_TYPES
             .map(t => `<option value="${t}">${esc(strings.events.types[t])}</option>`)
             .join('');
+        delete select.dataset.sharedLock;
         select.onchange = () => this.updateEventCustomLabelVisibility();
     },
 
@@ -477,6 +527,8 @@ export const personEventsMethods = uiModule({
         this.updateEventNoteLabel(select.value as LifeEventType);
         this.updateEventParticipantsVisibility(select.value as LifeEventType);
         this.updateEventDetails(select.value as LifeEventType, false);
+        // "Shared with" only for a type that can be shared (spec 085 §1).
+        if (this.sharedDraft) this.renderSharedSection();
     },
 
     /**
@@ -508,6 +560,7 @@ export const personEventsMethods = uiModule({
         const date = normalizeDateInput(val('input-event-date'));
         renderAgeCheck(document.getElementById('event-age-check'), val('input-event-age'),
             ageBirthDate(person), date || undefined);
+        this.updateSharedAgeChecks();
     },
 
     /** Offer godparents/witnesses only where a register would name them. */
@@ -590,6 +643,7 @@ export const personEventsMethods = uiModule({
             val('input-event-place'), val('input-event-note'), this.collectEventParticipants(),
             ...DETAIL_KEYS.map(k => val(`input-event-${k}`)),
             val('input-event-age-1'), val('input-event-age-2'),
+            this.sharedEditorState(),
         ]);
     },
 
@@ -619,12 +673,19 @@ export const personEventsMethods = uiModule({
         this.editingEventId = null;
         this.coupleEventPartnershipId = null;
         this.eventEditorSnapshot = null;
+        this.closeSharedMenus();
+        if (this.sharedPicker) this.closeSharedPicker();
+        this.sharedDraft = null;
+        this.resetRecordOwnEditor();
     },
 
-    /** Validate and persist the event editor, then refresh the list. */
-    saveEventFromModal(): void {
-        if (this.coupleEventPartnershipId) { this.saveCoupleEventFromModal(); return; }
-        if (!this.currentId) return;
+    /**
+     * The editor's fields as an event (only the fields set; with `editing`, an
+     * emptied field as an explicit undefined, so an update removes it). Null
+     * after telling what is wrong (an invalid date, a custom event without
+     * its name).
+     */
+    eventPayloadFromForm(editing: boolean): Omit<LifeEvent, 'id'> | null {
         const typeSelect = document.getElementById('input-event-type') as HTMLSelectElement | null;
         const labelInput = document.getElementById('input-event-custom-label') as HTMLInputElement | null;
         const dateInput = document.getElementById('input-event-date') as HTMLInputElement | null;
@@ -639,11 +700,11 @@ export const personEventsMethods = uiModule({
 
         if (date === null) {
             this.showAlert(strings.personModal.invalidDate, 'warning');
-            return;
+            return null;
         }
         if (type === 'custom' && !customLabel) {
             this.showAlert(strings.events.customLabelRequired, 'warning');
-            return;
+            return null;
         }
 
         // Only carry fields that are set (keeps stored events lean).
@@ -655,11 +716,9 @@ export const personEventsMethods = uiModule({
         for (const key of DETAIL_KEYS) {
             const v = (document.getElementById(`input-event-${key}`) as HTMLInputElement | null)?.value.trim() ?? '';
             if (v) payload[key] = v;
-            else if (this.editingEventId) payload[key] = undefined;
+            else if (editing) payload[key] = undefined;
         }
-        const participants = this.collectEventParticipants();
-
-        if (this.editingEventId) {
+        if (editing) {
             // An emptied field must reach updateLifeEvent as an explicit
             // undefined — a missing key would leave the old value in place.
             if (type !== 'custom') payload.customLabel = undefined;
@@ -670,18 +729,44 @@ export const personEventsMethods = uiModule({
             // even empty — or deleting the last participant would leave the old
             // list untouched (Object.assign never removes a key). updateLifeEvent
             // strips an empty array back out so stored events stay lean.
-            payload.participants = participants;
-            DataManager.updateLifeEvent(this.currentId, this.editingEventId, payload);
-        } else {
-            if (participants.length > 0) payload.participants = participants;
-            DataManager.addLifeEvent(this.currentId, payload);
+            payload.participants = this.collectEventParticipants();
+        }
+        return payload;
+    },
+
+    /** Validate and persist the event editor, then refresh the list. False when nothing was saved (the editor stays open). */
+    saveEventFromModal(): boolean {
+        if (this.coupleEventPartnershipId) { this.saveCoupleEventFromModal(); return true; }
+        if (!this.currentId) return false;
+        const payload = this.eventPayloadFromForm(!!this.editingEventId);
+        if (!payload) return false;
+        const participants = this.collectEventParticipants();
+        // A part at another's event recorded as an own event: roleAt and the copied citations (spec 085 §6c).
+        const recordedOwn = this.recordOwnPayload(payload);
+
+        // Shared with others (or becoming so, or no longer): one save of every copy (spec 085).
+        const shared = this.saveSharedFromModal(payload, participants);
+        if (shared === null) return false;
+        if (!shared) {
+            if (this.editingEventId) {
+                DataManager.updateLifeEvent(this.currentId, this.editingEventId, payload);
+            } else {
+                if (participants.length > 0) payload.participants = participants;
+                const owner = this.currentId;
+                // An own record's Undo toast says what was saved for whom (spec 085 6i).
+                if (recordedOwn) DataManager.runBatch(recordedOwn, () => DataManager.addLifeEvent(owner, payload));
+                else DataManager.addLifeEvent(owner, payload);
+            }
         }
 
+        const personId = this.currentId;
         this.forceCloseEventEditor();
         this.renderEventsList();
-        this.renderPersonLifeline(this.currentId);
+        this.renderPersonLifeline(personId);
         // The quick occupation/residence fields mirror the newest such event.
         this.refreshQuickFieldsFromEvents();
+        this.offerSharedUnifyAfterSave();
+        return true;
     },
 
     /** Confirm and remove an event, then refresh the list. */
@@ -695,10 +780,19 @@ export const personEventsMethods = uiModule({
         const meta = eventMeta(event.date, event.place);
         const what = `${eventTypeLabel(event)}${meta ? ` — ${meta}` : ''}`;
         const d = strings.danger;
-        const confirmed = await this.showConfirm(`${what}\n\n${d.undoHint}`, d.deleteEventTitle(eventTypeLabel(event)),
+        // A shared event goes only from this life; the others keep it (spec 085 §3).
+        const others = event.shareId ? sharedWith(DataManager.getSharedEventIndex(), this.currentId, eventId).length : 0;
+        const lines = [what, others > 0 ? strings.events.sharedDeleteSelfHint(others) : '', d.undoHint].filter(Boolean);
+        const confirmed = await this.showConfirm(`${lines[0]}\n\n${lines.slice(1).join(' ')}`, d.deleteEventTitle(eventTypeLabel(event)),
             { confirmLabel: d.deleteEvent, variant: 'danger', note: this.researchArchiveDeleteNote() });
         if (!confirmed) return;
-        DataManager.removeLifeEvent(this.currentId, eventId);
+        if (others > 0) {
+            const personId = this.currentId;
+            DataManager.runBatch(strings.events.sharedDeletedSelf(this.sharedTitleOf(event), others),
+                () => DataManager.removeFromShared(personId, eventId));
+        } else {
+            DataManager.removeLifeEvent(this.currentId, eventId);
+        }
         this.renderEventsList();
         this.renderPersonLifeline(this.currentId);
         this.refreshQuickFieldsFromEvents();

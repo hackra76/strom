@@ -31,7 +31,7 @@ export const HIST_TOUCH_MIN_H = 24;
 
 /** The places map (§1). */
 export const PERSON_PAGE_MAP_CSS = `
-.pp-map { position: relative; aspect-ratio: 2 / 1; margin: 0 0 12px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: var(--map-land); }
+.pp-map { position: relative; aspect-ratio: 2 / 1; margin: 0 0 12px; border: 1px solid var(--border); border-radius: var(--r-lg, 8px); overflow: hidden; background: var(--map-land); }
 .pp-map-in { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
 .pp-map-svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; overflow: hidden; }
 .pp-map-grid { fill: none; stroke: var(--divider); stroke-width: 0.8; vector-effect: non-scaling-stroke; }
@@ -80,6 +80,10 @@ export const PERSON_PAGE_MAP_CSS = `
 .pp-map-ilb--dn { --ty: 1px; }
 .pp-map-tools { align-items: center; }
 .pp-map-tools .pp-act { margin-top: 0; min-height: 34px; }
+.pp-map-path { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.pp-map-path-mark { font-size: 14px; }
+.pp-map-path[aria-disabled="true"] { color: var(--text-faint); cursor: not-allowed; text-decoration: none; }
+.pp-map-path-note { margin: -8px 0 12px; font-size: 12.5px; color: var(--text-light); text-align: right; }
 .pp-places { scroll-margin-top: 12px; }
 /* The kinds of places (spec 031 P2): the main map's chips, in the page's flow above the map. */
 .pp-map-kinds { display: flex; flex-wrap: wrap; gap: 2px; width: fit-content; max-width: 100%; margin: 0 0 10px; padding: 3px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
@@ -106,6 +110,9 @@ export const PERSON_PAGE_MAP_CSS = `
 .pp-map-badge--dot { width: 10px; height: 10px; margin: 6px 5px 0; }
 .pp-map-name { font-weight: 600; }
 .pp-map-ev { color: var(--text-light); }
+/* A shared event's "with …" line under the place's row (spec 085 §2g). */
+.pp-map-with { display: block; }
+.pp-map-with .shared-line { margin-top: 2px; font-size: 13px; }
 .pp-map-amb { color: var(--text-faint); font-size: 13px; }
 .pp-map-row--nopos { color: var(--text-light); }
 .pp-map-note { margin-top: 8px !important; color: var(--text-faint); font-size: 13px; }
@@ -149,6 +156,7 @@ export const PERSON_PAGE_MAP_CSS = `
   .pp-map-region.rg-d-r { left: auto; right: 16px; transform: none; }
 }
 @media (max-width: 640px) {
+  .pp-map-path-note { text-align: left; }
   .pp-map { aspect-ratio: 4 / 3; }
   .pp-map-in { left: -25%; width: 150%; }
   .lb-p-l { transform: translate(calc(-100% - var(--hw) - 5px), -50%); }

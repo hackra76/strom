@@ -64,6 +64,20 @@ export function plural(lang: Language, n: number, one: string, few: string, othe
  * "2 parents and 1 partner", "2 rodiče a 1 partner". (Intl.ListFormat is not
  * in the ES2020 lib this project targets.)
  */
+/**
+ * The Czech preposition "z" / "ze" before a number as it is spoken: "ze"
+ * before a number read with a "s", "z" or "dv" at its start (2, 7, 17,
+ * 70–79, 100–199, 700–799, and so the thousands of them), else "z"
+ * ("ze 106", "ze 7", "z 14", "z 300").
+ */
+export function csZ(n: number): string {
+    let lead = Math.floor(Math.abs(n));
+    while (lead >= 1000) lead = Math.floor(lead / 1000);
+    const ze = lead === 2 || lead === 7 || lead === 17 || (lead >= 70 && lead <= 79)
+        || (lead >= 100 && lead <= 199) || (lead >= 700 && lead <= 799);
+    return ze ? 'ze' : 'z';
+}
+
 export function joinAnd(lang: Language, parts: string[]): string {
     const items = parts.filter(Boolean);
     if (items.length <= 1) return items[0] ?? '';
@@ -135,6 +149,11 @@ function langName(ui: 'cs' | 'en' | 'de', code: string): string {
 const numCs = (n: number): string => n.toLocaleString('cs-CZ');
 const numEn = (n: number): string => n.toLocaleString('en-US');
 const numDe = (n: number): string => n.toLocaleString('de-DE');
+
+/** Ancestor counts of the map's path (spec 054): the number formatted for the language. */
+const ancEn = (n: number): string => `${numEn(n)} ${plural('en', n, 'ancestor', 'ancestors')}`;
+const ancCs = (n: number): string => `${numCs(n)} ${plural('cs', n, 'předek', 'předkové', 'předků')}`;
+const ancDe = (n: number): string => `${numDe(n)} ${plural('de', n, 'Vorfahr', 'Vorfahren')}`;
 
 /**
  * Tree overview, "Ask the family": a relative named by the path from the
@@ -254,7 +273,11 @@ const stringsEN = {
         export: 'Export',
         import: 'Import',
         newTree: 'New tree',
-        more: 'More'
+        more: 'More',
+        fullscreen: 'Full screen',
+        fullscreenExit: 'Exit full screen',
+        fullscreenIos: 'Full screen…',
+        fullscreenIosText: 'This browser does not offer web pages a full screen. Strom added to the Home Screen (Share → Add to Home Screen) opens without the browser’s bars. The app on the Home Screen has its own separate storage, though: a tree gets there by exporting it here and importing it in the app.'
     },
 
     // Empty state
@@ -320,6 +343,9 @@ const stringsEN = {
 
     // Family book
     book: {
+        // Spec 085 §2h: a shared event everyone of which is on the family's page.
+        familyTogether: 'Family together',
+        togetherYears: (n: number) => nEn(n, 'year', 'years'),
         indexSee: (a: string, b: string) => `${a} → ${b}`,
         indexMarried: (surname: string) => `married name ${surname}`,
         indexFormer: (surname: string) => `formerly ${surname}`,
@@ -851,6 +877,89 @@ const stringsEN = {
     },
 
     events: {
+        // A shared event (spec 085): one event of several persons, a copy at each (src/ui/shared-event-ui.ts).
+        sharedWith: 'Shared with',
+        sharedWithHint: 'Date, place, house, note and sources apply to everyone. Each person has their own age.',
+        sharedWithHintOwn: 'The event is part of their lives too. Date, place, note and sources apply to everyone.',
+        participantsHintOwn: 'Present as witnesses. The event is only shown in their lives.',
+        sharedAdd: 'Add a person',
+        sharedBanner: (n: number) => `Shared by ${n} people – changes apply to everyone`,
+        sharedColPerson: 'Person',
+        sharedColRole: 'Role',
+        sharedColAge: 'Age',
+        sharedRoleDefault: 'household member',
+        sharedRoleOther: 'Other role…',
+        sharedRolePlaceholder: 'Other role (lodger, servant…)',
+        sharedRoleBack: 'Back to the list of roles',
+        sharedAgeOwn: (name: string) => `only ${name}`,
+        sharedRowAge: (name: string) => `Age of ${name}`,
+        sharedRowRole: (name: string) => `Role of ${name}`,
+        sharedRowMenu: (name: string) => `More for ${name}`,
+        sharedShowMore: (n: number) => `Show ${n} more`,
+        sharedShowLess: 'Show less',
+        sharedOpenPerson: 'Open person',
+        sharedRemove: 'Remove from the event',
+        sharedRemoveHint: 'The event disappears for this person and stays for the others.',
+        sharedSeparate: 'Separate (keep an own copy)',
+        sharedSeparateHint: 'The copy stays; later changes no longer affect it.',
+        sharedSeparateSelf: 'Separate this person',
+        sharedDeleteSelf: 'Delete for this person only',
+        sharedDeleteSelfHint: (n: number) => `Stays for the other ${n}.`,
+        sharedDeleteAll: (n: number) => `Delete for all ${n} people…`,
+        sharedDeleteAllTitle: (ev: string, n: number) => `Delete ${ev} for all ${n} people?`,
+        sharedDeleteAllLead: 'The event will disappear for these people:',
+        sharedDeleteAllGo: (n: number) => `Delete for all ${n} people`,
+        undoHint: 'Can be undone with Undo.',
+        sharedTypeLocked: 'One person only',
+        sharedTypeLockedHint: (n: number) => `These types can’t be shared. First remove or separate the others in Shared with (${n}).`,
+        sharedSaved: (ev: string, n: number) => `${ev}: saved for ${n} ${plural('en', n, 'person', 'people')}.`,
+        sharedSaveRefused: 'Nothing saved: one of the persons is locked, or this type of event belongs to one person only.',
+        sharedNowN: (ev: string, n: number) => `${ev}: now shared by ${n} ${plural('en', n, 'person', 'people')}.`,
+        sharedDeletedSelf: (ev: string, n: number) => `${ev}: deleted for this person, stays for ${n} ${plural('en', n, 'other', 'others')}.`,
+        sharedDeletedAll: (ev: string, n: number) => `${ev}: deleted for ${n} ${plural('en', n, 'person', 'people')}.`,
+        sharedSeparated: (name: string) => `The copy for ${name} is now separate.`,
+        sharedOnlyOne: (ev: string, name: string) => `${ev}: now only for ${name}.`,
+        sharedLine: 'with',
+        sharedLineMore: (n: number) => `and ${n} more`,
+        sharedLineOpen: 'Open the shared event',
+        // Derived rows (spec 085 §5): a part at another's event in one's own list, "Role · type:" and the names.
+        derivedGodparent: 'Godparent · baptism:',
+        derivedGodparentF: 'Godparent · baptism:',
+        derivedWitness: 'Witness · marriage:',
+        derivedWitnessF: 'Witness · marriage:',
+        derivedOfficiant: 'Officiant · marriage:',
+        derivedMidwife: 'Midwife · baptism:',
+        derivedInformant: 'Informant · death:',
+        derivedOther: (role: string, type: string) => `${role} · ${type}:`,
+        derivedRoles: { godparent: { m: 'Godparent', f: 'Godparent' }, witness: { m: 'Witness', f: 'Witness' } },
+        /** An event type's name inside a derived row ("baptism"); German keeps its capital. */
+        derivedWord: (label: string) => label.toLowerCase(),
+        marriageWord: 'marriage',
+        derivedOpen: (type: string, names: string) => `Open ${type} (${names})`,
+        derivedMenu: 'More actions',
+        recordOwn: 'Also record as an own event',
+        recordOwnHintGodparent: 'Creates a godparent event linked to the baptism, with the same source.',
+        recordOwnHintWitness: 'Creates a wedding-witness event linked to the marriage, with the same source.',
+        recordOwnPrefilled: 'Prefilled from the baptism. Later changes to the baptism are not carried over.',
+        recordOwnPrefilledMarriage: 'Prefilled from the marriage. Later changes to the marriage are not carried over.',
+        recordOwnPrefilledEvent: (type: string) => `Prefilled from the event (${type}). Later changes to it are not carried over.`,
+        refBaptism: 'For the baptism',
+        refMarriage: 'For the marriage',
+        refEvent: 'For the event',
+        refLine: (names: string) => `for the baptism: ${names}`,
+        refLineMarriage: (names: string) => `for the marriage: ${names}`,
+        refLineOther: (type: string, names: string) => `for the ${type}: ${names}`,
+        unlink: 'Unlink',
+        recordedOwn: (type: string, name: string) => `${type}: saved for ${name}.`,
+        linkOffer: (name: string, meta: string) => `${name} (${meta}) is in the tree – link?`,
+        linkOfferMany: (n: number, name: string) => `${n} people named ${name} are in the tree – link?`,
+        link: 'Link',
+        notThisPerson: 'Not this person',
+        noneOfThem: 'None of them',
+        linked: (name: string) => `Linked: ${name}.`,
+        sharedDiffers: (name: string, fields: string) => `Copy differs: ${name} (${fields}).`,
+        sharedCompare: 'Compare',
+        sharedCellChanged: (field: string, ev: string, n: number) => `${field}: changed for ${n} ${plural('en', n, 'person', 'people')} (${ev}).`,
         occupationLabel: 'Occupation / trade',
         occupationHint: 'The trade itself — "blacksmith", not "worked in Kladno as a blacksmith". It goes out as the occupation in GEDCOM.',
         religionLabel: 'Denomination',
@@ -860,7 +969,6 @@ const stringsEN = {
         participantName: 'Name as written',
         participantNote: 'Detail (trade, "neighbour"…)',
         participantLink: 'Link to someone in the tree',
-        participantUnlink: 'Not this person',
         participantInTree: 'in the tree',
         roles: {
             godparent: 'Godparent',
@@ -909,6 +1017,8 @@ const stringsEN = {
             title: 'Title',
             nationality: 'Nationality',
             cremation: 'Cremation',
+            census: 'Census',
+            godparent: 'Godparent', weddingWitness: 'Wedding witness',
             custom: 'Custom'
         }
     },
@@ -1385,9 +1495,35 @@ const stringsEN = {
 
     // Overview minimap
     minimap: {
-        title: 'Overview minimap',
+        title: 'Minimap',
+        collapse: 'Collapse minimap',
+        expand: 'Expand minimap',
         settingLabel: 'Minimap',
         settingHint: 'Show an overview minimap for large trees',
+    },
+
+    // The tree legend folded into a chip and back
+    legend: {
+        title: 'Legend',
+        collapse: 'Collapse legend',
+        expand: 'Expand legend',
+        newMark: 'new mark',
+    },
+
+    // Children and siblings at once (the family view): the person menu's row, the focus bar's switch, the bubble over 150
+    bulk: {
+        tree: 'Children & siblings',
+        treeTip: 'Show the focus person’s children and the siblings of the focus person and of the ancestors in view',
+        treeNone: 'All children and siblings are already shown',
+        treeAria: (n: number) => `Children & siblings, ${nEn(n, 'person', 'people')} to add`,
+        menu: 'Expand children and siblings',
+        menuOff: 'Collapse children and siblings',
+        menuSub: 'the person’s children, siblings of the person and of their ancestors',
+        menuAria: (n: number) => `Expand children and siblings, ${nEn(n, 'person', 'people')} to add`,
+        bigTitle: (n: number) => `${nEn(n, 'person', 'people')} will be added`,
+        bigBody: (k: number) => `The tree will grow to about ${nEn(k, 'screen width', 'screen widths')}. The zoom stays.`,
+        go: (n: number) => `Expand +${n}`,
+        two: (m: number) => `Only 2 ancestor generations +${m}`,
     },
 
     // Titles of the name shown with it (Person.titleBefore / titleAfter)
@@ -1400,6 +1536,8 @@ const stringsEN = {
 
     // The person editor's married surname (Person.marriedSurname) and its suggestion from the husband's surname.
     person: {
+        // The delete-person confirmation: the shared events that stay with the others (spec 085 §3d).
+        deleteShared: 'Shared events stay with the others:',
         marriedSurname: 'Married surname',
         addMarriedSurname: '+ married surname',
         suggestion: (surname: string) => `Suggestion: ${surname}`,
@@ -1467,7 +1605,7 @@ const stringsEN = {
         step3: 'A new person is added here. A whole family at once (parents, partner, children) comes from the card menu: Add → Family…',
         step4: 'The focus panel shows who the tree centres on and how many generations of ancestors (↑) and descendants (↓) are visible; − and + change that.',
         step5: 'Switch views: Family, Descendants, Timeline, the ancestor Fan or the Map.',
-        step5Bar: 'Switch views: Family, Descendants and Timeline are here; the ancestor Fan and the Map are under More.',
+        step5Bar: 'Switch views: Family, Descendants and Table are here; the ancestor Fan, the Map and the Timeline are under More.',
         step6: 'Zoom in, zoom out, reset the view or fit the whole tree — the canvas can also be dragged and zoomed with the mouse wheel; the 0 key resets the view.',
         step6Touch: 'Zoom in, zoom out, reset the view or fit the whole tree — the canvas can also be dragged with a finger and pinched to zoom.',
         step7: 'Search for anyone by name, and use the funnel to filter by surname, place, birth years, gender or living status.',
@@ -3775,6 +3913,67 @@ const stringsEN = {
         researchElsewhere: (fix: string) => `This tree is linked to a research on another computer. Town and house are split there: research menu → Tree fixes → ${fix}.`,
         researchElsewhereFix: 'Streets and house numbers in fact places',
         hitKind: (kind: string) => HIT_KIND_EN[kind] ?? '',
+        // Ancestors' path to one person in Migration over time (spec 054).
+        timeModeShort: 'Over time',
+        timeTipTitle: 'Migration over time',
+        timeTipText: "Plays how the family lines moved and shows the ancestors' path to one person.",
+        timeTipTry: 'Try it',
+        timeTipLater: 'Not now',
+        pathPick: 'Path to a person…',
+        pathPickTitle: 'Path to a person',
+        pathPickPlaceholder: 'Name, surname or year',
+        pathPickRecent: 'Last focused',
+        pathPickFound: 'Found',
+        pathPickWholeTree: 'Searches the whole tree.',
+        pathPickOnMap: (n: number) => `${ancEn(n)} on the map`,
+        pathPickNone: 'ancestors have no places on the map yet',
+        pathChip: 'Path to:',
+        pathChange: 'Change person',
+        pathClear: 'Clear the path',
+        pathFromPage: "Ancestors' path on the map",
+        pathThisPerson: 'Path to this person',
+        pathBackToPage: 'Back to the person page',
+        pathGoal: (name: string) => `end: ${name}`,
+        pathGoalEnd: (name: string, year: number | undefined, kind: 'birth' | 'baptism' | 'residence') =>
+            [name, [kind === 'baptism' ? 'baptism' : kind === 'residence' ? 'residence' : '', year ?? ''].filter(v => v !== '').join(' ')]
+                .filter(Boolean).join(' · '),
+        pathTargetNoPlace: (name: string) => `${name} has no place on the map.`,
+        pathNoAncestors: 'No ancestor has a place on the map yet.',
+        pathOtherPerson: 'Choose another person',
+        linesTitle: 'Family lines',
+        linesChip: (n: number) => `Family lines (${n})`,
+        linesQuarters: 'Quarters',
+        linesEighths: 'Eighths',
+        linesCollapse: 'Collapse',
+        linesAncestors: (n: number) => ancEn(n),
+        linesRow: (rel: string, n: number) => `${rel} · ${ancEn(n)}`,
+        linesUnknown: (rel: string, _female: boolean) => `${rel} – unknown`,
+        linesOffTimeline: 'off the timeline',
+        linesTrunk: 'Trunk: parents and grandparents',
+        linesOff: 'No line colours',
+        linesImplex: (name: string, year: number | undefined, lineA: string, lineB: string) =>
+            `↻ ${name}${year != null ? ` (${year})` : ''} is in two lines: ${lineA} and ${lineB}.`,
+        linesImplexShort: '↻ in two lines',
+        linesCut: (shown: number, total: number) => `${numEn(shown)} of ${numEn(total)} lines shown`,
+        linesCutWhy: 'Closer generations and newly added lines come first.',
+        pathUndated: (n: number) => n === 1
+            ? '1 ancestor without a date or place is not on the timeline.'
+            : `${numEn(n)} ancestors without a date or place are not on the timeline.`,
+        pathUndatedList: 'List ›',
+        pathUndatedTitle: 'Ancestors not on the timeline',
+        pathUndatedPlacesNote: 'Locations of places are added in',
+        missingDate: 'no birth date',
+        missingPlace: 'no place',
+        missingBoth: 'no date or place',
+        timeMarkTitle: (surname: string, year: number) => `${surname}: earliest ancestor ${year}`,
+        lineE8: "father's father's father",
+        lineE9: "father's father's mother",
+        lineE10: "father's mother's father",
+        lineE11: "father's mother's mother",
+        lineE12: "mother's father's father",
+        lineE13: "mother's father's mother",
+        lineE14: "mother's mother's father",
+        lineE15: "mother's mother's mother",
     },
 
     fan: {
@@ -4044,7 +4243,7 @@ const stringsEN = {
         addSibling: '+ Add sibling',
         remove: 'Remove',
         witnesses: 'Wedding witnesses',
-        addWitness: '👥 Add witness',
+        addWitness: 'Add witness',
         witnessesTitle: 'Wedding witnesses',
         reassign: 'Reassign…',
         reassignHeading: 'Reassign to a different parent',
@@ -4209,10 +4408,6 @@ const stringsEN = {
         viewLinksNote: (n: number) => `View-only links (${n}) are not included`,
     },
 
-    // Focus mode
-    nav: {
-        timelineShort: 'Timeline',
-    },
     depth: {
         toggle: 'Number of generations',
     },
@@ -4664,9 +4859,28 @@ const stringsEN = {
 
     // Person picker
     personPicker: {
+        // The shared event's person picker (spec 085 §1c): the family first, a new person last.
+        family: 'Family',
+        familyAlive: (date: string) => `alive on ${date}`,
+        familyHidden: (n: number, list: string) => n === 1
+            ? `Without 1 person who was not alive on the event date: ${list}.`
+            : `Without ${n} people who were not alive on the event date: ${list}.`,
+        alreadyShared: 'already in Shared with',
+        /** A person whose own record of the same event joins on save (spec 085 K1.6 a). */
+        joinsOwnRecord: (title: string) => `already has ${title} – it will be joined`,
+        createPerson: 'Create a new person',
+        createNamed: (q: string) => `Create a new person “${q}”`,
+        noteHint: 'Anyone who doesn’t belong in the tree (lodger, servant) goes only into the event note.',
+        addN: (n: number) => `Add (${n})`,
+        createAdd: 'Create and add',
         placeholder: 'Search person...',
         noResults: 'No matching people',
-        showList: 'Show list'
+        showList: 'Show list',
+        distNone: 'no other details',
+        distChild: { f: (p: string) => `daughter of ${p}`, m: (p: string) => `son of ${p}`, u: (p: string) => `child of ${p}` },
+        distAnd: 'and',
+        distBorn: (m: string) => `born in ${m}`,
+        distLived: (m: string) => `lived in ${m}`,
     },
 
     // Errors
@@ -4782,6 +4996,8 @@ const stringsEN = {
         joinedFamilies: (n: number, prog?: string) =>
             `${n} more family ${n === 1 ? 'record' : 'records'} of the same couple (e.g. a second wedding) joined to their partnership`
             + (prog ? `; kept as written for the export “Back to ${prog}”` : ''),
+        // Another program's shared events (_SHAR) made into the app's (spec 085 7b); only when n > 0.
+        sharedConverted: (prog: string, n: number, m: number) => `Shared events from ${prog}: ${numEn(n)} converted (${nEn(m, 'person', 'people')})`,
         photos: 'Photos',
         documents: 'Documents',
         excerpts: 'Excerpts',
@@ -4839,7 +5055,6 @@ const stringsEN = {
             FACT: 'Fact',
             ALIA: 'Also known as',
         } as Record<string, string>,
-        census: 'Census',
         genericEvent: 'Event',
         altBirth: 'Birth (alternative record)',
         altDeath: 'Death (alternative record)',
@@ -4851,6 +5066,8 @@ const stringsEN = {
         remarriage: (divorced: string, married: string) => `Divorced ${divorced}, married again ${married}`,
         remarriageNoDate: (married: string) => `Divorced, married again ${married}`,
         association: (name: string, label: string) => `Association: ${name} (${label})`,
+        /** GEDCOM 7 ASSO roles the app has no role for, kept in the participant's note. */
+        assoRoles: { CHIL: 'child', FATH: 'father', FRIEND: 'friend', HUSB: 'husband', MOTH: 'mother', MULTIPLE: 'several roles', NGHBR: 'neighbour', PARENT: 'parent', SPOU: 'spouse', WIFE: 'wife' } as Record<string, string>,
         email: (value: string) => `E-mail: ${value}`,
         adoptedChild: 'adopted child',
         fosterChild: 'foster child',
@@ -4893,6 +5110,47 @@ const stringsEN = {
 
     // Validation messages
     validation: {
+        // A shared event whose copies differ (spec 085 §4)
+        groupShared: 'Shared events',
+        // Godparents and witnesses recorded by name who are probably in the tree (spec 085 §6, 6g)
+        nameLinkLead: (n: number) => n === 1
+            ? '1 godparent or witness recorded by name matches a person in the tree.'
+            : `${n} godparents and witnesses recorded by name match a person in the tree.`,
+        nameLinkReview: 'Review one by one',
+        nameLinkTitle: (n: number) => `Godparents and witnesses by name who are probably in the tree · ${n}`,
+        nameLinkHint: 'Nothing is linked automatically and the recorded name stays in the event. Once linked, the event shows in that person’s life.',
+        nameLinkBack: 'Back',
+        // The same event recorded separately at several persons (spec 085 K1.6 b)
+        sameJoinLead: (ev: string, n: number) => `${ev} – recorded separately for ${n} ${plural('en', n, 'person', 'people')}.`,
+        sameJoinSummary: (n: number) => n === 1
+            ? '1 event is recorded separately for several people.'
+            : `${n} events are recorded separately for several people.`,
+        sameJoinReview: 'Review one by one',
+        sameJoin: 'Join into one event',
+        sameJoinTitle: (n: number) => `Events recorded separately for several people · ${n}`,
+        sameJoinHint: 'Nothing is joined automatically. Once joined, it is one shared event; each person’s age and own details stay. When the common details differ, Make copies match is offered.',
+        sameJoinToShare: (n: number) => `Joins the shared event of ${n} ${plural('en', n, 'person', 'people')}.`,
+        sameJoinDone: (ev: string, n: number) => `${ev}: joined into one event for ${n} ${plural('en', n, 'person', 'people')}.`,
+        later: 'Later',
+        rejectedCount: (n: number) => `Rejected ones are not offered again (${n}).`,
+        sharedDiffersOne: (ev: string, name: string, field: string, val: string, other: string) => `${ev} · ${name}: ${field} differs (${val}; others ${other}).`,
+        sharedDiffersMany: (ev: string, n: number, fields: string) => `${ev} · ${n} copies differ: ${fields}.`,
+        unify: 'Make all match…',
+        separateCopy: 'Separate the differing copy',
+        separateCopies: (n: number) => `Separate the differing copies (${n})`,
+        openEvent: 'Open',
+        unifyTitle: (ev: string) => `Make copies match · ${ev}`,
+        unifyLead: (n: number, m: number) => `Copies for ${n} ${plural('en', n, 'person', 'people')}, ${m} differ. The valid value is picked for each field.`,
+        unifyTakeAll: 'Take everything from:',
+        unifySame: (fields: string) => `Same: ${fields}. Age, research status and verification belong to each person and are not matched.`,
+        unifyGo: (n: number) => `Make match for ${n} ${plural('en', n, 'person', 'people')}`,
+        unified: (ev: string, n: number) => `${ev}: matched for ${n} ${plural('en', n, 'person', 'people')}.`,
+        separatedCopies: (ev: string, n: number) => `${ev}: ${n} ${plural('en', n, 'copy', 'copies')} separated.`,
+        unifyEmpty: '(empty)',
+        sharedFields: {
+            type: 'type', customLabel: 'name', date: 'date', place: 'place', address: 'house', note: 'note',
+            sourceIds: 'sources', citationQuay: 'citation quality',
+        },
         parseError: 'Error reading file',
         invalidStructure: 'Invalid file structure',
         missingPersons: 'Missing people data',
@@ -4963,6 +5221,12 @@ const stringsEN = {
         switchToNewTree: 'Switch to the new tree?',
         stats: (merged: number, added: number) =>
             `${merged} merged, ${nEn(added, 'new person', 'new people')} added`,
+        /** A shared event both merged records are in (spec 085 §7). */
+        sharedOnce: 'Once – both are in it.',
+        /** A shared event one record is in while the other has the same event of its own. */
+        sharedAttach: (n: number) => `Attach to the shared event (${nEn(n, 'person', 'people')}) – the own copy matches`,
+        /** The tree merge's summary: shared events found in both trees and joined. */
+        sharedJoined: (n: number) => `Shared events: ${n} joined`,
         noItems: 'No items to display',
         newPerson: 'New',
         selectExisting: '-- Select existing person --',
@@ -5070,6 +5334,8 @@ const stringsEN = {
     // Person merge (duplicate resolution)
     personMerge: {
         title: 'Merge people',
+        /** The shared events of the merged person (spec 085 §7). */
+        sharedTitle: 'Shared events after the merge',
         keepPerson: 'Keep',
         mergeWith: 'Merge with',
         selectPerson: 'Select person to merge with...',
@@ -5266,6 +5532,9 @@ const stringsEN = {
         valRecurringGodparentDetail: (name: string, events: number, people: number, whose: string) =>
             `${name} — at ${events} events of ${people} people · ${whose}`,
         valRecurringGodparentByName: 'matched by name',
+        valSharedCopiesDiffer: 'Shared events',
+        valNameLink: 'Godparents and witnesses by name who are probably in the tree',
+        valSeparateSameEvent: 'Events recorded separately for several people',
         valOrphanedParticipantRef: 'Event participant links to a person who no longer exists',
         valOrphanedParticipantDetail: (person: string, event: string, who: string) =>
             `${person} · ${event}: ${who}`,
@@ -5383,7 +5652,7 @@ const stringsEN = {
 
     // Collaboration: send to a relative
     share: {
-        menuItem: '📩 Send to a relative',
+        menuItem: 'Send to a relative',
         menuDesc: 'One file by e-mail — they open it, add what they know, and send it back',
         passwordLabel: 'Password (optional)',
         dialogTitle: 'Send to a relative',
@@ -5936,6 +6205,61 @@ const stringsEN = {
         queueLoadMore: 'Load more',
         queueShown: (k: number, n: number) => `${k} of ${n} shown`,
         queueCapNote: (k: number, n: number) => `${k} of ${n} shown. A direction's or a branch's filter narrows the rest.`,
+        queueTitleCount: (title: string, n: number) => `${title} · ${numEn(n)}`,
+        queueSearchPh: 'Search tasks, people, archives…',
+        queueSearchAria: 'Search the queue',
+        queueSearchClear: 'Clear search',
+        queueSearchLink: 'Search the queue…',
+        queueSearchFound: (n: number) => `${numEn(n)} ${plural('en', n, 'task', 'tasks')} found`,
+        queueSearchInDir: (d: string) => `in ${d}`,
+        queueSearchNone: 'Nothing found.',
+        queueSearchNoneDir: (d: string) => `Nothing found in ${d}.`,
+        queueSearchCancel: 'Clear search',
+        queueSearchAllDirs: 'Search all directions',
+        // The search of a section of the overview (spec 083 §3); a section's name comes from its title.
+        waitingSearchPlaceholder: 'Search people, places, archives, tasks…',
+        waitingSearchAria: (section: string) => `Search ${section}`,
+        knowsSearchPlaceholder: 'Search people, conflicts, hypotheses…',
+        knowsSearchAria: (section: string) => `Search ${section}`,
+        sectionSearchFound: (n: number, total: number) => `Found ${numEn(n)} of ${numEn(total)}`,
+        sectionSearchNoneKind: (kind: string) => `Nothing found in ${kind}.`,
+        sectionSearchAllKinds: 'Search all kinds',
+        bulkSelectFound: (n: number) => `Select found with a proposal (${numEn(n)})`,
+        bulkSelectedHidden: (n: number, m: number) => `${numEn(n)} selected, ${numEn(m)} outside the search.`,
+        bulkDeselectHidden: 'Deselect outside the search',
+        /** A folded section's search in its heading: the text in the language's quotation marks. */
+        sectionSearchQuoted: (q: string) => `“${q}”`,
+        queueSearchElsewhere: (id: string, state: string) => `${id} is no longer in the queue (${state}).`,
+        queueState: { done: 'done', waiting: 'awaiting action', parked: 'postponed', dropped: 'given up' } as Record<string, string>,
+        queueSearchErr: 'Search failed; the research is not responding.',
+        queueSearchBusy: 'The research is busy; search is not available right now.',
+        queueTagDeferred: 'postponed',
+        queueNext: 'Do next',
+        queueNextHint: 'Comes up after the task in progress',
+        queueTagNext: 'next',
+        queueMoved: (id: string) => `${id} comes up next`,
+        queueBridgeErr: 'The research is not responding; the order has not changed.',
+        queueUndo: 'Undo',
+        knowsKindAll: 'All',
+        knowsKindCon: 'Conflicts',
+        knowsKindHyp: 'Hypotheses',
+        knowsKindAria: 'Kind',
+        // Work on the queue (spec 052 §5): the Queue heading's button, the Research menu's item and the dialog.
+        queueWork: 'Work on the queue…',
+        queueWorkTitle: 'Work on the queue',
+        queueWorkingLink: 'At work',
+        queueWorkAuto: 'Automatically',
+        queueWorkAutoHint: 'The agent takes one task after another as long as the subscription limit allows.',
+        queueWorkOnly: 'Only',
+        queueWorkOnlyWord: (n: number) => plural('en', n, 'task', 'tasks'),
+        queueWorkCountAria: 'Number of tasks',
+        queueWorkOnlyHint: (n: number) => `Stops after ${n} completed ${plural('en', n, 'task', 'tasks')}; a task that ends in waiting, postponing or giving up counts.`,
+        queueWorkFirst: 'First up',
+        queueWorkNoGate: 'Automatic work needs a subscription gate; the terminal offers to set one up.',
+        queueWorkConfirm: 'The research terminal confirms the start. Ctrl-C in its window or Finish and stop in Now stops the work.',
+        queueWorkOpenTerm: 'Open terminal',
+        queueWorkSession: (m: number) => `Session up to ${m < 60 ? `${m} min` : m % 60 === 0 ? `${m / 60} h` : `${Math.floor(m / 60)} h ${m % 60} min`}`,
+        queueWorkGate: (name: string) => `subscription gate: ${name}`,
         branchQueueBeyond: (n: number) => `The branch's tasks stand further on in the queue (${n}).`,
         branchNeverGroup: (n: number) => `Not researched · ${nEn(n, 'branch', 'branches')}`,
         branchAdd: (n: string) => `Add to the direction ${n}`,
@@ -8122,8 +8446,7 @@ const stringsEN = {
             othersBaptism: (y: string) => (y ? `Others at baptism ${y}` : 'Others at baptism'),
             witnesses: (y: string) => (y ? `Witnesses at marriage ${y}` : 'Witnesses at marriage'),
             others: (y: string) => (y ? `Others at marriage ${y}` : 'Others at marriage'),
-            godparentOf: { m: 'Godparent to', f: 'Godparent to', u: 'Godparent to' },
-            baptismOf: (y: string) => (y ? `baptism ${y}` : 'baptism'),
+            godparentWitness: { m: 'Godparent and witness for', f: 'Godparent and witness for', u: 'Godparent and witness for' },
             more: (n: number) => `and ${n} more`,
         },
         gal: {
@@ -8551,9 +8874,16 @@ const stringsEN = {
         warnLiving: (n: number, c: number) => `For ${nEn(n, 'living person', 'living people')}, ${nEn(c, 'citation is', 'citations are')} left out. The deceased keep their sources.`,
         keepSources: 'Keep sources',
     },
+    /** A sentence of the GEDCOM export's lead for a tree with shared events (spec 085 §7). */
+    exportHelp: {
+        sharedEvents: 'A shared event is written for each person separately, with its source, so other programs can read it. Strom joins it again on the next import.',
+    },
 
     /** The Table view (spec 073): the whole tree as rows of people or unions. */
     table: {
+        sharedCount: (n: number) => `${n} ${plural('en', n, 'person', 'people')}`,
+        agePerPerson: 'Age as recorded · per person',
+        sharedDiffers: (n: number) => `differs for ${n}`,
         rows: { persons: 'People', unions: 'Unions', events: 'Events', sources: 'Sources' },
         rowType: 'Rows',
         rowTypeNote: 'Each row type keeps its own columns, filter and sort.',
@@ -8962,6 +9292,78 @@ const stringsEN = {
         readOnly: 'Read only: edits and “Not an error” are not available here.',
         readOnlyShort: 'Read only',
     },
+    // Windows: views in satellite windows, the main window, a second tab (spec 079)
+    win: {
+        openInNewWindow: 'Open in a new window',
+        viewInNewWindow: (v: string) => `${v} in a new window`,
+        viewOnSecondScreen: (v: string) => `${v} on the second screen`,
+        segmentHint: (v: string) => `${v} · Ctrl+click: in a new window`,
+        segmentHintMac: (v: string) => `${v} · ⌘+click: in a new window`,
+        thisView: 'this view',
+        openAnother: 'Open another window',
+        otherWindows: (n: number) => nEn(n, 'more window', 'more windows'),
+        openWindows: 'Open windows',
+        bringToFront: 'Bring to front',
+        focusFailed: 'The window is open alongside – the browser didn’t bring it to the front.',
+        closeWindow: 'Close window',
+        closeAll: 'Close all',
+        blocked: 'The browser blocked the new window. Windows can be allowed in the browser settings for this site.',
+        retry: 'Try again',
+        manyWindows: (n: number) => `${n} windows open. Each extra window needs memory; with a large tree the app may slow down.`,
+        followSelection: 'Follow selection',
+        followSelectionState: (mode: string) => `Follow selection: ${mode}`,
+        followModeSwitch: 'switch',
+        followModeMark: 'mark only',
+        followModeOff: 'off',
+        followModeSwitchNote: 'A person chosen in another window becomes the centre here.',
+        followModeMarkNote: 'A person chosen in another window is only marked here.',
+        followSelectionOff: 'This window has its own selection.',
+        loading: 'Loading the tree…',
+        readOnlyLive: 'Read-only · the main window is following research',
+        goToMain: 'Go to the main window',
+        mainClosed: (t: string) => `The main window is closed · as of ${t}, read-only`,
+        openStrom: 'Open Strom',
+        makeMain: 'Make this the main window',
+        editConflict: 'The tree changed in another window meanwhile. The edit was not applied; the data is refreshed.',
+        draftKept: 'Draft kept · Enter applies, Esc discards',
+        treeGone: 'The tree no longer exists',
+        treeGoneNote: 'It was deleted in the main window.',
+        treeLocked: 'The tree is locked',
+        treeLockedNote: 'The password is entered in the main window.',
+        researchInMain: 'Research · runs in the main window',
+        researchMainOnly: 'Research · main window only',
+        alreadyOpen: 'Strom is already open in another window',
+        alreadyOpenNote: 'Only one window saves, so edits don’t overwrite each other. Other windows connect to it.',
+        switchThere: 'Switch there',
+        openAsWindow: 'Open as another window',
+        linkForwarded: 'The link opened in the main window.',
+        switchFailed: 'The browser didn’t bring the window to the front. Strom is open in another tab or browser window.',
+        tabCanClose: 'This tab can be closed.',
+        noResearch: 'This tree has no research',
+        noResearchNote: (t: string) => `The main window switched to ${t}, which has no research.`,
+        overviewInWindow: 'The research overview is in a separate window · click brings it to the front',
+        /** The overview window's heading: "Habrmans · Research overview" (no tree: the overview's name alone). */
+        overviewHead: (t: string, v: string) => (t ? `${t} · ${v}` : v),
+        /** The overview window before the main window's first state. */
+        overviewLoading: 'Loading the research overview…',
+        /** The research not running, in the overview window (after "The research is not running · "). */
+        overviewOffNote: 'showing what is in the tree',
+        restoreWindows: (n: number) => `Restore windows (${n})`,
+        restoreDismiss: 'Dismiss',
+        screen: 'Screen',
+        screenThis: 'This one',
+        screenOther: 'Second',
+        screenPermission: 'The browser will now ask for window management permission. The app needs it only to place windows on the second screen.',
+        continue: 'Continue',
+        screenDenied: 'Window management permission was denied. It can be allowed in the site settings (icon next to the address).',
+        moveToSecondScreen: 'Move to the second screen',
+        /** Satellite window title: "Table – Habrmans – Strom"; no tree: "Table – Strom". */
+        windowTitle: (v: string, t: string, app: string) => (t ? `${v} – ${t} – ${app}` : `${v} – ${app}`),
+        /** Main window title: "Habrmans – Strom"; no tree: "Strom". */
+        mainTitle: (t: string, app: string) => (t ? `${t} – ${app}` : app),
+        /** A tree switched in the main window: "Habrmans → Novaks". */
+        treeSwitched: (a: string, b: string) => `${a} → ${b}`,
+    },
 };
 
 const stringsCZ: StringsType = {
@@ -9021,7 +9423,11 @@ const stringsCZ: StringsType = {
         export: 'Export',
         import: 'Import',
         newTree: 'Nový strom',
-        more: 'Více'
+        more: 'Více',
+        fullscreen: 'Celá obrazovka',
+        fullscreenExit: 'Ukončit celou obrazovku',
+        fullscreenIos: 'Celá obrazovka…',
+        fullscreenIosText: 'Tento prohlížeč webovým stránkám celou obrazovku nenabízí. Strom přidaný na plochu (Sdílet → Přidat na plochu) se otevírá bez lišt prohlížeče. Aplikace na ploše má ale vlastní oddělené úložiště: strom se do ní dostane exportem tady a importem v aplikaci.'
     },
 
     // Empty state
@@ -9086,6 +9492,9 @@ const stringsCZ: StringsType = {
 
     // Family book
     book: {
+        // Spec 085 §2h: a shared event everyone of which is on the family's page.
+        familyTogether: 'Rodina spolu',
+        togetherYears: (n: number) => nCs(n, 'rok', 'roky', 'let'),
         indexSee: (a: string, b: string) => `${a} → ${b}`,
         indexMarried: (surname: string) => `provd. ${surname}`,
         indexFormer: (surname: string) => `dříve ${surname}`,
@@ -9612,6 +10021,86 @@ const stringsCZ: StringsType = {
     },
 
     events: {
+        sharedWith: 'Spolu s',
+        sharedWithHint: 'Datum, místo, dům, poznámka a prameny platí pro všechny. Věk má každý svůj.',
+        sharedWithHintOwn: 'Událost je i v jejich životě. Datum, místo, poznámka a prameny platí pro všechny.',
+        participantsHintOwn: 'Byli u toho jako svědci. V jejich životě se událost jen ukáže.',
+        sharedAdd: 'Přidat osobu',
+        sharedBanner: (n: number) => `Společná událost ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')} – úprava platí pro všechny`,
+        sharedColPerson: 'Osoba',
+        sharedColRole: 'Role',
+        sharedColAge: 'Věk',
+        sharedRoleDefault: 'člen domácnosti',
+        sharedRoleOther: 'Jiná role…',
+        sharedRolePlaceholder: 'Jiná role (podnájemník, čeleď…)',
+        sharedRoleBack: 'Zpět na seznam rolí',
+        sharedAgeOwn: (name: string) => `jen ${name}`,
+        sharedRowAge: (name: string) => `Věk – ${name}`,
+        sharedRowRole: (name: string) => `Role – ${name}`,
+        sharedRowMenu: (name: string) => `Další – ${name}`,
+        sharedShowMore: (n: number) => `Zobrazit další ${n}`,
+        sharedShowLess: 'Zobrazit méně',
+        sharedOpenPerson: 'Otevřít osobu',
+        sharedRemove: 'Odebrat z události',
+        sharedRemoveHint: 'Událost u této osoby zmizí, ostatním zůstane.',
+        sharedSeparate: 'Oddělit (ponechat vlastní kopii)',
+        sharedSeparateHint: 'Kopie zůstane, další úpravy se jí netýkají.',
+        sharedSeparateSelf: 'Oddělit tuto osobu',
+        sharedDeleteSelf: 'Smazat jen u této osoby',
+        sharedDeleteSelfHint: (n: number) => `U ostatních ${n} zůstane.`,
+        sharedDeleteAll: (n: number) => `Smazat u všech ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}…`,
+        sharedDeleteAllTitle: (ev: string, n: number) => `Smazat ${ev} u všech ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}?`,
+        sharedDeleteAllLead: 'Událost zmizí u těchto osob:',
+        sharedDeleteAllGo: (n: number) => `Smazat u všech ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}`,
+        undoHint: 'Jde vrátit přes Zpět.',
+        sharedTypeLocked: 'Jen pro jednu osobu',
+        sharedTypeLockedHint: (n: number) => `Tyto typy nejdou sdílet. Nejdřív ze Spolu s odebrat nebo oddělit ostatní (${n}).`,
+        sharedSaved: (ev: string, n: number) => `${ev}: uloženo u ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}.`,
+        sharedSaveRefused: 'Nic se neuložilo: některá z osob je zamčená, nebo tento typ události patří jen jedné osobě.',
+        sharedNowN: (ev: string, n: number) => `${ev}: teď u ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}.`,
+        sharedDeletedSelf: (ev: string, n: number) => `${ev}: smazáno u této osoby, u ${n} ${plural('cs', n, 'další', 'dalších', 'dalších')} zůstává.`,
+        sharedDeletedAll: (ev: string, n: number) => `${ev}: smazáno u ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}.`,
+        sharedSeparated: (name: string) => `Kopie u osoby ${name} je teď samostatná.`,
+        sharedOnlyOne: (ev: string, name: string) => `${ev}: teď jen u osoby ${name}.`,
+        sharedLine: 'spolu:',
+        sharedLineMore: (n: number) => `a další ${n}`,
+        sharedLineOpen: 'Otevřít společnou událost',
+        derivedGodparent: 'Kmotr · křest:',
+        derivedGodparentF: 'Kmotra · křest:',
+        derivedWitness: 'Svědek · sňatek:',
+        derivedWitnessF: 'Svědkyně · sňatek:',
+        derivedOfficiant: 'Oddávající · sňatek:',
+        derivedMidwife: 'Porodní bába · křest:',
+        derivedInformant: 'Oznamovatel · úmrtí:',
+        derivedOther: (role: string, type: string) => `${role} · ${type}:`,
+        derivedRoles: { godparent: { m: 'Kmotr', f: 'Kmotra' }, witness: { m: 'Svědek', f: 'Svědkyně' } },
+        derivedWord: (label: string) => label.toLowerCase(),
+        marriageWord: 'sňatek',
+        derivedOpen: (type: string, names: string) => `Otevřít ${type} (${names})`,
+        derivedMenu: 'Další akce',
+        recordOwn: 'Zapsat i jako vlastní událost',
+        recordOwnHintGodparent: 'Založí kmotrovství s odkazem na křest a se stejným pramenem.',
+        recordOwnHintWitness: 'Založí svědectví s odkazem na sňatek a se stejným pramenem.',
+        recordOwnPrefilled: 'Předvyplněno podle křtu. Pozdější změny křtu se sem nepropíšou.',
+        recordOwnPrefilledMarriage: 'Předvyplněno podle sňatku. Pozdější změny sňatku se sem nepropíšou.',
+        recordOwnPrefilledEvent: (type: string) => `Předvyplněno podle události (${type}). Pozdější změny se sem nepropíšou.`,
+        refBaptism: 'Ke křtu',
+        refMarriage: 'Ke sňatku',
+        refEvent: 'K události',
+        refLine: (names: string) => `ke křtu: ${names}`,
+        refLineMarriage: (names: string) => `ke sňatku: ${names}`,
+        refLineOther: (type: string, names: string) => `k události ${type}: ${names}`,
+        unlink: 'Zrušit propojení',
+        recordedOwn: (type: string, name: string) => `${type}: uloženo u osoby ${name}.`,
+        linkOffer: (name: string, meta: string) => `Ve stromu je ${name} (${meta}) – propojit?`,
+        linkOfferMany: (n: number, name: string) => `Ve stromu ${plural('cs', n, 'je', 'jsou', 'je')} ${n} ${plural('cs', n, 'osoba', 'osoby', 'osob')} se jménem ${name} – propojit?`,
+        link: 'Propojit',
+        notThisPerson: 'Není to tato osoba',
+        noneOfThem: 'Není to nikdo z nich',
+        linked: (name: string) => `Propojeno: ${name}.`,
+        sharedDiffers: (name: string, fields: string) => `Kopie se liší: ${name} (${fields}).`,
+        sharedCompare: 'Porovnat',
+        sharedCellChanged: (field: string, ev: string, n: number) => `${field}: změněno u ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')} (${ev}).`,
         occupationLabel: 'Povolání / řemeslo',
         occupationHint: 'Jen to řemeslo — „kovář“, ne „pracoval v Kladně jako kovář“. Odchází to jako povolání v GEDCOMu.',
         religionLabel: 'Vyznání',
@@ -9621,7 +10110,6 @@ const stringsCZ: StringsType = {
         participantName: 'Jméno, jak je zapsáno',
         participantNote: 'Bližší určení (řemeslo, „soused“…)',
         participantLink: 'Propojit s osobou ve stromu',
-        participantUnlink: 'Přece jen ne tato osoba',
         participantInTree: 've stromu',
         roles: {
             godparent: 'Kmotr / kmotra',
@@ -9669,6 +10157,8 @@ const stringsCZ: StringsType = {
             title: 'Titul',
             nationality: 'Národnost',
             cremation: 'Kremace',
+            census: 'Sčítání lidu',
+            godparent: 'Kmotrovství', weddingWitness: 'Svědek při sňatku',
             custom: 'Vlastní'
         }
     },
@@ -10112,9 +10602,34 @@ const stringsCZ: StringsType = {
 
     // Overview minimap
     minimap: {
-        title: 'Přehledová minimapa',
+        title: 'Minimapa',
+        collapse: 'Sbalit minimapu',
+        expand: 'Rozbalit minimapu',
         settingLabel: 'Minimapa',
         settingHint: 'Zobrazovat přehledovou minimapu u velkých stromů',
+    },
+
+    // The tree legend folded into a chip and back
+    legend: {
+        title: 'Legenda',
+        collapse: 'Sbalit legendu',
+        expand: 'Rozbalit legendu',
+        newMark: 'nová značka',
+    },
+
+    bulk: {
+        tree: 'Děti a sourozenci',
+        treeTip: 'Ukázat děti fokusu a sourozence fokusu i předků v pohledu',
+        treeNone: 'Všechny děti a sourozenci už jsou vidět',
+        treeAria: (n: number) => `Děti a sourozenci, přibude ${nCs(n, 'osoba', 'osoby', 'osob')}`,
+        menu: 'Rozbalit děti a sourozence',
+        menuOff: 'Sbalit děti a sourozence',
+        menuSub: 'děti osoby, sourozenci osoby a jejích předků',
+        menuAria: (n: number) => `Rozbalit děti a sourozence, přibude ${nCs(n, 'osoba', 'osoby', 'osob')}`,
+        bigTitle: (n: number) => `${plural('cs', n, 'Přibude', 'Přibudou', 'Přibude')} ${nCs(n, 'osoba', 'osoby', 'osob')}`,
+        bigBody: (k: number) => `Strom se rozšíří asi na ${nCs(k, 'šířku', 'šířky', 'šířek')} obrazovky. Přiblížení se nemění.`,
+        go: (n: number) => `Rozbalit +${n}`,
+        two: (m: number) => `Jen 2 generace předků +${m}`,
     },
 
     // Titles of the name shown with it (Person.titleBefore / titleAfter)
@@ -10127,6 +10642,7 @@ const stringsCZ: StringsType = {
 
     // Příjmení po sňatku v editoru osoby (Person.marriedSurname) a návrh z příjmení manžela.
     person: {
+        deleteShared: 'Společné události zůstanou ostatním:',
         marriedSurname: 'Příjmení po sňatku',
         addMarriedSurname: '+ příjmení po sňatku',
         suggestion: (surname: string) => `Návrh: ${surname}`,
@@ -10193,7 +10709,7 @@ const stringsCZ: StringsType = {
         step3: 'Tady se přidává nová osoba. Celou rodinu najednou (rodiče, partnera, děti) přidá nabídka karty: Přidat → Rodinu…',
         step4: 'Panel fokusu ukazuje, na koho je strom zaměřený a kolik generací předků (↑) a potomků (↓) je vidět; − a + to mění.',
         step5: 'Přepínání pohledů: Rodina, Potomci, Časová osa, Vějíř předků nebo Mapa.',
-        step5Bar: 'Přepínání pohledů: Rodina, Potomci a Časová osa jsou tady; Vějíř předků a Mapa jsou ve Více.',
+        step5Bar: 'Přepínání pohledů: Rodina, Potomci a Tabulka jsou tady; Vějíř předků, Mapa a Časová osa jsou ve Více.',
         step6: 'Přiblížit, oddálit, výchozí pohled nebo celý strom na obrazovku — plátno jde také táhnout myší a přibližovat kolečkem; klávesa 0 vrátí výchozí pohled.',
         step6Touch: 'Přiblížit, oddálit, výchozí pohled nebo celý strom na obrazovku — plátno jde také posouvat prstem a přibližovat roztažením dvou prstů.',
         step7: 'Hledání kohokoli podle jména; trychtýř filtruje podle příjmení, místa, let narození, pohlaví nebo žijící/zemřelí.',
@@ -12482,6 +12998,66 @@ const stringsCZ: StringsType = {
         researchElsewhere: (fix: string) => `Strom je spojený s výzkumem na jiném počítači. Obec a dům se rozdělí tam: menu výzkumu → Opravy stromu → ${fix}.`,
         researchElsewhereFix: 'Ulice a čísla domů v místech údajů',
         hitKind: (kind: string) => HIT_KIND_CS[kind] ?? '',
+        // Cesta předků k jedné osobě v Migraci v čase (spec 054).
+        timeModeShort: 'V čase',
+        timeTipTitle: 'Migrace v čase',
+        timeTipText: 'Přehraje, jak se rody stěhovaly, a ukáže cestu předků k jedné osobě.',
+        timeTipTry: 'Vyzkoušet',
+        timeTipLater: 'Teď ne',
+        pathPick: 'Cesta k osobě…',
+        pathPickTitle: 'Cesta k osobě',
+        pathPickPlaceholder: 'Jméno, příjmení nebo rok',
+        pathPickRecent: 'Naposledy zaměřená',
+        pathPickFound: 'Nalezeno',
+        pathPickWholeTree: 'Hledá se v celém stromu.',
+        pathPickOnMap: (n: number) => `${ancCs(n)} na mapě`,
+        pathPickNone: 'předkové zatím bez míst na mapě',
+        pathChip: 'Cesta k:',
+        pathChange: 'Změnit osobu',
+        pathClear: 'Zrušit cestu',
+        pathFromPage: 'Cesta předků na mapě',
+        pathThisPerson: 'Cesta k této osobě',
+        pathBackToPage: 'Zpět na stránku osoby',
+        pathGoal: (name: string) => `cíl: ${name}`,
+        pathGoalEnd: (name: string, year: number | undefined, kind: 'birth' | 'baptism' | 'residence') =>
+            [name, [kind === 'baptism' ? 'křest' : kind === 'residence' ? 'bydliště' : '', year ?? ''].filter(v => v !== '').join(' ')]
+                .filter(Boolean).join(' · '),
+        pathTargetNoPlace: (name: string) => `${name} nemá místo na mapě.`,
+        pathNoAncestors: 'Předkové zatím nemají místa na mapě.',
+        pathOtherPerson: 'Vybrat jinou osobu',
+        linesTitle: 'Rody',
+        linesChip: (n: number) => `Rody (${n})`,
+        linesQuarters: 'Čtvrtiny',
+        linesEighths: 'Osminy',
+        linesCollapse: 'Sbalit',
+        linesAncestors: (n: number) => ancCs(n),
+        linesRow: (rel: string, n: number) => `${rel} · ${ancCs(n)}`,
+        linesUnknown: (rel: string, female: boolean) => `${rel} – ${female ? 'neznámá' : 'neznámý'}`,
+        linesOffTimeline: 'mimo lištu',
+        linesTrunk: 'Kmen: rodiče a prarodiče',
+        linesOff: 'Bez barev rodů',
+        linesImplex: (name: string, year: number | undefined, lineA: string, lineB: string) =>
+            `↻ ${name}${year != null ? ` (${year})` : ''} je ve dvou větvích: ${lineA} a ${lineB}.`,
+        linesImplexShort: '↻ ve dvou větvích',
+        linesCut: (shown: number, total: number) => `Ukázáno ${numCs(shown)} z ${numCs(total)} čar`,
+        linesCutWhy: 'Přednost mají bližší generace a čáry, které právě přibyly.',
+        pathUndated: (n: number) => `${numCs(n)} ${plural('cs', n,
+            'předek bez data nebo místa na liště není', 'předkové bez data nebo místa na liště nejsou', 'předků bez data nebo místa na liště není')}.`,
+        pathUndatedList: 'Seznam ›',
+        pathUndatedTitle: 'Předkové mimo lištu',
+        pathUndatedPlacesNote: 'Polohy míst doplní stránka',
+        missingDate: 'bez data narození',
+        missingPlace: 'bez místa',
+        missingBoth: 'bez data a místa',
+        timeMarkTitle: (surname: string, year: number) => `${surname}: nejstarší předek ${year}`,
+        lineE8: 'otec otcova otce',
+        lineE9: 'matka otcova otce',
+        lineE10: 'otec otcovy matky',
+        lineE11: 'matka otcovy matky',
+        lineE12: 'otec matčina otce',
+        lineE13: 'matka matčina otce',
+        lineE14: 'otec matčiny matky',
+        lineE15: 'matka matčiny matky',
     },
 
     fan: {
@@ -12750,7 +13326,7 @@ const stringsCZ: StringsType = {
         addSibling: '+ Přidat sourozence',
         remove: 'Odebrat',
         witnesses: 'Svědci sňatku',
-        addWitness: '👥 Přidat svědka',
+        addWitness: 'Přidat svědka',
         witnessesTitle: 'Svědci sňatku',
         reassign: 'Přepojit…',
         reassignHeading: 'Přepojit k jinému rodiči',
@@ -12907,10 +13483,6 @@ const stringsCZ: StringsType = {
         viewLinksNote: (n: number) => `Připojení jen v zobrazení (${n}) se do výstupu nepřenášejí`,
     },
 
-    // Focus mode
-    nav: {
-        timelineShort: 'Čas. osa',
-    },
     depth: {
         toggle: 'Počet generací',
     },
@@ -13336,9 +13908,26 @@ const stringsCZ: StringsType = {
 
     // Person picker
     personPicker: {
+        family: 'Rodina',
+        familyAlive: (date: string) => `kdo k ${date} žil`,
+        familyHidden: (n: number, list: string) => n === 1
+            ? `Bez 1 osoby, která k datu události nežila: ${list}.`
+            : `Bez ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}, které k datu události nežily: ${list}.`,
+        alreadyShared: 'už je ve Spolu s',
+        joinsOwnRecord: (title: string) => `už má ${title} – připojí se`,
+        createPerson: 'Založit novou osobu',
+        createNamed: (q: string) => `Založit novou osobu „${q}“`,
+        noteHint: 'Kdo ve stromu být nemá (podnájemník, čeleď), patří jen do poznámky události.',
+        addN: (n: number) => `Přidat (${n})`,
+        createAdd: 'Založit a přidat',
         placeholder: 'Hledat osobu...',
         noResults: 'Žádné odpovídající osoby',
-        showList: 'Zobrazit seznam'
+        showList: 'Zobrazit seznam',
+        distNone: 'bez dalších údajů',
+        distChild: { f: (p: string) => `dcera: ${p}`, m: (p: string) => `syn: ${p}`, u: (p: string) => `dítě: ${p}` },
+        distAnd: 'a',
+        distBorn: (m: string) => `rodiště ${m}`,
+        distLived: (m: string) => `bydliště ${m}`,
     },
 
     // Errors
@@ -13452,6 +14041,7 @@ const stringsCZ: StringsType = {
                 'další záznamy rodiny téhož páru (např. druhý sňatek) jsou připojeny',
                 'dalších záznamů rodiny téhož páru (např. druhý sňatek) je připojeno')} k jejich vztahu`
             + (prog ? `; uchováno pro export „Zpět do ${prog}“` : ''),
+        sharedConverted: (prog: string, n: number, m: number) => `Sdílené události z ${prog}: ${numCs(n)} převedeno (${nCs(m, 'osoba', 'osoby', 'osob')})`,
         photos: 'Fotografie',
         documents: 'Dokumenty',
         excerpts: 'Výřezy',
@@ -13508,7 +14098,6 @@ const stringsCZ: StringsType = {
             FACT: 'Údaj',
             ALIA: 'Také uváděn jako',
         } as Record<string, string>,
-        census: 'Sčítání lidu',
         genericEvent: 'Událost',
         altBirth: 'Narození (alternativní záznam)',
         altDeath: 'Úmrtí (alternativní záznam)',
@@ -13520,6 +14109,7 @@ const stringsCZ: StringsType = {
         remarriage: (divorced: string, married: string) => `Rozvod ${divorced}, nový sňatek ${married}`,
         remarriageNoDate: (married: string) => `Rozvod, nový sňatek ${married}`,
         association: (name: string, label: string) => `Vztah: ${name} (${label})`,
+        assoRoles: { CHIL: 'dítě', FATH: 'otec', FRIEND: 'přítel', HUSB: 'manžel', MOTH: 'matka', MULTIPLE: 'více rolí', NGHBR: 'soused', PARENT: 'rodič', SPOU: 'manžel nebo manželka', WIFE: 'manželka' } as Record<string, string>,
         email: (value: string) => `E-mail: ${value}`,
         adoptedChild: 'osvojené dítě',
         fosterChild: 'dítě v pěstounské péči',
@@ -13570,6 +14160,45 @@ const stringsCZ: StringsType = {
 
     // Validation messages
     validation: {
+        // A shared event whose copies differ (spec 085 §4)
+        groupShared: 'Společné události',
+        // Kmotři a svědci zapsaní jménem, kteří jsou nejspíš ve stromu (spec 085 §6, 6g)
+        nameLinkLead: (n: number) => n === 1
+            ? '1 kmotr či svědek zapsaný jménem odpovídá osobě ve stromu.'
+            : `${n} ${plural('cs', n, 'kmotr', 'kmotři a svědci zapsaní jménem odpovídají', 'kmotrů a svědků zapsaných jménem odpovídá')} osobě ve stromu.`,
+        nameLinkReview: 'Projít po jednom',
+        nameLinkTitle: (n: number) => `Kmotři a svědci jménem, kteří jsou nejspíš ve stromu · ${n}`,
+        nameLinkHint: 'Nic se nepropojí samo a zapsané jméno v události zůstane. Po propojení se událost ukáže v životě té osoby.',
+        nameLinkBack: 'Zpět',
+        // Stejná událost zapsaná zvlášť u více osob (spec 085 K1.6 b)
+        sameJoinLead: (ev: string, n: number) => `${ev} – zapsáno zvlášť u ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}.`,
+        sameJoinSummary: (n: number) => `${n} ${plural('cs', n, 'událost je zapsaná', 'události jsou zapsané', 'událostí je zapsaných')} zvlášť u více osob.`,
+        sameJoinReview: 'Projít po jedné',
+        sameJoin: 'Spojit do jedné události',
+        sameJoinTitle: (n: number) => `Události zapsané zvlášť u více osob · ${n}`,
+        sameJoinHint: 'Nic se nespojí samo. Po spojení je to jedna společná událost; věk a vlastní údaje každé osoby zůstanou. Liší-li se společné údaje, nabídne se Sjednotit kopie.',
+        sameJoinToShare: (n: number) => `Připojí se ke společné události ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}.`,
+        sameJoinDone: (ev: string, n: number) => `${ev}: spojeno do jedné události u ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}.`,
+        later: 'Později',
+        rejectedCount: (n: number) => `Odmítnuté se znovu nenabízejí (${n}).`,
+        sharedDiffersOne: (ev: string, name: string, field: string, val: string, other: string) => `${ev} · ${name}: ${field} se liší (${val}, u ostatních ${other}).`,
+        sharedDiffersMany: (ev: string, n: number, fields: string) => `${ev} · ${n} ${plural('cs', n, 'kopie', 'kopie', 'kopií')} se liší: ${fields}.`,
+        unify: 'Sjednotit…',
+        separateCopy: 'Oddělit rozdílnou kopii',
+        separateCopies: (n: number) => `Oddělit rozdílné kopie (${n})`,
+        openEvent: 'Otevřít',
+        unifyTitle: (ev: string) => `Sjednotit kopie · ${ev}`,
+        unifyLead: (n: number, m: number) => `Kopie u ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}, ${m} se liší. U každého pole se vybere platná hodnota.`,
+        unifyTakeAll: 'Vzít vše podle:',
+        unifySame: (fields: string) => `Shodné: ${fields}. Věk, stav výzkumu a ověření má každá osoba svůj a nesjednocují se.`,
+        unifyGo: (n: number) => `Sjednotit u ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}`,
+        unified: (ev: string, n: number) => `${ev}: sjednoceno u ${n} ${plural('cs', n, 'osoby', 'osob', 'osob')}.`,
+        separatedCopies: (ev: string, n: number) => `${ev}: ${plural('cs', n, 'oddělena', 'odděleny', 'odděleno')} ${n} ${plural('cs', n, 'kopie', 'kopie', 'kopií')}.`,
+        unifyEmpty: '(prázdné)',
+        sharedFields: {
+            type: 'typ', customLabel: 'název', date: 'datum', place: 'místo', address: 'dům', note: 'poznámka',
+            sourceIds: 'prameny', citationQuay: 'kvalita citace',
+        },
         parseError: 'Chyba při čtení souboru',
         invalidStructure: 'Neplatná struktura souboru',
         missingPersons: 'Chybí data osob',
@@ -13640,6 +14269,9 @@ const stringsCZ: StringsType = {
         switchToNewTree: 'Přepnout na nový strom?',
         stats: (merged: number, added: number) =>
             `Sloučeno: ${nCs(merged, 'osoba', 'osoby', 'osob')}, přidáno: ${nCs(added, 'nová osoba', 'nové osoby', 'nových osob')}`,
+        sharedOnce: 'Jednou – je u obou.',
+        sharedAttach: (n: number) => `Připojit ke společné události (${nCs(n, 'osoba', 'osoby', 'osob')}) – vlastní kopie se shoduje`,
+        sharedJoined: (n: number) => `Sdílené události: ${n} spojeno`,
         noItems: 'Žádné položky k zobrazení',
         newPerson: 'Nová',
         selectExisting: '-- Vybrat existující osobu --',
@@ -13747,6 +14379,7 @@ const stringsCZ: StringsType = {
     // Person merge (duplicate resolution)
     personMerge: {
         title: 'Sloučit osoby',
+        sharedTitle: 'Sdílené události po sloučení',
         keepPerson: 'Ponechat',
         mergeWith: 'Sloučit s',
         selectPerson: 'Vybrat osobu ke sloučení...',
@@ -13942,6 +14575,9 @@ const stringsCZ: StringsType = {
         valRecurringGodparentDetail: (name: string, events: number, people: number, whose: string) =>
             `${name} — u ${events} ${plural('cs', events, 'události', 'událostí', 'událostí')} ${people} ${plural('cs', people, 'osoby', 'osob', 'osob')} · ${whose}`,
         valRecurringGodparentByName: 'shoda podle jména',
+        valSharedCopiesDiffer: 'Společné události',
+        valNameLink: 'Kmotři a svědci jménem, kteří jsou nejspíš ve stromu',
+        valSeparateSameEvent: 'Události zapsané zvlášť u více osob',
         valOrphanedParticipantRef: 'Účastník události odkazuje na osobu, která už neexistuje',
         valOrphanedParticipantDetail: (person: string, event: string, who: string) =>
             `${person} · ${event}: ${who}`,
@@ -14059,7 +14695,7 @@ const stringsCZ: StringsType = {
 
     // Collaboration: send to a relative
     share: {
-        menuItem: '📩 Poslat rodině',
+        menuItem: 'Poslat rodině',
         menuDesc: 'Jeden soubor e-mailem — k otevření, doplnění a poslání zpět',
         passwordLabel: 'Heslo (volitelné)',
         dialogTitle: 'Poslat rodině',
@@ -14609,6 +15245,60 @@ const stringsCZ: StringsType = {
         queueLoadMore: 'Načíst další',
         queueShown: (k: number, n: number) => `zobrazeno ${k} z ${n}`,
         queueCapNote: (k: number, n: number) => `Zobrazeno ${k} z ${n}. Zbytek zúží štítek linie nebo větve.`,
+        queueTitleCount: (title: string, n: number) => `${title} · ${numCs(n)}`,
+        queueSearchPh: 'Hledat úkol, osobu, archiv…',
+        queueSearchAria: 'Hledat ve frontě',
+        queueSearchClear: 'Vymazat hledání',
+        queueSearchLink: 'Hledat ve frontě…',
+        queueSearchFound: (n: number) => `${plural('cs', n, 'Nalezen', 'Nalezeny', 'Nalezeno')} ${numCs(n)} ${plural('cs', n, 'úkol', 'úkoly', 'úkolů')}`,
+        queueSearchInDir: (d: string) => `v linii ${d}`,
+        queueSearchNone: 'Nic nenalezeno.',
+        queueSearchNoneDir: (d: string) => `V linii ${d} nic nenalezeno.`,
+        queueSearchCancel: 'Zrušit hledání',
+        queueSearchAllDirs: 'Hledat ve všech liniích',
+        // The search of a section of the overview (spec 083 §3); a section's name comes from its title.
+        waitingSearchPlaceholder: 'Hledat osobu, místo, archiv, úkol…',
+        waitingSearchAria: (section: string) => `Hledat v ${section}`,
+        knowsSearchPlaceholder: 'Hledat osobu, rozpor, hypotézu…',
+        knowsSearchAria: (section: string) => `Hledat v ${section}`,
+        sectionSearchFound: (n: number, total: number) => `Nalezeno ${numCs(n)} ${csZ(total)} ${numCs(total)}`,
+        sectionSearchNoneKind: (kind: string) => `V druhu ${kind} nic nenalezeno.`,
+        sectionSearchAllKinds: 'Hledat ve všech druzích',
+        bulkSelectFound: (n: number) => `Vybrat nalezené s návrhem (${numCs(n)})`,
+        bulkSelectedHidden: (n: number, m: number) => `Vybráno ${numCs(n)}, z toho ${numCs(m)} mimo hledání.`,
+        bulkDeselectHidden: 'Odznačit mimo hledání',
+        sectionSearchQuoted: (q: string) => `„${q}“`,
+        queueSearchElsewhere: (id: string, state: string) => `${id} už ve frontě není (${state}).`,
+        queueState: { done: 'hotovo', waiting: 'čeká na vyřízení', parked: 'odloženo', dropped: 'vzdáno' } as Record<string, string>,
+        queueSearchErr: 'Hledání se nepovedlo, výzkum neodpovídá.',
+        queueSearchBusy: 'Výzkum je zaneprázdněný, hledat teď nejde.',
+        queueTagDeferred: 'odloženo',
+        queueNext: 'Udělat jako další',
+        queueNextHint: 'Přijde na řadu po rozdělaném úkolu',
+        queueTagNext: 'jako další',
+        queueMoved: (id: string) => `${id} jako další`,
+        queueBridgeErr: 'Výzkum neodpovídá, pořadí se nezměnilo.',
+        queueUndo: 'Vrátit',
+        knowsKindAll: 'Vše',
+        knowsKindCon: 'Rozpory',
+        knowsKindHyp: 'Hypotézy',
+        knowsKindAria: 'Druh',
+        // Pracovat na frontě (spec 052 §5).
+        queueWork: 'Pracovat na frontě…',
+        queueWorkTitle: 'Pracovat na frontě',
+        queueWorkingLink: 'Pracuje se',
+        queueWorkAuto: 'Automaticky',
+        queueWorkAutoHint: 'Agent bere úkol za úkolem, dokud to dovolí limit předplatného.',
+        queueWorkOnly: 'Jen',
+        queueWorkOnlyWord: (n: number) => plural('cs', n, 'úkol', 'úkoly', 'úkolů'),
+        queueWorkCountAria: 'Počet úkolů',
+        queueWorkOnlyHint: (n: number) => `Skončí po ${n} ${n === 1 ? 'vyřízeném úkolu' : 'vyřízených úkolech'}; úkol, který skončí čekáním, odložením nebo vzdáním, se počítá.`,
+        queueWorkFirst: 'Jako první přijde',
+        queueWorkNoGate: 'Automatická práce potřebuje nastavenou bránu předplatného; terminál nabídne nastavení.',
+        queueWorkConfirm: 'Spuštění potvrdí terminál výzkumu. Práci zastaví Ctrl-C v jeho okně nebo Dokončit a skončit v oddílu Teď.',
+        queueWorkOpenTerm: 'Otevřít terminál',
+        queueWorkSession: (m: number) => `Sezení nejvýš ${m < 60 ? `${m} min` : m % 60 === 0 ? `${m / 60} h` : `${Math.floor(m / 60)} h ${m % 60} min`}`,
+        queueWorkGate: (name: string) => `brána předplatného: ${name}`,
         branchQueueBeyond: (n: number) => `Úkoly větve stojí ve frontě dál (${n}).`,
         branchNeverGroup: (n: number) => `Nezkoumá se · ${nCs(n, 'větev', 'větve', 'větví')}`,
         branchAdd: (n: string) => `Přidat k linii ${n}`,
@@ -16768,8 +17458,7 @@ const stringsCZ: StringsType = {
             othersBaptism: (y: string) => (y ? `Další při křtu ${y}` : 'Další při křtu'),
             witnesses: (y: string) => (y ? `Svědci při sňatku ${y}` : 'Svědci při sňatku'),
             others: (y: string) => (y ? `Další při sňatku ${y}` : 'Další při sňatku'),
-            godparentOf: { m: 'Byl kmotrem', f: 'Byla kmotrou', u: 'Kmotr/a' },
-            baptismOf: (y: string) => (y ? `křest ${y}` : 'křest'),
+            godparentWitness: { m: 'Kmotr a svědek u', f: 'Kmotra a svědkyně u', u: 'Kmotr a svědek u' },
             more: (n: number) => `a další (${n})`,
         },
         gal: {
@@ -17190,8 +17879,14 @@ const stringsCZ: StringsType = {
         warnLiving: (n: number, c: number) => `U ${nCs(n, 'žijící osoby', 'žijících osob', 'žijících osob')} ${plural('cs', c, 'se vynechá', 'se vynechají', 'se vynechá')} ${nCs(c, 'citace', 'citace', 'citací')}. Zemřelým prameny zůstanou.`,
         keepSources: 'Ponechat prameny',
     },
+    exportHelp: {
+        sharedEvents: 'Společná událost jde do souboru u každé osoby zvlášť i s pramenem, jiné programy ji tak přečtou. Strom ji při dalším importu zase spojí.',
+    },
 
     table: {
+        sharedCount: (n: number) => `${n} ${plural('cs', n, 'osoba', 'osoby', 'osob')}`,
+        agePerPerson: 'Věk podle zápisu · každý svůj',
+        sharedDiffers: (n: number) => `liší se u ${n}`,
         rows: { persons: 'Osoby', unions: 'Svazky', events: 'Události', sources: 'Prameny' },
         rowType: 'Řádky',
         rowTypeNote: 'Každý typ řádků má vlastní sloupce, filtr a řazení.',
@@ -17600,6 +18295,75 @@ const stringsCZ: StringsType = {
         readOnly: 'Jen ke čtení: úpravy a „Není chyba“ tu nejsou.',
         readOnlyShort: 'Jen ke čtení',
     },
+    // Windows: views in satellite windows, the main window, a second tab (spec 079)
+    win: {
+        openInNewWindow: 'Otevřít v novém okně',
+        viewInNewWindow: (v: string) => `${v} v novém okně`,
+        viewOnSecondScreen: (v: string) => `${v} na druhé obrazovce`,
+        segmentHint: (v: string) => `${v} · Ctrl+klik: v novém okně`,
+        segmentHintMac: (v: string) => `${v} · ⌘+klik: v novém okně`,
+        thisView: 'tento pohled',
+        openAnother: 'Otevřít další okno',
+        otherWindows: (n: number) => nCs(n, 'další okno', 'další okna', 'dalších oken'),
+        openWindows: 'Otevřená okna',
+        bringToFront: 'Přenést do popředí',
+        focusFailed: 'Okno je otevřené vedle – prohlížeč ho nepřenesl do popředí.',
+        closeWindow: 'Zavřít okno',
+        closeAll: 'Zavřít vše',
+        blocked: 'Prohlížeč nové okno zablokoval. Okna lze povolit v nastavení prohlížeče u této stránky.',
+        retry: 'Zkusit znovu',
+        manyWindows: (n: number) => `Otevřeno ${n} oken. Každé další okno potřebuje paměť; u velkého stromu může aplikace zpomalit.`,
+        followSelection: 'Sledovat výběr',
+        followSelectionState: (mode: string) => `Sledovat výběr: ${mode}`,
+        followModeSwitch: 'přepnout',
+        followModeMark: 'jen vyznačit',
+        followModeOff: 'vypnuto',
+        followModeSwitchNote: 'Osoba vybraná v jiném okně se tu stane středem.',
+        followModeMarkNote: 'Osoba vybraná v jiném okně se tu jen vyznačí.',
+        followSelectionOff: 'Okno má vlastní výběr osoby.',
+        loading: 'Načítá se strom…',
+        readOnlyLive: 'Jen ke čtení · hlavní okno sleduje výzkum',
+        goToMain: 'Přejít do hlavního okna',
+        mainClosed: (t: string) => `Hlavní okno je zavřené · stav k ${t}, jen ke čtení`,
+        openStrom: 'Otevřít Strom',
+        makeMain: 'Udělat hlavním',
+        editConflict: 'Strom se mezitím změnil v jiném okně. Úprava se nepoužila, data jsou obnovená.',
+        draftKept: 'Rozepsané zůstalo · Enter použije, Esc zahodí',
+        treeGone: 'Strom už neexistuje',
+        treeGoneNote: 'V hlavním okně byl smazán.',
+        treeLocked: 'Strom je zamčený',
+        treeLockedNote: 'Heslo se zadává v hlavním okně.',
+        researchInMain: 'Výzkum · provede hlavní okno',
+        researchMainOnly: 'Výzkum · jen s hlavním oknem',
+        alreadyOpen: 'Strom už je otevřený v jiném okně',
+        alreadyOpenNote: 'Ukládá jen jedno okno, aby se úpravy navzájem nepřepisovaly. Další okna se k němu připojí.',
+        switchThere: 'Přepnout tam',
+        openAsWindow: 'Otevřít jako další okno',
+        linkForwarded: 'Odkaz se otevřel v hlavním okně.',
+        switchFailed: 'Prohlížeč okno nepřenesl do popředí. Strom je otevřený v jiné kartě nebo okně prohlížeče.',
+        tabCanClose: 'Tuto kartu lze zavřít.',
+        noResearch: 'Strom nemá výzkum',
+        noResearchNote: (t: string) => `Hlavní okno přepnulo na strom ${t}, který výzkum nemá.`,
+        overviewInWindow: 'Přehled výzkumu je v samostatném okně · klik ho přenese do popředí',
+        overviewHead: (t: string, v: string) => (t ? `${t} · ${v}` : v),
+        overviewLoading: 'Načítá se přehled výzkumu…',
+        overviewOffNote: 'ukazuje se, co je ve stromu',
+        restoreWindows: (n: number) => `Obnovit okna (${n})`,
+        restoreDismiss: 'Nenabízet',
+        screen: 'Obrazovka',
+        screenThis: 'Tato',
+        screenOther: 'Druhá',
+        screenPermission: 'Prohlížeč se teď zeptá na oprávnění ke správě oken. Aplikace ho potřebuje jen k umístění okna na druhou obrazovku.',
+        continue: 'Pokračovat',
+        screenDenied: 'Oprávnění ke správě oken je odmítnuté. Lze ho povolit v nastavení stránky (ikona vedle adresy).',
+        moveToSecondScreen: 'Přesunout na druhou obrazovku',
+        /** Satellite window title: "Table – Habrmans – Strom"; no tree: "Table – Strom". */
+        windowTitle: (v: string, t: string, app: string) => (t ? `${v} – ${t} – ${app}` : `${v} – ${app}`),
+        /** Main window title: "Habrmans – Strom"; no tree: "Strom". */
+        mainTitle: (t: string, app: string) => (t ? `${t} – ${app}` : app),
+        /** A tree switched in the main window: "Habrmans → Novaks". */
+        treeSwitched: (a: string, b: string) => `${a} → ${b}`,
+    },
 };
 
 const stringsDE: StringsType = {
@@ -17655,7 +18419,11 @@ const stringsDE: StringsType = {
         export: 'Export',
         import: 'Import',
         newTree: 'Neuer Stammbaum',
-        more: 'Mehr'
+        more: 'Mehr',
+        fullscreen: 'Vollbild',
+        fullscreenExit: 'Vollbild beenden',
+        fullscreenIos: 'Vollbild…',
+        fullscreenIosText: 'Dieser Browser bietet Webseiten kein Vollbild an. Strom auf dem Home-Bildschirm (Teilen → Zum Home-Bildschirm) öffnet sich ohne die Leisten des Browsers. Die App dort hat aber einen eigenen, getrennten Speicher: Ein Stammbaum kommt hinein, indem er hier exportiert und in der App importiert wird.'
     },
 
     // Empty state
@@ -17720,6 +18488,9 @@ const stringsDE: StringsType = {
 
     // Family book
     book: {
+        // Spec 085 §2h: a shared event everyone of which is on the family's page.
+        familyTogether: 'Familie gemeinsam',
+        togetherYears: (n: number) => nDe(n, 'Jahr', 'Jahre'),
         indexSee: (a: string, b: string) => `${a} → ${b}`,
         indexMarried: (surname: string) => `verh. ${surname}`,
         indexFormer: (surname: string) => `früher ${surname}`,
@@ -18236,6 +19007,86 @@ const stringsDE: StringsType = {
     },
 
     events: {
+        sharedWith: 'Gemeinsam mit',
+        sharedWithHint: 'Datum, Ort, Haus, Notiz und Quellen gelten für alle. Das Alter hat jede Person für sich.',
+        sharedWithHintOwn: 'Das Ereignis steht auch in ihrem Leben. Datum, Ort, Notiz und Quellen gelten für alle.',
+        participantsHintOwn: 'Waren als Zeugen dabei. In ihrem Leben wird das Ereignis nur angezeigt.',
+        sharedAdd: 'Person hinzufügen',
+        sharedBanner: (n: number) => `Gemeinsames Ereignis von ${n} ${plural('de', n, 'Person', 'Personen')} – Änderungen gelten für alle`,
+        sharedColPerson: 'Person',
+        sharedColRole: 'Rolle',
+        sharedColAge: 'Alter',
+        sharedRoleDefault: 'Haushaltsmitglied',
+        sharedRoleOther: 'Andere Rolle…',
+        sharedRolePlaceholder: 'Andere Rolle (Untermieter, Gesinde…)',
+        sharedRoleBack: 'Zurück zur Liste der Rollen',
+        sharedAgeOwn: (name: string) => `nur ${name}`,
+        sharedRowAge: (name: string) => `Alter – ${name}`,
+        sharedRowRole: (name: string) => `Rolle – ${name}`,
+        sharedRowMenu: (name: string) => `Mehr – ${name}`,
+        sharedShowMore: (n: number) => `${n} weitere anzeigen`,
+        sharedShowLess: 'Weniger anzeigen',
+        sharedOpenPerson: 'Person öffnen',
+        sharedRemove: 'Aus dem Ereignis entfernen',
+        sharedRemoveHint: 'Bei dieser Person verschwindet das Ereignis, bei den anderen bleibt es.',
+        sharedSeparate: 'Abtrennen (eigene Kopie behalten)',
+        sharedSeparateHint: 'Die Kopie bleibt, weitere Änderungen betreffen sie nicht.',
+        sharedSeparateSelf: 'Diese Person abtrennen',
+        sharedDeleteSelf: 'Nur bei dieser Person löschen',
+        sharedDeleteSelfHint: (n: number) => `Bei den anderen ${n} bleibt es.`,
+        sharedDeleteAll: (n: number) => `Bei allen ${n} ${plural('de', n, 'Person', 'Personen')} löschen…`,
+        sharedDeleteAllTitle: (ev: string, n: number) => `${ev} bei allen ${n} ${plural('de', n, 'Person', 'Personen')} löschen?`,
+        sharedDeleteAllLead: 'Das Ereignis verschwindet bei diesen Personen:',
+        sharedDeleteAllGo: (n: number) => `Bei allen ${n} ${plural('de', n, 'Person', 'Personen')} löschen`,
+        undoHint: 'Lässt sich mit Rückgängig zurücknehmen.',
+        sharedTypeLocked: 'Nur für eine Person',
+        sharedTypeLockedHint: (n: number) => `Diese Arten lassen sich nicht teilen. Zuerst die anderen aus „Gemeinsam mit“ entfernen oder abtrennen (${n}).`,
+        sharedSaved: (ev: string, n: number) => `${ev}: bei ${n} ${plural('de', n, 'Person', 'Personen')} gespeichert.`,
+        sharedSaveRefused: 'Nichts gespeichert: Eine der Personen ist gesperrt, oder diese Ereignisart gehört nur zu einer Person.',
+        sharedNowN: (ev: string, n: number) => `${ev}: jetzt bei ${n} ${plural('de', n, 'Person', 'Personen')}.`,
+        sharedDeletedSelf: (ev: string, n: number) => `${ev}: bei dieser Person gelöscht, bei ${n} ${plural('de', n, 'weiteren', 'weiteren')} bleibt es.`,
+        sharedDeletedAll: (ev: string, n: number) => `${ev}: bei ${n} ${plural('de', n, 'Person', 'Personen')} gelöscht.`,
+        sharedSeparated: (name: string) => `Die Kopie bei ${name} ist jetzt eigenständig.`,
+        sharedOnlyOne: (ev: string, name: string) => `${ev}: jetzt nur bei ${name}.`,
+        sharedLine: 'mit',
+        sharedLineMore: (n: number) => `und ${n} weitere`,
+        sharedLineOpen: 'Gemeinsames Ereignis öffnen',
+        derivedGodparent: 'Pate · Taufe:',
+        derivedGodparentF: 'Patin · Taufe:',
+        derivedWitness: 'Trauzeuge · Heirat:',
+        derivedWitnessF: 'Trauzeugin · Heirat:',
+        derivedOfficiant: 'Trauender · Heirat:',
+        derivedMidwife: 'Hebamme · Taufe:',
+        derivedInformant: 'Anzeigender · Tod:',
+        derivedOther: (role: string, type: string) => `${role} · ${type}:`,
+        derivedRoles: { godparent: { m: 'Pate', f: 'Patin' }, witness: { m: 'Zeuge', f: 'Zeugin' } },
+        derivedWord: (label: string) => label,
+        marriageWord: 'Heirat',
+        derivedOpen: (type: string, names: string) => `${type} öffnen (${names})`,
+        derivedMenu: 'Weitere Aktionen',
+        recordOwn: 'Auch als eigenes Ereignis eintragen',
+        recordOwnHintGodparent: 'Legt eine Patenschaft mit Verweis auf die Taufe und derselben Quelle an.',
+        recordOwnHintWitness: 'Legt eine Trauzeugenschaft mit Verweis auf die Heirat und derselben Quelle an.',
+        recordOwnPrefilled: 'Nach der Taufe vorausgefüllt. Spätere Änderungen der Taufe werden nicht übernommen.',
+        recordOwnPrefilledMarriage: 'Nach der Heirat vorausgefüllt. Spätere Änderungen der Heirat werden nicht übernommen.',
+        recordOwnPrefilledEvent: (type: string) => `Nach dem Ereignis (${type}) vorausgefüllt. Spätere Änderungen werden nicht übernommen.`,
+        refBaptism: 'Zur Taufe',
+        refMarriage: 'Zur Heirat',
+        refEvent: 'Zum Ereignis',
+        refLine: (names: string) => `zur Taufe: ${names}`,
+        refLineMarriage: (names: string) => `zur Heirat: ${names}`,
+        refLineOther: (type: string, names: string) => `zum Ereignis ${type}: ${names}`,
+        unlink: 'Verknüpfung lösen',
+        recordedOwn: (type: string, name: string) => `${type}: bei ${name} gespeichert.`,
+        linkOffer: (name: string, meta: string) => `${name} (${meta}) ist im Stammbaum – verknüpfen?`,
+        linkOfferMany: (n: number, name: string) => `${n} Personen namens ${name} sind im Stammbaum – verknüpfen?`,
+        link: 'Verknüpfen',
+        notThisPerson: 'Nicht diese Person',
+        noneOfThem: 'Keine von ihnen',
+        linked: (name: string) => `Verknüpft: ${name}.`,
+        sharedDiffers: (name: string, fields: string) => `Kopie weicht ab: ${name} (${fields}).`,
+        sharedCompare: 'Vergleichen',
+        sharedCellChanged: (field: string, ev: string, n: number) => `${field}: bei ${n} ${plural('de', n, 'Person', 'Personen')} geändert (${ev}).`,
         occupationLabel: 'Beruf / Gewerbe',
         occupationHint: 'Nur das Gewerbe selbst — „Schmied“, nicht „arbeitete in Kladno als Schmied“. Es wird als Beruf in GEDCOM ausgegeben.',
         religionLabel: 'Konfession',
@@ -18245,7 +19096,6 @@ const stringsDE: StringsType = {
         participantName: 'Name wie geschrieben',
         participantNote: 'Detail (Gewerbe, „Nachbar“…)',
         participantLink: 'Mit jemandem im Stammbaum verknüpfen',
-        participantUnlink: 'Nicht diese Person',
         participantInTree: 'im Stammbaum',
         roles: {
             godparent: 'Pate/Patin',
@@ -18293,6 +19143,8 @@ const stringsDE: StringsType = {
             title: 'Titel',
             nationality: 'Staatsangehörigkeit',
             cremation: 'Einäscherung',
+            census: 'Volkszählung',
+            godparent: 'Patenschaft', weddingWitness: 'Trauzeuge',
             custom: 'Eigenes'
         }
     },
@@ -18738,9 +19590,34 @@ const stringsDE: StringsType = {
 
     // Overview minimap
     minimap: {
-        title: 'Übersichts-Minikarte',
+        title: 'Minikarte',
+        collapse: 'Minikarte einklappen',
+        expand: 'Minikarte ausklappen',
         settingLabel: 'Minikarte',
         settingHint: 'Eine Übersichts-Minikarte für große Stammbäume anzeigen',
+    },
+
+    // The tree legend folded into a chip and back
+    legend: {
+        title: 'Legende',
+        collapse: 'Legende einklappen',
+        expand: 'Legende ausklappen',
+        newMark: 'neues Zeichen',
+    },
+
+    bulk: {
+        tree: 'Kinder & Geschwister',
+        treeTip: 'Kinder des Fokus sowie Geschwister des Fokus und der Vorfahren in der Ansicht zeigen',
+        treeNone: 'Alle Kinder und Geschwister sind schon sichtbar',
+        treeAria: (n: number) => `Kinder & Geschwister, ${nDe(n, 'Person kommt', 'Personen kommen')} hinzu`,
+        menu: 'Kinder und Geschwister aufklappen',
+        menuOff: 'Kinder und Geschwister zuklappen',
+        menuSub: 'Kinder der Person, Geschwister der Person und ihrer Vorfahren',
+        menuAria: (n: number) => `Kinder und Geschwister aufklappen, ${nDe(n, 'Person kommt', 'Personen kommen')} hinzu`,
+        bigTitle: (n: number) => `${nDe(n, 'Person kommt', 'Personen kommen')} hinzu`,
+        bigBody: (k: number) => `Der Baum wird etwa ${nDe(k, 'Bildschirmbreite', 'Bildschirmbreiten')} breit. Der Zoom bleibt.`,
+        go: (n: number) => `Aufklappen +${n}`,
+        two: (m: number) => `Nur 2 Vorfahrengenerationen +${m}`,
     },
 
     // Titles of the name shown with it (Person.titleBefore / titleAfter)
@@ -18753,6 +19630,7 @@ const stringsDE: StringsType = {
 
     // Der Ehename im Personeneditor (Person.marriedSurname) und sein Vorschlag aus dem Nachnamen des Ehemanns.
     person: {
+        deleteShared: 'Gemeinsame Ereignisse bleiben bei den anderen:',
         marriedSurname: 'Ehename',
         addMarriedSurname: '+ Ehename',
         suggestion: (surname: string) => `Vorschlag: ${surname}`,
@@ -18819,7 +19697,7 @@ const stringsDE: StringsType = {
         step3: 'Hier kommt eine neue Person hinzu. Eine ganze Familie auf einmal (Eltern, Partner, Kinder) fügt das Kartenmenü hinzu: Hinzufügen → Familie…',
         step4: 'Das Fokus-Panel zeigt, auf wen der Stammbaum zentriert ist und wie viele Generationen an Vorfahren (↑) und Nachkommen (↓) sichtbar sind; − und + ändern das.',
         step5: 'Ansichten wechseln: Familie, Nachkommen, Zeitleiste, der Ahnen-Fächer oder die Karte.',
-        step5Bar: 'Ansichten wechseln: Familie, Nachkommen und Zeitleiste sind hier; der Ahnen-Fächer und die Karte stehen unter Mehr.',
+        step5Bar: 'Ansichten wechseln: Familie, Nachkommen und Tabelle sind hier; der Ahnen-Fächer, die Karte und die Zeitleiste stehen unter Mehr.',
         step6: 'Vergrößern, verkleinern, Ansicht zurücksetzen oder den ganzen Stammbaum einpassen — die Arbeitsfläche lässt sich auch mit der Maus ziehen und mit dem Mausrad zoomen; die Taste 0 setzt die Ansicht zurück.',
         step6Touch: 'Vergrößern, verkleinern, Ansicht zurücksetzen oder den ganzen Stammbaum einpassen — die Arbeitsfläche lässt sich auch mit dem Finger verschieben und mit zwei Fingern zoomen.',
         step7: 'Jemanden nach Namen suchen und mit dem Trichter nach Nachname, Ort, Geburtsjahren, Geschlecht oder Lebendstatus filtern.',
@@ -21022,8 +21900,8 @@ const stringsDE: StringsType = {
         tilesNotice: 'Der Kartenhintergrund stammt von openstreetmap.org — beim Laden erfährt dieser Server, welcher Bereich gerade angezeigt wird, mehr nicht. Die Familiendaten bleiben in der App.',
         tilesNoticeOk: 'Karte anzeigen',
         tilesBlocked: 'Der Kartenhintergrund ist nicht verfügbar: Der Kachelserver von OpenStreetMap hat ihn abgelehnt. Die Orte werden weiter angezeigt.',
-        timeMode: 'Wanderung über die Zeit',
-        timeModeEmpty: 'Mit Daten (Geburt, Tod, Ereignisse) lässt sich die Wanderung der Familie über die Zeit verfolgen.',
+        timeMode: 'Migration im Zeitverlauf',
+        timeModeEmpty: 'Mit Daten (Geburt, Tod, Ereignisse) lässt sich die Migration der Familie im Zeitverlauf verfolgen.',
         timePlay: 'Abspielen',
         timePause: 'Pause',
         timeYear: 'Jahr',
@@ -21098,6 +21976,67 @@ const stringsDE: StringsType = {
         researchElsewhere: (fix: string) => `Dieser Stammbaum ist mit einer Forschung auf einem anderen Computer verbunden. Ort und Haus werden dort aufgeteilt: Forschungsmenü → Baumkorrekturen → ${fix}.`,
         researchElsewhereFix: 'Straßen und Hausnummern in Ortsangaben',
         hitKind: (kind: string) => HIT_KIND_DE[kind] ?? '',
+        // Weg der Vorfahren zu einer Person in der Migration im Zeitverlauf (spec 054).
+        timeModeShort: 'Zeitverlauf',
+        timeTipTitle: 'Migration im Zeitverlauf',
+        timeTipText: 'Spielt ab, wie die Linien umzogen, und zeigt den Weg der Vorfahren zu einer Person.',
+        timeTipTry: 'Ausprobieren',
+        timeTipLater: 'Nicht jetzt',
+        pathPick: 'Weg zu einer Person…',
+        pathPickTitle: 'Weg zu einer Person',
+        pathPickPlaceholder: 'Name, Nachname oder Jahr',
+        pathPickRecent: 'Zuletzt fokussiert',
+        pathPickFound: 'Gefunden',
+        pathPickWholeTree: 'Gesucht wird im ganzen Stammbaum.',
+        pathPickOnMap: (n: number) => `${ancDe(n)} auf der Karte`,
+        pathPickNone: 'Vorfahren noch ohne Orte auf der Karte',
+        pathChip: 'Weg zu:',
+        pathChange: 'Person ändern',
+        pathClear: 'Weg aufheben',
+        pathFromPage: 'Weg der Vorfahren auf der Karte',
+        pathThisPerson: 'Weg zu dieser Person',
+        pathBackToPage: 'Zurück zur Personenseite',
+        pathGoal: (name: string) => `Ziel: ${name}`,
+        pathGoalEnd: (name: string, year: number | undefined, kind: 'birth' | 'baptism' | 'residence') =>
+            [name, [kind === 'baptism' ? 'Taufe' : kind === 'residence' ? 'Wohnort' : '', year ?? ''].filter(v => v !== '').join(' ')]
+                .filter(Boolean).join(' · '),
+        pathTargetNoPlace: (name: string) => `${name} hat keinen Ort auf der Karte.`,
+        pathNoAncestors: 'Noch kein Vorfahre hat einen Ort auf der Karte.',
+        pathOtherPerson: 'Andere Person wählen',
+        linesTitle: 'Stammlinien',
+        linesChip: (n: number) => `Stammlinien (${n})`,
+        linesQuarters: 'Viertel',
+        linesEighths: 'Achtel',
+        linesCollapse: 'Einklappen',
+        linesAncestors: (n: number) => ancDe(n),
+        linesRow: (rel: string, n: number) => `${rel} · ${ancDe(n)}`,
+        linesUnknown: (rel: string, _female: boolean) => `${rel} – unbekannt`,
+        linesOffTimeline: 'außerhalb der Zeitleiste',
+        linesTrunk: 'Stamm: Eltern und Großeltern',
+        linesOff: 'Ohne Linienfarben',
+        linesImplex: (name: string, year: number | undefined, lineA: string, lineB: string) =>
+            `↻ ${name}${year != null ? ` (${year})` : ''} gehört zu zwei Linien: ${lineA} und ${lineB}.`,
+        linesImplexShort: '↻ in zwei Linien',
+        linesCut: (shown: number, total: number) => `${numDe(shown)} von ${numDe(total)} Linien gezeigt`,
+        linesCutWhy: 'Vorrang haben nähere Generationen und neu hinzugekommene Linien.',
+        pathUndated: (n: number) => n === 1
+            ? '1 Vorfahr ohne Datum oder Ort ist nicht auf der Zeitleiste.'
+            : `${numDe(n)} Vorfahren ohne Datum oder Ort sind nicht auf der Zeitleiste.`,
+        pathUndatedList: 'Liste ›',
+        pathUndatedTitle: 'Vorfahren außerhalb der Zeitleiste',
+        pathUndatedPlacesNote: 'Lagen der Orte ergänzt die Seite',
+        missingDate: 'ohne Geburtsdatum',
+        missingPlace: 'ohne Ort',
+        missingBoth: 'ohne Datum und Ort',
+        timeMarkTitle: (surname: string, year: number) => `${surname}: ältester Vorfahr ${year}`,
+        lineE8: 'Vater des Vaters des Vaters',
+        lineE9: 'Mutter des Vaters des Vaters',
+        lineE10: 'Vater der Mutter des Vaters',
+        lineE11: 'Mutter der Mutter des Vaters',
+        lineE12: 'Vater des Vaters der Mutter',
+        lineE13: 'Mutter des Vaters der Mutter',
+        lineE14: 'Vater der Mutter der Mutter',
+        lineE15: 'Mutter der Mutter der Mutter',
     },
 
     fan: {
@@ -21362,7 +22301,7 @@ const stringsDE: StringsType = {
         addSibling: '+ Geschwister hinzufügen',
         remove: 'Entfernen',
         witnesses: 'Trauzeugen',
-        addWitness: '👥 Trauzeuge hinzufügen',
+        addWitness: 'Trauzeuge hinzufügen',
         witnessesTitle: 'Trauzeugen',
         reassign: 'Umhängen…',
         reassignHeading: 'An einen anderen Elternteil umhängen',
@@ -21516,10 +22455,6 @@ const stringsDE: StringsType = {
         viewLinksNote: (n: number) => `Nur angezeigte Verbindungen (${n}) werden nicht übernommen`,
     },
 
-    // Focus mode
-    nav: {
-        timelineShort: 'Zeitleiste',
-    },
     depth: {
         toggle: 'Anzahl der Generationen',
     },
@@ -21943,9 +22878,26 @@ const stringsDE: StringsType = {
 
     // Person picker
     personPicker: {
+        family: 'Familie',
+        familyAlive: (date: string) => `wer am ${date} lebte`,
+        familyHidden: (n: number, list: string) => n === 1
+            ? `Ohne 1 Person, die zum Datum nicht mehr lebte: ${list}.`
+            : `Ohne ${n} Personen, die zum Datum nicht mehr lebten: ${list}.`,
+        alreadyShared: 'schon bei „Gemeinsam mit“',
+        joinsOwnRecord: (title: string) => `hat ${title} bereits – wird verbunden`,
+        createPerson: 'Neue Person anlegen',
+        createNamed: (q: string) => `Neue Person „${q}“ anlegen`,
+        noteHint: 'Wer nicht in den Stammbaum gehört (Untermieter, Gesinde), kommt nur in die Notiz des Ereignisses.',
+        addN: (n: number) => `Hinzufügen (${n})`,
+        createAdd: 'Anlegen und hinzufügen',
         placeholder: 'Person suchen...',
         noResults: 'Keine passenden Personen',
-        showList: 'Liste anzeigen'
+        showList: 'Liste anzeigen',
+        distNone: 'keine weiteren Angaben',
+        distChild: { f: (p: string) => `Tochter von ${p}`, m: (p: string) => `Sohn von ${p}`, u: (p: string) => `Kind von ${p}` },
+        distAnd: 'und',
+        distBorn: (m: string) => `Geburtsort ${m}`,
+        distLived: (m: string) => `Wohnort ${m}`,
     },
 
     // Errors
@@ -22057,6 +23009,7 @@ const stringsDE: StringsType = {
         joinedFamilies: (n: number, prog?: string) =>
             `${n} ${n === 1 ? 'weiterer Familiendatensatz' : 'weitere Familiendatensätze'} desselben Paares (z. B. eine zweite Heirat) `
             + `mit dessen Partnerschaft zusammengeführt` + (prog ? `; für den Export „Zurück zu ${prog}“ aufbewahrt` : ''),
+        sharedConverted: (prog: string, n: number, m: number) => `Geteilte Ereignisse aus ${prog}: ${numDe(n)} übernommen (${nDe(m, 'Person', 'Personen')})`,
         photos: 'Fotos',
         documents: 'Dokumente',
         excerpts: 'Ausschnitte',
@@ -22112,7 +23065,6 @@ const stringsDE: StringsType = {
             FACT: 'Angabe',
             ALIA: 'Auch bekannt als',
         } as Record<string, string>,
-        census: 'Volkszählung',
         genericEvent: 'Ereignis',
         altBirth: 'Geburt (alternativer Eintrag)',
         altDeath: 'Tod (alternativer Eintrag)',
@@ -22124,6 +23076,7 @@ const stringsDE: StringsType = {
         remarriage: (divorced: string, married: string) => `Geschieden ${divorced}, erneut geheiratet ${married}`,
         remarriageNoDate: (married: string) => `Geschieden, erneut geheiratet ${married}`,
         association: (name: string, label: string) => `Verknüpfung: ${name} (${label})`,
+        assoRoles: { CHIL: 'Kind', FATH: 'Vater', FRIEND: 'Freund', HUSB: 'Ehemann', MOTH: 'Mutter', MULTIPLE: 'mehrere Rollen', NGHBR: 'Nachbar', PARENT: 'Elternteil', SPOU: 'Ehepartner', WIFE: 'Ehefrau' } as Record<string, string>,
         email: (value: string) => `E-Mail: ${value}`,
         adoptedChild: 'adoptiertes Kind',
         fosterChild: 'Pflegekind',
@@ -22166,6 +23119,45 @@ const stringsDE: StringsType = {
 
     // Validation messages
     validation: {
+        // A shared event whose copies differ (spec 085 §4)
+        groupShared: 'Gemeinsame Ereignisse',
+        // Namentlich eingetragene Paten und Zeugen, die wohl im Stammbaum sind (spec 085 §6, 6g)
+        nameLinkLead: (n: number) => n === 1
+            ? '1 namentlich eingetragener Pate oder Zeuge entspricht einer Person im Stammbaum.'
+            : `${n} namentlich eingetragene Paten und Zeugen entsprechen einer Person im Stammbaum.`,
+        nameLinkReview: 'Einzeln durchgehen',
+        nameLinkTitle: (n: number) => `Namentliche Paten und Zeugen, die wohl im Stammbaum sind · ${n}`,
+        nameLinkHint: 'Nichts wird automatisch verknüpft, der eingetragene Name bleibt im Ereignis. Nach dem Verknüpfen erscheint das Ereignis im Leben dieser Person.',
+        nameLinkBack: 'Zurück',
+        // Dasselbe Ereignis bei mehreren Personen getrennt eingetragen (spec 085 K1.6 b)
+        sameJoinLead: (ev: string, n: number) => `${ev} – bei ${n} ${plural('de', n, 'Person', 'Personen')} getrennt eingetragen.`,
+        sameJoinSummary: (n: number) => `${n} ${plural('de', n, 'Ereignis ist', 'Ereignisse sind')} bei mehreren Personen getrennt eingetragen.`,
+        sameJoinReview: 'Einzeln durchgehen',
+        sameJoin: 'Zu einem Ereignis verbinden',
+        sameJoinTitle: (n: number) => `Bei mehreren Personen getrennt eingetragene Ereignisse · ${n}`,
+        sameJoinHint: 'Nichts wird automatisch verbunden. Danach ist es ein gemeinsames Ereignis; Alter und eigene Angaben jeder Person bleiben. Weichen gemeinsame Angaben ab, wird Kopien angleichen angeboten.',
+        sameJoinToShare: (n: number) => `Wird dem gemeinsamen Ereignis von ${n} ${plural('de', n, 'Person', 'Personen')} angeschlossen.`,
+        sameJoinDone: (ev: string, n: number) => `${ev}: bei ${n} ${plural('de', n, 'Person', 'Personen')} zu einem Ereignis verbunden.`,
+        later: 'Später',
+        rejectedCount: (n: number) => `Abgelehnte werden nicht wieder angeboten (${n}).`,
+        sharedDiffersOne: (ev: string, name: string, field: string, val: string, other: string) => `${ev} · ${name}: ${field} weicht ab (${val}, bei den anderen ${other}).`,
+        sharedDiffersMany: (ev: string, n: number, fields: string) => `${ev} · ${n} ${plural('de', n, 'Kopie weicht', 'Kopien weichen')} ab: ${fields}.`,
+        unify: 'Angleichen…',
+        separateCopy: 'Abweichende Kopie abtrennen',
+        separateCopies: (n: number) => `Abweichende Kopien abtrennen (${n})`,
+        openEvent: 'Öffnen',
+        unifyTitle: (ev: string) => `Kopien angleichen · ${ev}`,
+        unifyLead: (n: number, m: number) => `Kopien bei ${n} ${plural('de', n, 'Person', 'Personen')}, ${m} weichen ab. Für jedes Feld wird der gültige Wert gewählt.`,
+        unifyTakeAll: 'Alles übernehmen von:',
+        unifySame: (fields: string) => `Gleich: ${fields}. Alter, Forschungsstand und Prüfung hat jede Person für sich, sie werden nicht angeglichen.`,
+        unifyGo: (n: number) => `Bei ${n} ${plural('de', n, 'Person', 'Personen')} angleichen`,
+        unified: (ev: string, n: number) => `${ev}: bei ${n} ${plural('de', n, 'Person', 'Personen')} angeglichen.`,
+        separatedCopies: (ev: string, n: number) => `${ev}: ${n} ${plural('de', n, 'Kopie', 'Kopien')} abgetrennt.`,
+        unifyEmpty: '(leer)',
+        sharedFields: {
+            type: 'Art', customLabel: 'Bezeichnung', date: 'Datum', place: 'Ort', address: 'Haus', note: 'Notiz',
+            sourceIds: 'Quellen', citationQuay: 'Zitatqualität',
+        },
         parseError: 'Fehler beim Lesen der Datei',
         invalidStructure: 'Ungültige Dateistruktur',
         missingPersons: 'Personendaten fehlen',
@@ -22233,6 +23225,9 @@ const stringsDE: StringsType = {
         switchToNewTree: 'Zum neuen Stammbaum wechseln?',
         stats: (merged: number, added: number) =>
             `${nDe(merged, 'Person', 'Personen')} zusammengeführt, ${nDe(added, 'neue Person', 'neue Personen')} hinzugefügt`,
+        sharedOnce: 'Einmal – beide sind dabei.',
+        sharedAttach: (n: number) => `Dem gemeinsamen Ereignis anschließen (${nDe(n, 'Person', 'Personen')}) – die eigene Kopie stimmt überein`,
+        sharedJoined: (n: number) => `Gemeinsame Ereignisse: ${n} zusammengeführt`,
         noItems: 'Keine Einträge zum Anzeigen',
         newPerson: 'Neu',
         selectExisting: '-- Vorhandene Person auswählen --',
@@ -22328,6 +23323,7 @@ const stringsDE: StringsType = {
     // Person merge (duplicate resolution)
     personMerge: {
         title: 'Personen zusammenführen',
+        sharedTitle: 'Gemeinsame Ereignisse nach dem Zusammenführen',
         keepPerson: 'Behalten',
         mergeWith: 'Zusammenführen mit',
         selectPerson: 'Person zum Zusammenführen auswählen...',
@@ -22521,6 +23517,9 @@ const stringsDE: StringsType = {
         valRecurringGodparentDetail: (name: string, events: number, people: number, whose: string) =>
             `${name} — bei ${events} Ereignissen von ${people} Personen · ${whose}`,
         valRecurringGodparentByName: 'nach Namen abgeglichen',
+        valSharedCopiesDiffer: 'Gemeinsame Ereignisse',
+        valNameLink: 'Namentliche Paten und Zeugen, die wohl im Stammbaum sind',
+        valSeparateSameEvent: 'Bei mehreren Personen getrennt eingetragene Ereignisse',
         valOrphanedParticipantRef: 'Ereignisbeteiligter verweist auf eine nicht mehr vorhandene Person',
         valOrphanedParticipantDetail: (person: string, event: string, who: string) =>
             `${person} · ${event}: ${who}`,
@@ -22633,7 +23632,7 @@ const stringsDE: StringsType = {
 
     // Collaboration: send to a relative
     share: {
-        menuItem: '📩 An Verwandte senden',
+        menuItem: 'An Verwandte senden',
         menuDesc: 'Eine Datei per E-Mail — zum Öffnen, Ergänzen und Zurückschicken',
         passwordLabel: 'Passwort (optional)',
         dialogTitle: 'An Verwandte senden',
@@ -23182,6 +24181,60 @@ const stringsDE: StringsType = {
         queueLoadMore: 'Weitere laden',
         queueShown: (k: number, n: number) => `${k} von ${n} angezeigt`,
         queueCapNote: (k: number, n: number) => `${k} von ${n} angezeigt. Den Rest grenzt der Filter einer Richtung oder eines Zweigs ein.`,
+        queueTitleCount: (title: string, n: number) => `${title} · ${numDe(n)}`,
+        queueSearchPh: 'Aufgabe, Person, Archiv suchen…',
+        queueSearchAria: 'In der Warteschlange suchen',
+        queueSearchClear: 'Suche löschen',
+        queueSearchLink: 'In der Warteschlange suchen…',
+        queueSearchFound: (n: number) => `${numDe(n)} ${plural('de', n, 'Aufgabe', 'Aufgaben')} gefunden`,
+        queueSearchInDir: (d: string) => `in ${d}`,
+        queueSearchNone: 'Nichts gefunden.',
+        queueSearchNoneDir: (d: string) => `In ${d} nichts gefunden.`,
+        queueSearchCancel: 'Suche aufheben',
+        queueSearchAllDirs: 'In allen Richtungen suchen',
+        // The search of a section of the overview (spec 083 §3); a section's name comes from its title.
+        waitingSearchPlaceholder: 'Person, Ort, Archiv, Aufgabe suchen…',
+        waitingSearchAria: (section: string) => `In „${section}“ suchen`,
+        knowsSearchPlaceholder: 'Person, Widerspruch, Hypothese suchen…',
+        knowsSearchAria: (section: string) => `In „${section}“ suchen`,
+        sectionSearchFound: (n: number, total: number) => `${numDe(n)} von ${numDe(total)} gefunden`,
+        sectionSearchNoneKind: (kind: string) => `In der Art ${kind} nichts gefunden.`,
+        sectionSearchAllKinds: 'In allen Arten suchen',
+        bulkSelectFound: (n: number) => `Gefundene mit Vorschlag auswählen (${numDe(n)})`,
+        bulkSelectedHidden: (n: number, m: number) => `${numDe(n)} ausgewählt, davon ${numDe(m)} außerhalb der Suche.`,
+        bulkDeselectHidden: 'Auswahl außerhalb der Suche aufheben',
+        sectionSearchQuoted: (q: string) => `„${q}“`,
+        queueSearchElsewhere: (id: string, state: string) => `${id} ist nicht mehr in der Warteschlange (${state}).`,
+        queueState: { done: 'erledigt', waiting: 'wartet auf Bearbeitung', parked: 'zurückgestellt', dropped: 'aufgegeben' } as Record<string, string>,
+        queueSearchErr: 'Die Suche ist fehlgeschlagen, die Forschung antwortet nicht.',
+        queueSearchBusy: 'Die Forschung ist beschäftigt, Suchen geht gerade nicht.',
+        queueTagDeferred: 'zurückgestellt',
+        queueNext: 'Als Nächstes erledigen',
+        queueNextHint: 'Kommt nach der laufenden Aufgabe an die Reihe',
+        queueTagNext: 'als Nächstes',
+        queueMoved: (id: string) => `${id} als Nächstes`,
+        queueBridgeErr: 'Die Forschung antwortet nicht, die Reihenfolge ist unverändert.',
+        queueUndo: 'Rückgängig',
+        knowsKindAll: 'Alle',
+        knowsKindCon: 'Widersprüche',
+        knowsKindHyp: 'Hypothesen',
+        knowsKindAria: 'Art',
+        // An der Warteschlange arbeiten (Spec 052 §5).
+        queueWork: 'An der Warteschlange arbeiten…',
+        queueWorkTitle: 'An der Warteschlange arbeiten',
+        queueWorkingLink: 'In Arbeit',
+        queueWorkAuto: 'Automatisch',
+        queueWorkAutoHint: 'Der Agent nimmt eine Aufgabe nach der anderen, solange das Abo-Limit es erlaubt.',
+        queueWorkOnly: 'Nur',
+        queueWorkOnlyWord: (n: number) => plural('de', n, 'Aufgabe', 'Aufgaben'),
+        queueWorkCountAria: 'Anzahl Aufgaben',
+        queueWorkOnlyHint: (n: number) => `Endet nach ${n} ${n === 1 ? 'erledigten Aufgabe' : 'erledigten Aufgaben'}; eine Aufgabe, die mit Warten, Zurückstellen oder Aufgeben endet, zählt mit.`,
+        queueWorkFirst: 'Als Erstes kommt',
+        queueWorkNoGate: 'Automatische Arbeit braucht eine eingerichtete Abo-Schranke; das Terminal bietet die Einrichtung an.',
+        queueWorkConfirm: 'Den Start bestätigt das Forschungsterminal. Die Arbeit stoppt Strg-C in dessen Fenster oder „Abschließen und beenden“ im Bereich Jetzt.',
+        queueWorkOpenTerm: 'Terminal öffnen',
+        queueWorkSession: (m: number) => `Sitzung höchstens ${m < 60 ? `${m} Min.` : m % 60 === 0 ? `${m / 60} Std.` : `${Math.floor(m / 60)} Std. ${m % 60} Min.`}`,
+        queueWorkGate: (name: string) => `Abo-Schranke: ${name}`,
         branchQueueBeyond: (n: number) => `Die Aufgaben des Zweigs stehen weiter hinten in der Warteschlange (${n}).`,
         branchNeverGroup: (n: number) => `Nicht erforscht · ${nDe(n, 'Zweig', 'Zweige')}`,
         branchAdd: (n: string) => `Zur Richtung ${n} hinzufügen`,
@@ -25327,8 +26380,7 @@ const stringsDE: StringsType = {
             othersBaptism: (y: string) => (y ? `Weitere bei der Taufe ${y}` : 'Weitere bei der Taufe'),
             witnesses: (y: string) => (y ? `Trauzeugen bei der Heirat ${y}` : 'Trauzeugen bei der Heirat'),
             others: (y: string) => (y ? `Weitere bei der Heirat ${y}` : 'Weitere bei der Heirat'),
-            godparentOf: { m: 'Pate von', f: 'Patin von', u: 'Pate/Patin von' },
-            baptismOf: (y: string) => (y ? `Taufe ${y}` : 'Taufe'),
+            godparentWitness: { m: 'Pate und Zeuge bei', f: 'Patin und Zeugin bei', u: 'Pate und Zeuge bei' },
             more: (n: number) => `und ${n} weitere`,
         },
         gal: {
@@ -25749,8 +26801,14 @@ const stringsDE: StringsType = {
         warnLiving: (n: number, c: number) => `Bei ${nDe(n, 'lebenden Person', 'lebenden Personen')} ${plural('de', c, 'entfällt', 'entfallen')} ${nDe(c, 'Zitat', 'Zitate')}. Verstorbene behalten ihre Quellen.`,
         keepSources: 'Quellen behalten',
     },
+    exportHelp: {
+        sharedEvents: 'Ein gemeinsames Ereignis wird bei jeder Person einzeln mit Quelle geschrieben, so können andere Programme es lesen. Strom fügt es beim nächsten Import wieder zusammen.',
+    },
 
     table: {
+        sharedCount: (n: number) => `${n} ${plural('de', n, 'Person', 'Personen')}`,
+        agePerPerson: 'Alter laut Eintrag · je Person',
+        sharedDiffers: (n: number) => `weicht bei ${n} ab`,
         rows: { persons: 'Personen', unions: 'Verbindungen', events: 'Ereignisse', sources: 'Quellen' },
         rowType: 'Zeilen',
         rowTypeNote: 'Jede Zeilenart behält eigene Spalten, Filter und Sortierung.',
@@ -26158,6 +27216,75 @@ const stringsDE: StringsType = {
         nothingMissingText: (n: number) => `Alle beobachteten Felder (Geburt, Verbindungen, Tod und ihre Quellen) sind ${n === 1 ? 'bei der einen Person' : `bei allen ${numDe(n)} Personen`} ausgefüllt.`,
         readOnly: 'Nur lesen: Bearbeiten und „Kein Fehler“ gibt es hier nicht.',
         readOnlyShort: 'Nur lesen',
+    },
+    // Windows: views in satellite windows, the main window, a second tab (spec 079)
+    win: {
+        openInNewWindow: 'In neuem Fenster öffnen',
+        viewInNewWindow: (v: string) => `${v} in neuem Fenster`,
+        viewOnSecondScreen: (v: string) => `${v} auf dem zweiten Bildschirm`,
+        segmentHint: (v: string) => `${v} · Strg+Klick: in neuem Fenster`,
+        segmentHintMac: (v: string) => `${v} · ⌘+Klick: in neuem Fenster`,
+        thisView: 'diese Ansicht',
+        openAnother: 'Weiteres Fenster öffnen',
+        otherWindows: (n: number) => (n === 1 ? '1 weiteres Fenster' : `${n} weitere Fenster`),
+        openWindows: 'Geöffnete Fenster',
+        bringToFront: 'In den Vordergrund',
+        focusFailed: 'Das Fenster ist daneben geöffnet – der Browser hat es nicht nach vorne geholt.',
+        closeWindow: 'Fenster schließen',
+        closeAll: 'Alle schließen',
+        blocked: 'Der Browser hat das neue Fenster blockiert. Fenster lassen sich in den Browsereinstellungen für diese Seite erlauben.',
+        retry: 'Erneut versuchen',
+        manyWindows: (n: number) => `${n} Fenster geöffnet. Jedes weitere Fenster braucht Speicher; bei einem großen Stammbaum kann die App langsamer werden.`,
+        followSelection: 'Auswahl folgen',
+        followSelectionState: (mode: string) => `Auswahl folgen: ${mode}`,
+        followModeSwitch: 'wechseln',
+        followModeMark: 'nur markieren',
+        followModeOff: 'aus',
+        followModeSwitchNote: 'Eine in einem anderen Fenster gewählte Person wird hier zur Mitte.',
+        followModeMarkNote: 'Eine in einem anderen Fenster gewählte Person wird hier nur markiert.',
+        followSelectionOff: 'Dieses Fenster hat eine eigene Auswahl.',
+        loading: 'Stammbaum wird geladen…',
+        readOnlyLive: 'Nur lesen · das Hauptfenster verfolgt die Forschung',
+        goToMain: 'Zum Hauptfenster',
+        mainClosed: (t: string) => `Das Hauptfenster ist geschlossen · Stand ${t}, nur lesen`,
+        openStrom: 'Strom öffnen',
+        makeMain: 'Zum Hauptfenster machen',
+        editConflict: 'Der Stammbaum wurde inzwischen in einem anderen Fenster geändert. Die Änderung wurde nicht übernommen, die Daten sind aktualisiert.',
+        draftKept: 'Entwurf bleibt · Enter übernimmt, Esc verwirft',
+        treeGone: 'Der Stammbaum existiert nicht mehr',
+        treeGoneNote: 'Er wurde im Hauptfenster gelöscht.',
+        treeLocked: 'Der Stammbaum ist gesperrt',
+        treeLockedNote: 'Das Passwort wird im Hauptfenster eingegeben.',
+        researchInMain: 'Forschung · läuft im Hauptfenster',
+        researchMainOnly: 'Forschung · nur mit Hauptfenster',
+        alreadyOpen: 'Strom ist bereits in einem anderen Fenster geöffnet',
+        alreadyOpenNote: 'Nur ein Fenster speichert, damit sich Änderungen nicht gegenseitig überschreiben. Weitere Fenster verbinden sich damit.',
+        switchThere: 'Dorthin wechseln',
+        openAsWindow: 'Als weiteres Fenster öffnen',
+        linkForwarded: 'Der Link wurde im Hauptfenster geöffnet.',
+        switchFailed: 'Der Browser hat das Fenster nicht nach vorne geholt. Strom ist in einem anderen Tab oder Browserfenster geöffnet.',
+        tabCanClose: 'Dieser Tab kann geschlossen werden.',
+        noResearch: 'Dieser Stammbaum hat keine Forschung',
+        noResearchNote: (t: string) => `Das Hauptfenster hat zu ${t} gewechselt, ohne Forschung.`,
+        overviewInWindow: 'Die Forschungsübersicht ist in einem eigenen Fenster · Klick holt sie nach vorne',
+        overviewHead: (t: string, v: string) => (t ? `${t} · ${v}` : v),
+        overviewLoading: 'Forschungsübersicht wird geladen…',
+        overviewOffNote: 'gezeigt wird, was im Stammbaum ist',
+        restoreWindows: (n: number) => `Fenster wiederherstellen (${n})`,
+        restoreDismiss: 'Ausblenden',
+        screen: 'Bildschirm',
+        screenThis: 'Dieser',
+        screenOther: 'Zweiter',
+        screenPermission: 'Der Browser fragt jetzt nach der Berechtigung zur Fensterverwaltung. Die App braucht sie nur, um Fenster auf dem zweiten Bildschirm zu platzieren.',
+        continue: 'Weiter',
+        screenDenied: 'Die Berechtigung zur Fensterverwaltung wurde abgelehnt. Sie lässt sich in den Website-Einstellungen erlauben (Symbol neben der Adresse).',
+        moveToSecondScreen: 'Auf den zweiten Bildschirm verschieben',
+        /** Satellite window title: "Table – Habrmans – Strom"; no tree: "Table – Strom". */
+        windowTitle: (v: string, t: string, app: string) => (t ? `${v} – ${t} – ${app}` : `${v} – ${app}`),
+        /** Main window title: "Habrmans – Strom"; no tree: "Strom". */
+        mainTitle: (t: string, app: string) => (t ? `${t} – ${app}` : app),
+        /** A tree switched in the main window: "Habrmans → Novaks". */
+        treeSwitched: (a: string, b: string) => `${a} → ${b}`,
     },
 };
 

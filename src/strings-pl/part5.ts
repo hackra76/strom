@@ -1,8 +1,8 @@
 import type { StringsType } from '../strings.js';
-import { nPl, plPl, joinAndPl, relationPl } from './helpers.js';
+import { nPl, numPl, plPl, joinAndPl, relationPl } from './helpers.js';
 
 export const plPart5: Pick<StringsType, 'danger' | 'emptyStates' | 'relationships' | 'card' | 'buttons' | 'dialog'
-    | 'gender' | 'partnershipStatus' | 'parentRelType' | 'export' | 'nav' | 'depth' | 'rodView' | 'focus'
+    | 'gender' | 'partnershipStatus' | 'parentRelType' | 'export' | 'depth' | 'rodView' | 'focus'
     | 'generationLabels' | 'treeOverview' | 'branchTabs' | 'search' | 'deepLink' | 'searchFilters' | 'personPicker'
     | 'errors' | 'storageSafety' | 'addChild' | 'uiTips' | 'about' | 'gedcom' | 'gedcomNotes' | 'saveCurrent'
     | 'validation'> = {
@@ -76,7 +76,7 @@ export const plPart5: Pick<StringsType, 'danger' | 'emptyStates' | 'relationship
         addSibling: '+ Dodaj rodzeństwo',
         remove: 'Usuń',
         witnesses: 'Świadkowie ślubu',
-        addWitness: '👥 Dodaj świadka',
+        addWitness: 'Dodaj świadka',
         witnessesTitle: 'Świadkowie ślubu',
         reassign: 'Przenieś…',
         reassignHeading: 'Przeniesienie do innego rodzica',
@@ -233,10 +233,6 @@ export const plPart5: Pick<StringsType, 'danger' | 'emptyStates' | 'relationship
         viewLinksNote: (n: number) => `Połączenia tylko w widoku (${n}) nie są przenoszone do wyniku`,
     },
 
-    // Focus mode
-    nav: {
-        timelineShort: 'Oś czasu',
-    },
     depth: {
         toggle: 'Liczba pokoleń',
     },
@@ -662,9 +658,26 @@ export const plPart5: Pick<StringsType, 'danger' | 'emptyStates' | 'relationship
 
     // Person picker
     personPicker: {
+        family: 'Rodzina',
+        familyAlive: (date: string) => `żyjący w dniu ${date}`,
+        familyHidden: (n: number, list: string) => n === 1
+            ? `Bez 1 osoby, która nie żyła w dniu wydarzenia: ${list}.`
+            : `Bez ${nPl(n, 'osoby', 'osób', 'osób')}, które nie żyły w dniu wydarzenia: ${list}.`,
+        alreadyShared: 'już w „Razem z”',
+        joinsOwnRecord: (title: string) => `ma już ${title} – zostanie dołączone`,
+        createPerson: 'Utwórz nową osobę',
+        createNamed: (q: string) => `Utwórz nową osobę „${q}”`,
+        noteHint: 'Kto nie powinien być w drzewie (lokator, służba), trafia tylko do notatki wydarzenia.',
+        addN: (n: number) => `Dodaj (${n})`,
+        createAdd: 'Utwórz i dodaj',
         placeholder: 'Szukaj osoby...',
         noResults: 'Brak pasujących osób',
-        showList: 'Pokaż listę'
+        showList: 'Pokaż listę',
+        distNone: 'brak innych danych',
+        distChild: { f: (p: string) => `córka: ${p}`, m: (p: string) => `syn: ${p}`, u: (p: string) => `dziecko: ${p}` },
+        distAnd: 'i',
+        distBorn: (m: string) => `miejsce urodzenia ${m}`,
+        distLived: (m: string) => `zamieszkanie ${m}`,
     },
 
     // Errors
@@ -776,6 +789,7 @@ export const plPart5: Pick<StringsType, 'danger' | 'emptyStates' | 'relationship
         joinedFamilies: (n: number, prog?: string) =>
             `Dołączono do związku tej samej pary: ${nPl(n, 'kolejny rekord rodziny', 'kolejne rekordy rodziny', 'kolejnych rekordów rodziny')} (np. drugi ślub)`
             + (prog ? `; zachowano do eksportu „Z powrotem do ${prog}”` : ''),
+        sharedConverted: (prog: string, n: number, m: number) => `Wspólne wydarzenia z ${prog}: ${numPl(n)} przeniesiono (${nPl(m, 'osoba', 'osoby', 'osób')})`,
         photos: 'Zdjęcia',
         documents: 'Dokumenty',
         excerpts: 'Wycinki',
@@ -832,7 +846,6 @@ export const plPart5: Pick<StringsType, 'danger' | 'emptyStates' | 'relationship
             FACT: 'Informacja',
             ALIA: 'Występuje także jako',
         } as Record<string, string>,
-        census: 'Spis ludności',
         genericEvent: 'Zdarzenie',
         altBirth: 'Urodzenie (alternatywny zapis)',
         altDeath: 'Zgon (alternatywny zapis)',
@@ -844,6 +857,7 @@ export const plPart5: Pick<StringsType, 'danger' | 'emptyStates' | 'relationship
         remarriage: (divorced: string, married: string) => `Rozwód ${divorced}, ponowny ślub ${married}`,
         remarriageNoDate: (married: string) => `Rozwód, ponowny ślub ${married}`,
         association: (name: string, label: string) => `Relacja: ${name} (${label})`,
+        assoRoles: { CHIL: 'dziecko', FATH: 'ojciec', FRIEND: 'przyjaciel', HUSB: 'mąż', MOTH: 'matka', MULTIPLE: 'kilka ról', NGHBR: 'sąsiad', PARENT: 'rodzic', SPOU: 'małżonek', WIFE: 'żona' } as Record<string, string>,
         email: (value: string) => `E-mail: ${value}`,
         adoptedChild: 'dziecko adoptowane',
         fosterChild: 'dziecko w rodzinie zastępczej',
@@ -893,6 +907,45 @@ export const plPart5: Pick<StringsType, 'danger' | 'emptyStates' | 'relationship
 
     // Validation messages
     validation: {
+        // A shared event whose copies differ (spec 085 §4)
+        groupShared: 'Wspólne wydarzenia',
+        // Chrzestni i świadkowie z nazwiska, którzy prawdopodobnie są w drzewie (spec 085 §6, 6g)
+        nameLinkLead: (n: number) => n === 1
+            ? '1 chrzestny lub świadek zapisany z nazwiska odpowiada osobie w drzewie.'
+            : `${n} ${plPl(n, 'chrzestny', 'chrzestnych i świadków zapisanych z nazwiska odpowiada', 'chrzestnych i świadków zapisanych z nazwiska odpowiada')} osobie w drzewie.`,
+        nameLinkReview: 'Przejrzyj po kolei',
+        nameLinkTitle: (n: number) => `Chrzestni i świadkowie z nazwiska, którzy prawdopodobnie są w drzewie · ${n}`,
+        nameLinkHint: 'Nic nie łączy się samo, a zapisane imię zostaje w wydarzeniu. Po połączeniu wydarzenie pojawi się w życiu tej osoby.',
+        nameLinkBack: 'Wstecz',
+        // To samo wydarzenie zapisane osobno u kilku osób (spec 085 K1.6 b)
+        sameJoinLead: (ev: string, n: number) => `${ev} – zapisano osobno u ${n} ${plPl(n, 'osoby', 'osób', 'osób')}.`,
+        sameJoinSummary: (n: number) => `${n} ${plPl(n, 'wydarzenie zapisano', 'wydarzenia zapisano', 'wydarzeń zapisano')} osobno u kilku osób.`,
+        sameJoinReview: 'Przejrzyj po kolei',
+        sameJoin: 'Połącz w jedno wydarzenie',
+        sameJoinTitle: (n: number) => `Wydarzenia zapisane osobno u kilku osób · ${n}`,
+        sameJoinHint: 'Nic nie łączy się samo. Po połączeniu to jedno wspólne wydarzenie; wiek i własne dane każdej osoby zostają. Gdy wspólne dane się różnią, proponowane jest ujednolicenie kopii.',
+        sameJoinToShare: (n: number) => `Dołączy do wspólnego wydarzenia ${n} ${plPl(n, 'osoby', 'osób', 'osób')}.`,
+        sameJoinDone: (ev: string, n: number) => `${ev}: połączono w jedno wydarzenie u ${n} ${plPl(n, 'osoby', 'osób', 'osób')}.`,
+        later: 'Później',
+        rejectedCount: (n: number) => `Odrzucone nie są proponowane ponownie (${n}).`,
+        sharedDiffersOne: (ev: string, name: string, field: string, val: string, other: string) => `${ev} · ${name}: ${field} się różni (${val}, u pozostałych ${other}).`,
+        sharedDiffersMany: (ev: string, n: number, fields: string) => `${ev} · ${n} ${plPl(n, 'kopia się różni', 'kopie się różnią', 'kopii się różni')}: ${fields}.`,
+        unify: 'Ujednolić…',
+        separateCopy: 'Odłącz różniącą się kopię',
+        separateCopies: (n: number) => `Odłącz różniące się kopie (${n})`,
+        openEvent: 'Otwórz',
+        unifyTitle: (ev: string) => `Ujednolić kopie · ${ev}`,
+        unifyLead: (n: number, m: number) => `Kopie u ${nPl(n, 'osoby', 'osób', 'osób')}, ${m} się różnią. Dla każdego pola wybiera się właściwą wartość.`,
+        unifyTakeAll: 'Weź wszystko od:',
+        unifySame: (fields: string) => `Zgodne: ${fields}. Wiek, stan badań i weryfikację każda osoba ma własne – nie są ujednolicane.`,
+        unifyGo: (n: number) => `Ujednolić u ${nPl(n, 'osoby', 'osób', 'osób')}`,
+        unified: (ev: string, n: number) => `${ev}: ujednolicono u ${nPl(n, 'osoby', 'osób', 'osób')}.`,
+        separatedCopies: (ev: string, n: number) => `${ev}: odłączono ${nPl(n, 'kopię', 'kopie', 'kopii')}.`,
+        unifyEmpty: '(puste)',
+        sharedFields: {
+            type: 'typ', customLabel: 'nazwa', date: 'data', place: 'miejsce', address: 'dom', note: 'notatka',
+            sourceIds: 'źródła', citationQuay: 'jakość cytatu',
+        },
         parseError: 'Błąd odczytu pliku',
         invalidStructure: 'Nieprawidłowa struktura pliku',
         missingPersons: 'Brak danych osób',

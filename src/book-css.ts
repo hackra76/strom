@@ -6,6 +6,7 @@
 
 import { PERSON_PAGE_CHART_CSS, PERSON_PAGE_VIZ_LIGHT_TOKENS } from './person-page-viz-css.js';
 import { STORY_COMPARE_CSS } from './story-compare.js';
+import { SEL_LIGHT_DECLS, SEL_RULES_CSS } from './ui/sel-css.js';
 
 /** A text as a CSS string literal: quotes, backslashes and line breaks escaped ("Rod O\"Brien"). */
 export function cssString(text: string): string {
@@ -20,8 +21,9 @@ export function rodPagesCss(heads: readonly string[]): string {
 const SANS = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
 
 export const BOOK_CSS = `
-:root { ${PERSON_PAGE_VIZ_LIGHT_TOKENS} --text: #1f1c17; --text-light: #4a4438; --text-faint: #5c5546; --accent: #8a5528; --accent-text: #8a5528;
-    --primary: #3f6b4f; --divider: #e3dccd; --pp-bg: #fffdf8; --hover-bg: #f3eee2; color-scheme: light; }
+:root { ${PERSON_PAGE_VIZ_LIGHT_TOKENS} --r-sm: 4px; --r-md: 6px; --r-lg: 8px; --r-tag: 3px; --text: #1f1c17; --text-light: #4a4438; --text-faint: #5c5546; --accent: #8a5528; --accent-text: #8a5528;
+    --primary: #3f6b4f; --divider: #e3dccd; --pp-bg: #fffdf8; --hover-bg: #f3eee2;
+    ${SEL_LIGHT_DECLS} color-scheme: light; }
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
 body { margin: 0; background: #f1ece2; color: #1f1c17; font: 12pt/1.5 'Strom Serif', Georgia, 'Times New Roman', serif; font-kerning: normal; }
@@ -125,6 +127,10 @@ a { color: inherit; }
 .book-clip img { display: block; max-width: 100%; max-height: 60mm; object-fit: contain; }
 .book-clip figcaption { font-size: 9.5pt; color: #4a4438; margin-top: 3px; }
 .book-photo { width: 34mm; float: right; margin: 0 0 6px 12px; border-radius: 4px; }
+/* "Family together" (spec 085 §2h): the family's shared events once, between two rules */
+.book-together { border-top: 1px solid #e3dccd; border-bottom: 1px solid #e3dccd; padding: 2px 0 8px; break-inside: avoid; }
+.book-together .book-sub { margin-top: 8px; }
+.book-together-line { margin: 3px 0; font-size: 11pt; line-height: 1.5; }
 .book-couple-events .book-ce { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 12px; font-size: 11pt; }
 
 /* The person page's timeline rows, set for paper */
@@ -177,7 +183,7 @@ ${PERSON_PAGE_CHART_CSS}
 .book-nv { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; margin: 0 0 12px; padding: 10px 14px; border-radius: 8px; background: #f6ecd3; color: #7f5500; font: 13px/1.45 ${SANS}; text-align: left; }
 .book-nv > span { flex: 1; min-width: 200px; }
 .book-nv-compare, .bc-btn { padding: 6px 12px; border-radius: 7px; border: 1px solid #e2cf9f; background: #fffdf8; color: #2b2822; font: 500 13px ${SANS}; cursor: pointer; text-decoration: none; }
-.book-compare { width: min(720px, 92vw); max-height: 88vh; padding: 0; border: 0; border-radius: 14px; box-shadow: 0 12px 40px rgba(20,16,8,.3); background: #fffdf8; color: #2b2822; font-family: ${SANS}; }
+.book-compare { width: min(720px, 92vw); max-height: 88vh; padding: 0; border: 1px solid #ddd4c2; border-radius: var(--r-lg, 8px); box-shadow: var(--shadow-lg, 0 4px 14px rgba(20,16,8,.14)); background: #fffdf8; color: #2b2822; font-family: ${SANS}; }
 .book-compare[open] { display: flex; flex-direction: column; }
 .book-compare::backdrop { background: rgba(20,16,8,.45); }
 .bc-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 20px 24px 14px; border-bottom: 1px solid #ece5d6; }
@@ -228,4 +234,6 @@ ${STORY_COMPARE_CSS}
     .book-source-scan a[data-print]::after { content: attr(data-print); }
     .book-source-scan a[data-print] span { display: none; }
 }
-`;
+
+/* The selection indicator (src/ui/sel-css.ts), last: the story comparison's tabs */
+${SEL_RULES_CSS}`;

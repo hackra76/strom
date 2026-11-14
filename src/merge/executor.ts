@@ -14,6 +14,7 @@ import {
     StromData,
     LifeEvent,
     EventParticipant,
+    EventRoleAt,
     CoupleEvent,
     generateLifeEventId,
     partnershipParticipants,
@@ -41,8 +42,10 @@ import {
 } from './types.js';
 import { StorageManager } from '../storage.js';
 import { mergeNoteText } from './notes.js';
+import { censusTypeText, isLegacyCensus } from '../events.js';
 import { sourcePlaceKey } from '../source-location.js';
 import { sameFileRecord } from './id-match.js';
+import { MARRIAGE_EVENT_ID, allShareCopies, joinSameShareCopies, shareIdMaker, tidyShares, treeShareIds } from '../shared-events.js';
 
 // ==================== BACKUP ====================
 
@@ -450,6 +453,12 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
         delete mergedData.defaultPersonId;
         delete mergedData.defaultView;
 
+        // Shared events (spec 085 §7): an incoming share the tree already holds
+        // takes the tree's id, so its copies join it instead of doubling; one
+        // whose id the tree uses for another event gets a new id.
+        const sharePlan = planIncomingShares(state, mapping);
+        const shared = (person: Person): Person => withRenamedShares(person, sharePlan.rename);
+
         let mergedCount = 0;
         let addedCount = 0;
         // Incoming persons the user chose to skip (Primitive 2). Counted for the
@@ -467,14 +476,14 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
                 const existingPerson = mergedData.persons[match.existingId];
                 if (existingPerson) {
                     // Merge data according to conflict resolutions
-                    mergePersonData(existingPerson, match.incomingPerson, match.conflicts, mapping.persons, state.incomingData.persons);
+                    mergePersonData(existingPerson, shared(match.incomingPerson), match.conflicts, mapping.persons, state.incomingData.persons);
                     carryMergedImports(existingPerson, state.existingData.persons[match.existingId], match.incomingPerson, importMap);
                     mergedCount++;
                 }
             } else if (decision?.type === 'manual_match') {
                 const existingPerson = mergedData.persons[decision.targetId];
                 if (existingPerson) {
-                    mergePersonData(existingPerson, match.incomingPerson, match.conflicts, mapping.persons, state.incomingData.persons);
+                    mergePersonData(existingPerson, shared(match.incomingPerson), match.conflicts, mapping.persons, state.incomingData.persons);
                     carryMergedImports(existingPerson, state.existingData.persons[decision.targetId], match.incomingPerson, importMap);
                     mergedCount++;
                 }
@@ -489,7 +498,7 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
             const existingId = mapping.persons.get(incomingId)!;
             const existingPerson = mergedData.persons[existingId];
             if (!existingPerson?.isPlaceholder) continue;
-            mergePersonData(existingPerson, incoming, [], mapping.persons, state.incomingData.persons);
+            mergePersonData(existingPerson, shared(incoming), [], mapping.persons, state.incomingData.persons);
             carryMergedImports(existingPerson, state.existingData.persons[existingId], incoming, importMap);
         }
 
@@ -519,7 +528,7 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
         ];
 
         for (const incomingId of toAdd) {
-            const incoming = state.incomingData.persons[incomingId];
+            const incoming = state.incomingData.persons[incomingId] && shared(state.incomingData.persons[incomingId]);
             if (!incoming) continue;
 
             const newId = mapping.persons.get(incomingId)!;
@@ -589,7 +598,7 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
 
                 if (isReferenced) {
                     const newPerson: Person = {
-                        ...person,
+                        ...shared(person),
                         id: newId,
                         partnerships: person.partnerships
                             .map(pship => mapping.partnerships.get(pship))
@@ -703,6 +712,8 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
         }
 
         carryAlsoChildOf(mergedData, state, mapping, unionTarget);
+        // Own godparent / witness events of the incoming tree point at the merged couples and events.
+        resolveIncomingRoleAt(mergedData, state.incomingData, unionTarget);
 
         // Update parent-child relationships for merged persons
         updateRelationships(mergedData, state, mapping);
@@ -743,6 +754,11 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
         remapSourceReferences(mergedData, sourceRemap, state.incomingData.sources);
         unlinkOrphanExcerpts(mergedData);
 
+        // A person holding two alike copies of one shared event keeps one; a
+        // share left with one copy is an ordinary event.
+        for (const person of Object.values(mergedData.persons)) joinSameShareCopies(person);
+        tidyShares(mergedData);
+
         // Validate result
         const validationErrors = validateMergedData(mergedData);
         if (validationErrors.length > 0) {
@@ -756,7 +772,8 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
                 merged: mergedCount,
                 added: addedCount,
                 skipped: skippedCount,
-                partnerships: Object.keys(mergedData.partnerships).length
+                partnerships: Object.keys(mergedData.partnerships).length,
+                sharedJoined: sharePlan.joined,
             },
             backupKey,
             importMap,
@@ -835,6 +852,70 @@ function remapEventParticipants(
 ): void {
     for (const ev of events ?? []) {
         if (ev.participants) remapParticipants(ev.participants, idMap, incomingPersons);
+        // An own record of a part at another's event (spec 085 §6) follows that person,
+        // or loses the link (the couple's link is checked when the tree is read).
+        if (ev.roleAt) {
+            // Whose event it pointed at in the incoming tree: the couple and the event itself are
+            // resolved once the couples are merged (resolveIncomingRoleAt).
+            incomingRoleAt.set(ev.roleAt, {
+                personId: ev.roleAt.personId, partnershipId: ev.roleAt.partnershipId, eventId: ev.roleAt.eventId,
+            });
+            if (ev.roleAt.personId) {
+                const mapped = idMap.get(ev.roleAt.personId);
+                if (mapped) ev.roleAt.personId = mapped;
+                else delete ev.roleAt.personId;
+            }
+        }
+    }
+}
+
+/** An incoming event's roleAt as the incoming tree wrote it (filled by remapEventParticipants). */
+const incomingRoleAt = new WeakMap<EventRoleAt, { personId?: PersonId; partnershipId?: PartnershipId; eventId?: string }>();
+
+/**
+ * The couple and the event an incoming own godparent / witness event points
+ * at (spec 085 §6), as they are in the merged tree: the couple where the
+ * incoming one ended up, the event the incoming one became there (the same
+ * id of the same type, else the event saying the same; a couple event by
+ * what it says first, its id may have been renamed). What cannot be found
+ * is left out, never left pointing at the incoming tree's ids.
+ */
+function resolveIncomingRoleAt(
+    merged: StromData,
+    incoming: StromData,
+    unionTarget: ReadonlyMap<PartnershipId, PartnershipId>,
+): void {
+    for (const person of Object.values(merged.persons)) {
+        for (const ev of person.events ?? []) {
+            const at = ev.roleAt;
+            const from = at ? incomingRoleAt.get(at) : undefined;
+            if (!at || !from) continue;
+            incomingRoleAt.delete(at);
+            if (from.partnershipId) {
+                const target = unionTarget.get(from.partnershipId);
+                if (target && merged.partnerships[target]) at.partnershipId = target;
+                else delete at.partnershipId;
+            }
+            if (!from.eventId) continue;
+            let eventId: string | undefined;
+            if (from.eventId === MARRIAGE_EVENT_ID) {
+                if (at.partnershipId) eventId = MARRIAGE_EVENT_ID;
+            } else if (from.personId && at.personId) {
+                const before = incoming.persons[from.personId]?.events?.find(e => e.id === from.eventId);
+                const list = merged.persons[at.personId]?.events ?? [];
+                const found = before && (list.find(e => e.id === before.id && e.type === before.type)
+                    ?? list.find(e => eventKey(e) === eventKey(before)));
+                eventId = found?.id;
+            } else if (from.partnershipId && at.partnershipId) {
+                const before = incoming.partnerships[from.partnershipId]?.events?.find(e => e.id === from.eventId);
+                const list = merged.partnerships[at.partnershipId]?.events ?? [];
+                const found = before && (list.find(e => coupleEventKey(e) === coupleEventKey(before))
+                    ?? list.find(e => e.id === before.id && e.type === before.type));
+                eventId = found?.id;
+            }
+            if (eventId) at.eventId = eventId;
+            else delete at.eventId;
+        }
     }
 }
 
@@ -853,6 +934,86 @@ function remapParticipants(
         if (mapped) part.personId = mapped;
         else delete part.personId;
     }
+    // "Not this person" follows the persons rejected (spec 085 §6).
+    for (const part of participants) {
+        if (!part.linkRejected) continue;
+        const kept = [...new Set(part.linkRejected.flatMap(pid => idMap.get(pid) ?? []))];
+        if (kept.length > 0) part.linkRejected = kept;
+        else delete part.linkRejected;
+    }
+}
+
+// ==================== SHARED EVENTS ====================
+
+/** What the tree merge does with the incoming shares: their ids in the merged tree, and how many joined one there. */
+interface IncomingSharePlan {
+    rename: Map<string, string>;
+    joined: number;
+}
+
+/**
+ * Each incoming share (spec 085 §7): its copies at persons merged into the
+ * tree's are paired with the tree's events (the same id, else the same
+ * record — kind, date, place, label, note — in the same share, else the same
+ * record). Paired with the tree's copies of a share, it takes that share's id
+ * (the most copies decide); paired only with events of no share, it keeps its
+ * id (a new one when the tree uses it); both count as joined. A share paired
+ * with nothing whose id the tree uses for another event gets a new id.
+ */
+function planIncomingShares(state: MergeState, mapping: IdMapping): IncomingSharePlan {
+    const rename = new Map<string, string>();
+    let joined = 0;
+    const existingIds = treeShareIds(state.existingData);
+    const taken = new Set([...existingIds, ...treeShareIds(state.incomingData)]);
+    const fresh = shareIdMaker(taken);
+    for (const [shareId, copies] of allShareCopies(state.incomingData)) {
+        const votes = new Map<string, number>();
+        let pairedPlain = false;
+        for (const { personId, event } of copies) {
+            const targetId = existingTargetOf(state, personId) ?? mapping.persons.get(personId);
+            const target = targetId ? state.existingData.persons[targetId] : undefined;
+            if (!target) continue;
+            const events = target.events ?? [];
+            const key = eventKey(event);
+            const twin = events.find(e => e.id === event.id && eventKey(e) === key)
+                ?? events.find(e => e.shareId === shareId && eventKey(e) === key)
+                ?? events.find(e => eventKey(e) === key);
+            if (!twin) continue;
+            if (twin.shareId) votes.set(twin.shareId, (votes.get(twin.shareId) ?? 0) + 1);
+            else pairedPlain = true;
+        }
+        if (votes.size > 0) {
+            const best = [...votes].sort((a, b) => b[1] - a[1] || (a[0] === shareId ? -1 : b[0] === shareId ? 1 : 0))[0][0];
+            if (best !== shareId) rename.set(shareId, best);
+            joined++;
+        } else {
+            if (existingIds.has(shareId)) rename.set(shareId, fresh());
+            if (pairedPlain) joined++;
+        }
+    }
+    return { rename, joined };
+}
+
+/** `person` with its events' share ids renamed (a copy; the person itself when nothing changes). */
+function withRenamedShares(person: Person, rename: ReadonlyMap<string, string>): Person {
+    if (!person.events?.some(e => e.shareId && rename.has(e.shareId))) return person;
+    return {
+        ...person,
+        events: person.events.map(e => e.shareId && rename.has(e.shareId) ? { ...e, shareId: rename.get(e.shareId)! } : e),
+    };
+}
+
+/**
+ * The tree's record of an event the incoming tree has in a share: one in no
+ * share joins it with its role; one in the same share takes the role and the
+ * age it lacks. One in another share stays in it.
+ */
+function adoptShare(kept: LifeEvent, incoming: LifeEvent): void {
+    if (!incoming.shareId || eventKey(kept) !== eventKey(incoming)) return;
+    if (!kept.shareId) kept.shareId = incoming.shareId;
+    if (kept.shareId !== incoming.shareId) return;
+    if (!kept.shareRole && incoming.shareRole) kept.shareRole = incoming.shareRole;
+    if (!kept.age?.trim() && incoming.age?.trim()) kept.age = incoming.age;
 }
 
 // ==================== DUPLICATE CONTENT ====================
@@ -870,9 +1031,20 @@ function contentKey(text: string | undefined): string {
  * What makes two events the same record: kind, date, place, label — and the
  * note, because for occupations and titles the note IS the fact
  * ("blacksmith" vs "innkeeper" with no date are two events, not one).
+ *
+ * A census is the census an older import read as a custom event: a custom
+ * event named only "Census" (a tree not updated to data version 20), and a
+ * custom event named by the census's TYPE with the rest of the note (Strom
+ * 3.27 named it so, and nothing tells it from another custom event), so the
+ * same file loaded again adds no census twice.
  */
 function eventKey(ev: LifeEvent): string {
-    return [ev.type, ev.date ?? '', contentKey(ev.place), contentKey(ev.customLabel), contentKey(ev.note)].join('\u0001');
+    const typed = censusTypeText(ev);
+    const as: Pick<LifeEvent, 'type' | 'customLabel' | 'note'> = typed
+        ? { type: 'custom', customLabel: typed.text, note: typed.note }
+        : { type: ev.type, customLabel: ev.customLabel, note: ev.note };
+    if (isLegacyCensus(as)) { as.type = 'census'; delete as.customLabel; }
+    return [as.type, ev.date ?? '', contentKey(ev.place), contentKey(as.customLabel), contentKey(as.note)].join('\u0001');
 }
 
 /**
@@ -1342,7 +1514,12 @@ export function mergePersonData(
         const seen = new Set(existing.events.map(e => e.id));
         const byContent = new Map(existing.events.map(e => [eventKey(e), e] as const));
         for (const event of incoming.events) {
-            if (seen.has(event.id)) continue;
+            if (seen.has(event.id)) {
+                // The same event of the same tree: it takes the share the incoming copy is in.
+                const same = existing.events.find(e => e.id === event.id);
+                if (same) adoptShare(same, event);
+                continue;
+            }
             // A tree loaded before the value on the event's line was kept (`1 EDUC Gymnázium`): its
             // event without it is this one, and takes it.
             const valued = !byContent.has(eventKey(event)) ? lineValueTwin(byContent, event) : undefined;
@@ -1361,6 +1538,8 @@ export function mergePersonData(
                 if (!twin.gedcomValue && event.gedcomValue && twin.note === event.note) twin.gedcomValue = event.gedcomValue;
                 if (!twin.gedcomAddress && event.gedcomAddress && twin.address === event.address) twin.gedcomAddress = structuredClone(event.gedcomAddress);
                 unionCitations(twin, event, 'sourceIds');
+                // The same record of a shared event: the kept copy is in it.
+                adoptShare(twin, event);
                 // The e-mail the file wrote (its note line is the same): a tree loaded before it was kept takes it.
                 if (!twin.gedcomEmails?.length && event.gedcomEmails?.length) twin.gedcomEmails = [...event.gedcomEmails];
                 continue;

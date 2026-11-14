@@ -8,7 +8,9 @@
  * in src/ui/research-ui.ts. Nothing here touches the DOM or storage.
  */
 
-import { StromData, Person, PersonId, PartnershipId, Partnership, ResearchLink, Source, APP_VERSION, isPrimaryName, PlaceRecordBy } from './types.js';
+import { StromData, Person, PersonId, PartnershipId, Partnership, ResearchLink, Source, APP_VERSION, isPrimaryName, PlaceRecordBy, LifeEvent, EventRoleAt } from './types.js';
+import { eventIsShareable, eventValueIsOnTag } from './events.js';
+import { SUPPORTED_LANGUAGES, getStringsForLang } from './strings.js';
 import { withoutConvertedStandIns, isPurePlaceholder } from './single-parent.js';
 import { carryOverTreeDecisions, withRejectionDetails } from './quality-dismiss.js';
 import { keepPlaceOrigins, placesWithoutMeta, isPlaceRecordId, cleanCoords } from './place-records.js';
@@ -50,7 +52,7 @@ export const RESEARCH_LINK_ACTIONS = [
     'send', 'excerpt', 'app', 'open', 'chat', 'task', 'review', 'research',
     'new', 'update', 'sessions', 'conflict', 'story', 'sync-undo', 'setup', 'live',
     'direction', 'finish', 'media', 'archive', 'seal', 'experiment', 'history', 'fixes', 'doctor', 'places',
-    'history-kinds', 'history-align', 'hypothesis', 'hypotheses',
+    'history-kinds', 'history-align', 'hypothesis', 'hypotheses', 'work',
 ] as const;
 export type ResearchLinkAction = typeof RESEARCH_LINK_ACTIONS[number];
 
@@ -82,6 +84,8 @@ export const RESEARCH_LINK_MARKS: Readonly<Record<ResearchLinkAction, ResearchAc
     hypothesis: 'terminal', hypotheses: 'terminal',
     // The agent's work: a conversation, or a session the terminal starts with its estimate.
     chat: 'agent', history: 'agent', places: 'agent',
+    // Work on the queue (spec 052 §5): the terminal shows what runs and starts the agent's sessions on a yes.
+    work: 'agent',
 };
 
 /** What a link asks of the research besides its action (the `do=` of a task, a conflict, an experiment, a fix). */
@@ -332,6 +336,13 @@ export interface ResearchLinkParams {
     /** `places`: run the queue of places to identify (with `place`: that one place); the research asks in its terminal. */
     placesDo?: 'run';
     /**
+     * `work` (spec 052 §5, `work.link`): work on the queue automatically (`loop`, while the subscription's
+     * gate allows) or only `n` tasks (`tasks`, 1–100); the research's terminal shows what runs and asks.
+     */
+    workDo?: ResearchWorkDo;
+    /** `work` with `workDo: 'tasks'`: how many tasks (1–100; a number or its digits). */
+    n?: number | string;
+    /**
      * `history-kinds` (spec 035): the kinds of events to search — a list of kinds, `all`, `none`
      * or `all` without some (`all,-law`) — or `inherit` (the research's own value dropped).
      */
@@ -361,6 +372,18 @@ export interface ResearchLinkParams {
      * address (`do=start`), no new window and no terminal; without it the link also opens the app followed live.
      */
     liveDo?: 'start';
+}
+
+/** What a `work` link asks (spec 052 §5): automatic work, or only a number of tasks. */
+export type ResearchWorkDo = 'loop' | 'tasks';
+/** The fewest and the most tasks of "Only N tasks" (`strom run --tasks N`). */
+export const WORK_TASKS_MIN = 1;
+export const WORK_TASKS_MAX = 100;
+
+/** A number of tasks for "Only N tasks": a whole number 1–100 (as a number, or 1–3 digits), else null. */
+export function workTasksCount(value: unknown): number | null {
+    const n = typeof value === 'number' ? value : typeof value === 'string' && /^\d{1,3}$/.test(value.trim()) ? Number(value.trim()) : NaN;
+    return Number.isInteger(n) && n >= WORK_TASKS_MIN && n <= WORK_TASKS_MAX ? n : null;
 }
 
 /** Who decides the research's hypotheses (spec 060): the person (the default), or the agent on its own. */
@@ -528,6 +551,13 @@ export function researchSchemeUrl(action: ResearchLinkAction, p: ResearchLinkPar
         case 'history-align':
             // spec 035: the research's terminal shows the preview and asks; `prune=1` leads to the shared catalogues (only there).
             return p.prune ? `${base}&prune=1` : base;
+        case 'work': {
+            // spec 052 §5: the fixed `do`, and a count 1–100 only with `tasks` — nothing else.
+            if (p.workDo === 'loop') return p.n === undefined ? `${base}&do=loop` : null;
+            if (p.workDo !== 'tasks') return null;
+            const n = workTasksCount(p.n);
+            return n !== null ? `${base}&do=tasks&n=${n}` : null;
+        }
         case 'places': {
             // spec 034: the fixed `do=run`, and one place only by its record id — never a place name.
             if (p.placesDo !== 'run') return null;
@@ -1464,6 +1494,12 @@ export function stabilizeIds(next: StromData, previous: StromData): StromData {
     /** What an item says: all but its id and its participants' ids. */
     const said = (x: Item, remap: boolean): string => {
         const { id: _id, participants, ...rest } = x;
+        // The baptism or wedding a godparent's own event points at is found again at each reading
+        // (by its type, with a new id): the event is the same whatever id that one has now.
+        const roleAt = (rest as { roleAt?: EventRoleAt }).roleAt;
+        if (roleAt) {
+            (rest as { roleAt?: unknown }).roleAt = [roleAt.role, roleAt.personId ?? '', roleAt.partnershipId ?? '', roleAt.eventType];
+        }
         const out = { ...rest, ...(participants ? { participants: participants.map(({ id: _p, ...y }) => y) } : {}) };
         return JSON.stringify(remap ? remapIds(out, map) : out);
     };
@@ -1496,6 +1532,179 @@ export function stabilizeIds(next: StromData, previous: StromData): StromData {
     for (const [k, v] of inner) map.set(k, v);
 
     return remapIds(next, map) as StromData;
+}
+
+// ==================== SHARED EVENTS ACROSS UPDATES ====================
+
+/** The bridge feature of a research that reads, keeps and gives back `_STROM_SHARE` and `_STROM_ROLE` (spec 085). */
+export const EVENT_SHARE_FEATURE = 'event.share';
+
+/** Types of a person's own event at another's that an older research gives back as a custom event with its name. */
+const ROLE_AT_TYPES: ReadonlySet<string> = new Set(['godparent', 'weddingWitness']);
+
+/** An event's type, date, place and the value on its line, as an update is matched by them. */
+function eventMatchKey(ev: LifeEvent, type: string = ev.type, label: string = ev.type === 'custom' ? ev.customLabel ?? '' : ''): string {
+    const text = (v: string | undefined): string => (v ?? '').normalize('NFC').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+    const value = eventValueIsOnTag(ev.type) ? (ev.note ?? '').split('\n')[0] : '';
+    return [type, text(label), text(ev.date), text(ev.place), text(value)].join('\u0000');
+}
+
+/** The names a godparent / wedding witness event goes out with as `2 TYPE` (every language of the app). */
+function roleAtTypeLabels(type: string): string[] {
+    return SUPPORTED_LANGUAGES
+        .map(l => (getStringsForLang(l.code).events.types as Record<string, string | undefined>)[type] ?? '')
+        .filter(Boolean);
+}
+
+/** The keys of a previous event an event of the update may have: its own, and a custom event's of its name. */
+function previousEventKeys(ev: LifeEvent): string[] {
+    const keys = [eventMatchKey(ev)];
+    if (ROLE_AT_TYPES.has(ev.type)) for (const label of roleAtTypeLabels(ev.type)) keys.push(eventMatchKey(ev, 'custom', label));
+    return keys;
+}
+
+/**
+ * The share marks (LifeEvent.shareId with the copy's own shareRole) and a
+ * person's part at another's event (roleAt, with the godparent / wedding
+ * witness type it gives) that a research version lacks. A research without
+ * `event.share` in its `features` (not known = an older research) drops
+ * `_STROM_SHARE` and `_STROM_ROLE` under an event and gives the events back
+ * without them: each event of the update takes them from the previous state
+ * — the person matched by REFN (or the same id), the event by its type,
+ * date, place and the value on its line, only where that is unique on both
+ * sides. A copy the research changed (another date) does not match and is an
+ * ordinary event of its person; the other copies stay joined, and a share
+ * left with one copy is none. A godparent's own event comes back as a custom
+ * event with the type's name: it is the godparent event again, pointing at
+ * the person or couple it pointed at (as they are in the update) and at the
+ * same baptism or wedding when that one matches too. A mark the update has
+ * stays as it is.
+ *
+ * With the feature the research decides — unless its version has no mark at
+ * all while the previous state has some: it never got them (the tree went
+ * there while the research was older), so they stay as with an older one.
+ * Returns a new object when any event changed; neither input is changed.
+ */
+export function keepEventShares(next: StromData, previous: StromData, features: readonly string[] | null | undefined): StromData {
+    const marked = (data: StromData): boolean => Object.values(data.persons ?? {})
+        .some(p => (p?.events ?? []).some(e => !!e?.shareId || !!e?.roleAt));
+    if (!marked(previous)) return next;
+    if (features?.includes(EVENT_SHARE_FEATURE) && marked(next)) return next;
+
+    // Persons: previous id → id in the update.
+    const personMap = new Map<PersonId, PersonId>();
+    const prevByRefn = uniqueRefns(previous);
+    for (const [refn, id] of uniqueRefns(next)) {
+        const prevId = prevByRefn.get(refn);
+        if (prevId) personMap.set(prevId, id);
+    }
+    const targeted = new Set(personMap.values());
+    for (const [id, was] of Object.entries(previous.persons ?? {}) as [PersonId, Person][]) {
+        const now = next.persons?.[id];
+        if (!was || !now || personMap.has(id) || targeted.has(id)) continue;
+        if ((was.refn?.trim() ?? '') !== (now.refn?.trim() ?? '')) continue;
+        personMap.set(id, id);
+        targeted.add(id);
+    }
+
+    const partnershipIn = (prevId: PartnershipId | undefined): PartnershipId | undefined => {
+        const was = prevId ? previous.partnerships?.[prevId] : undefined;
+        const a = was ? personMap.get(was.person1Id) : undefined;
+        const b = was ? personMap.get(was.person2Id) : undefined;
+        if (!a || !b) return undefined;
+        const found = Object.values(next.partnerships ?? {}).filter(u => u
+            && ((u.person1Id === a && u.person2Id === b) || (u.person1Id === b && u.person2Id === a)));
+        return found.length === 1 ? found[0].id : undefined;
+    };
+    /** The event of the update that a previous event is, when that is unique on both sides. */
+    const counterpart = (prevEvents: readonly LifeEvent[], nextEvents: readonly LifeEvent[], ev: LifeEvent): LifeEvent | undefined => {
+        const keys = previousEventKeys(ev);
+        const own = eventMatchKey(ev);
+        if (prevEvents.filter(e => e && eventMatchKey(e) === own).length !== 1) return undefined;
+        const found = nextEvents.filter(e => e && keys.includes(eventMatchKey(e)));
+        return found.length === 1 ? found[0] : undefined;
+    };
+    /** roleAt of a previous event as it points into the update (null: whose event it was is not there). */
+    const roleAtIn = (at: EventRoleAt): EventRoleAt => {
+        const out: EventRoleAt = { role: at.role, eventType: at.eventType };
+        const personId = at.personId ? personMap.get(at.personId) : undefined;
+        const partnershipId = at.partnershipId ? partnershipIn(at.partnershipId) : undefined;
+        if (personId) out.personId = personId;
+        if (partnershipId) out.partnershipId = partnershipId;
+        if (at.eventId && personId) {
+            const wasEvent = previous.persons[at.personId!]?.events?.find(e => e.id === at.eventId);
+            const nowEvent = wasEvent
+                ? counterpart(previous.persons[at.personId!]?.events ?? [], next.persons[personId]?.events ?? [], wasEvent)
+                : undefined;
+            if (nowEvent) out.eventId = nowEvent.id;
+        } else if (at.eventId && partnershipId) {
+            if (at.eventId === 'marriage') out.eventId = at.eventId;
+            else {
+                const prevEvents = (previous.partnerships[at.partnershipId!]?.events ?? []) as unknown as LifeEvent[];
+                const nextEvents = (next.partnerships[partnershipId]?.events ?? []) as unknown as LifeEvent[];
+                const wasEvent = prevEvents.find(e => e.id === at.eventId);
+                const nowEvent = wasEvent ? counterpart(prevEvents, nextEvents, wasEvent) : undefined;
+                if (nowEvent) out.eventId = nowEvent.id;
+            }
+        }
+        return out;
+    };
+
+    let persons: StromData['persons'] | null = null;
+    const restored = new Set<string>();
+    for (const [prevId, was] of Object.entries(previous.persons ?? {}) as [PersonId, Person][]) {
+        const prevEvents = was?.events ?? [];
+        if (!prevEvents.some(e => e?.shareId || e?.roleAt)) continue;
+        const id = personMap.get(prevId);
+        const now = id ? (persons ?? next.persons)[id] : undefined;
+        if (!id || !now?.events?.length) continue;
+        let events: LifeEvent[] | null = null;
+        for (const ev of prevEvents) {
+            if (!ev?.shareId && !ev?.roleAt) continue;
+            const match = counterpart(prevEvents, now.events, ev);
+            if (!match) continue;
+            const at = (events ?? now.events).indexOf(match);
+            const copy: LifeEvent = { ...match };
+            let changed = false;
+            if (ev.shareId && !copy.shareId && eventIsShareable(copy.type)) {
+                copy.shareId = ev.shareId;
+                if (ev.shareRole?.trim()) copy.shareRole = ev.shareRole;
+                restored.add(ev.shareId);
+                changed = true;
+            }
+            if (ev.roleAt && !copy.roleAt) {
+                if (ROLE_AT_TYPES.has(ev.type) && copy.type === 'custom') {
+                    copy.type = ev.type;
+                    delete copy.customLabel;
+                }
+                copy.roleAt = roleAtIn(ev.roleAt);
+                changed = true;
+            }
+            if (!changed) continue;
+            events ??= [...now.events];
+            events[at] = copy;
+        }
+        if (!events) continue;
+        persons ??= { ...next.persons };
+        persons[id] = { ...now, events };
+    }
+    if (!persons) return next;
+
+    // A share that only one copy came back to is no share (the others changed there).
+    const counts = new Map<string, number>();
+    for (const p of Object.values(persons)) for (const e of p?.events ?? []) if (e.shareId) counts.set(e.shareId, (counts.get(e.shareId) ?? 0) + 1);
+    for (const [pid, p] of Object.entries(persons) as [PersonId, Person][]) {
+        if (!p?.events?.some(e => e.shareId && restored.has(e.shareId) && (counts.get(e.shareId) ?? 0) < 2)) continue;
+        persons[pid] = {
+            ...p,
+            events: p.events.map(e => {
+                if (!e.shareId || !restored.has(e.shareId) || (counts.get(e.shareId) ?? 0) >= 2) return e;
+                const { shareId: _s, shareRole: _r, ...rest } = e;
+                return rest as LifeEvent;
+            }),
+        };
+    }
+    return { ...next, persons };
 }
 
 // ==================== MEDIA ACROSS UPDATES ====================
@@ -2077,6 +2286,8 @@ export interface LiveStatus {
     sourceProposals?: Record<string, ReadSourceProposal>;
     /** `busy` (with `status.busy` in `features`): sessions and runs working now; absent: not said (an archive, an older research). */
     busy?: LiveBusy;
+    /** `work` (with `work.link` in `features`, spec 052 §5): the gate and a session's length; absent: not said (an archive, an older research). */
+    work?: LiveWork;
     /** `caps`: what the bridge does with the directions; absent: an older research, an archive, a research waiting for its agent. */
     caps?: ResearchCaps;
     /** `offLine` (with `offLine.branches` in `features`): work outside the directions by branches; absent: not said. */
@@ -2629,6 +2840,36 @@ export const OFF_LINE_BRANCHES_FEATURE = 'offLine.branches';
 export const QUEUE_OWN_FEATURE = 'queue.own';
 /** `/status.features`: the whole queue by pages (`GET /queue`), each task's `pos` and `/status.queueCounts`. */
 export const QUEUE_PAGE_FEATURE = 'queue.page';
+/** `/status.features`: the queue is searched by its bridge (`GET /queue?q=`, with `q`, `match` and `elsewhere`; Strom Research 1.32). */
+export const QUEUE_SEARCH_FEATURE = 'queue.search';
+/**
+ * `/status.features`: "Do next" puts the latest one marked on top, and a write answers what the task's place
+ * was (`was`), put back exactly by `{do: 'restore', was}` (Strom Research 1.32).
+ */
+export const QUEUE_NEXT_FEATURE = 'queue.next';
+/**
+ * `/status.features`: the link `work` (spec 052 §5) — the research's terminal works on the queue
+ * (`do=loop|tasks`) — and `/status.work` saying the gate and a session's length (Strom Research 1.32).
+ */
+export const WORK_LINK_FEATURE = 'work.link';
+/** `/status.features`: `strom run --tasks N`, so "Only N tasks" of the link `work` is offered. */
+export const RUN_TASKS_FEATURE = 'run.tasks';
+
+/** `/status.work`: the subscription's gate by its name (null: none set) and a session's length in minutes. */
+export interface LiveWork {
+    gate: string | null;
+    minutes: number;
+}
+
+/** `/status.work`, checked; null when it is not one (no gate key, or minutes not a count). */
+export function sanitizeLiveWork(value: unknown): LiveWork | null {
+    const r = asRecord(value);
+    if (!r || !('gate' in r)) return null;
+    const gate = r.gate === null ? null : cleanText(r.gate, 120);
+    if (r.gate !== null && !gate) return null;
+    const minutes = asCount(r.minutes);
+    return { gate, minutes: minutes ?? 0 };
+}
 
 /** `/status.queueCounts`: tasks up next by direction and branch (absent = 0), all of them, set aside, and the order's print. */
 export interface LiveQueueCounts {
@@ -2965,7 +3206,7 @@ function waitingHypothesisFields(r: Record<string, unknown>): Partial<LiveWaitin
 const MAX_QUEUE = 20;
 
 /** The `queue` list of the status. Untrusted input: bad items are dropped. */
-export function sanitizeQueue(value: unknown, offLine = false, branches = false, max = MAX_QUEUE): LiveQueueItem[] {
+export function sanitizeQueue(value: unknown, offLine = false, branches = false, max = MAX_QUEUE, ownPlace = branches): LiveQueueItem[] {
     if (!Array.isArray(value)) return [];
     const out: LiveQueueItem[] = [];
     for (const item of value) {
@@ -2980,9 +3221,10 @@ export function sanitizeQueue(value: unknown, offLine = false, branches = false,
         // When work outside the lines comes, and how a task helps a line: only from a research that says so.
         const off = offLine && (r.offLine === 'last' || r.offLine === 'never' || (branches && r.offLine === 'occasional')) ? r.offLine : null;
         const helps = offLine && (r.helps === 'question' || r.helps === 'joins' || r.helps === 'agent') ? r.helps : null;
-        // The branch, the own place and the reason: only from a research with branches outside the directions.
+        // The branch and the reason: only from a research with branches outside the directions.
         const branch = branches ? researchBranchRef(r.branch) : null;
-        const own = branches && (r.own === 'next' || r.own === 'last') ? r.own : null;
+        // Its own place: from a research with branches, or one whose "Do next" is offered without them (`queue.next`).
+        const own = ownPlace && (r.own === 'next' || r.own === 'last') ? r.own : null;
         const why = branches ? sanitizeQueueWhy(r.why) : null;
         // Its place in the whole queue: tasks up next only (one set aside has none).
         const pos = state === 'next' && typeof r.pos === 'number' && Number.isInteger(r.pos) && r.pos >= 1 && r.pos <= 10_000_000 ? r.pos : null;
@@ -3344,7 +3586,8 @@ export function sanitizeLiveStatus(value: unknown): LiveStatus | null {
         working: sanitizeWorking(r.working, !!features?.includes(WORKING_HELPS_FEATURE)),
         waiting: sanitizeWaiting(r.waiting, !!features?.includes(WAITING_GROUPS_FEATURE), !!features?.includes(OFF_LINE_BRANCHES_FEATURE)),
         links: sanitizeResearchLinks(r.links),
-        queue: sanitizeQueue(r.queue, !!features?.includes(TASKS_OFF_LINE_FEATURE), !!features?.includes(OFF_LINE_BRANCHES_FEATURE)),
+        queue: sanitizeQueue(r.queue, !!features?.includes(TASKS_OFF_LINE_FEATURE), !!features?.includes(OFF_LINE_BRANCHES_FEATURE), undefined,
+            !!features?.includes(OFF_LINE_BRANCHES_FEATURE) || !!features?.includes(QUEUE_NEXT_FEATURE)),
         queueMore: asCount(r.queueMore) ?? 0,
         update: sanitizeUpdate(r.update),
         spend: sanitizeSpend(r.spend, !!features?.includes(SPEND_READERS_FEATURE)),
@@ -3373,6 +3616,7 @@ export function sanitizeLiveStatus(value: unknown): LiveStatus | null {
         ...directionsRevSaid(r, features),
         ...verifyStatusSaid(r, features),
         ...(features?.includes(STATUS_BUSY_FEATURE) && sanitizeBusy(r.busy) ? { busy: sanitizeBusy(r.busy)! } : {}),
+        ...(features?.includes(WORK_LINK_FEATURE) && sanitizeLiveWork(r.work) ? { work: sanitizeLiveWork(r.work)! } : {}),
         ...(sanitizeResearchCaps(r.caps) ? { caps: sanitizeResearchCaps(r.caps)! } : {}),
         ...(features?.includes(OFF_LINE_BRANCHES_FEATURE) && sanitizeOffLine(r.offLine) ? { offLine: sanitizeOffLine(r.offLine)! } : {}),
         ...(features?.includes(QUEUE_PAGE_FEATURE) && sanitizeQueueCounts(r.queueCounts) ? { queueCounts: sanitizeQueueCounts(r.queueCounts)! } : {}),

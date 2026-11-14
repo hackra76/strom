@@ -18,7 +18,7 @@ import { researchActionLabel } from '../research-open-mark.js';
 import { researchBubbleActions, type ResearchBubble, type ResearchBubbleAction } from './table-research-bubble.js';
 
 /** What a bubble shows (its class `tv-bubble--<kind>`). */
-export type BubbleKind = 'finding' | 'legend' | 'cites' | 'research';
+export type BubbleKind = 'finding' | 'legend' | 'cites' | 'research' | 'ages';
 
 /** One finding as the bubble shows it. */
 export interface BubbleFinding {
@@ -28,6 +28,12 @@ export interface BubbleFinding {
     detail: string;
     /** Who or what it is about (the person's list, §7.4): the subject, else the people of the finding. */
     about?: string;
+    /**
+     * A shared event whose copies differ (spec 085 4b): the actions of Data
+     * quality instead of "Not an error": Make all match… and Separate (its
+     * label says how many) and Open.
+     */
+    shared?: { separateLabel: string };
 }
 
 export interface BubbleActions {
@@ -65,7 +71,14 @@ export function bubbleHtml(findings: readonly BubbleFinding[], readOnly: boolean
         if (f.detail) html += `<div class="tv-bub-detail">${esc(f.detail)}</div>`;
         if (unusual) html += `<div class="tv-bub-note">${esc(t.dismissedNote)}</div>`;
         html += '<div class="tv-bub-actions">';
-        if (!readOnly) {
+        if (f.shared) {
+            const v = strings.validation;
+            if (!readOnly) {
+                html += `<button type="button" class="tv-bub-btn tv-bub-btn--primary" data-act="unify" data-i="${i}">${esc(v.unify)}</button>`
+                    + `<button type="button" class="tv-bub-btn" data-act="separate" data-i="${i}">${esc(f.shared.separateLabel)}</button>`;
+            }
+            html += `<button type="button" class="tv-bub-link" data-act="open" data-i="${i}">${esc(v.openEvent)}</button>`;
+        } else if (!readOnly) {
             html += `<button type="button" class="tv-bub-btn" data-act="${unusual ? 'restore' : 'dismiss'}" data-i="${i}">`
                 + `${esc(unusual ? t.reReport : t.notError)}</button>`;
         }
@@ -259,7 +272,7 @@ export function openBubblePanel(opts: {
         }
         if (e.key !== 'Tab') return;
         // The focus stays in the bubble while it is open.
-        const items = [...el.querySelectorAll<HTMLElement>('button, a[href]')];
+        const items = [...el.querySelectorAll<HTMLElement>('button, a[href], input')];
         if (!items.length) { e.preventDefault(); return; }
         const at = items.indexOf(document.activeElement as HTMLElement);
         const next = e.shiftKey ? (at <= 0 ? items.length - 1 : at - 1) : (at + 1) % items.length;

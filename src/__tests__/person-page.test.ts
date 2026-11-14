@@ -1172,7 +1172,7 @@ describe('the contents "On this page" in the file (round 3 §0.7)', () => {
         expect(html).toContain('<div class="pp-file-layout"><nav class="pp-toc" aria-label="Na stránce"><div class="pp-toc-h">Na stránce</div><ol>');
         const nav = navOf(html);
         expect(hrefs(nav)).toEqual(['pp-sec-facts', ...sectionIds(html)]);
-        expect(nav).toContain('>Rodina</a>');
+        expect(nav).toContain('>Rodina</span></a>');
         expect(nav).not.toMatch(/<script|onclick|data-pp-toc/);
         // The fold: under the header, closed, the same entries.
         const fold = html.slice(html.indexOf('<details class="pp-toc-m">'), html.indexOf('</details>', html.indexOf('<details class="pp-toc-m">')));
@@ -1399,7 +1399,7 @@ describe('person page 2 (§0, §3, §4)', () => {
         // The role lives in the group's heading; each name stands alone, without a declined role after it (round 2, point 8).
         expect(sec).toContain('<dt>Kmotři při křtu 1860</dt><dd><ul><li><strong>Josef Kmotr</strong></li></ul></dd>');
         expect(sec).toContain('<dt>Svědci při sňatku 1888</dt><dd><ul><li><strong>František Svědek</strong>, soused</li></ul></dd>');
-        expect(sec).toMatch(/<dt>Byl kmotrem<\/dt><dd><ul><li><strong><button[^>]*data-pp-person="cizi"[^>]*>Tomáš Neznámý<\/button><\/strong> <span class="pp-people-note">\(křest 1870\)<\/span>/);
+        expect(sec).toMatch(/<dt>Kmotr a svědek u<\/dt><dd><ul><li><strong><button[^>]*data-pp-person="cizi"[^>]*>Tomáš Neznámý<\/button><\/strong> <span class="pp-people-note">· kmotr · křest 1870<\/span>/);
         expect(sec).not.toContain('pp-people-role');
         // After the gallery, before the notes.
         expect(html.indexOf('pp-sec-people')).toBeGreaterThan(html.indexOf('pp-sec-materials'));
@@ -1929,5 +1929,89 @@ describe('the Ancestors section: a four-generation fan under the family (1031, �
         const html = anc(body(d, { lang: 'de' }));
         expect(html).toContain('um 1830');
         expect(anc(body(d))).toContain('asi 1830');
+    });
+});
+
+describe('a shared event on the person page (spec 085 §2b–2c)', () => {
+    function census(): StromData {
+        const d = fiskTree();
+        const ev = (pid: string, age: string) => ({ id: `c_${pid}`, type: 'census' as const, date: '1900-12-31', place: 'Čapkov', age, shareId: 'sh_c1900' });
+        for (const [pid, age] of [['jan', '40'], ['marie', '35'], ['rosa', '7']] as const) {
+            const per = d.persons[pid as PersonId];
+            per.events = [...(per.events ?? []), ev(pid, age)];
+        }
+        return d;
+    }
+
+    it('writes "with" and the given names as links to the persons, the line opening the editor', () => {
+        const html = body(census());
+        // The timeline's line (the places list above it names the others too, without opening).
+        const line = html.match(/<span class="shared-line shared-line--open"[^>]*>[\s\S]*?<\/span><\/span>/)?.[0] ?? '';
+        expect(line).toContain('data-pp-action="shared-event"');
+        expect(line).toContain('data-pp-event="c_jan"');
+        expect(line).toContain('spolu: ');
+        expect(line).toMatch(/data-pp-person="marie"[^>]*title="Marie Dvořáková"[^>]*>Marie</);
+        expect(line).toMatch(/data-pp-person="rosa"[^>]*>Rosa</);
+        expect(line).toContain('shared-line-mark');
+    });
+
+    it('the lead takes no case: the names stay in the nominative after it (cs, pl), "with" in en and de', () => {
+        const lineText = (lang?: 'pl' | 'de' | 'en') => {
+            const html = body(census(), lang ? { lang } : {});
+            const line = html.match(/<span class="shared-line shared-line--open"[^>]*>[\s\S]*?<\/span><\/span>/)?.[0] ?? '';
+            return line.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+        };
+        expect(lineText()).toMatch(/^spolu: Marie, Rosa/);
+        expect(lineText('pl')).toMatch(/^razem: Marie, Rosa/);
+        expect(lineText('de')).toMatch(/^mit Marie, Rosa/);
+        expect(lineText('en')).toMatch(/^with Marie, Rosa/);
+    });
+
+    it('a read-only page names the persons without opening the editor', () => {
+        const op = opts();
+        const html = buildPersonPageBody(preparePersonPageData(census(), op, { readOnly: true }), op);
+        expect(html).toContain('class="shared-line"');
+        expect(html).not.toContain('data-pp-action="shared-event"');
+    });
+
+    it('print writes the whole names, without the mark', () => {
+        const html = doc(census(), { mode: 'print' });
+        const line = html.match(/<span class="shared-line[^"]*"[^>]*>[\s\S]*?<\/span><\/span>/)?.[0] ?? '';
+        expect(line).toContain('Marie Dvořáková');
+        expect(line).toContain('Rosa Fíšková');
+        expect(line).not.toContain('shared-line-mark');
+        expect(line).not.toContain('data-pp-action');
+    });
+
+    it('the places map keeps the person\'s own point; the place\'s row names the others (spec 085 §2g)', () => {
+        const d = census();
+        d.places = { capkov: { lat: 49.6, lon: 15.1 }, viden: { lat: 48.2, lon: 16.37 } };
+        const html = body(d);
+        const section = html.match(/<section class="pp-sec pp-sec--places[\s\S]*?<\/section>/)?.[0] ?? '';
+        const row = section.match(/<li class="pp-map-row[^"]*"[^>]*data-pp-map-place="capkov"[\s\S]*?<\/li>/)?.[0] ?? '';
+        expect(row).toContain('class="pp-map-with"');
+        expect(row).toMatch(/data-pp-person="marie"[^>]*>Marie</);
+        expect(row).toMatch(/data-pp-person="rosa"[^>]*>Rosa</);
+        // The row selects the place: the line opens no editor of its own.
+        expect(row).not.toContain('data-pp-action="shared-event"');
+        // Vídeň has no shared event: no line.
+        const other = section.match(/<li class="pp-map-row[^"]*"[^>]*data-pp-map-place="viden"[\s\S]*?<\/li>/)?.[0] ?? '';
+        expect(other).not.toContain('pp-map-with');
+        // One point per place, as before.
+        expect(section.match(/data-pp-map-place="capkov"/g)!.length).toBe(html.match(/data-pp-map-place="capkov"/g)!.length);
+    });
+
+    it('a living person of the event is left out under privacy', () => {
+        // A lodger of the same census marked as alive.
+        const d = census();
+        d.persons['host' as PersonId] = p('host', 'Bořivoj', 'Podnájemný', 'male', { isDeceased: false,
+            events: [{ id: 'c_host', type: 'census', date: '1900-12-31', place: 'Čapkov', age: '1', shareId: 'sh_c1900' }] });
+        const full = body(d);
+        expect(full).toContain('data-pp-person="host"');
+        const op = opts({ privacy: 'initials' });
+        const line = buildPersonPageBody(preparePersonPageData(d, op), op).match(/<span class="shared-line[^"]*"[^>]*>[\s\S]*?<\/span><\/span>/)?.[0] ?? '';
+        expect(line).toContain('Marie');
+        expect(line).not.toContain('data-pp-person="host"');
+        expect(line).not.toContain('B. P.');
     });
 });

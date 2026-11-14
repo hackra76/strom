@@ -82,6 +82,10 @@ export interface FanViewHost {
     menuSheet(menu: FanMenuSpec, onClose: () => void): void;
     /** Close that sheet. */
     hideMenuSheet(): void;
+    /** The view's own choices (the legend open) are kept on the device; a satellite window keeps them in its memory only. */
+    remembersPrefs?(): boolean;
+    /** The person selected in another window (spec 079 §2): their sectors outlined. */
+    windowSelected?(): string | null;
 }
 
 /** One sector's menu (§5.4). */
@@ -266,7 +270,8 @@ export class FanViewController {
     /** Extra options of the drawing: the outlined first occurrence, the way back in the focus disc. */
     protected svgExtras(): Partial<FanSvgOptions> {
         const extras: Partial<FanSvgOptions> = {};
-        if (this.flashKey) extras.marks = [this.flashKey];
+        const marks = [...(this.flashKey ? [this.flashKey] : []), ...this.windowSelectedKeys()];
+        if (marks.length) extras.marks = marks;
         const back = this.backTarget();
         if (back) {
             const p = this.host.data().persons[back];
@@ -878,6 +883,33 @@ export class FanViewController {
         if (!inside) zoom.animateTo({ z: zoom.zoom(), cx: x, cy: y });
     }
 
+    /** The sectors of the person selected in another window (not the focus: the centre is them already). */
+    private windowSelectedKeys(): string[] {
+        const id = this.host.windowSelected?.();
+        const m = this.model;
+        if (!id || !m) return [];
+        return [...m.sectors, ...m.desc].filter(s => s.person?.id === id).map(s => s.key);
+    }
+
+    /**
+     * Another window's selection: the person's sectors outlined; the view
+     * pans (the zoom kept) to the first of them only when none is in view.
+     */
+    revealPerson(id: string): void {
+        const zoom = this.zoom;
+        if (!zoom || !this.host.active()) return;
+        this.draw();
+        const keys = this.windowSelectedKeys();
+        if (keys.length === 0 || id !== this.host.windowSelected?.()) return;
+        const vb = zoom.viewBox();
+        const mids = keys.map(k => this.sectorOf(k)).filter((s): s is NonNullable<typeof s> => !!s).map(s => {
+            const r = (s.r1 + s.r2) / 2, a = ((s.lo + s.hi) / 2) * Math.PI / 180;
+            return { x: r * Math.cos(a), y: -r * Math.sin(a) };
+        });
+        if (mids.some(p => p.x >= vb.x && p.x <= vb.x + vb.w && p.y >= vb.y && p.y <= vb.y + vb.h)) return;
+        zoom.animateTo({ z: zoom.zoom(), cx: mids[0].x, cy: mids[0].y });
+    }
+
     private clearFlash(redraw: boolean): void {
         if (this.flashTimer) { clearTimeout(this.flashTimer); this.flashTimer = null; }
         if (!this.flashKey) return;
@@ -1158,12 +1190,12 @@ export class FanViewController {
         const sel = this.host.settings().colorMode === 'rod' ? this.host.selectedRod?.() ?? null : null;
         const selKey = sel === null ? null : legend.some(r => r.item.key === sel) ? sel : 'rodOther';
         const rows = legend.map(r =>
-            `<div class="fan-legend-row${r.item.key === selKey ? ' is-selected' : ''}" data-fan-legend="${esc(r.item.key)}">${this.swatch(r)}`
+            `<div class="fan-legend-row sel-opt${r.item.key === selKey ? ' is-selected' : ''}" data-sel-form="row" data-fan-legend="${esc(r.item.key)}">${this.swatch(r)}`
             + `<span class="fan-legend-label">${esc(r.item.label)}</span>`
             + (r.item.who ? `<span class="fan-legend-who">${esc(r.item.who)}</span>` : '')
             + '</div>');
         if (this.model && fanHasRepeats(this.model)) {
-            rows.push(`<div class="fan-legend-row fan-legend-repeats" data-fan-legend="repeats"><span class="fan-sw fan-sw-hatch" aria-hidden="true"></span>`
+            rows.push(`<div class="fan-legend-row fan-legend-repeats sel-opt" data-sel-form="row" data-fan-legend="repeats"><span class="fan-sw fan-sw-hatch" aria-hidden="true"></span>`
                 + `<span class="fan-legend-label">${esc(strings.fan.legendRepeats)}</span></div>`);
         }
         return rows.join('');
@@ -1207,7 +1239,9 @@ export class FanViewController {
 
     private toggleLegend(): void {
         this.legendOpen = !this.legendOpen;
-        try { localStorage.setItem(FAN_STORAGE_KEYS.legendOpen, this.legendOpen ? '1' : '0'); } catch { /* ignore */ }
+        if (this.host.remembersPrefs?.() !== false) {
+            try { localStorage.setItem(FAN_STORAGE_KEYS.legendOpen, this.legendOpen ? '1' : '0'); } catch { /* ignore */ }
+        }
         this.renderLegend();
     }
 

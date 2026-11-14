@@ -29,8 +29,8 @@
  * a cell, or Enter on it, asks for the finding's bubble (`onIssue`).
  *
  * The row's actions (§10.1): a click selects a row, ↑ ↓ move the selection,
- * Escape clears it; the first column carries ⌖ ▤ ✎ (under the pointer and on
- * the selected row), Enter opens the person, a double click edits, a right
+ * Escape clears it; the row's end carries ⌖ ▤ ✎ (under the pointer and on
+ * the selected row; no column narrowed for them), Enter opens the person, a double click edits, a right
  * click / Shift+F10 / the menu key ask for the row's menu. After a change a
  * row lights up for a moment (`flash`, §10.3) and a row that no longer
  * passes the filter stays dimmed with a note (`stale`).
@@ -39,7 +39,7 @@
 import { strings } from '../../strings.js';
 import { cellPlainText, columnLabel, groupLabel, type ColumnDef, type SortSpec } from './table-columns.js';
 import { rowKey, type CellName, type CellSeverity, type CellValue, type ResearchCellDetail, type ResearchSignal, type RowType, type TableModel, type TableRow } from './table-model.js';
-import { columnRun, groupRuns, MIN_COLUMN_WIDTH, type CollapsedBand } from './table-state.js';
+import { columnRun, groupRuns, lockedColumn, MIN_COLUMN_WIDTH, type CollapsedBand } from './table-state.js';
 import { columnOffsets, columnWindow, lineOffsets, lineWindow, type ColumnWindow } from './table-window.js';
 import { lineCell, lineKey, lineLevel, plainLines, type GridLine } from './table-subrows.js';
 import type { CoverageCell } from './table-coverage.js';
@@ -48,6 +48,7 @@ import { copyPlainText } from './table-cell.js';
 import { shownNameOrEmpty as personName } from '../../person-name.js';
 import { AGENT_SPIN_MS, sharedPhaseDelay } from '../../card-signals.js';
 import { PERSON_FINDINGS_COLUMNS } from './table-checks.js';
+import { sharedEventMarkSvg } from '../../icons.js';
 
 export interface GridInput {
     model: TableModel;
@@ -63,6 +64,8 @@ export interface GridInput {
     homeId: string | null;
     /** The selected row's key (rowKey), if any. */
     selected: string | null;
+    /** The selected row is shared with other windows (spec 079 §2): its own look. */
+    selectedShared?: boolean;
     /** The grid's accessible name. */
     label: string;
     /** The lines drawn (§3: rows with their union sub-rows); default one line per row. */
@@ -92,7 +95,7 @@ export interface GridInput {
     /** Rows kept after a change that no longer pass the filter (§10.3, their row keys). */
     stale?: ReadonlySet<string>;
     /** The action icons in the first column (§10.1; `edit` false: read-only); none on a phone (10b). */
-    actions?: { edit: boolean } | null;
+    actions?: { edit: boolean; tree?: boolean } | null;
     /** Live-only research columns while the research is not followed (§16.2: the head's dashed "live" tag). */
     liveOff?: ReadonlySet<string>;
     /** An open research conflict on a fact's cell (§16.3): ≠ before its value; null: none. */
@@ -122,8 +125,16 @@ export interface CellEditSpec {
     save(text: string): string | null;
 }
 
-/** The least width of an editor, wider than a narrow column (T54 F8: it goes over the cell's edge). */
-const EDITOR_MIN_WIDTH: Record<CellEditSpec['input'], number> = { text: 160, date: 150, place: 240, select: 150 };
+/** The width of the row's actions (§10.1): three 26 px icons, their gaps and padding. */
+const ROW_ACTIONS_ROOM = 100;
+
+/**
+ * The least width of a field edited in place (T54 F8), by its kind. A field
+ * fits its cell; only a column narrower than this gets a field this wide,
+ * floating over its neighbours with a shadow (.is-floating), so it is plain
+ * that it lies over the row's other cells for the while.
+ */
+const EDITOR_MIN_WIDTH: Record<CellEditSpec['input'], number> = { text: 100, date: 100, place: 140, select: 90 };
 
 /** The agent at a row (§16.6): at work on its task, or just done. */
 export type AgentRowState = { kind: 'working'; task: string } | { kind: 'done' };
@@ -169,8 +180,14 @@ export interface GridHandlers {
     onScroll?(top: number, left: number): void;
     /** A row was selected (a click, ↑ ↓; a sub-row selects its person); null: Escape cleared it. */
     onSelect?(key: string | null, row: TableRow | null): void;
-    /** A line was clicked or tapped, after its selection (a phone opens the row's sheet, 10b); the cell it was on. */
-    onRowClick?(line: GridLine, cell: GridCellRef | null): void;
+    /** A cell's editor closed (saved, Esc, blur): what waited for the edit may come now. */
+    onEditClosed?(): void;
+    /**
+     * A line was clicked or tapped, after its selection (a tap opens the row's
+     * sheet, 10b); the cell it was on and the pointer of the click
+     * (`clickPointerType`: a mouse or a pen only selects).
+     */
+    onRowClick?(line: GridLine, cell: GridCellRef | null, pointer: string): void;
     /** A row's action (§10.1): its icon, Enter (open), a double click (edit). */
     onRowAction?(action: RowAction, line: GridLine): void;
     /**
@@ -180,6 +197,8 @@ export interface GridHandlers {
     onName?(line: GridLine, col: ColumnDef, name: CellName, anchor: HTMLElement): void;
     /** The pill "+N" of a citation cell (§14.3): the further citations' bubble. */
     onMoreCites?(line: GridLine, col: ColumnDef, ids: readonly string[], anchor: HTMLElement): void;
+    /** A shared event's ages (spec 085 §4, 4a): their bubble. */
+    onSharedAges?(line: GridLine, anchor: HTMLElement): void;
     /** The row's menu (§10.1): a right click, Shift+F10, the menu key; the cell it is for (T54 F4). */
     onRowMenu?(line: GridLine, anchor: HTMLElement, cell: GridCellRef | null): void;
     /**
@@ -212,8 +231,8 @@ export interface GridHandlers {
     onIssue?(line: GridLine, col: number, cell: HTMLElement): void;
     /** A person's Findings or Highest level cell with a mark was clicked or Enter was pressed on it (§7.4): the person's findings. */
     onFindings?(line: GridLine, col: number, cell: HTMLElement): void;
-    /** A tap on a completeness cell (§6.2): true when its bubble opened (touch; a mouse has the title). */
-    onComp?(line: GridLine, col: number, cell: HTMLElement): boolean;
+    /** A tap on a completeness cell (§6.2): true when its bubble opened (touch; a mouse or a pen has the title). */
+    onComp?(line: GridLine, col: number, cell: HTMLElement, pointer: string): boolean;
     /** A click on a column's head (§8.4); `add`: with Shift, a further sort key. */
     onHeadSort?(colId: string, add: boolean): void;
     /** A click on a coverage cell (§6.1: only empty / only filled). */
@@ -233,6 +252,23 @@ const FIT_ROWS = 200;
 const FIT_MAX = 480;
 
 const ROW_HEIGHT_FALLBACK = 32;
+
+/**
+ * The pointer of a click: the click's own `pointerType` where the browser
+ * gives one, else the one of the pointerdown before it (a click with a
+ * pointer behind it, `detail` > 0); '' for a click without one (keyboard,
+ * script).
+ */
+export function clickPointerType(e: MouseEvent, lastDown: string): string {
+    const own = (e as Partial<PointerEvent>).pointerType;
+    if (typeof own === 'string' && own) return own;
+    return e.detail > 0 ? lastDown : '';
+}
+
+/** A click of a mouse or a pen: it selects only, the row's sheet or a bubble is for a finger (tester's report, 1113). */
+export function isMouseLikePointer(pointer: string): boolean {
+    return pointer === 'mouse' || pointer === 'pen';
+}
 
 function esc(text: string): string {
     return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -361,10 +397,28 @@ function cellValueCore(value: CellValue, col: ColumnDef, hit = ''): string {
         html += `<span class="tv-subst" title="${esc(tip)}" aria-label="${esc(tip)}">${esc(value.subst === 'bap' ? s.bapShort : s.burShort)}</span>`;
     }
     if (value.prefix) html += `<span class="tv-qual">${hit ? highlightHtml(value.prefix, hit) : esc(value.prefix)}</span>`;
+    if (value.shared && value.names?.length && !value.na) return html + sharedNamesHtml(value, hit);
     if (value.names?.length && !value.na) return html + `<span class="tv-cell-text">${namesHtml(value.names, hit)}</span>`;
+    if (value.sharedAges && !value.na) {
+        // A shared event's own ages (4a): a button that opens each one's age.
+        return html + `<button type="button" class="tv-ages" tabindex="-1" aria-haspopup="dialog" title="${esc(strings.table.agePerPerson)}">`
+            + `<span class="tv-cell-text">${hit ? highlightHtml(cellText(value), hit) : esc(cellText(value) || '–')}</span></button>`;
+    }
     if (value.link && !value.na) return html + linkHtml(value.link, hit);
     if (value.dots && !value.na) return html + readersHtml(value, hit);
     return html + `<span class="tv-cell-text">${hit && !value.na ? highlightHtml(cellText(value), hit) : esc(cellText(value))}</span>`;
+}
+
+/**
+ * The Persons cell of a shared event (spec 085 §4, 4a): the given names
+ * ("+N" for the persons not named) after the badge with the two circles
+ * and "4 people", which stays in sight when the names are cut.
+ */
+export function sharedNamesHtml(value: CellValue, hit = ''): string {
+    const s = value.shared!;
+    const more = s.more > 0 ? `<span class="tv-shared-more"> +${s.more}</span>` : '';
+    return `<span class="tv-shared"><span class="tv-shared-pill">${sharedEventMarkSvg(13)}${esc(strings.table.sharedCount(s.count))}</span>`
+        + `<span class="tv-cell-text">${namesHtml(value.names ?? [], hit)}${more}</span></span>`;
 }
 
 /**
@@ -392,9 +446,10 @@ export function readersHtml(value: CellValue, hit = ''): string {
 export function namesHtml(names: readonly CellName[], hit = ''): string {
     return names.map((n, i) => {
         const text = hit ? highlightHtml(n.text, hit) : esc(n.text);
-        if (!n.personId && !n.role) return `<span>${text}</span>`;
+        const title = n.title ? ` title="${esc(n.title)}"` : '';
+        if (!n.personId && !n.role) return `<span${title}>${text}</span>`;
         return `<button type="button" class="tv-nm${n.personId ? ' tv-nm--person' : ''}" data-ni="${i}" tabindex="-1"`
-            + `${n.role ? ' aria-haspopup="menu"' : ''}>${text}</button>`;
+            + `${n.role ? ' aria-haspopup="menu"' : ''}${title}>${text}</button>`;
     }).join(', ');
 }
 
@@ -435,6 +490,8 @@ export class TableGrid {
     private headFocus: string | null = null;
     /** A drag or a long press just ended: the click that follows is not a click. */
     private swallowClick = false;
+    /** The pointer of the body's last pointerdown (`clickPointerType`). */
+    private lastPointerDown = '';
     private measureCtx: CanvasRenderingContext2D | null = null;
     /** The lines drawn and their tops (§3). */
     private lines: readonly GridLine[] = [];
@@ -453,6 +510,8 @@ export class TableGrid {
     private drawnRows: DrawnRow[] = [];
     /** The agent's bars stop while out of sight (§16.6). */
     private agentBars: IntersectionObserver | null = null;
+    /** The line whose action icons the pointer may show (it came onto the row away from where they stand), by its key. */
+    private armedKey: string | null = null;
     /** The rows lit after a change (row keys, §10.3) and the timer that ends it. */
     private readonly flashKeys = new Set<string>();
     private flashTimer: ReturnType<typeof setTimeout> | null = null;
@@ -486,7 +545,12 @@ export class TableGrid {
             this.schedule();
             this.placeEditor();
         }, { passive: true });
+        this.body.addEventListener('pointerdown', (e) => { this.lastPointerDown = e.pointerType; }, { passive: true });
+        this.body.addEventListener('pointermove', (e) => this.armRowActions(e), { passive: true });
+        this.body.addEventListener('pointerleave', () => this.disarmRowActions(), { passive: true });
         this.body.addEventListener('click', (e) => {
+            const pointer = clickPointerType(e, this.lastPointerDown);
+            this.lastPointerDown = '';
             const t = e.target as Element;
             const rowEl = t.closest<HTMLElement>('.tv-row[data-key]');
             const line = rowEl ? this.lines[Number(rowEl.dataset.index)] : undefined;
@@ -507,6 +571,12 @@ export class TableGrid {
             if (nm && cellEl && this.nameAt(line, cellEl, nm)) return;
             const more = t.closest<HTMLElement>('.tv-cites-more');
             if (more && cellEl && this.moreCitesAt(line, cellEl, more)) return;
+            const ages = t.closest<HTMLElement>('.tv-ages');
+            if (ages && line.kind === 'row' && this.handlers.onSharedAges) {
+                this.select(line);
+                this.handlers.onSharedAges(line, ages);
+                return;
+            }
             // A web address opens its own window (§14.2); the row stays as it is.
             if (t.closest('a.tv-link')) return;
             const conf = t.closest<HTMLElement>('.tv-conf');
@@ -536,13 +606,13 @@ export class TableGrid {
                 return;
             }
             this.select(line);
-            if (cellEl?.querySelector('.tv-comp') && this.handlers.onComp?.(line, Number(cellEl.getAttribute('aria-colindex')) - 1, cellEl)) return;
-            this.handlers.onRowClick?.(line, this.cellRefOf(line, cellEl));
+            if (cellEl?.querySelector('.tv-comp') && this.handlers.onComp?.(line, Number(cellEl.getAttribute('aria-colindex')) - 1, cellEl, pointer)) return;
+            this.handlers.onRowClick?.(line, this.cellRefOf(line, cellEl), pointer);
         });
         // A double click edits (§10.1); the ▾/▸, the count pill and the icons are their own.
         this.body.addEventListener('dblclick', (e) => {
             const t = e.target as Element;
-            if (t.closest('.tv-toggle, .tv-unions-pill, .tv-act, .tv-more-btn, .tv-nm, .tv-link, .tv-cites-more, .tv-conf')) return;
+            if (t.closest('.tv-toggle, .tv-unions-pill, .tv-act, .tv-more-btn, .tv-nm, .tv-link, .tv-cites-more, .tv-conf, .tv-ages')) return;
             const line = this.lineOf(t);
             if (!line || line.kind === 'more') return;
             // A cell edited in place (T54 F8) opens its editor; any other cell edits the row.
@@ -664,7 +734,7 @@ export class TableGrid {
 
     /** The names of the active cell (the one with the body's tab stop) in the tab order, the others out (§14.1). */
     private syncNameTabs(): void {
-        for (const b of this.body.querySelectorAll<HTMLElement>('.tv-nm[data-ni], .tv-link, .tv-cites-more, .tv-conf')) {
+        for (const b of this.body.querySelectorAll<HTMLElement>('.tv-nm[data-ni], .tv-link, .tv-cites-more, .tv-conf, .tv-ages')) {
             b.tabIndex = b.closest('[aria-colindex]')?.getAttribute('tabindex') === '0' ? 0 : -1;
         }
     }
@@ -777,6 +847,11 @@ export class TableGrid {
         this.body.style.height = `${tops[this.lines.length]}px`;
         const cw = columnWindow(input.widths, input.pinned, this.el.scrollLeft, this.el.clientWidth);
         if (!this.noMatch.hidden) this.noMatch.style.width = `${this.el.clientWidth}px`;
+        // A table narrower than the grid: the row's actions right after its last column, over no cell;
+        // with less room there, as far out as the grid's edge lets them.
+        const free = this.el.clientWidth - cw.total;
+        this.body.classList.toggle('has-acts-room', free >= ROW_ACTIONS_ROOM);
+        this.body.style.setProperty('--tv-acts-out', `${Math.max(0, Math.min(free, ROW_ACTIONS_ROOM))}px`);
         const rw = lineWindow(tops, Math.max(0, this.el.scrollTop - headH), Math.max(0, this.el.clientHeight - headH));
         const colKey = cw.indices.join(',');
         if (colKey !== this.headKey) {
@@ -1278,7 +1353,9 @@ export class TableGrid {
             if (line.kind !== 'more' && this.flashKeys.has(rk)) cls += ' is-flash';
             if (input.stale?.has(rk)) cls += ' is-stale';
             if (line.kind === 'row') {
-                attrs += ` aria-selected="${rowSelected ? 'true' : 'false'}"`;
+                cls += ' sel-opt';
+                attrs += ` data-sel-form="row" aria-selected="${rowSelected ? 'true' : 'false'}"`;
+                if (rowSelected && input.selectedShared) cls += ' is-shared';
                 if (line.expanded !== null) attrs += ` aria-expanded="${line.expanded}"`;
                 if (line.expanded === false && row.kind === 'person') {
                     attrs += ` aria-label="${esc(strings.table.a11y.collapsed(personName(row.person), line.n))}"`;
@@ -1326,9 +1403,12 @@ export class TableGrid {
                     + `${i === tailAt ? this.rowTail(input, line) : ''}</div>`);
             }
             if (cw.after > 0) cells.push(this.spacer(cw.after));
+            const acts = this.rowActions(input, line);
+            if (acts) cells.push(acts);
             drawn.push({ key, open, cells });
         }
         this.paintBody(drawn);
+        this.armedRowEl()?.classList.add('is-acts-armed');
         this.syncNameTabs();
         this.syncActiveMark();
         if (refocus) this.focusActive(false);
@@ -1393,38 +1473,79 @@ export class TableGrid {
     }
 
     /**
-     * The column that carries the row's tail: the first; in the Events table
-     * the person or couple when it is pinned (the narrow Type keeps its text, §14.1).
+     * The column that carries the row's tail: the locked one (the name), wherever
+     * it stands in the pinned zone (spec 082 K2.1); in the Events table the person
+     * or couple when it is pinned (the narrow Type keeps its text, §14.1).
      */
     private tailColumn(input: GridInput): number {
-        if (input.type !== 'events') return 0;
-        const at = input.columns.findIndex(c => c.id === 'evWho');
-        return at > 0 && at < input.pinned ? at : 0;
+        if (input.type === 'events') {
+            const who = input.columns.findIndex(c => c.id === 'evWho');
+            if (who >= 0 && who < input.pinned) return who;
+        }
+        const lock = lockedColumn(input.type);
+        const at = input.columns.findIndex((c, i) => c.id === lock && !input.bands?.[i]);
+        return at >= 0 ? at : 0;
     }
 
     /**
-     * The end of a line's first cell (§10.1, §10.3): "no longer matches" on a
-     * stale row, then the action icons (shown by the stylesheet under the
-     * pointer and on the selected row).
+     * The row's icons stand over the end of the last cells seen (§10.1): they
+     * show under the pointer only once it has been on the row away from where
+     * they stand, so they never come up under a pointer that came for a cell
+     * there (its click reaches the cell). The selected row shows them while
+     * the pointer is elsewhere.
      */
+    private armRowActions(e: PointerEvent): void {
+        if (e.pointerType !== 'mouse' && e.pointerType !== 'pen') return;
+        const rowEl = (e.target as Element).closest<HTMLElement>('.tv-body > .tv-row');
+        const key = rowEl?.dataset.key ?? null;
+        if (key !== null && key === this.armedKey && rowEl!.classList.contains('is-acts-armed')) return;
+        if (key !== this.armedKey) this.disarmRowActions();
+        const dock = rowEl?.querySelector<HTMLElement>(':scope > .tv-acts-dock');
+        if (!rowEl || !dock || key === null) return;
+        const at = dock.getBoundingClientRect().left;
+        const out = parseFloat(this.body.style.getPropertyValue('--tv-acts-out')) || 0;
+        const from = this.body.classList.contains('has-acts-room') ? at : at + out - ROW_ACTIONS_ROOM;
+        if (key !== this.armedKey && e.clientX >= from) return;
+        rowEl.classList.add('is-acts-armed');
+        this.armedKey = key;
+    }
+
+    private disarmRowActions(): void {
+        if (this.armedKey === null) return;
+        this.armedRowEl()?.classList.remove('is-acts-armed');
+        this.armedKey = null;
+    }
+
+    /** The armed line's row as drawn now (a row drawn anew, e.g. on a selection, gets the mark back). */
+    private armedRowEl(): HTMLElement | null {
+        if (this.armedKey === null) return null;
+        for (const el of this.body.children) if ((el as HTMLElement).dataset.key === this.armedKey) return el as HTMLElement;
+        return null;
+    }
+
+    /** The end of a line's first cell (§10.3): "no longer matches" on a stale row. */
     private rowTail(input: GridInput, line: GridLine): string {
-        if (line.kind === 'more') return '';
-        let html = '';
-        if (line.kind === 'row' && input.stale?.has(rowKey(line.row))) {
-            html += `<span class="tv-stale-note">${esc(strings.table.staleRow)}</span>`;
-        }
+        if (line.kind !== 'row' || !input.stale?.has(rowKey(line.row))) return '';
+        return `<span class="tv-stale-note">${esc(strings.table.staleRow)}</span>`;
+    }
+
+    /**
+     * The row's action icons (§10.1), shown by the stylesheet under the
+     * pointer and on the selected row: at the row's end, after its cells, so
+     * no column is narrowed for them (the name keeps its whole width).
+     */
+    private rowActions(input: GridInput, line: GridLine): string {
         const acts = input.actions;
-        if (acts) {
-            const t = strings.table.act;
-            const b = (act: RowAction, icon: string, label: string): string =>
-                `<button type="button" class="tv-act" data-act="${act}" tabindex="-1" title="${esc(label)}" aria-label="${esc(label)}">`
-                + `<span aria-hidden="true">${icon}</span></button>`;
-            // A source is not in the tree (§14.2): Open source and Edit, both its dialog.
-            html += line.row.kind === 'source'
-                ? `<span class="tv-acts">${b('open', '▤', t.openSource)}${acts.edit ? b('edit', '✎', t.edit) : ''}</span>`
-                : `<span class="tv-acts">${b('tree', '⌖', t.tree)}${b('open', '▤', t.open)}${acts.edit ? b('edit', '✎', t.edit) : ''}</span>`;
-        }
-        return html;
+        if (!acts || line.kind === 'more') return '';
+        const t = strings.table.act;
+        const b = (act: RowAction, icon: string, label: string): string =>
+            `<button type="button" class="tv-act" data-act="${act}" tabindex="-1" title="${esc(label)}" aria-label="${esc(label)}">`
+            + `<span aria-hidden="true">${icon}</span></button>`;
+        // A source is not in the tree (§14.2): Open source and Edit, both its dialog.
+        const icons = line.row.kind === 'source'
+            ? `${b('open', '▤', t.openSource)}${acts.edit ? b('edit', '✎', t.edit) : ''}`
+            : `${acts.tree === false ? '' : b('tree', '⌖', t.tree)}${b('open', '▤', t.open)}${acts.edit ? b('edit', '✎', t.edit) : ''}`;
+        return `<div class="tv-acts-dock" role="gridcell"><span class="tv-acts">${icons}</span></div>`;
     }
 
     /** The name cell of the People table (§3.1, §3.2): ▾/▸ and the count pill, a sub-row's "Union k of n", the "more" button. */
@@ -1518,7 +1639,7 @@ export class TableGrid {
         if (this.copyKey(e)) return;
         if (e.altKey) return;
         // A name in a cell (§14.1) is a button: Enter and Space are its own.
-        if ((e.key === 'Enter' || e.key === ' ') && (e.target as Element).closest?.('.tv-nm, .tv-link, .tv-cites-more, .tv-conf')) return;
+        if ((e.key === 'Enter' || e.key === ' ') && (e.target as Element).closest?.('.tv-nm, .tv-link, .tv-cites-more, .tv-conf, .tv-ages')) return;
         const at = this.activeLineIndex();
         const line = this.lines[at];
         const col = Math.min(this.activeCol, input.columns.length - 1);
@@ -1654,6 +1775,56 @@ export class TableGrid {
         return !!this.editor;
     }
 
+    /** The open editor's row and column (null: none open). */
+    editingCell(): { key: string; colId: string } | null {
+        const ed = this.editor;
+        return ed ? { key: ed.key, colId: ed.colId } : null;
+    }
+
+    /**
+     * A cell's text the tree did not take (spec 079 §3.4: the edit was refused,
+     * the tree is fresh): the editor opens again over the cell with that text,
+     * framed as a draft with `note` under it — Enter saves it on the fresh
+     * tree, Esc drops it. An open editor (another cell) is kept as it is and
+     * framed instead. False when the row or the column is not drawn.
+     */
+    reopenDraft(key: string, colId: string, text: string, note: string): boolean {
+        if (this.markOpenDraft(note)) return true;
+        const input = this.input;
+        const at = this.lines.findIndex(l => lineKey(l) === key);
+        const col = input ? input.columns.findIndex(c => c.id === colId) : -1;
+        if (at < 0 || col < 0) return false;
+        this.focusCell(at, col);
+        if (!this.startEditAt(at, col) || !this.editor) return false;
+        const field = (this.editor as { input: HTMLInputElement | HTMLSelectElement }).input;
+        field.value = text;
+        if (field instanceof HTMLInputElement) field.select();
+        this.markDraft(note);
+        return true;
+    }
+
+    /** The open editor framed as a kept draft (false: none is open). */
+    markOpenDraft(note: string): boolean {
+        if (!this.editor) return false;
+        this.markDraft(note);
+        return true;
+    }
+
+    /** The open editor framed as a kept draft, its note under the cell. */
+    private markDraft(note: string): void {
+        const ed = this.editor;
+        if (!ed) return;
+        ed.box.classList.add('is-draft-kept');
+        let bubble = ed.box.querySelector<HTMLElement>('.tv-draft-kept');
+        if (!bubble) {
+            bubble = document.createElement('div');
+            bubble.className = 'tv-draft-kept';
+            bubble.setAttribute('role', 'status');
+            ed.box.append(bubble);
+        }
+        bubble.textContent = note;
+    }
+
     /** A drawn line's cell edited in place, by the line's index and the column's drawn position. */
     private startEditAt(at: number, col: number): boolean {
         const line = this.lines[at];
@@ -1775,6 +1946,7 @@ export class TableGrid {
         this.editor = null;
         ed.box.remove();
         if (refocus) this.focusActive(true);
+        this.handlers.onEditClosed?.();
     }
 
     /** The editor's line or column is gone (another filter, view or table): closed unsaved; else placed again. */
@@ -1789,7 +1961,11 @@ export class TableGrid {
         this.placeEditor();
     }
 
-    /** The editor over its cell (in the scrolled area), as wide as the column and at least its kind's width. */
+    /**
+     * The editor over its cell (in the scrolled area), as wide as the column:
+     * it never lies over a neighbouring cell, except in a column narrower than
+     * its kind's least width, where it floats over them with a shadow.
+     */
     private placeEditor(): void {
         const ed = this.editor;
         const input = this.input;
@@ -1801,12 +1977,14 @@ export class TableGrid {
         const g = this.el.getBoundingClientRect();
         const r = cell.getBoundingClientRect();
         const width = Math.max(r.width, EDITOR_MIN_WIDTH[ed.spec.input]);
-        let left = r.left - g.left - this.el.clientLeft + this.el.scrollLeft;
+        const cellLeft = r.left - g.left - this.el.clientLeft + this.el.scrollLeft;
+        let left = cellLeft;
         // Wider than the room to the right: it ends at the visible edge.
         const right = this.el.scrollLeft + this.el.clientWidth;
         if (left + width > right) left = Math.max(this.el.scrollLeft, right - width);
         const top = r.top - g.top - this.el.clientTop + this.el.scrollTop;
         ed.box.style.cssText = `left:${Math.round(left)}px;top:${Math.round(top)}px;width:${Math.round(width)}px;height:${Math.round(r.height)}px`;
+        ed.box.classList.toggle('is-floating', width > r.width + 0.5 || Math.abs(left - cellLeft) > 0.5);
     }
 
     /** Scroll a row into view (§8.3: the app's person search in the table) and draw. */
@@ -1819,6 +1997,26 @@ export class TableGrid {
         if (tops[at] < this.el.scrollTop || tops[at + 1] > this.el.scrollTop + view) {
             this.el.scrollTop = Math.max(0, tops[at] - Math.round(view / 3));
         }
+        this.activeKey = key;
+        this.activeCol = 0;
+        this.cellChosen = false;
+        this.bodyKey = '';
+        this.draw();
+    }
+
+    /**
+     * Scroll a row into view only when it is out of it, by the nearest edge
+     * (spec 079 §2: a selection from another window; never scrollIntoView),
+     * and draw.
+     */
+    revealKeyNearest(key: string): void {
+        const at = this.lines.findIndex(l => lineKey(l) === key);
+        if (at < 0) return;
+        const tops = this.lineTops(this.rowHeight());
+        const headH = this.head.offsetHeight;
+        const el = this.el;
+        if (tops[at] < el.scrollTop) el.scrollTop = tops[at];
+        else if (tops[at + 1] + headH > el.scrollTop + el.clientHeight) el.scrollTop = Math.max(0, tops[at + 1] + headH - el.clientHeight);
         this.activeKey = key;
         this.activeCol = 0;
         this.cellChosen = false;

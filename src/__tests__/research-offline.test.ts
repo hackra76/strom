@@ -9,8 +9,9 @@ import {
     sanitizeLiveStatus, sanitizeOffLine, sanitizeQueue, sanitizeQueueWhy, sanitizeWaiting,
 } from '../research-link.js';
 import {
-    setBranchMode, setOffLineTree, setTaskOrder, answerBranchWaiting, fetchBranchTasks,
+    setBranchMode, setOffLineTree, setTaskOrder, answerBranchWaiting, fetchBranchTasks, restoreTaskOrder, sanitizeTaskOrderWas,
 } from '../research-directions-write.js';
+import { setLanguage, strings } from '../strings.js';
 
 const BRANCH = {
     id: 'B-P0031', person: 'P0031', via: { person: 'P0017', rel: 'sibling' }, nearest: 'G0003', tasks: 14, persons: 6,
@@ -142,6 +143,64 @@ describe('writes outside the directions', () => {
         expect(sent()).toEqual({ do: 'next' });
         expect(r.ok && r.task?.own).toBe('next');
         expect((await setTaskOrder(BASE, 'T0412', 'first' as 'next')).ok).toBe(false);
+    });
+
+    it('queue.next: the place before (`was`) read from the answer, sent back by restore as it came', async () => {
+        reply(200, { task: { id: 'T0412', text: 'Sňatek', state: 'next', own: 'next' }, was: { own: 'last', at: '2026-11-13T08:00:00Z' }, head: 'abcdef3' });
+        const r = await setTaskOrder(BASE, 'T0412', 'next');
+        expect(r.ok && r.was).toEqual({ own: 'last', at: '2026-11-13T08:00:00Z' });
+        reply(200, { task: null, was: {}, head: 'abcdef4' });
+        expect((await setTaskOrder(BASE, 'T0412', 'next')).ok && true).toBe(true);
+        const back = await restoreTaskOrder(BASE, 'T0412', { own: 'last', at: '2026-11-13T08:00:00Z' });
+        expect(back.ok).toBe(true);
+        expect(calls[2].url).toContain('/tok/queue/T0412');
+        expect(sent(2)).toEqual({ do: 'restore', was: { own: 'last', at: '2026-11-13T08:00:00Z' } });
+        await restoreTaskOrder(BASE, 'T0412', {});
+        expect(sent(3)).toEqual({ do: 'restore', was: {} });
+        // A `was` the app cannot send back as it came is not sent.
+        expect((await restoreTaskOrder(BASE, 'T0412', { own: 'first' as 'next', at: 'x' })).ok).toBe(false);
+        expect(calls).toHaveLength(4);
+    });
+
+    it('queue.next: the answer to restore read as the research sends it (its place, its reason, no mark of its own)', async () => {
+        reply(200, { task: { id: 'T0086', text: 'Matriky', state: 'next', pos: 6, research: 'G0001', why: { kind: 'line', research: 'G0001' } }, was: { own: 'next', at: '2026-11-13T05:10:00Z' }, head: 'abcdef5', parent: 'abcdef4' });
+        const r = await restoreTaskOrder(BASE, 'T0086', {});
+        expect(r.ok && r.task).toEqual({ id: 'T0086', text: 'Matriky', state: 'next', pos: 6, research: 'G0001', why: { kind: 'line', research: 'G0001' } });
+    });
+
+    it('queue.next: the toast of Do next names the task, in every language without addressing anyone', () => {
+        const said = (lang: Parameters<typeof setLanguage>[0]) => {
+            setLanguage(lang);
+            return strings.live.queueMoved('T0103');
+        };
+        expect(['en', 'cs', 'de', 'pl'].map(l => said(l as Parameters<typeof setLanguage>[0])))
+            .toEqual(['T0103 comes up next', 'T0103 jako další', 'T0103 als Nächstes', 'T0103 jako następne']);
+        setLanguage('en');
+    });
+
+    it('the queue search names a line with the word the rest of the panel uses (cs linie, pl linia; en direction, de Richtung)', () => {
+        const said = (lang: Parameters<typeof setLanguage>[0]) => {
+            setLanguage(lang);
+            const L = strings.live;
+            return [L.dirTitleEmpty, L.queueSearchInDir('Novák'), L.queueSearchNoneDir('Novák'), L.queueSearchAllDirs];
+        };
+        expect(['en', 'cs', 'de', 'pl'].map(l => said(l as Parameters<typeof setLanguage>[0]))).toEqual([
+            ['Directions', 'in Novák', 'Nothing found in Novák.', 'Search all directions'],
+            ['Linie', 'v linii Novák', 'V linii Novák nic nenalezeno.', 'Hledat ve všech liniích'],
+            ['Richtungen', 'in Novák', 'In Novák nichts gefunden.', 'In allen Richtungen suchen'],
+            ['Linie', 'w linii Novák', 'W linii Novák nic nie znaleziono.', 'Szukaj we wszystkich liniach'],
+        ]);
+        setLanguage('en');
+    });
+
+    it('queue.next: a `was` is {} or own + at, nothing else', () => {
+        expect(sanitizeTaskOrderWas({})).toEqual({});
+        expect(sanitizeTaskOrderWas({ own: 'next', at: '2026-11-13T08:00:00Z' })).toEqual({ own: 'next', at: '2026-11-13T08:00:00Z' });
+        expect(sanitizeTaskOrderWas({ own: 'next' })).toBeNull();
+        expect(sanitizeTaskOrderWas({ own: 'first', at: '2026-11-13T08:00:00Z' })).toBeNull();
+        expect(sanitizeTaskOrderWas({ own: 'next', at: '2026-11-13T08:00:00Z', x: 1 })).toBeNull();
+        expect(sanitizeTaskOrderWas(null)).toBeNull();
+        expect(sanitizeTaskOrderWas([])).toBeNull();
     });
 
     it('a growing branch: line (with a direction), keep, never', async () => {

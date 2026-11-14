@@ -811,11 +811,16 @@ export function buildSlovakStrings(cz: StringsType): StringsType {
     };
 
     sk.mobileMenu = {
+        ...sk.mobileMenu,
         addPerson: 'Pridať osobu',
         export: 'Exportovať',
         import: 'Importovať',
         newTree: 'Nový rodokmeň',
         more: 'Viac',
+        fullscreen: 'Celá obrazovka',
+        fullscreenExit: 'Ukončiť celú obrazovku',
+        fullscreenIos: 'Celá obrazovka…',
+        fullscreenIosText: 'Tento prehliadač webovým stránkam celú obrazovku neponúka. Strom pridaný na plochu (Zdieľať → Pridať na plochu) sa otvára bez líšt prehliadača. Aplikácia na ploche má však vlastné oddelené úložisko: rodokmeň sa do nej dostane exportom tu a importom v aplikácii.',
     };
 
     sk.menu = {

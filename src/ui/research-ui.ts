@@ -20,7 +20,9 @@
  * The pure logic lives in src/research-link.ts.
  */
 
+import { noteOverviewSectionRows } from './overview-columns-ui.js';
 import { keepTableViews } from '../table-views-data.js';
+import { pressOnToast } from '../sheet-toasts.js';
 import { setResearchActionLabel, researchActionMark } from './research-open-mark.js';
 import { DataManager, migrateData } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
@@ -39,26 +41,30 @@ import { formatLiveTime, formatLiveClock } from '../live-time.js';
 import { isMobile } from '../breakpoints.js';
 import {
     readResearchHeader, parseLoopbackUrl, parseLiveBridge, contentFingerprint, fingerprintLike,
-    decideResearchOpen, stabilizeIds, keepTitles, keepMarriedSurname, keepSurnameVariants, keepLineageOverrides, researchHasTitles, withResearchTitles, TITLES_FEATURE, carryOverMedia, carryOverUnknownPartners, sanitizeLiveStatus, sanitizeLiveChange,
+    decideResearchOpen, stabilizeIds, keepEventShares, keepTitles, keepMarriedSurname, keepSurnameVariants, keepLineageOverrides, researchHasTitles, withResearchTitles, TITLES_FEATURE, carryOverMedia, carryOverUnknownPartners, sanitizeLiveStatus, sanitizeLiveChange,
     sanitizeLiveEnd, sanitizeWorking, WORKING_HELPS_FEATURE, researchFamilyPartners, workingWithFamilyPersons, parseEventData, extractChangedRefs, personsByRefs,
     humanizeChange, isGedcomFileName, isSafariBrowser,
     parseSendBridge, pickSendDefault, sanitizeSyncReply, researchSchemeUrl, researchTaskRef,
     ResearchLinkAction, ResearchLinkParams, LiveBridgeUrls, LiveStatus, LiveChange, LiveWorker, LiveWaiting,
-    LiveQueueItem, LiveSpend, LiveIntake, LiveDirection, LiveBusy, ResearchCaps, BrowserInfo, LiveOffLine, ResearchHeaderInfo, ExportXrefs, ResearchAccepts, statusAgentless,
-    LiveQueueCounts, QUEUE_PAGE_FEATURE,
+    LiveQueueItem, LiveSpend, LiveIntake, LiveDirection, LiveBusy, LiveWork, ResearchCaps, BrowserInfo, LiveOffLine, ResearchHeaderInfo, ExportXrefs, ResearchAccepts, statusAgentless,
+    LiveQueueCounts, QUEUE_PAGE_FEATURE, QUEUE_SEARCH_FEATURE,
     researchLinkMark, researchUrlMark,
 } from '../research-link.js';
 import { keepImports } from '../import-origin.js';
 import { uiModule } from './module.js';
 import { returnFocusAfterViewer } from './sources.js';
 import { withAppVersion, researchGedcomTitles, researchSendsReadings, researchSendsSourceFields, TitlesInGedcom, changeKind, changeAdds, sanitizeLiveLog, sourceIdsByRef, findSourceTitle, lineNewerThanLoaded, textKind, textPersonRefs, textWithoutRefs, LiveChangeKind, LiveLogEntry, LiveCommitAdds, LiveRecent, waitingAnswerPlace } from '../research-link.js';
+import { overviewInWindow } from '../windows/overview-window.js';
 import { AGENT_DONE_MS, AGENT_DONE_FADE_MS, ResearchCardInfo, setResearchCardInfoProvider } from '../card-signals.js';
 import {
     activeDirections, directionGlyph, directionsMulti, keepLineFocus, lineGlyphFor, linesMulti, queueDirectionFilter, selectedLine,
     taskDirectionName, workingLineCount, workingLineGroups,
 } from './research-directions-ui.js';
 import { iconSvg } from '../icons.js';
-import { queueBranchFilter, queueWhyText, setQueueBranchFilter, taskOrderOffered, waitBranchText, workingWhyText } from './research-offline-ui.js';
+import {
+    branchName, focusQueueMoved, personByRefn, queueBranchFilter, queueNextFor, queueNextOffered, queueRowFlash, queueWhyText, setQueueBranchFilter, taskMenuOrders, taskOrderOffered,
+    waitBranchText, workingWhyText,
+} from './research-offline-ui.js';
 import type { TaskOrderDo } from '../research-directions-write.js';
 import { OTHER_GROUP, panelWaiting, textWithLinks, todoWaiting, waitingSection, waitingTodoCount } from '../research-waiting.js';
 import { agoShort } from '../research-others.js';
@@ -67,9 +73,12 @@ import {
     waitingSeen, watchSectionPrefsStorage, PANEL_PREF_KEYS,
 } from './live-section-prefs.js';
 import {
-    QUEUE_ROWS_CAP, QueueFilter, loadMoreQueueList, noteQueueRev, onQueueListsChange, queueList, queueListItem, requestQueueList,
+    QUEUE_ROWS_CAP, QueueFilter, QueueList, loadMoreQueueList, noteQueueRev, onQueueListsChange, queueList, queueListItem, queueRemote, requestQueueList,
     resetQueueLists, retryQueueList,
 } from '../research-queue-pages.js';
+import {
+    QueueSearch, activeQueueSearch, clearQueueSearch, markQueueSearchPending, queueSearchFor, queueSearchOffered, sayQueueSearch,
+} from './queue-search-ui.js';
 import { followNotice, researchNameBeside, FOLLOW_NOTICE_MS, FOLLOW_HIGHLIGHT_MS, FollowTreeRef } from '../research-follow.js';
 import { SettingsManager } from '../settings.js';
 import { countImages, stripMedia } from '../attachments.js';
@@ -86,7 +95,7 @@ import { sourceReadings, researchSendVouches, conflictTakeovers, heldConflicts }
 import { currentAppBrowser, appBrowserName } from '../research-transfer.js';
 import { localNetworkStatus } from '../local-network.js';
 import { pendingAdopt } from './pending-adopt.js';
-import { shownNameOrEmpty, fitNameHtml } from '../person-name.js';
+import { shownName, shownNameOrEmpty, fitNameHtml } from '../person-name.js';
 import { bindSectionMenu, sectionClickSwallowed, sectionMovedNow } from './live-section-edit-ui.js';
 import { BRIDGE_ANSWER_MS } from '../bridge-ask.js';
 import { bridgeGivesEtag, bridgeGivesImagesByHash, bridgeGivesStale, staleTreeUrl, storedTreeEtag, treeFamilyPartners, treeFileState, treeReplyEtag, treeReplyHeads, treeReplyImages, TREE_GED_TIMEOUT_MS, type TreeReplyHeads } from '../research-tree-file.js';
@@ -174,6 +183,8 @@ export interface LiveSession {
     update: { version: string } | null;
     /** Sessions and runs working now (its last status's `busy`; absent: not said). */
     busy?: LiveBusy;
+    /** The gate and a session's length for "Work on the queue…" (its last status's `work`, `work.link`; absent: not said). */
+    work?: LiveWork;
     spend: LiveSpend | null;
     lastIntake: LiveIntake | null;
     /** The research's directions (empty: an older research). */
@@ -277,7 +288,18 @@ const PANEL_CHANGES = 5;
 
 /** The small panel hides on another tree and while the overview (which shows the same) is drawn. */
 function livePanelHidden(s: LiveSession): boolean {
-    return DataManager.getCurrentTreeId() !== s.treeId || (s.overview && !s.ended);
+    // The overview in its own window (spec 079 6g): the small panel stays here.
+    return DataManager.getCurrentTreeId() !== s.treeId || (s.overview && !s.ended && !overviewInWindow()) || viewingShown();
+}
+
+/**
+ * The overview open without following on the tree on screen: it hides the
+ * panel (an ended following's, or the one without following) as a followed
+ * research's overview does; the panel lay over its ⤡ and took its click.
+ */
+function viewingShown(): boolean {
+    // Kept for the overview's own window (6g): nothing is drawn over the panel here.
+    return !!viewing && viewing.treeId === DataManager.getCurrentTreeId() && !overviewInWindow();
 }
 
 /** Whether a panel section is folded: the user's choice, else the panel's own. */
@@ -389,6 +411,8 @@ export interface LiveFold {
  */
 export function liveSection(host: HTMLElement, o: {
     id: string; title: string; summary?: string; summaryCls?: string;
+    /** In place of `summary`: an element of its own (a folded section's search, spec 083 §1). */
+    summaryEl?: HTMLElement;
     collapsed: boolean; headCls?: string; onToggle: () => void;
     /** A control beside the heading (not inside its button). */
     aside?: HTMLElement;
@@ -408,7 +432,8 @@ export function liveSection(host: HTMLElement, o: {
     head.append(chevron, el('span', 'live-section__title', o.title));
     // A pause between the title and each chip for a screen reader (the spans would run together).
     for (const x of o.extra ?? []) head.append(el('span', 'live-section__sep', ', '), x);
-    if (o.summary) head.appendChild(el('span', `live-section__sum${o.summaryCls ? ` ${o.summaryCls}` : ''}`, o.summary));
+    if (o.summaryEl) head.appendChild(o.summaryEl);
+    else if (o.summary) head.appendChild(el('span', `live-section__sum${o.summaryCls ? ` ${o.summaryCls}` : ''}`, o.summary));
     if (o.locked) {
         head.setAttribute('aria-disabled', 'true');
         head.classList.add('is-locked');
@@ -488,12 +513,33 @@ export function queueKindTag(q: Pick<LiveQueueItem, 'kind'>): HTMLElement | null
     return tag;
 }
 
+/** A task set to come next with `queue.next` (its "next" tag). */
+function queueNextTagged(q: LiveQueueItem, s: LiveSession): boolean {
+    return q.state === 'next' && q.own === 'next' && queueNextOffered(s);
+}
+
+/** A queued task's row with `queue.next`: its "next" tag after the text, lit for a while when just moved. */
+function markQueueNextRow(li: HTMLElement, text: HTMLElement, q: LiveQueueItem, s: LiveSession): void {
+    if (queueNextTagged(q, s)) text.append(' ', el('span', 'research-queue__tag-next', strings.live.queueTagNext));
+    if (queueRowFlash(q.id)) {
+        li.classList.add('research-queue__row--flash');
+        if (!li.hasAttribute('tabindex')) li.tabIndex = -1;
+    }
+}
+
+/** A queued task has its ⋯: the research's actions, a place by hand, or "Do next" for it. */
+function queueRowMenu(s: LiveSession, q: LiveQueueItem, canTask: boolean, canOrder: boolean): boolean {
+    return canTask || canOrder || (queueNextOffered(s) && queueNextFor(s, q));
+}
+
 /**
  * The note under a queued task's text (a quiet second line): why it stands
  * where it stands (a research with branches; one line, the whole sentence
  * in its title), else what an older research says of it.
  */
 function appendQueueNote(text: HTMLElement, q: LiveQueueItem, s: LiveSession): void {
+    // `queue.next`: a task set to come next carries its tag instead of the sentence.
+    if (queueNextTagged(q, s)) return;
     const why = queueWhyText(q, s);
     if (why) {
         const note = el('span', 'live-queue-note live-queue-why', why);
@@ -661,7 +707,10 @@ function waitingFocusIds(): ReadonlySet<string> {
 /** Light a waiting item's row when it is one of the person's the card led to. */
 export function markWaitingFocus(li: HTMLElement, w: LiveWaiting): void {
     li.dataset.waitingId = w.id;
-    if (waitingFocusIds().has(w.id)) li.classList.add('is-person-focus');
+    if (!waitingFocusIds().has(w.id)) return;
+    // Lit: a row of the one selection indicator, always in its chosen state.
+    li.classList.add('is-person-focus', 'sel-opt', 'is-selected');
+    li.dataset.selForm = 'row';
 }
 
 /** The line under a lit row that cannot be answered here (null: none). */
@@ -1499,9 +1548,22 @@ export function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: st
     return node;
 }
 
+/**
+ * The Research overview in a window of its own (spec 079 K3): what it draws,
+ * taken from the main window's snapshot (null: this is not that window).
+ * Its session is the followed one or the viewed one; nothing here follows or
+ * asks a bridge for it.
+ */
+let windowDrawn: { live: LiveSession | null; viewing: OverviewViewing | null } | null = null;
+
+/** The overview window's research as the main window last said it (null: not that window). */
+export function setOverviewWindowDrawn(d: { live: LiveSession | null; viewing: OverviewViewing | null } | null): void {
+    windowDrawn = d;
+}
+
 /** The followed research (null: none), for the overview. */
 export function liveSession(): LiveSession | null {
-    return live;
+    return windowDrawn ? windowDrawn.live : live;
 }
 
 /**
@@ -1537,13 +1599,40 @@ let viewing: OverviewViewing | null = null;
 
 /** The overview open without following (null: not open, or open while following). */
 export function overviewViewing(): OverviewViewing | null {
-    return viewing;
+    return windowDrawn ? windowDrawn.viewing : viewing;
 }
 
 /** What the overview and its sections act on: the followed research, else the one viewed through its bridge. */
 export function researchSession(): LiveSession | null {
-    if (live && !live.ended) return live;
-    return viewing?.kind === 'bridge' ? viewing.session : null;
+    const l = liveSession();
+    if (l && !l.ended) return l;
+    const v = overviewViewing();
+    return v?.kind === 'bridge' ? v.session : null;
+}
+
+/**
+ * The small panel of a followed research, folded or open, kept on this device
+ * for every research ('1' open, '0' folded; anything else is open): a new
+ * following, another research and a reload take it. Only the panel's arrow
+ * writes it, never a phone (its strip opens the overview sheet). Without
+ * storage (a private window) it lasts while the page is open.
+ */
+const MINI_OPEN_KEY = 'strom-research-mini-open';
+let miniFoldedInMemory = false;
+
+function miniPanelFolded(): boolean {
+    try {
+        return localStorage.getItem(MINI_OPEN_KEY) === '0';
+    } catch {
+        return miniFoldedInMemory;
+    }
+}
+
+function rememberMiniPanelFolded(folded: boolean): void {
+    miniFoldedInMemory = folded;
+    try {
+        localStorage.setItem(MINI_OPEN_KEY, folded ? '0' : '1');
+    } catch { /* storage unavailable: kept in memory */ }
 }
 
 /** No bridge known (the overview drawn from the tree). */
@@ -1564,9 +1653,39 @@ function viewingSessionOf(bridge: LiveBridgeUrls, researchId: string, treeId: Tr
     };
 }
 
+/**
+ * How the status of `s` is asked after a write through its bridge: `live`
+ * (followed: its stream's way), `bridge` (the overview viewing it through
+ * its bridge without following: the bridge asked at once), or null (neither,
+ * e.g. ended, another research, or the bridge not answering).
+ */
+export function statusAfterWriteWay(s: LiveSession, followed: LiveSession | null, viewed: OverviewViewing | null): 'live' | 'bridge' | null {
+    if (s.ended) return null;
+    if (followed === s) return 'live';
+    return viewed?.kind === 'bridge' && viewed.session === s && !!s.bridge.base ? 'bridge' : null;
+}
+
+/**
+ * The research viewed through its bridge without following whose status a
+ * write of `researchId` made elsewhere (not from the overview's lists) asks
+ * at once; null: followed (its stream says it), another research, the
+ * overview drawn from the tree or not open.
+ */
+export function viewedWriteSession(researchId: string, followed: LiveSession | null, viewed: OverviewViewing | null): LiveSession | null {
+    if (followed && !followed.ended) return null;
+    const s = viewed?.kind === 'bridge' ? viewed.session : null;
+    if (!s || s.researchId.toLowerCase() !== researchId.toLowerCase()) return null;
+    return statusAfterWriteWay(s, followed, viewed) === 'bridge' ? s : null;
+}
+
 /** The followed research's whole queue is read by pages now (`queue.page`, its bridge answering). */
 export function queuePaged(s: LiveSession | null): boolean {
-    return !!s && !s.ended && s.lostSince === null && !!s.bridge.base && !!s.features?.includes(QUEUE_PAGE_FEATURE);
+    if (!s || s.ended || s.lostSince !== null || !s.features?.includes(QUEUE_PAGE_FEATURE)) return false;
+    // The overview's own window: its pages asked of the main window while its bridge answers, with the search
+    // only (spec 052 §1 there); a research without `queue.search` keeps the window's queue as before.
+    const remote = queueRemote();
+    if (remote) return remote.up() && s.features.includes(QUEUE_SEARCH_FEATURE);
+    return !!s.bridge.base;
 }
 
 /** A queued task by id: in the status's window, else in a page read past it. */
@@ -2120,7 +2239,7 @@ export const researchUiMethods = uiModule({
                 // knows them never got (B18-1): never asked about, never lost. The surname after marriage
                 // likewise, from a research that does not keep a name's kind, and the surname-variant groups
                 // from a version that carries none.
-                data = keepTableViews(keepImports(keepLineageOverrides(keepSurnameVariants(keepMarriedSurname(keepTitles(data, previous, features, researchHasTitles(existing.research, features)), previous, features), previous), previous), previous, features), previous);
+                data = keepEventShares(keepTableViews(keepImports(keepLineageOverrides(keepSurnameVariants(keepMarriedSurname(keepTitles(data, previous, features, researchHasTitles(existing.research, features)), previous, features), previous), previous), previous, features), previous), previous, features);
             }
             action = decideResearchOpen(existing.research, previous ? fingerprintLike(previous, existing.research?.fingerprint) : null);
             // The app's images stay (carryOverMedia); those of people or sources
@@ -2812,7 +2931,8 @@ export const researchUiMethods = uiModule({
         if (!v) return;
         if (DataManager.getCurrentTreeId() !== v.treeId || this.activeResearchId() !== v.researchId || (live && !live.ended)) {
             this.closeOverviewViewing();
-            if (draw) this.renderResearchOverview();
+            // The panel it hid shows again (and the overview goes with the redraw).
+            if (draw) this.renderLivePanel();
             return;
         }
         const status = onComputer() ? this.researchStatusOf(v.researchId) : null;
@@ -2865,6 +2985,7 @@ export const researchUiMethods = uiModule({
         s.offLine = status.offLine;
         s.update = status.update;
         s.busy = status.busy;
+        s.work = status.work;
         s.browser = status.browser;
         s.spend = status.spend;
         s.lastIntake = status.lastIntake;
@@ -3300,6 +3421,7 @@ export const researchUiMethods = uiModule({
                 ...(status.queueCounts ? { queueCounts: status.queueCounts } : {}),
                 update: status.update,
                 ...(status.busy ? { busy: status.busy } : {}),
+                ...(status.work ? { work: status.work } : {}),
                 spend: status.spend,
                 lastIntake: status.lastIntake,
                 researches: status.researches,
@@ -3320,7 +3442,7 @@ export const researchUiMethods = uiModule({
                 adds: [],
                 recent: status.recent,
                 ended: false,
-                collapsed: isMobile(),
+                collapsed: isMobile() || miniPanelFolded(),
                 seenChanges: 0,
                 es: null,
                 timer: null,
@@ -3333,7 +3455,6 @@ export const researchUiMethods = uiModule({
             const viewed = !!viewing?.follow && viewing.treeId === treeId;
             viewing = null;
             live.overview = viewed || this.researchOverviewRemembered();
-            if (live.overview) live.collapsed = false;
             // Pages of the queue read through the bridge redraw the overview when they come.
             resetQueueLists();
             if (live.queueCounts) noteQueueRev(bridge.base, live.queueCounts.rev);
@@ -3484,6 +3605,40 @@ export const researchUiMethods = uiModule({
         }, wait);
     },
 
+    /**
+     * A write through the bridge changed the research `s` (a task's place,
+     * an item of Awaiting action, a line): its status, so the overview shows
+     * the research's own again. Followed: as
+     * after its events (liveStatusSoon). Viewed without following (spec 057
+     * §7): its bridge asked at once, not at the next regular ask, and the
+     * overview takes the answer in (nothing is followed, the tree stays).
+     */
+    researchStatusAfterWrite(s: LiveSession): void {
+        const way = statusAfterWriteWay(s, live, viewing);
+        if (way === 'live') {
+            this.liveStatusSoon(s);
+            return;
+        }
+        if (way !== 'bridge' || !onComputer()) return;
+        const v = viewing!;
+        void this.askResearchBridge(v.researchId, BRIDGE_ANSWER_MS, s.bridge.base).then(() => {
+            // Still the overview of that research: it takes in what the bridge said (with the rest of the app).
+            if (viewing === v) this.refreshResearchSyncUi();
+        });
+    },
+
+    /**
+     * A write through the bridge of the research `researchId` made outside the
+     * overview's own lists (a conflict decided, a fact verified, a place
+     * answered): the overview viewing it through its bridge without following
+     * asks it at once (researchStatusAfterWrite). Followed: nothing changes
+     * here (its stream says it, as ever).
+     */
+    researchViewedStatusAfterWrite(researchId: string): void {
+        const s = viewedWriteSession(researchId, live, viewing);
+        if (s) this.researchStatusAfterWrite(s);
+    },
+
     /** The bridge answered: following goes on (after a silence: say so by redrawing). */
     liveBridgeBack(s: LiveSession): void {
         s.failures = 0;
@@ -3552,6 +3707,7 @@ export const researchUiMethods = uiModule({
         s.offLine = status.offLine;
         s.update = status.update;
         s.busy = status.busy;
+        s.work = status.work;
         s.browser = status.browser;
         s.spend = status.spend;
         s.lastIntake = status.lastIntake;
@@ -3715,7 +3871,7 @@ export const researchUiMethods = uiModule({
         const features = this.researchStatusOf(s.researchId)?.features;
         const knowsTitles = !!features?.includes(TITLES_FEATURE);
         const link = TreeManager.getTreeMetadata(s.treeId)?.research;
-        const known = previous ? keepTableViews(keepImports(keepLineageOverrides(keepSurnameVariants(keepMarriedSurname(keepTitles(data, previous, features, researchHasTitles(link, features)), previous, features), previous), previous), previous, features), previous) : data;
+        const known = previous ? keepEventShares(keepTableViews(keepImports(keepLineageOverrides(keepSurnameVariants(keepMarriedSurname(keepTitles(data, previous, features, researchHasTitles(link, features)), previous, features), previous), previous), previous, features), previous), previous, features) : data;
         const kept = previous ? carryOverMedia(stabilizeIds(known, previous), previous).data : data;
         const stable = migrateData(previous && !this.researchKeepsLoneFamilies(s.researchId) ? carryOverUnknownPartners(kept, previous) : kept);
         if (active) {
@@ -3751,7 +3907,10 @@ export const researchUiMethods = uiModule({
     stopLiveFollow(silent = false): void {
         const s = live;
         if (!s) return;
-        this.endLiveFollow(s, 'stopped');
+        // "Stop following" asked with the overview open: it stays (an end the app makes closes it).
+        const keepOverview = !silent && !s.ended && s.overview
+            && DataManager.getCurrentTreeId() === s.treeId && this.isResearchOverviewOpen();
+        this.endLiveFollow(s, 'stopped', { keepOverview });
         if (silent) return;
         this.showToast(strings.research.stopped);
         // The one-time "How should changes go?" right away, not at a later click (063 U3 A7).
@@ -3759,7 +3918,7 @@ export const researchUiMethods = uiModule({
     },
 
     /** End a session: close the stream, lift read-only, keep the last state. */
-    endLiveFollow(s: LiveSession, reason: 'ended' | 'other' | 'stopped'): void {
+    endLiveFollow(s: LiveSession, reason: 'ended' | 'other' | 'stopped', opts: { keepOverview?: boolean } = {}): void {
         if (live !== s) return;
         forgetLiveBridge();
         resetQueueLists();
@@ -3777,6 +3936,9 @@ export const researchUiMethods = uiModule({
         if (followNote?.treeId === s.treeId) clearFollowNote();
         if (reason === 'stopped') {
             live = null;
+            // Stopped with its overview open: following ends, the overview stays, now without following
+            // (only its ⤡, × or Escape close it).
+            if (opts.keepOverview) this.openOverviewViewing();
         } else if (!wasEnded && reason === 'other') {
             this.showToast(strings.research.liveOtherTree, 6000);
         }
@@ -3794,6 +3956,8 @@ export const researchUiMethods = uiModule({
     toggleLivePanel(): void {
         if (!live) return;
         live.collapsed = !live.collapsed;
+        // The phone's strip opens the overview sheet: its state is not the small panel's.
+        if (!isMobile()) rememberMiniPanelFolded(live.collapsed);
         if (live.collapsed) {
             live.seenChanges = live.changes.length;
             waitingFocus = null;
@@ -3807,7 +3971,7 @@ export const researchUiMethods = uiModule({
         if (!panel) return;
         // The same rule as the panel's own redraw: a drawn overview hides it.
         if (live) panel.hidden = livePanelHidden(live);
-        else if (idlePanel) panel.hidden = this.activeResearchId() !== idlePanel;
+        else if (idlePanel) panel.hidden = this.activeResearchId() !== idlePanel || viewingShown();
     },
 
     /** The panel element (created on first use). */
@@ -4133,6 +4297,7 @@ export const researchUiMethods = uiModule({
     renderLivePanel(): void {
         this.readWorkingFamilies();
         queueMicrotask(keepLineFocus());
+        queueMicrotask(focusQueueMoved);
         syncResearchCardInfo();
         // A selected line drops with the tree it was made in or the end of following.
         this.syncLineSelection();
@@ -4214,8 +4379,10 @@ export const researchUiMethods = uiModule({
         if (this.canExpandLivePanel()) {
             const expand = el('button', 'live-panel-expand', '⤢');
             expand.type = 'button';
-            expand.setAttribute('aria-label', L.openOverview);
-            expand.title = L.openOverview;
+            // The overview in its own window (6g): ⤢ brings that window to the front.
+            const label = overviewInWindow() ? strings.win.overviewInWindow : L.openOverview;
+            expand.setAttribute('aria-label', label);
+            expand.title = label;
             expand.onclick = () => this.openResearchOverview();
             icons.appendChild(expand);
         }
@@ -4384,7 +4551,7 @@ export const researchUiMethods = uiModule({
         if (!s.ended && s.spend && !phone) this.appendSpendFoot(panel, s.spend);
         placeLivePanel(panel);
         const again = menuTask ? panel.querySelector<HTMLElement>(`.live-queue-more[data-task="${menuTask}"]`) : null;
-        if (again && menuTask) this.openLiveTaskMenu(again, menuTask);
+        if (again && menuTask) this.openLiveTaskMenu(again, menuTask, true);
         // Too tall for the window: fold from the bottom up (by default Up next, then Changes, then Working;
         // never Waiting, never a section with a choice: one kept expanded makes the panel scroll). Not remembered.
         if (!collapsed && !panel.hidden && body.scrollHeight > body.clientHeight + 1) {
@@ -4465,13 +4632,25 @@ export const researchUiMethods = uiModule({
         const shownNext = list ? next : next.slice(0, limit);
         const shownParked = list ? parked : parked.slice(0, limit);
         const hidden = s.queueMore + (next.length - shownNext.length) + (parked.length - shownParked.length);
+        // The overview's own window guesses its height for its columns; more loaded splits them anew.
+        if (directions) noteOverviewSectionRows('queue', shownNext.length + shownParked.length, list ? list.items.length : 0);
 
         const sel = !directions && dirFilter !== 'all' ? s.researches.find(d => d.id === dirFilter) : undefined;
+        // The overview's queue searched through the bridge (`queue.search`): the field under the heading, once unfolded.
+        const searchable = directions && queueSearchOffered(s);
+        const search = searchable && paged ? queueSearchFor(s, () => this.renderResearchOverview()) : null;
+        // The heading's own action on its right (unfolded only), and the count in the title whenever the field or it is there.
+        const action = directions && !fold.collapsed ? this.queueHeadAction(s) : null;
+        const counted = searchable || !!action;
         const host = liveSection(body, {
-            ...fold, title, headCls: 'live-queue-toggle', help: 'queue',
-            summary: sel ? strings.otherResearch.lineQueueOf(counts ? lineCount(sel.id) : next.length, nextCount, directionGlyph(sel))
-                : L.queueCount(nextCount),
+            ...fold, title: counted ? L.queueTitleCount(title, nextCount) : title, headCls: 'live-queue-toggle', help: 'queue',
+            ...(action ? { aside: action } : {}),
+            ...(counted ? {} : {
+                summary: sel ? strings.otherResearch.lineQueueOf(counts ? lineCount(sel.id) : next.length, nextCount, directionGlyph(sel))
+                    : L.queueCount(nextCount),
+            }),
         });
+        if (search) search.field.mount(host);
         if (multi) {
             const pills = el('div', 'research-overview__filters research-overview__queue-filters');
             pills.setAttribute('role', 'radiogroup');
@@ -4485,7 +4664,7 @@ export const researchUiMethods = uiModule({
                 ...active.map(d => [d.id, d.name, lineCount(d.id)] as [string, string, number]),
             ];
             for (const [id, label, n] of options) {
-                const chip = el('button', 'research-overview__filter', `${label} ${n}`);
+                const chip = el('button', 'research-overview__filter sel-opt', `${label} ${n}`);
                 chip.type = 'button';
                 chip.setAttribute('role', 'radio');
                 chip.setAttribute('aria-checked', String(dirFilter === id));
@@ -4514,8 +4693,10 @@ export const researchUiMethods = uiModule({
             pills.prepend(chip);
             pills.scrollLeft = 0;
         }
+        if (search && this.appendQueueSearchResult(host, s, search, { base, branch, dirFilter, multi })) return;
         const ul = el('ul', 'live-panel-list live-queue');
         host.appendChild(ul);
+        if (search) this.queueRowsKeys(ul, search);
         if (list && list.total === null) {
             // The filter's first page not read yet: being read, or failed (try again).
             this.appendQueueListState(ul, list.error, () => {
@@ -4539,6 +4720,8 @@ export const researchUiMethods = uiModule({
         shownNext.forEach((q, i) => {
             const li = el('li', 'live-queue-row');
             li.dataset.task = q.id;
+            // With the search: ↓ from its field comes here.
+            if (search) li.tabIndex = -1;
             const place = placeAt(q, i);
             const num = el('span', 'live-queue-num', String(place));
             if (placeOf || list) num.setAttribute('aria-label', L.branchQueuePos(place));
@@ -4549,6 +4732,7 @@ export const researchUiMethods = uiModule({
             if (glyph) text.prepend(el('span', 'live-queue-dir', `${glyph} `));
             const kind = queueKindTag(q);
             if (kind) text.append(' ', kind);
+            markQueueNextRow(li, text, q, s);
             const dir = multi ? taskDirectionName(s, q.research) : '';
             if (dir) text.appendChild(el('span', 'research-overview__dir', ` · ${dir}`));
             appendQueueNote(text, q, s);
@@ -4560,7 +4744,7 @@ export const researchUiMethods = uiModule({
             }
             if (this.taskOrderBusy(q.id)) li.setAttribute('aria-busy', 'true');
             li.appendChild(text);
-            if (canTask || canOrder) {
+            if (queueRowMenu(s, q, canTask, canOrder)) {
                 const more = el('button', 'live-queue-more', '⋯');
                 more.type = 'button';
                 more.setAttribute('aria-label', r.taskMenu);
@@ -4577,6 +4761,7 @@ export const researchUiMethods = uiModule({
         for (const q of shownParked) {
             const li = el('li', 'live-queue-row live-queue-row--parked');
             li.dataset.task = q.id;
+            if (search) li.tabIndex = -1;
             const text = el('span', 'live-queue-text', `${r.parkedPrefix} ${q.text}`);
             const kind = queueKindTag(q);
             if (kind) text.append(' ', kind);
@@ -4645,6 +4830,217 @@ export const researchUiMethods = uiModule({
             li.appendChild(more);
             ul.appendChild(li);
         }
+        // The small panel: "Search the queue…" opens the overview's queue with the caret in its field (not on a phone).
+        if (!directions && this.canExpandLivePanel() && queueSearchOffered(s)) {
+            const link = el('button', 'link-button live-queue-search-link', L.queueSearchLink);
+            link.type = 'button';
+            link.onclick = () => this.openQueueSearch();
+            host.appendChild(link);
+        }
+    },
+
+    /**
+     * The control on the right of the overview's Queue heading (null: none). Its
+     * being there also puts the queue's count into the title ("QUEUE · 1 240").
+     */
+    queueHeadAction(s: LiveSession): HTMLElement | null {
+        // "Work on the queue…" (spec 052 §5), or "At work ›" while the research works.
+        return this.queueWorkHead(s);
+    },
+
+    /**
+     * The search's answer under the field (`queue.search`): the line saying what
+     * was found, then its tasks. False: nothing searched (or the first answer not
+     * read yet), the queue itself is drawn (dimmed while a search is typed or read).
+     */
+    appendQueueSearchResult(host: HTMLElement, s: LiveSession, search: QueueSearch,
+        o: { base: string; branch: string | null; dirFilter: string; multi: boolean }): boolean {
+        const L = strings.live;
+        if (!search.applied) {
+            search.shown = null;
+            markQueueSearchPending(search.typing);
+            return false;
+        }
+        // The chips narrow the search too: the tasks of the chip that match the text.
+        const filter: QueueFilter = o.branch ? { branch: o.branch, q: search.applied }
+            : o.dirFilter !== 'all' ? { research: o.dirFilter, q: search.applied } : { q: search.applied };
+        const list = requestQueueList(o.base, filter, 'search');
+        const read = list.total !== null;
+        if (read) search.shown = list;
+        const failed = !read && !!list.error;
+        markQueueSearchPending(search.typing || (!read && !failed));
+        const narrowed = o.branch ? branchName(o.branch) : o.dirFilter !== 'all' ? taskDirectionName(s, o.dirFilter) : '';
+        const line = el('div', 'research-overview__queue-result');
+        const cancel = (): HTMLElement => {
+            const b = el('button', 'link-button research-overview__queue-cancel', L.queueSearchCancel);
+            b.type = 'button';
+            b.onclick = () => clearQueueSearch();
+            return b;
+        };
+        if (failed) {
+            // The bridge failed or is busy: why, and Try again; the text stays in the field.
+            line.classList.add('is-error');
+            line.appendChild(el('span', 'research-overview__queue-result-text', list.error === 'busy' ? L.queueSearchBusy : L.queueSearchErr));
+            const retry = el('button', 'link-button live-queue-retry', L.dirRetry);
+            retry.type = 'button';
+            retry.dataset.do = 'queue-retry';
+            retry.onclick = () => {
+                retryQueueList(o.base, filter, 'search');
+                this.renderResearchOverview();
+            };
+            line.appendChild(retry);
+            host.appendChild(line);
+            return true;
+        }
+        const drawn = read ? list : search.shown;
+        if (!drawn || drawn.total === null) {
+            // The first answer not read yet: the queue stays, dimmed.
+            search.shown = null;
+            return false;
+        }
+        const total = drawn.total;
+        let said: string;
+        if (total > 0 || drawn.items.length > 0) {
+            said = L.queueSearchFound(total) + (narrowed ? ` · ${L.queueSearchInDir(narrowed)}` : '');
+            line.appendChild(el('span', 'research-overview__queue-result-text', said));
+        } else if (drawn.elsewhere) {
+            // A task's number outside the queue: where it is now.
+            const state = L.queueState[drawn.elsewhere.state] ?? drawn.elsewhere.state;
+            said = L.queueSearchElsewhere(drawn.elsewhere.id, state);
+            line.append(el('span', 'research-overview__queue-result-text', said), cancel());
+        } else {
+            said = narrowed ? L.queueSearchNoneDir(narrowed) : L.queueSearchNone;
+            line.appendChild(el('span', 'research-overview__queue-result-text', said));
+            if (narrowed) {
+                // The same text in the whole queue: the chip back on All.
+                const all = el('button', 'link-button research-overview__queue-all', L.queueSearchAllDirs);
+                all.type = 'button';
+                all.onclick = () => {
+                    setQueueBranchFilter(s, null);
+                    this.setWorkingLine('all');
+                    activeQueueSearch()?.input.focus({ preventScroll: true });
+                };
+                line.appendChild(all);
+            }
+            line.appendChild(cancel());
+        }
+        host.appendChild(line);
+        if (read) sayQueueSearch(list.key, said);
+        if (drawn.items.length === 0) return true;
+        const ul = el('ul', 'live-panel-list live-queue research-overview__queue-found');
+        host.appendChild(ul);
+        this.queueRowsKeys(ul, search);
+        this.appendQueueSearchRows(ul, s, drawn, o.multi);
+        const has = drawn.items.length;
+        if (drawn === list && list.error) {
+            this.appendQueueListState(ul, list.error, () => {
+                loadMoreQueueList(o.base, filter, 'search');
+                this.renderResearchOverview();
+            });
+        } else if (drawn.next !== null && has < total && has < QUEUE_ROWS_CAP) {
+            const li = el('li', 'live-queue-row live-queue-row--more live-queue-row--load');
+            const busy = !!drawn.loading;
+            const btn = el('button', 'link-button live-queue-load', busy ? L.queueLoading : L.queueLoadMore);
+            btn.type = 'button';
+            btn.dataset.do = 'queue-more';
+            if (busy) {
+                btn.setAttribute('aria-disabled', 'true');
+                li.setAttribute('aria-busy', 'true');
+            } else if (drawn === list) {
+                btn.onclick = () => {
+                    loadMoreQueueList(o.base, filter, 'search');
+                    this.renderResearchOverview();
+                    document.querySelector<HTMLElement>('#research-overview .live-queue-load')?.focus({ preventScroll: true });
+                };
+            }
+            li.append(btn, el('span', 'live-queue-shown', L.queueShown(has, total)));
+            ul.insertBefore(li, ul.querySelector('.live-queue-row--parked'));
+        } else if (has >= QUEUE_ROWS_CAP && total > has) {
+            const li = el('li', 'live-queue-row live-queue-row--more live-queue-row--cap');
+            li.appendChild(el('span', 'live-queue-shown', L.queueCapNote(has, total)));
+            ul.insertBefore(li, ul.querySelector('.live-queue-row--parked'));
+        }
+        return true;
+    },
+
+    /** The tasks found: the queue's rows with the task's number under the text (lit when the number or the person matched). */
+    appendQueueSearchRows(ul: HTMLElement, s: LiveSession, list: QueueList, multi: boolean): void {
+        const r = strings.research;
+        const L = strings.live;
+        const canTask = this.researchLinkAvailable('task');
+        const canOrder = taskOrderOffered(s);
+        // Set-aside ones last (the research's order), without a place.
+        const items = [...list.items.filter(q => q.state === 'next'), ...list.items.filter(q => q.state === 'parked')];
+        const widest = items.reduce((m, q) => Math.max(m, q.pos ?? 0), 0);
+        if (widest >= 10) ul.style.setProperty('--live-queue-num', `${String(widest).length}ch`);
+        for (const q of items) {
+            const parked = q.state === 'parked';
+            const li = el('li', `live-queue-row${parked ? ' live-queue-row--parked' : ''}`);
+            li.dataset.task = q.id;
+            li.tabIndex = -1;
+            const place = !parked ? q.pos : undefined;
+            const num = el('span', 'live-queue-num', place !== undefined ? String(place) : '–');
+            if (place !== undefined) num.setAttribute('aria-label', L.branchQueuePos(place));
+            li.appendChild(num);
+            const text = el('span', 'live-queue-text', q.text);
+            const kind = queueKindTag(q);
+            if (kind) text.append(' ', kind);
+            if (!parked) markQueueNextRow(li, text, q, s);
+            const dir = multi ? taskDirectionName(s, q.research) : '';
+            if (dir) text.appendChild(el('span', 'research-overview__dir', ` · ${dir}`));
+            appendQueueNote(text, q, s);
+            // The task's number (lit when it matched), the person who matched, "deferred".
+            const how = list.match?.[q.id];
+            const meta = el('span', 'live-queue-meta');
+            meta.appendChild(el('span', how === 'id' ? 'research-queue__match' : 'live-queue-id', q.id));
+            if (how === 'person' && q.person) {
+                const p = personByRefn(q.person);
+                meta.appendChild(el('span', 'research-queue__match', p ? `${q.person} ${shownName(p)}` : q.person));
+            }
+            if (parked) meta.appendChild(el('span', 'research-queue__deferred', L.queueTagDeferred));
+            text.appendChild(meta);
+            const problem = this.taskOrderProblem(q.id);
+            if (problem) {
+                const box = el('span', 'live-queue-problem', problem);
+                box.setAttribute('role', 'alert');
+                text.appendChild(box);
+            }
+            if (this.taskOrderBusy(q.id)) li.setAttribute('aria-busy', 'true');
+            li.appendChild(text);
+            if (!parked && queueRowMenu(s, q, canTask, canOrder)) {
+                const more = el('button', 'live-queue-more', '⋯');
+                more.type = 'button';
+                more.setAttribute('aria-label', r.taskMenu);
+                more.setAttribute('aria-haspopup', 'menu');
+                more.dataset.task = q.id;
+                more.onclick = (e) => {
+                    e.stopPropagation();
+                    this.openLiveTaskMenu(more, q.id);
+                };
+                li.appendChild(more);
+            } else if (parked && canTask) {
+                const wake = setResearchActionLabel(el('button', 'link-button live-queue-wake'), r.wake, researchLinkMark('task', { taskDo: 'wake' }));
+                wake.type = 'button';
+                wake.onclick = () => this.runLiveTask(q.id, 'wake');
+                li.appendChild(wake);
+            }
+            ul.appendChild(li);
+        }
+    },
+
+    /** The rows under the search's field: ↑/↓ from row to row, ↑ from the first back to the field. */
+    queueRowsKeys(ul: HTMLElement, search: QueueSearch): void {
+        ul.addEventListener('keydown', (e) => {
+            if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+            const row = (e.target as HTMLElement | null)?.closest<HTMLElement>('li.live-queue-row[data-task]');
+            if (!row || e.target !== row) return;
+            const rows = [...ul.querySelectorAll<HTMLElement>(':scope > li.live-queue-row[data-task]')];
+            const i = rows.indexOf(row);
+            e.preventDefault();
+            if (e.key === 'ArrowDown') rows[i + 1]?.focus();
+            else if (i > 0) rows[i - 1].focus();
+            else search.input.focus();
+        });
     },
 
     /** A list of the queue not read: "Loading tasks…", or why it failed with Try again. */
@@ -4673,11 +5069,13 @@ export const researchUiMethods = uiModule({
     },
 
     /** Pages of the queue came (or failed): the overview drawn again, the focus kept on "Load more" or moved to the rows it brought. */
-    queueListsChanged(): void {
+    queueListsChanged(draw?: () => void): void {
         const a = document.activeElement as HTMLElement | null;
         const fromLoad = !!a?.matches?.('#research-overview .live-queue-load, #research-overview .live-queue-retry');
         const before = fromLoad ? document.querySelectorAll('#research-overview .live-queue > .live-queue-row:not(.live-queue-row--more)').length : 0;
-        this.renderResearchOverview();
+        // `draw`: the overview's own window draws its states over the overview too (greyed while the main window is closed).
+        if (draw) draw();
+        else this.renderResearchOverview();
         const now = document.activeElement;
         if (!fromLoad || (now && now !== document.body && now.isConnected)) return;
         const load = document.querySelector<HTMLElement>('#research-overview .live-queue-load');
@@ -4698,8 +5096,11 @@ export const researchUiMethods = uiModule({
         if (url) this.launchResearchLink(url);
     },
 
-    /** The small ⋯ menu of a queued task: Park / Drop (in the research). Escape or a click elsewhere closes it. */
-    openLiveTaskMenu(anchor: HTMLElement, task: string): void {
+    /**
+     * The small ⋯ menu of a queued task: Park / Drop (in the research). Escape or a click elsewhere closes it.
+     * `again`: drawn anew after a panel redraw (a phone's sheet stands at once, without sliding up again).
+     */
+    openLiveTaskMenu(anchor: HTMLElement, task: string, again = false): void {
         const wasOpen = document.getElementById('live-task-menu')?.dataset.task === task;
         this.closeLiveTaskMenu();
         if (wasOpen) return;
@@ -4709,15 +5110,31 @@ export const researchUiMethods = uiModule({
         menu.dataset.task = task;
         menu.setAttribute('role', 'menu');
         menu.setAttribute('aria-label', r.taskMenu);
-        const s = liveSession();
+        // The followed research, else the one viewed through its bridge without following (spec 057 §7).
+        const s = researchSession();
         const q = liveQueueItem(s, task);
-        if (s && q && taskOrderOffered(s)) {
+        // `queue.next`: "Do next" (exact Undo) first, also without branches; not for a task first already, at work or set aside.
+        const { next: nextOn, orders } = taskMenuOrders(s, q);
+        // On a phone, with `queue.next`: a sheet at the bottom titled by the task.
+        const sheet = nextOn && !!q && window.matchMedia('(max-width: 640px)').matches;
+        if (sheet && q) {
+            // The app's bottom sheet: its handle on top, over a darkened window (bottom-sheet.ts).
+            menu.classList.add('live-task-menu--sheet', 'bottom-sheet');
+            const handle = el('div', 'bottom-sheet-handle');
+            handle.setAttribute('aria-hidden', 'true');
+            menu.appendChild(handle);
+            const title = el('div', 'live-task-menu__title');
+            title.append(el('span', 'live-task-menu__num', q.id), document.createTextNode(` ${q.text}`));
+            menu.appendChild(title);
+        }
+        if (s && q && orders.length > 0) {
             const L = strings.live;
-            const own: [TaskOrderDo, string, string | undefined][] = [
-                ['next', L.taskDoNext, L.taskDoNextHint],
-                ['last', L.taskDoLast, L.taskDoLastHint],
-            ];
-            if (q.own) own.push(['default', L.taskOrderReset, undefined]);
+            const labels: Record<TaskOrderDo, [string, string | undefined]> = {
+                next: nextOn ? [L.queueNext, L.queueNextHint] : [L.taskDoNext, L.taskDoNextHint],
+                last: [L.taskDoLast, L.taskDoLastHint],
+                default: [L.taskOrderReset, undefined],
+            };
+            const own = orders.map(what => [what, ...labels[what]] as const);
             for (const [what, label, hint] of own) {
                 const item = el('div', 'context-menu-item research-direction-menu__item');
                 item.setAttribute('role', 'menuitem');
@@ -4726,14 +5143,14 @@ export const researchUiMethods = uiModule({
                 if (q.own === what) item.setAttribute('aria-current', 'true');
                 item.appendChild(el('span', 'research-direction-menu__label', label));
                 if (hint) item.appendChild(el('span', 'research-direction-menu__hint', hint));
-                const go = (): void => { void this.changeTaskOrder(task, what); };
+                const go = (): void => { void (nextOn && what === 'next' ? this.doTaskNext(task) : this.changeTaskOrder(task, what)); };
                 item.onclick = go;
                 item.onkeydown = (e) => {
                     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
                 };
                 menu.appendChild(item);
             }
-            if (this.researchLinkAvailable('task')) {
+            if (own.length && this.researchLinkAvailable('task')) {
                 const sep = el('div', 'context-menu-divider');
                 sep.setAttribute('role', 'separator');
                 menu.appendChild(sep);
@@ -4750,15 +5167,29 @@ export const researchUiMethods = uiModule({
             };
             menu.appendChild(item);
         }
-        document.body.appendChild(menu);
+        // A phone's sheet: over the app's darkened backdrop; a tap on it closes the sheet (focus back on the ⋯).
+        const backdrop = sheet ? el('div', 'bottom-sheet-overlay live-task-sheet') : null;
+        if (backdrop) {
+            backdrop.appendChild(menu);
+            backdrop.addEventListener('click', (e) => {
+                if (e.target !== backdrop) return;
+                this.closeLiveTaskMenu();
+                anchor.focus({ preventScroll: true });
+            });
+            if (again) backdrop.classList.add('active');
+            document.body.appendChild(backdrop);
+            if (!again) requestAnimationFrame(() => backdrop.classList.add('active'));
+        } else document.body.appendChild(menu);
         anchor.setAttribute('aria-expanded', 'true');
-        const rect = anchor.getBoundingClientRect();
-        const left = Math.max(8, Math.min(rect.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8));
-        const below = rect.bottom + 4;
-        const top = below + menu.offsetHeight > window.innerHeight - 8 ? rect.top - menu.offsetHeight - 4 : below;
-        menu.style.left = `${Math.round(left)}px`;
-        menu.style.top = `${Math.round(top)}px`;
-        (menu.firstElementChild as HTMLElement | null)?.focus();
+        if (!sheet) {
+            const rect = anchor.getBoundingClientRect();
+            const left = Math.max(8, Math.min(rect.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8));
+            const below = rect.bottom + 4;
+            const top = below + menu.offsetHeight > window.innerHeight - 8 ? rect.top - menu.offsetHeight - 4 : below;
+            menu.style.left = `${Math.round(left)}px`;
+            menu.style.top = `${Math.round(top)}px`;
+        }
+        menu.querySelector<HTMLElement>('.context-menu-item')?.focus();
         const onKey = (e: KeyboardEvent): void => {
             if (e.key === 'Escape') {
                 e.preventDefault();
@@ -4773,6 +5204,10 @@ export const researchUiMethods = uiModule({
             }
         };
         const onDown = (e: Event): void => {
+            // A sheet's backdrop closes it on its click (a press there alone would let the click fall through).
+            if (backdrop && e.target === backdrop) return;
+            // A press on a toast over the sheet (its Undo) leaves it open: else the toast would glide away under it.
+            if (pressOnToast(e.target)) return;
             if (!menu.contains(e.target as Node)) this.closeLiveTaskMenu();
         };
         document.addEventListener('keydown', onKey, true);
@@ -4791,7 +5226,8 @@ export const researchUiMethods = uiModule({
     closeLiveTaskMenu(): void {
         liveTaskMenuCleanup?.();
         liveTaskMenuCleanup = null;
-        document.getElementById('live-task-menu')?.remove();
+        const menu = document.getElementById('live-task-menu');
+        (menu?.parentElement?.classList.contains('live-task-sheet') ? menu.parentElement : menu)?.remove();
     },
 
     /** "Agent this month: 4 sessions · $3.20" at the foot of the panel, (research) to the sessions. */
@@ -4832,7 +5268,8 @@ export const researchUiMethods = uiModule({
         panel.setAttribute('aria-label', r.panelIdle);
         panel.classList.remove('ended', 'collapsed');
         panel.classList.add('idle');
-        panel.hidden = this.activeResearchId() !== researchId;
+        // The overview open without following shows the same (and the panel lay over its ⤡).
+        panel.hidden = this.activeResearchId() !== researchId || viewingShown();
         panel.replaceChildren();
 
         const head = el('div', 'live-panel-head');
@@ -4946,3 +5383,19 @@ export const researchUiMethods = uiModule({
         publishLiveStrip();
     },
 });
+
+/** A button that lights a group in the tree: which group (its kind and name, as the pill holds them). */
+export function lightsGroup(btn: HTMLElement, kind: string, name: string): void {
+    btn.dataset.lights = kind;
+    btn.dataset.lightsName = name;
+}
+
+/** The buttons whose group the main window's tree lights now are lit (`is-lit`, aria-current); the rest not. */
+export function markOverviewLit(root: HTMLElement, lit: { kind: string; label: string } | null): void {
+    for (const btn of root.querySelectorAll<HTMLElement>('[data-lights]')) {
+        const on = !!lit && btn.dataset.lights === lit.kind && btn.dataset.lightsName === lit.label;
+        btn.classList.toggle('is-lit', on);
+        if (on) btn.setAttribute('aria-current', 'true');
+        else btn.removeAttribute('aria-current');
+    }
+}

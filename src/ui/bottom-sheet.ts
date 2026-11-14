@@ -15,12 +15,14 @@ import { TreeRenderer } from '../renderer.js';
 import { TreeManager } from '../tree-manager.js';
 import { DataManager } from '../data.js';
 import { ZoomPan, CARD_PAN_THRESHOLD_PX } from '../zoom.js';
-import { isPhoneBar, MQ_PHONE_LANDSCAPE } from '../breakpoints.js';
+import { isPhoneBar, isTabletOrMobile, MQ_PHONE_LANDSCAPE } from '../breakpoints.js';
+import { currentFullscreenOffer, toggleFullscreen } from './fullscreen.js';
 import { menuItemBody, menuItemAria, PersonMenuAction } from './context-menu.js';
 import { shownName, shownNameFull, nameHtml } from '../person-name.js';
 import type { ResearchSheetGroup } from './research-actions-ui.js';
 import { researchTrialTagHtml } from './research-tree-settings-ui.js';
 import { getSelectedRod, rodLabel, rodPickerOffered } from './rod-view.js';
+import { satelliteResearchMenu } from '../windows/window-research-menu.js';
 
 /** A row / section in a menu-style bottom sheet (the "More" and "Tree" sheets). */
 interface MenuRow {
@@ -103,6 +105,12 @@ export const bottomSheetMethods = uiModule({
      * "More ›") turns the sheet into that page (‹ Back returns).
      */
     showPersonBottomSheet(personId: PersonId, fromCard = false): void {
+        // A satellite asks the main window for the research's rows first (at most RESEARCH_MENU_WAIT_MS).
+        const satResearch = satelliteResearchMenu();
+        if (satResearch?.needsFetch(personId)) {
+            void satResearch.fetch(personId).then(() => this.showPersonBottomSheet(personId, fromCard));
+            return;
+        }
         this.noteBottomSheetTrigger();
         this.hideBottomSheet();
         const actions = this.getPersonMenuActions(personId, fromCard);
@@ -125,7 +133,8 @@ export const bottomSheetMethods = uiModule({
 
         const itemHtml = (a: PersonMenuAction, index: number): string => {
             const divider = a.divider ? '<div class="bottom-sheet-divider" role="separator"></div>' : '';
-            const header = a.header ? `<div class="bottom-sheet-section" role="presentation">${esc(a.header)}</div>` : '';
+            const header = (a.section ? `<div class="bottom-sheet-section win-research-head" role="presentation">${esc(a.section)}</div>` : '')
+                + (a.header ? `<div class="bottom-sheet-section" role="presentation">${esc(a.header)}</div>` : '');
             if (a.caption) {
                 return `${divider}${header}<div class="bottom-sheet-caption" role="menuitem" aria-disabled="true"><span class="view-link-icon" aria-hidden="true"></span><span>${esc(a.label)}</span></div>`;
             }
@@ -137,7 +146,8 @@ export const bottomSheetMethods = uiModule({
                 : a.disabled ? 'bottom-sheet-item is-disabled' : a.link ? 'bottom-sheet-item is-link' : 'bottom-sheet-item';
             const note = a.sheetNote ? `<p class="bottom-sheet-row-note">${esc(a.sheetNote)}</p>` : '';
             // Greyed: read out, a tap runs nothing and the sheet stays (no data-action).
-            if (a.disabled) return `${divider}${header}<button type="button" class="${cls}" role="menuitem" aria-disabled="true"${menuItemAria(a)}>${menuItemBody(a)}</button>${note}`;
+            const dimCls = a.dim ? `${cls} is-dim` : cls;
+            if (a.disabled) return `${divider}${header}<button type="button" class="${dimCls}" role="menuitem" aria-disabled="true"${menuItemAria(a)}>${menuItemBody(a)}</button>${note}`;
             return `${divider}${header}<button type="button" class="${cls}" role="menuitem" data-action="${esc(a.action)}"${menuItemAria(a)}>${menuItemBody(a)}</button>${note}`;
         };
         const tilesHtml = tiles.length === 0 ? '' : `<div class="sheet-tiles" style="--tiles: ${tiles.length}">`
@@ -430,18 +440,32 @@ export const bottomSheetMethods = uiModule({
             ] });
         }
 
-        // 5) View: Fan | Map | Table tiles (no bottom-bar tab of their own); on a phone under them the
+        // 5) View: Fan | Map | Timeline tiles (no bottom-bar tab of their own); on a phone under them the
         //    family line's choice (spec 039 §5.1: not on the timeline and the map, nor in a tree
         //    without a line; a tablet has it in its top bar).
         const rod = getSelectedRod();
         const rodRow: ValueRow | undefined = isPhoneBar() && mode !== 'timeline' && mode !== 'map' && mode !== 'table' && rodPickerOffered()
             ? { label: s.rodView.row, value: rod ? rodLabel(rod) : s.familyPages.wholeTree, id: 'sheet-rod', run: () => this.showRodPickerSheet() }
             : undefined;
+        // Full screen (spec 082 K1.3): only in the bottom-bar regime; on an iPhone the way to the Home Screen.
+        // Held sideways the sheet has no height to spare: there it joins the View line as a fourth tile.
+        const fullscreen = isTabletOrMobile() ? currentFullscreenOffer() : null;
+        const fullscreenRow: MenuRow | null = fullscreen ? {
+            id: 'sheet-fullscreen',
+            label: fullscreen === 'exit' ? s.mobileMenu.fullscreenExit
+                : fullscreen === 'ios-hint' ? s.mobileMenu.fullscreenIos : s.mobileMenu.fullscreen,
+            run: fullscreen === 'ios-hint'
+                ? () => { void this.showAlert(s.mobileMenu.fullscreenIosText, 'info', s.mobileMenu.fullscreen); }
+                : () => toggleFullscreen(),
+        } : null;
+        const sideways = typeof matchMedia === 'function' && matchMedia(MQ_PHONE_LANDSCAPE).matches;
         blocks.push({ divider: true, rows: [], pairLabel: s.menu.sectionView, pair: [
             { label: s.viewModeSwitch.fan, run: () => this.setDisplayViewMode('fan'), active: mode === 'fan' },
             { label: s.viewModeSwitch.map, run: () => this.setDisplayViewMode('map'), active: mode === 'map' },
-            { label: s.viewModeSwitch.table, run: () => this.setDisplayViewMode('table'), active: mode === 'table' },
+            { label: s.viewModeSwitch.timeline, run: () => this.setDisplayViewMode('timeline'), active: mode === 'timeline' },
+            ...(fullscreenRow && sideways ? [fullscreenRow] : []),
         ], valueRow: rodRow });
+        if (fullscreenRow && !sideways) blocks.push({ rows: [fullscreenRow] });
 
         // 6) [Ancestor research · New] · "Tree: {name} ›" (every whole-tree action) · Add family.
         // ("AI ancestor research" only where the research group is not: it is this tree's research.)
@@ -525,6 +549,11 @@ export const bottomSheetMethods = uiModule({
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'bottom-sheet-item' + (row.danger ? ' danger' : '') + (row.active ? ' active' : '');
+            // A choice (a tree, a view): a row of the one selection indicator (a tile in a pair).
+            if (row.active !== undefined) {
+                btn.classList.add('sel-opt');
+                btn.dataset.selForm = 'row';
+            }
             if (row.id) btn.id = row.id;
             if (row.icon !== undefined) {
                 const icon = document.createElement('span');
@@ -890,7 +919,10 @@ export const bottomSheetMethods = uiModule({
                     pairRow.setAttribute('role', 'group');
                     pairRow.setAttribute('aria-label', block.pairLabel);
                 }
-                for (const row of block.pair) pairRow.appendChild(makeButton(row));
+                for (const row of block.pair) {
+                    const btn = pairRow.appendChild(makeButton(row));
+                    if (btn.classList.contains('sel-opt')) btn.dataset.selForm = 'tile';
+                }
                 list.appendChild(pairRow);
             }
             if (block.valueRow) list.appendChild(makeValueButton(block.valueRow));

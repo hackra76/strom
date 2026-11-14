@@ -52,6 +52,13 @@ import { bottomSheetMethods } from './bottom-sheet.js';
 
 import { personModalMethods } from './person-modal.js';
 import { personEventsMethods } from './person-events.js';
+import { sharedEventMethods } from './shared-event-ui.js';
+import { sharedLineMethods } from './shared-line-ui.js';
+import { derivedRowsMethods } from './derived-rows-ui.js';
+import { nameLinkMethods } from './name-link-ui.js';
+import { sameEventJoinMethods } from './same-event-join-ui.js';
+import { sharedUnifyMethods, type SharedUnifyState } from './shared-unify-ui.js';
+import type { SharedDraft } from '../shared-event-editor.js';
 import { coupleEventsMethods } from './couple-events-ui.js';
 import { sourcesMethods, CitationContext, ExcerptDraft } from './sources.js';
 import { attachmentsMethods } from './attachments-ui.js';
@@ -108,8 +115,10 @@ import { waitingTaskMethods } from './waiting-task-ui.js';
 import { researchBrowserMethods } from './research-browser-ui.js';
 import { researchRemovedMethods } from './research-removed-ui.js';
 import { researchDirectionsMethods } from './research-directions-ui.js';
+import { overviewWindowMethods } from './overview-window-ui.js';
 import { directionFormMethods } from './direction-form-ui.js';
 import { researchOffLineMethods } from './research-offline-ui.js';
+import { queueWorkMethods } from './queue-work-dialog.js';
 import { liveFollowMethods } from './live-follow-ui.js';
 import { fanFollowMethods } from './fan-follow-ui.js';
 import { mapFollowMethods } from './map-follow-ui.js';
@@ -124,10 +133,14 @@ import { bookRodsUiMethods } from './book-rods-ui.js';
 import { lineageEditUiMethods } from './lineage-edit-ui.js';
 import { snapshotsUiMethods } from './snapshots-ui.js';
 import { minimapMethods, MinimapTransform, WorldBox } from './minimap.js';
+import { treeLegendMethods } from './tree-legend.js';
 import { genLabelsMethods } from './gen-labels.js';
 import { anniversariesUiMethods } from './anniversaries-ui.js';
 import { slideshowMethods } from './slideshow.js';
 import { mapMethods, MapScope } from './map-ui.js';
+import { mapPathMethods } from './map-path-ui.js';
+import { mapLinesLegendMethods } from './map-lines-legend-ui.js';
+import type { LineMode } from '../map-lines.js';
 import { tableMethods } from './table-view/table-ui.js';
 import { tableResearchMethods } from './table-view/table-research-ui.js';
 import { placesManagerMethods } from './places-manager-ui.js';
@@ -394,6 +407,8 @@ export class UIClass {
      * cards to fly to; null means the show ran in the view it started in.
      */
     slideshowReturnView: ViewMode | null = null;
+    /** Full screen was on before the show started: its end leaves it on. */
+    slideshowKeepsFullscreen = false;
 
     // Map view. mapCenter null = not framed yet (the next draw fits the places).
     mapScope: MapScope = 'view';
@@ -427,6 +442,22 @@ export class UIClass {
     mapTimePlaying = false;
     /** setInterval handle for playback, null when idle. Cleared on leave/toggle. */
     mapTimeTimer: number | null = null;
+    /**
+     * The ancestors' path to one person (spec 054): the person chosen, or
+     * null. While set (and the time mode on) the scope does not apply, but
+     * `mapScope` stays as it was and clearing the path brings it back.
+     */
+    mapPathTarget: PersonId | null = null;
+    /** The colours of the path by grandparent (quarter) or great-grandparent (eighth) line. */
+    mapLineMode: LineMode = 'quarter';
+    /** Off: every path line and point in --primary, the trunk still wider. */
+    mapLineColors = true;
+    /** The legend of the lines folded into its chip (a phone always starts folded). */
+    mapLegendCollapsed = false;
+    /** The pinned line of the legend (quarter or eighth index in the mode), null = none. */
+    mapLineFocus: number | null = null;
+    /** The line a legend row highlights while the pointer is over it (wins over the pinned one). */
+    mapLineHover: number | null = null;
 
     // Surname-spellings dialog: what is picked, and what to return to.
     surnamePicks: string[] = [];
@@ -474,6 +505,39 @@ export class UIClass {
     returnToEditPersonId: PersonId | null = null;  // Track if we should return to edit dialog
     /** Form values of the event / source editor at open (unsaved-changes check). */
     eventEditorSnapshot: string | null = null;
+    /** The event editor's "Shared with" draft (src/ui/shared-event-ui.ts); null for a couple's event. */
+    sharedDraft: SharedDraft | null = null;
+    /** A new own record of a part at another's event, prefilled until Save (src/ui/derived-rows-ui.ts, spec 085 §6c). */
+    recordOwnDraft: import('../derived-participations.js').OwnRecordPrefill | null = null;
+    /** A large household shows all its rows (not only the first five). */
+    sharedShowAll = false;
+    /** The shared event's person picker while open. */
+    sharedPicker: { chosen: PersonId[]; query: string; creating: boolean } | null = null;
+    /** The Unify dialog of a shared event's differing copies while open (src/ui/shared-unify-ui.ts). */
+    sharedUnify: SharedUnifyState | null = null;
+    /** A shared save joined records whose common fields differ: Unify is offered once the editor has closed (spec 085 K1.6 a). */
+    sharedUnifyAfterSave: { shareId: string; viewerId: PersonId } | null = null;
+    /** The button whose shared-event menu is open. */
+    sharedMenuOwner: HTMLElement | null = null;
+    /** Where the open shared-event menu's button stood (top, px) when it opened. */
+    sharedMenuAnchorTop = 0;
+    /**
+     * Closes the shared-event menu on a scroll or resize (bound once, so it
+     * can be removed); a scroll that leaves its button where it was (the
+     * dialog settling as the menu opens) keeps it.
+     */
+    sharedMenuCloser = (): void => {
+        const top = this.sharedMenuOwner?.getBoundingClientRect().top;
+        if (top !== undefined && Math.abs(top - this.sharedMenuAnchorTop) < 2) return;
+        this.closeSharedMenus();
+    };
+    /** Closes the shared-event menu on a press outside it and its button. */
+    sharedMenuOutside = (e: Event): void => {
+        const menu = document.getElementById('shared-event-menu');
+        const t = e.target as Node | null;
+        if (!menu || !t || menu.contains(t) || this.sharedMenuOwner?.contains(t)) return;
+        this.closeSharedMenus();
+    };
     sourceEditorSnapshot: string | null = null;
     /** The panel owns an open DataManager edit session (review S9). */
     relSessionOwned = false;
@@ -491,6 +555,8 @@ export class UIClass {
     personMergeOtherId: PersonId | null = null;
     personMergeFieldResolutions: Map<string, 'keep' | 'other'> = new Map();
     personMergePartnershipResolutions: Map<PartnershipId, 'merge' | 'keep_both'> = new Map();
+    /** Shares whose matching own event the person merge keeps apart (unticked). */
+    personMergeShareDetach: Set<string> = new Set();
 
     // Import-as-new-tree flag
     importToCurrentTree: boolean = false;
@@ -541,8 +607,26 @@ export interface UIClass extends PersonModalMethods {}
 Object.assign(UIClass.prototype, personModalMethods);
 
 type PersonEventsMethods = typeof personEventsMethods;
+type SharedEventMethods = typeof sharedEventMethods;
 export interface UIClass extends PersonEventsMethods {}
+export interface UIClass extends SharedEventMethods {}
 Object.assign(UIClass.prototype, personEventsMethods);
+Object.assign(UIClass.prototype, sharedEventMethods);
+type SharedLineMethods = typeof sharedLineMethods;
+export interface UIClass extends SharedLineMethods {}
+Object.assign(UIClass.prototype, sharedLineMethods);
+type DerivedRowsMethods = typeof derivedRowsMethods;
+export interface UIClass extends DerivedRowsMethods {}
+Object.assign(UIClass.prototype, derivedRowsMethods);
+type NameLinkMethods = typeof nameLinkMethods;
+export interface UIClass extends NameLinkMethods {}
+Object.assign(UIClass.prototype, nameLinkMethods);
+type SameEventJoinMethods = typeof sameEventJoinMethods;
+export interface UIClass extends SameEventJoinMethods {}
+Object.assign(UIClass.prototype, sameEventJoinMethods);
+type SharedUnifyMethods = typeof sharedUnifyMethods;
+export interface UIClass extends SharedUnifyMethods {}
+Object.assign(UIClass.prototype, sharedUnifyMethods);
 
 type CoupleEventsMethods = typeof coupleEventsMethods;
 export interface UIClass extends CoupleEventsMethods {}
@@ -814,6 +898,10 @@ type ResearchDirectionsMethods = typeof researchDirectionsMethods;
 export interface UIClass extends ResearchDirectionsMethods {}
 Object.assign(UIClass.prototype, researchDirectionsMethods);
 
+type OverviewWindowMethods = typeof overviewWindowMethods;
+export interface UIClass extends OverviewWindowMethods {}
+Object.assign(UIClass.prototype, overviewWindowMethods);
+
 type DirectionFormMethods = typeof directionFormMethods;
 export interface UIClass extends DirectionFormMethods {}
 Object.assign(UIClass.prototype, directionFormMethods);
@@ -821,6 +909,10 @@ Object.assign(UIClass.prototype, directionFormMethods);
 type ResearchOffLineMethods = typeof researchOffLineMethods;
 export interface UIClass extends ResearchOffLineMethods {}
 Object.assign(UIClass.prototype, researchOffLineMethods);
+
+type QueueWorkMethods = typeof queueWorkMethods;
+export interface UIClass extends QueueWorkMethods {}
+Object.assign(UIClass.prototype, queueWorkMethods);
 
 type LiveFollowMethods = typeof liveFollowMethods;
 export interface UIClass extends LiveFollowMethods {}
@@ -878,6 +970,10 @@ type MinimapMethods = typeof minimapMethods;
 export interface UIClass extends MinimapMethods {}
 Object.assign(UIClass.prototype, minimapMethods);
 
+type TreeLegendMethods = typeof treeLegendMethods;
+export interface UIClass extends TreeLegendMethods {}
+Object.assign(UIClass.prototype, treeLegendMethods);
+
 type GenLabelsMethods = typeof genLabelsMethods;
 export interface UIClass extends GenLabelsMethods {}
 Object.assign(UIClass.prototype, genLabelsMethods);
@@ -893,6 +989,14 @@ Object.assign(UIClass.prototype, slideshowMethods);
 type MapMethods = typeof mapMethods;
 export interface UIClass extends MapMethods {}
 Object.assign(UIClass.prototype, mapMethods);
+
+type MapPathMethods = typeof mapPathMethods;
+export interface UIClass extends MapPathMethods {}
+Object.assign(UIClass.prototype, mapPathMethods);
+
+type MapLinesLegendMethods = typeof mapLinesLegendMethods;
+export interface UIClass extends MapLinesLegendMethods {}
+Object.assign(UIClass.prototype, mapLinesLegendMethods);
 
 type TableMethods = typeof tableMethods;
 export interface UIClass extends TableMethods {}
