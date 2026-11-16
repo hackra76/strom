@@ -97,6 +97,7 @@ function surnameNoteGroups(noteLines: readonly string[] | null): string[][] {
 }
 import { excerptFromDataUrl } from './excerpts';
 import { unionCitations } from './citation-quality';
+import { cleanSourceEvents } from './citation-order';
 import { imageRefSha, resolveImageFile } from './research-image-refs';
 import { normalizeSha256 } from './sha256';
 import { isConfirmDay, isTranscriptMark } from './source-confirm';
@@ -1298,6 +1299,8 @@ interface RawCoupleEvent {
     participants?: RawParticipant[];
     /** `1 EVEN value`: the value on the tag line, kept when a TYPE takes the label. */
     tagValue?: string;
+    /** `2 TYPE` under a census: what kind of census it was (CoupleEvent.gedcomType). */
+    typeText?: string;
     /** 2 _STROM_STATUS: the research's status of the event. */
     status?: FactStatus;
     /** 2 _STROM_IMPORT (app files only). */
@@ -1390,6 +1393,8 @@ interface CitationSlot {
     dataText?: string[];
     /** Its EVEN (with ROLE) as written, levels from the citation's (EVEN = 1). */
     even?: string[];
+    /** `_STROM_MAIN Y` under it: the fact's main citation (spec 095). */
+    main?: boolean;
 }
 
 /** Raw GEDCOM source record (0 @Sx@ SOUR). */
@@ -1453,6 +1458,8 @@ interface RawSource {
     fileIds?: OriginalIdLine[];
     /** A page's source of its own: the record (xref) it was cut from. */
     derivedFrom?: string;
+    /** `1 DATA / 2 EVEN BIRT, CHR`: the events the record records (GEDCOM 5.5.1 EVENTS_RECORDED, spec 095). */
+    events?: string[];
 }
 
 /** Raw OBJE under a source record. */
@@ -1705,6 +1712,13 @@ export interface ParsedGedcom {
      * default, `null` when the citation gave none while the source has one.
      */
     citationQuay?: Map<string[], Map<string, number | null | undefined>>;
+    /**
+     * The main citation of a fact (`3 _STROM_MAIN Y` under its `2 SOUR`, spec
+     * 095), by the list its pointer is in: the source it cites (the record, or
+     * a page's source of its own). A citation of a person or a family itself
+     * (`1 SOUR`) is no fact's: its mark is not read.
+     */
+    citationMain?: Map<string[], string>;
     individuals: Map<string, GedcomIndividual>;
     families: Map<string, GedcomFamily>;
     sources: Map<string, RawSource>;
@@ -2169,6 +2183,14 @@ const JOINED_VALUE_TAGS = new Set(['PLAC', 'NAME', '_WITN', 'WITN', 'PAGE', 'WWW
     '_STROM_FOLIO', '_STROM_IMAGE', '_STROM_LOCATOR', 'CALN']);
 
 /**
+ * A participant's lines (godparent, witness, another person of the event):
+ * the NOTE under one is read from its own line only, so its CONC / CONT lines
+ * are joined up front too — a long or multi-line note (Strom writes one so)
+ * reads back whole.
+ */
+const PARTICIPANT_TAGS = new Set(['ASSO', '_WITN', 'WITN']);
+
+/**
  * Split the file into lines and do the reading that needs the whole file:
  * - join continuation lines of JOINED_VALUE_TAGS into their value;
  * - collect shared note records (0 @N1@ NOTE text + CONT/CONC; GEDCOM 7
@@ -2204,9 +2226,13 @@ function preprocessGedcomLines(lines: string[]): {
     const inlineByText = new Map<string, string>();
     const records: GedLine[] = [];
     let inHead = false;
+    /** The tag of the line each level is under, for the line being read. */
+    const tagAt: string[] = [];
     for (let i = 0; i < parsed.length; i++) {
         const rec = parsed[i];
         if (rec.level === 0) inHead = rec.tag === 'HEAD';
+        tagAt.length = rec.level;
+        tagAt[rec.level] = rec.tag;
         // 0 @N1@ NOTE text / 1 CONT … / 1 CONC …
         if (rec.level === 0 && GED_POINTER.test(rec.tag)) {
             const m = /^(NOTE|SNOTE)(?:\s+(.*))?$/.exec(rec.value);
@@ -2222,7 +2248,8 @@ function preprocessGedcomLines(lines: string[]): {
                 continue;
             }
         }
-        if (rec.level > 0 && JOINED_VALUE_TAGS.has(rec.tag)) {
+        if (rec.level > 0 && (JOINED_VALUE_TAGS.has(rec.tag)
+            || (rec.tag === 'NOTE' && PARTICIPANT_TAGS.has(tagAt[rec.level - 1])))) {
             let value = rec.value;
             while (i + 1 < parsed.length && parsed[i + 1].level === rec.level + 1
                 && (parsed[i + 1].tag === 'CONC' || parsed[i + 1].tag === 'CONT')) {
@@ -2866,6 +2893,8 @@ export function parseGedcom(content: string): ParsedGedcom {
     let currentSource: RawSource | null = null;
     /** The source record's first AUTH is being read (its CONT/CONC lines join Source.author). */
     let readingAuthor = false;
+    /** The source record's `1 DATA` had a line its events are not (counted once). */
+    let sourceDataCounted = false;
     /** Which name the current 1 NAME line was: -1 the primary, else its variant index. */
     let currentNameSlot: number | null = null;
     let currentMedia: RawMedia | null = null;
@@ -3107,6 +3136,9 @@ export function parseGedcom(content: string): ParsedGedcom {
      */
     let openRole: { level: number; part: RawParticipant } | null = null;
     const participantLine = (part: RawParticipant, level: number, tag: string, value: string): typeof openRole => {
+        // A citation of the participant (`3 SOUR @S1@` under an ASSO): the app keeps
+        // citations of a fact, not of one person at it, so it is counted as left out.
+        if (tag === 'SOUR') { drop(tag); return null; }
         const role = readParticipantLine(part, tag, value);
         return role ? { level, part: role } : null;
     };
@@ -3392,6 +3424,11 @@ export function parseGedcom(content: string): ParsedGedcom {
                 // The date of this very citation (one read through cite()).
                 const c = currentCitation as CitationSlot | null;
                 if (c && c.id === citeRef && c.line === citeLine && c.date === undefined) c.date = date;
+            }
+            // The fact's main citation (spec 095): `_STROM_MAIN Y` right under this very citation.
+            if (level === citeLevel + 1 && tag === '_STROM_MAIN' && value.trim().toUpperCase() === 'Y') {
+                const c = currentCitation as CitationSlot | null;
+                if (c && c.id === citeRef && c.line === citeLine) c.main = true;
             }
             // What the citation says that Strom does not read (DATA > TEXT, EVEN > ROLE)
             // is kept as written for "Back to {prog}" (not from the research's files).
@@ -3898,6 +3935,8 @@ export function parseGedcom(content: string): ParsedGedcom {
                 else if (tag === '_STROM_IMG_OMITTED') src.imageHeld = imageHeldReason(value);
                 else if (tag === 'QUAY') { const q = parseInt(value, 10); if (q >= 0 && q <= 3) src.quality = q; }
                 else if (tag === 'WWW' || tag === 'URL') src.url = value;
+                // `1 DATA / 2 EVEN …`: the events the record records (read below; spec 095).
+                else if (tag === 'DATA') sourceDataCounted = false;
                 // Separate notes stay separate: a blank line between them. A
                 // NOTE whose text starts on its CONT line opens with one break
                 // fewer, since that CONT brings its own.
@@ -3928,6 +3967,14 @@ export function parseGedcom(content: string): ParsedGedcom {
                     else if (tag === 'CONC') src.note += plain(value);
                     if (readingAuthor && tag === 'CONT') src.author += '\n' + value;
                     else if (readingAuthor && tag === 'CONC') src.author += value;
+                } else if (currentSubTag === 'DATA') {
+                    // GEDCOM 5.5.1 EVENTS_RECORDED: tags separated by commas, on one EVEN or several.
+                    if (tag === 'EVEN') {
+                        for (const part of value.split(',')) {
+                            const ev = part.trim().toUpperCase();
+                            if (ev && !(src.events ??= []).includes(ev)) src.events.push(ev);
+                        }
+                    } else if (!sourceDataCounted) { sourceDataCounted = true; count('DATA'); }
                 } else if (currentSubTag === IMPORT_TAG && tag === '_XREF') {
                     const xref = value.trim();
                     if (GED_POINTER.test(xref) && src.importXref === undefined) src.importXref = xref.slice(1, -1);
@@ -3962,6 +4009,9 @@ export function parseGedcom(content: string): ParsedGedcom {
                     // FORM, _STROM_KIND, _REGION: nothing to keep — the data URL
                     // says the format, and every image on a source is its excerpt.
                 }
+            } else if (level >= 3 && currentSubTag === 'DATA') {
+                // The period of an EVEN (`3 DATE`), anything under DATA's AGNC: no field to keep it in — counted once.
+                if (!sourceDataCounted) { sourceDataCounted = true; count('DATA'); }
             } else if (level === 3 && currentSubTag === 'OBJE' && sourceMediaSubTag === 'FILE'
                 && tag === 'CONC' && src.media.length > 0) {
                 src.media[src.media.length - 1].file += value;
@@ -4742,6 +4792,10 @@ export function parseGedcom(content: string): ParsedGedcom {
                                 ev.note = ev.note ? `${ev.tagValue}\n${ev.note}` : ev.tagValue;
                                 delete ev.tagValue;
                             }
+                        } else if (tag === 'TYPE' && ev.type === 'census' && value.trim()) {
+                            // 1 CENS / 2 TYPE Census of Bohemia under FAM: the kind
+                            // of census, as for a person's census (convertToStrom).
+                            ev.typeText = ev.typeText ? `${ev.typeText} ${value.trim()}` : value.trim();
                         } else if (tag === 'SOUR' && value) {
                             cite(ev.sourceRefs ??= [], value);
                         } else if (tag === 'NOTE') {
@@ -5070,6 +5124,8 @@ export function parseGedcom(content: string): ParsedGedcom {
                 // Another page of the same book: its call number too (the folio and image are the record's page's).
                 ...(src.callNumber ? { callNumber: src.callNumber } : {}),
                 ...(src.abbr ? { abbr: src.abbr } : {}),
+                // The same record's events (spec 095): a page of a baptism register is a baptism entry too.
+                ...(src.events?.length ? { events: [...src.events] } : {}),
                 ...(quality !== undefined ? { quality } : {}),
                 ...(date ? { recordDate: date } : {}),
                 ...(src.importMark ? { importMark: src.importMark } : {}),
@@ -5107,6 +5163,16 @@ export function parseGedcom(content: string): ParsedGedcom {
         if (list.has(target)) continue;
         const def = sources.get(target)?.quality;
         list.set(target, quay === def ? undefined : quay ?? null);
+    }
+    // The main citation of each fact (spec 095), the first marked one: the
+    // source it cites now (the record, or a page's source of its own). Only a
+    // fact's citation (level 2 and below): a person's or a family's own
+    // `1 SOUR` is no fact, and a family's shares its list with its wedding's.
+    const citationMain = new Map<string[], string>();
+    for (const c of citations) {
+        if (!c.main || c.level < 2 || citationMain.has(c.list)) continue;
+        const target = c.list[c.index];
+        if (target) citationMain.set(c.list, target);
     }
 
     closePlaceRecord();
@@ -5146,6 +5212,7 @@ export function parseGedcom(content: string): ParsedGedcom {
         ...((stromApp || stromResearch) && headImports.length > 0 ? { stromImports: headImports } : {}),
         ...(mediaRecords.size > 0 ? { mediaRecords } : {}),
         ...(citationQuay.size > 0 ? { citationQuay } : {}),
+        ...(citationMain.size > 0 ? { citationMain } : {}),
     };
 }
 
@@ -5257,6 +5324,8 @@ export function convertToStrom(gedcom: ParsedGedcom, options: GedcomConvertOptio
             if (raw.heldClips?.length) src.heldClips = raw.heldClips;
         }
         if (raw.recordDate) src.recordDate = raw.recordDate;
+        const events = cleanSourceEvents(raw.events);
+        if (events) src.events = events;
         if (raw.author !== undefined && raw.author !== '' && src.note) src.gedcomAuthor = raw.author;
         // Images on a source record are crops of its entry. Only embedded
         // raster images come in; a path or URL (another program's media
@@ -5304,6 +5373,15 @@ export function convertToStrom(gedcom: ParsedGedcom, options: GedcomConvertOptio
             if (q !== undefined) out[id] = q;
         }
         return Object.keys(out).length ? out : undefined;
+    };
+    /**
+     * A fact's main citation by catalog id (spec 095): the source the marked
+     * citation of the list cites, while the list still names it.
+     */
+    const mainOf = (refs: string[] | undefined, ids: readonly string[]): string | undefined => {
+        const raw = refs ? gedcom.citationMain?.get(refs) : undefined;
+        const id = raw ? sourceIdMap.get(raw) : undefined;
+        return id && ids.includes(id) ? id : undefined;
     };
     /** The research's pointers in what its hypotheses say: a person's number, a family's partners. */
     const researchRefs: ResearchRefs = {
@@ -5458,6 +5536,8 @@ export function convertToStrom(gedcom: ParsedGedcom, options: GedcomConvertOptio
                 if (evRefs.length > 0) out.sourceIds = evRefs;
                 const evQuay = quayOf(ev.sourceRefs);
                 if (evQuay) out.citationQuay = { sourceIds: evQuay };
+                const evMain = mainOf(ev.sourceRefs, evRefs);
+                if (evMain) out.citationMain = { sourceIds: evMain };
 
                 // A household member another program named under the event
                 // (`_SHAR`, role Household / Principal / none) is a copy of a
@@ -5570,6 +5650,12 @@ export function convertToStrom(gedcom: ParsedGedcom, options: GedcomConvertOptio
             ...(quayOf(indi.deathSourceRefs) ? { deathSourceIds: quayOf(indi.deathSourceRefs) } : {}),
         };
         if (Object.keys(personQuay).length) person.citationQuay = personQuay;
+        // A fact's main citation (the person's own citations are no fact's).
+        const birthMain = mainOf(indi.birthSourceRefs, birthRefs);
+        const deathMain = mainOf(indi.deathSourceRefs, deathRefs);
+        if (birthMain || deathMain) {
+            person.citationMain = { ...(birthMain ? { birthSourceIds: birthMain } : {}), ...(deathMain ? { deathSourceIds: deathMain } : {}) };
+        }
 
         // OBJE media: a data-URL FILE is either the portrait (Strom marker)
         // or an attachment. External file paths cannot be embedded — counted
@@ -5788,10 +5874,17 @@ export function convertToStrom(gedcom: ParsedGedcom, options: GedcomConvertOptio
                 if (ev.address) out.address = ev.address;
                 if (ev.note) out.note = ev.note;
                 if (ev.status) out.status = ev.status;
+                // The census's TYPE heads its note and goes back as TYPE.
+                if (ev.typeText && out.type === 'census') {
+                    out.note = out.note ? `${ev.typeText}\n${out.note}` : ev.typeText;
+                    out.gedcomType = ev.typeText;
+                }
                 const refs = mapRefs(ev.sourceRefs);
                 if (refs.length > 0) out.sourceIds = refs;
                 const evQuay = quayOf(ev.sourceRefs);
                 if (evQuay) out.citationQuay = { sourceIds: evQuay };
+                const evMain = mainOf(ev.sourceRefs, refs);
+                if (evMain) out.citationMain = { sourceIds: evMain };
                 // Household members named by another program (`_SHAR`): the
                 // couple's event becomes a shared event of them all (convertGedShares).
                 const household: PendingCoupleShars['members'] = [];
@@ -5825,6 +5918,12 @@ export function convertToStrom(gedcom: ParsedGedcom, options: GedcomConvertOptio
         const divorceQuay = quayOf(fam.divorceSourceRefs);
         if (famQuay || divorceQuay) {
             partnership.citationQuay = { ...(famQuay ? { sourceIds: famQuay } : {}), ...(divorceQuay ? { divorceSourceIds: divorceQuay } : {}) };
+        }
+        // The wedding's and the divorce's main citations (a `1 SOUR` of the family is no fact's: not read).
+        const famMain = mainOf(fam.sourceRefs, famRefs);
+        const divorceMain = mainOf(fam.divorceSourceRefs, divorceRefs);
+        if (famMain || divorceMain) {
+            partnership.citationMain = { ...(famMain ? { sourceIds: famMain } : {}), ...(divorceMain ? { divorceSourceIds: divorceMain } : {}) };
         }
 
         // Witnesses at the wedding, named under 1 MARR.

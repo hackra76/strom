@@ -234,6 +234,8 @@ export interface LifeEvent {
     sourceIds?: string[];
     /** A citation's own QUAY where it differs from its source's (see CitationQuay). */
     citationQuay?: CitationQuay<'sourceIds'>;
+    /** The citation the user chose as the fact's main one (see CitationMain, data v21). */
+    citationMain?: CitationMain<'sourceIds'>;
     /** Godparents, witnesses, the officiating priest… (see EventParticipant). */
     participants?: EventParticipant[];
     /** The research's status of the event (see FactStatus). */
@@ -401,6 +403,14 @@ export interface Source {
      * GEDCOM: citation DATA.DATE (entry recording date).
      */
     recordDate?: string;
+    /**
+     * The events the record records, as GEDCOM tags in upper case (GEDCOM
+     * 5.5.1 EVENTS_RECORDED, `1 DATA / 2 EVEN CHR, BURI` on the source
+     * record), e.g. `["CHR"]` for a baptism entry (data v21). A citation of
+     * such a record at a fact of that event is its primary record in the
+     * order of a fact's citations (src/citation-order.ts).
+     */
+    events?: string[];
     /** Crops of the entry from its scan (see SourceExcerpt). */
     excerpts?: SourceExcerpt[];
     /**
@@ -705,6 +715,12 @@ export interface Person {
     deathSourceIds?: string[];
     /** A citation's own QUAY where it differs from its source's, per list (see CitationQuay). */
     citationQuay?: CitationQuay<PersonCitationField>;
+    /**
+     * The main citation the user chose for the birth and the death (see
+     * CitationMain, data v21). Never of `sourceIds`: the person's own
+     * citations are no fact (an entry there is dropped when the tree is read).
+     */
+    citationMain?: CitationMain<PersonCitationField>;
     /** Attached documents (scans, certificates, letters…). */
     attachments?: Attachment[];
     /**
@@ -1427,6 +1443,8 @@ export interface Partnership {
     divorceSourceIds?: string[];
     /** A citation's own QUAY where it differs from its source's, per list (see CitationQuay). */
     citationQuay?: CitationQuay<PartnershipCitationField>;
+    /** The main citation the user chose for the wedding and the divorce (see CitationMain, data v21). */
+    citationMain?: CitationMain<PartnershipCitationField>;
     /**
      * Witnesses at the wedding (see EventParticipant). A marriage entry names
      * them the way a baptism names godparents, and they are the same kind of
@@ -1514,10 +1532,18 @@ export interface CoupleEvent {
     sourceIds?: string[];
     /** A citation's own QUAY where it differs from its source's (see CitationQuay). */
     citationQuay?: CitationQuay<'sourceIds'>;
+    /** The citation the user chose as the fact's main one (see CitationMain, data v21). */
+    citationMain?: CitationMain<'sourceIds'>;
     /** Witnesses and others the record names. */
     participants?: EventParticipant[];
     /** The research's status of the event (see FactStatus). */
     status?: FactStatus;
+    /**
+     * What kind of census another program's file wrote under the couple's
+     * `1 CENS` (`2 TYPE`), as written: the first line of the note, written
+     * back as `2 TYPE` while the note still begins with it (as LifeEvent.gedcomType).
+     */
+    gedcomType?: string;
 }
 
 /** The partnership fields the relationships panel edits (DataManager.updatePartnership). */
@@ -1540,6 +1566,17 @@ export type LastFocusedMarker = typeof LAST_FOCUSED;
  * nothing (dropped when the tree is read).
  */
 export type CitationQuay<F extends string = string> = Partial<Record<F, Record<string, number | null>>>;
+
+/**
+ * The main citation of a fact (spec 095 K2, data v21), by citation list: the
+ * id of the source in that list the user chose to stand first (a source cited
+ * at another place of an entry has a source of its own, so the id names the
+ * citation). Set only by hand: without it the order is automatic
+ * (src/citation-order.ts). An entry of a source no longer in its list says
+ * nothing (dropped when the tree is read and when the citation goes). Only
+ * the facts' lists have one, never a person's own citations (not a fact).
+ */
+export type CitationMain<F extends string = string> = Partial<Record<F, string>>;
 
 /** A person's citation lists: the person as a whole, the birth, the death. */
 export const PERSON_CITATION_FIELDS = ['sourceIds', 'birthSourceIds', 'deathSourceIds'] as const;
@@ -1687,8 +1724,16 @@ export function partnershipParticipants(u: Pick<Partnership, 'participants' | 'e
  *   when the tree is read, a backup is taken first. An older app (v19) would
  *   edit one copy alone and the copies would go apart, so the bump makes it
  *   open the tree read-only.
+ * v21 (2026-11, spec 095): the main citation of a fact
+ *   (Person/Partnership/LifeEvent/CoupleEvent.citationMain), chosen by hand,
+ *   and the events a source records (Source.events, GEDCOM EVENTS_RECORDED
+ *   `1 DATA / 2 EVEN`), by which the citations of a fact are ordered when
+ *   shown and exported (src/citation-order.ts; the stored lists are never
+ *   reordered). Additive: nothing is changed when a tree is read. An older
+ *   app (v20) would show the automatic first citation and drop the choice on
+ *   a re-save, so the bump makes it warn first.
  */
-export const STROM_DATA_VERSION = 20;
+export const STROM_DATA_VERSION = 21;
 
 /** The rows of a saved Table view (spec 073 §2; events and sources come later). */
 export type TableViewRowType = 'persons' | 'unions' | 'events' | 'sources';
@@ -2108,6 +2153,27 @@ export const CARD_SIZE: Record<'compact' | 'normal', Pick<LayoutConfig, 'cardWid
     normal: { cardWidth: 188, cardHeight: 64 },
 };
 
+/** Settings → Person card → Photo on the card (spec 096): its size; small = the card as it always was. */
+export type CardPhotoSize = 'small' | 'medium' | 'large';
+/** The photo's (and the initials') shape on the card. */
+export type CardPhotoShape = 'circle' | 'rounded';
+
+/**
+ * The Normal card's box per photo size of the view (spec 096 §2): the card's
+ * width and base height, the photo's size and the card's side padding on a
+ * card with a photo. A view takes the medium or large box only when someone
+ * drawn in it has a photo (renderer.ts viewHasPhoto), else the small one,
+ * which is CARD_SIZE.normal. The text column beside the photo is 126px in
+ * every size (src/card-width.ts normalCardTextWidth). A large card with a
+ * photo is 96px tall through LayoutConfig.personHeights (the view's
+ * cardHeight stays 64). MUST match index.html body[data-card-photo].
+ */
+export const NORMAL_PHOTO_BOX: Record<CardPhotoSize, { cardWidth: number; cardHeight: number; avatar: number; padX: number }> = {
+    small: { cardWidth: 188, cardHeight: 64, avatar: 34, padX: 9 },
+    medium: { cardWidth: 200, cardHeight: 64, avatar: 48, padX: 8 },
+    large: { cardWidth: 236, cardHeight: 96, avatar: 80, padX: 10 },
+};
+
 export const DEFAULT_LAYOUT_CONFIG: LayoutConfig = {
     cardWidth: 188,
     cardHeight: 64,
@@ -2223,7 +2289,7 @@ export interface AuditLog {
  * should be kept in sync with package.json.
  */
 declare const __APP_VERSION__: string | undefined;
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '3.28.0';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '3.29.0';
 
 /** Envelope wrapping embedded data in exported HTML files */
 export interface EmbeddedDataEnvelope {
@@ -2350,6 +2416,8 @@ export interface AppSettings {
     historyPlacesSort?: 'persons' | 'alpha';  // default: 'persons' - History of places → Places: all places by people or alphabetically
     placesSort?: 'state' | 'name' | 'people';  // default: 'state' - Places dialog order (a stored 'unplaced' reads as 'state')
     cardDensity?: CardDensity;  // default: 'normal' - how much detail a card shows
+    /** Settings → Person card → Photo on the card (spec 096); absent = small + circle (the card as before). This device only. */
+    cardPhoto?: { size?: CardPhotoSize; shape?: CardPhotoShape };
     exportScope?: 'tree' | 'view';  // default: 'tree' - the export dialog's whole tree / current view switch
     treeSpacing?: TreeSpacing;  // default: 'normal' - gaps between cards and generations in the tree view
     posterSpacing?: TreeSpacing;  // default: 'normal' - the same for an exported image, poster or PDF
@@ -2408,6 +2476,12 @@ export interface TreeMetadata {
     isHidden?: boolean;
     /** Whether tree is locked (all persons read-only) */
     isLocked?: boolean;
+    /**
+     * The bundled sample tree ("Try a sample tree"): never sent to a research
+     * nor tied to one. An older sample without the mark gets it when it is
+     * opened (demo-sample.ts looksLikeSampleTree).
+     */
+    demo?: true;
     /**
      * The data version of the stored record (written with every save, put
      * right at every read). Above STROM_DATA_VERSION: a newer app saved the

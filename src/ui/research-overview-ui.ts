@@ -61,6 +61,7 @@ import { knowsSearchIndex, type KnowsIndex, type KnowsSearchRow } from '../knows
 import { PREF_KEYS, PrefKey, SectionPref, prefKeyOfOverview, sectionOrder, sectionPrefs, setSectionPref, topPrefs, topTileShown } from './live-section-prefs.js';
 import { OverviewSourceKind, afterTurnOnKeys, skeletonLines } from '../research-overview-source.js';
 import { sectionTitle } from './live-section-edit.js';
+import { keepSectionControlFocus } from './live-section-edit-ui.js';
 import { joinAnd } from '../strings.js';
 import { canOpenWindows, openInNewWindow } from '../windows/window-open.js';
 import { focusOverviewWindow, overviewChanged, overviewInWindow } from '../windows/overview-window.js';
@@ -434,6 +435,26 @@ export const researchOverviewMethods = uiModule({
         else heading?.focus({ preventScroll: true });
     },
 
+    /**
+     * "Research overview ›" under the queue's tasks in "Work on the queue": the overview (open
+     * already when the dialog came from it) with its Queue unfolded, its heading at the top and focused.
+     */
+    showOverviewQueue(): void {
+        if (overviewInWindow()) {
+            this.openResearchOverview();
+            return;
+        }
+        if (!this.isResearchOverviewOpen()) this.openResearchOverview();
+        if (!drawnSession()) return;
+        this.unfoldOverviewSection('queue');
+        this.renderLivePanel();
+        const body = document.querySelector<HTMLElement>('#research-overview .research-overview__body');
+        const heading = body?.querySelector<HTMLElement>('[aria-controls="ov-sec-queue"]');
+        if (!body || !heading) return;
+        scrollHeadingToTop(body, heading);
+        heading.focus({ preventScroll: true });
+    },
+
     /** "Awaiting action" in the open overview, shown until it closes (the choice stays), in view and focused. */
     showOverviewWaiting(): void {
         const s = drawnSession();
@@ -527,6 +548,7 @@ export const researchOverviewMethods = uiModule({
         queueMicrotask(keepLineFocus());
         queueMicrotask(keepAnswerFocus());
         queueMicrotask(keepKeyFocus());
+        queueMicrotask(keepSectionControlFocus());
         // A task just moved by "Do next": focused once drawn first.
         queueMicrotask(focusQueueMoved);
         // The followed research's, else the open tree's viewed without following (spec 057 §7.2).
@@ -1808,6 +1830,7 @@ export const researchOverviewMethods = uiModule({
             for (const g of groups) list.appendChild(this.overviewNowLine(g, sel === g.id, mode));
             const stopped = sel !== 'all' && !groups.some(g => g.id === sel) ? s.researches.find(d => d.id === sel) : undefined;
             if (stopped) list.appendChild(this.overviewNowLine({ id: stopped.id, direction: stopped, workers: [] }, true, mode));
+            this.appendOverviewNowWork(host, s);
             return;
         }
         if (s.working.length === 0) list.appendChild(el('li', 'live-empty', L.nobody));
@@ -1830,6 +1853,23 @@ export const researchOverviewMethods = uiModule({
             if (actions) li.appendChild(actions);
             list.appendChild(li);
         }
+        this.appendOverviewNowWork(host, s);
+    },
+
+    /**
+     * Now's "Work on the queue…" (the Queue heading's action, its mark and its
+     * conditions): offered while nothing runs, so Now starts the work as well
+     * as it finishes it. While an agent works Now keeps "Finish and stop" only.
+     */
+    appendOverviewNowWork(host: HTMLElement, s: LiveSession): void {
+        if (s.working.length > 0 || this.queueWorkOfferFor(s) !== 'offer') return;
+        const row = el('div', 'research-overview__now-actions research-overview__now-work');
+        const btn = setResearchActionLabel(el('button', 'link-button research-overview__work'), strings.live.queueWork, researchLinkMark('work'));
+        btn.type = 'button';
+        btn.setAttribute('aria-haspopup', 'dialog');
+        btn.onclick = () => this.showQueueWorkDialog(s, btn);
+        row.appendChild(btn);
+        host.appendChild(row);
     },
 
     /**

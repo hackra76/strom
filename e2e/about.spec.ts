@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFileSync } from 'fs';
-import { openApp } from './helpers.js';
+import { openApp, seedSetting } from './helpers.js';
 
 const APP_VERSION = JSON.parse(readFileSync('package.json', 'utf-8')).version;
 
@@ -15,7 +15,7 @@ test('About shows the version and offers "Buy me a coffee" as a plain link in a 
     const about = page.locator('#about-modal');
     await expect(about).toBeVisible();
     await expect(about.locator('#about-version')).toHaveText(APP_VERSION);
-    await expect(about.locator('.about-support p')).toContainText('free and open source');
+    await expect(about.locator('.about-support > p').first()).toContainText('free and open source');
     const link = about.getByRole('link', { name: 'Buy me a coffee' });
     await expect(link).toBeVisible();
     await expect(link).toHaveAttribute('href', 'https://www.buymeacoffee.com/acidekcz');
@@ -152,6 +152,231 @@ for (const vp of [
         expect(wn!.x + wn!.width).toBeLessThanOrEqual(dialog!.x + dialog!.width);
         expect(wn!.x + wn!.width).toBeLessThanOrEqual(vp.width);
     });
+}
+
+/**
+ * Sharing helps too: under the coffee, "Share Strom" opens the system share
+ * sheet with the website in the UI language; without one it copies the
+ * address and says so briefly; a sheet closed without sharing ends quietly.
+ * The author on X is a link beside the others, in a new tab.
+ */
+test('About: Share Strom opens the share sheet with the website in the UI language', async ({ page }) => {
+    await seedSetting(page, 'language', 'de');
+    await page.addInitScript(() => {
+        const w = window as unknown as { __shared: unknown[] };
+        w.__shared = [];
+        Object.defineProperty(navigator, 'share', {
+            configurable: true,
+            // A person picks a target: the sheet answers after a while.
+            value: async (data: unknown) => { w.__shared.push(data); await new Promise(r => setTimeout(r, 500)); },
+        });
+    });
+    await openApp(page);
+    await page.evaluate(() => window.Strom.UI.showAboutDialog());
+    const about = page.locator('#about-modal');
+    await expect(about.locator('.about-share-note')).toHaveText('Auch Teilen hilft: Je mehr Menschen Strom kennen, desto mehr kann es wachsen.');
+    const share = about.getByRole('button', { name: 'Strom teilen' });
+    await share.click();
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __shared: unknown[] }).__shared))
+        .toEqual([{ title: 'Strom', url: 'https://stromapp.info/de/' }]);
+    await page.waitForTimeout(800);
+    await expect(page.locator('.toast')).toHaveCount(0);
+    await expect(about).toBeVisible();
+});
+
+test('About: a cancelled share sheet shows nothing; without a sheet the address is copied with a short notice', async ({ page }) => {
+    await seedSetting(page, 'language', 'cs');
+    await page.addInitScript(() => {
+        const w = window as unknown as { __copied: string[] };
+        w.__copied = [];
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: async (t: string) => { w.__copied.push(t); } },
+        });
+        Object.defineProperty(navigator, 'share', {
+            configurable: true,
+            // Closed by a person: after a while, not at once.
+            value: async () => {
+                await new Promise(r => setTimeout(r, 500));
+                throw new DOMException('Share canceled', 'AbortError');
+            },
+        });
+    });
+    const errors: string[] = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await openApp(page);
+    await page.evaluate(() => window.Strom.UI.showAboutDialog());
+    const about = page.locator('#about-modal');
+    await expect(about.locator('.about-share-note')).toHaveText('Pomůže i sdílení: čím víc lidí o Stromu ví, tím víc se může rozvíjet.');
+    const share = about.getByRole('button', { name: 'Sdílet Strom' });
+
+    // A share sheet closed without sharing: no copy, no notice, no error.
+    await share.click();
+    await page.waitForTimeout(900);
+    await expect(page.locator('.toast')).toHaveCount(0);
+    expect(await page.evaluate(() => (window as unknown as { __copied: string[] }).__copied)).toEqual([]);
+
+    // No share sheet: the address is copied and the notice says so.
+    await page.evaluate(() => {
+        Object.defineProperty(navigator, 'share', { configurable: true, value: undefined });
+    });
+    await share.click();
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __copied: string[] }).__copied))
+        .toEqual(['https://stromapp.info/cs/']);
+    await expect(page.locator('.toast')).toHaveText('Odkaz zkopírován');
+    expect(errors).toEqual([]);
+});
+
+test('About: a share sheet that never opens (an app window on a Mac) still copies the address, the notice over the dialog', async ({ page }) => {
+    await page.addInitScript(() => {
+        const w = window as unknown as { __copied: string[] };
+        w.__copied = [];
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: async (t: string) => { w.__copied.push(t); } },
+        });
+        // Chrome's share() in an app window on a Mac: no sheet, never settles.
+        Object.defineProperty(navigator, 'share', { configurable: true, value: () => new Promise(() => {}) });
+    });
+    await openApp(page);
+    await page.evaluate(() => window.Strom.UI.showAboutDialog());
+    const about = page.locator('#about-modal');
+    await about.getByRole('button', { name: 'Share Strom' }).click();
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __copied: string[] }).__copied), { timeout: 4000 })
+        .toEqual(['https://stromapp.info/']);
+    const toast = page.locator('.toast');
+    await expect(toast).toHaveText('Link copied');
+    await expect(about).toBeVisible();
+    // Seen, not under the dialog's shade: the toast is what is on top at its centre, above the Close button.
+    await expect.poll(() => toast.evaluate(el => {
+        const r = el.getBoundingClientRect();
+        return el.contains(document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2));
+    })).toBe(true);
+    const close = await about.locator('.about-footer button').boundingBox();
+    const box = await toast.boundingBox();
+    expect(box!.y + box!.height).toBeLessThanOrEqual(close!.y);
+});
+
+/**
+ * An installed web app of Chrome on a Mac (measured 15 Nov 2026): share()
+ * resolves at once (0 ms) and no sheet shows. An answer that quick is no
+ * sheet: the address is copied with the notice. In a desktop app window
+ * (standalone) the sheet is skipped and the copy comes at once.
+ */
+for (const variant of ['share() succeeds at once', 'a desktop app window'] as const) {
+    test(`About: Share Strom copies the address with the notice when ${variant}`, async ({ page }) => {
+        await page.addInitScript((appWindow) => {
+            const w = window as unknown as { __copied: string[]; __shareCalls: number };
+            w.__copied = [];
+            w.__shareCalls = 0;
+            Object.defineProperty(navigator, 'clipboard', {
+                configurable: true,
+                value: { writeText: async (t: string) => { w.__copied.push(t); } },
+            });
+            // Like Chrome: share() called off the navigator throws "Illegal invocation".
+            Object.defineProperty(navigator, 'share', {
+                configurable: true,
+                value: async function (this: unknown) {
+                    if (this !== navigator) throw new TypeError('Illegal invocation');
+                    w.__shareCalls++;
+                },
+            });
+            // Chromium on a Mac (headless CI runs on Linux).
+            Object.defineProperty(navigator, 'userAgentData', {
+                configurable: true,
+                value: { mobile: false, platform: 'macOS', brands: [] },
+            });
+            if (appWindow) {
+                const real = window.matchMedia.bind(window);
+                window.matchMedia = (q: string) => /display-mode:\s*standalone/.test(q)
+                    ? { ...real(q), matches: true, media: q } as MediaQueryList
+                    : real(q);
+            }
+        }, variant === 'a desktop app window');
+        await openApp(page);
+        await page.evaluate(() => window.Strom.UI.showAboutDialog());
+        const about = page.locator('#about-modal');
+        const t0 = Date.now();
+        await about.getByRole('button', { name: 'Share Strom' }).click();
+        await expect.poll(() => page.evaluate(() => (window as unknown as { __copied: string[] }).__copied))
+            .toEqual(['https://stromapp.info/']);
+        await expect(page.locator('.toast')).toHaveText('Link copied');
+        // At once, not after the long wait for a sheet that never answers.
+        expect(Date.now() - t0).toBeLessThan(1200);
+        const calls = await page.evaluate(() => (window as unknown as { __shareCalls: number }).__shareCalls);
+        expect(calls).toBe(variant === 'a desktop app window' ? 0 : 1);
+    });
+}
+
+test('About: the author on X is a link beside the others, in a new tab', async ({ page }) => {
+    await openApp(page);
+    await page.evaluate(() => window.Strom.UI.showAboutDialog());
+    const x = page.locator('#about-modal .about-meta').getByRole('link', { name: 'Author on X ↗' });
+    await expect(x).toBeVisible();
+    await expect(x).toHaveAttribute('href', 'https://x.com/visekm');
+    await expect(x).toHaveAttribute('target', '_blank');
+    await expect(x).toHaveAttribute('rel', /\bnoopener\b/);
+    // The share button is a web action without a mark (no ↗, no ◆).
+    await expect(page.locator('#about-share')).toHaveText('Share Strom');
+});
+
+/**
+ * About with the sharing line and the X link fits every screen: nothing
+ * spills past the dialog or the viewport, nothing overlaps, and on touch the
+ * support buttons are a finger high. German has the longest texts; a wider
+ * fallback font stands in for CI's fonts.
+ */
+for (const vp of [
+    { name: 'desktop', width: 1440, height: 900 },
+    { name: 'tablet', width: 1024, height: 768 },
+    { name: 'phone', width: 390, height: 844, touch: true },
+    { name: 'phone sideways', width: 844, height: 390, touch: true },
+]) {
+    for (const lang of ['de', 'pl']) {
+        test(`About with sharing and the X link fits (${lang}, ${vp.name})`, async ({ browser }) => {
+            const context = await browser.newContext({
+                viewport: { width: vp.width, height: vp.height },
+                hasTouch: !!vp.touch, isMobile: !!vp.touch,
+            });
+            const page = await context.newPage();
+            await seedSetting(page, 'language', lang);
+            await openApp(page);
+            await page.addStyleTag({ content: '#about-modal, #about-modal * { font-family: Verdana, "DejaVu Sans", sans-serif !important; }' });
+            await page.evaluate(() => window.Strom.UI.showAboutDialog());
+            const about = page.locator('#about-modal .about-modal');
+            await expect(about).toBeVisible();
+            const share = page.locator('#about-share');
+            await share.scrollIntoViewIfNeeded();
+            const res = await page.evaluate(() => {
+                const dlg = document.querySelector<HTMLElement>('#about-modal .about-modal')!;
+                const d = dlg.getBoundingClientRect();
+                const els = [...dlg.querySelectorAll<HTMLElement>('.about-meta a, .about-support p, .about-coffee')];
+                const rects = els.map(el => ({ t: el.textContent!.trim().slice(0, 20), r: el.getBoundingClientRect() }));
+                const outside = rects.filter(({ r }) => r.left < d.left - 0.5 || r.right > d.right + 0.5 || r.right > window.innerWidth)
+                    .map(x => x.t);
+                const overlaps: string[] = [];
+                for (let i = 0; i < rects.length; i++) for (let j = i + 1; j < rects.length; j++) {
+                    const a = rects[i].r, b = rects[j].r;
+                    if (a.left < b.right - 0.5 && b.left < a.right - 0.5 && a.top < b.bottom - 0.5 && b.top < a.bottom - 0.5) overlaps.push(`${rects[i].t} / ${rects[j].t}`);
+                }
+                const buttons = [...dlg.querySelectorAll<HTMLElement>('.about-coffee')].map(b => b.getBoundingClientRect().height);
+                const shareBtn = dlg.querySelector<HTMLElement>('#about-share')!;
+                return {
+                    outside, overlaps, buttons,
+                    dialogScroll: dlg.scrollWidth - dlg.clientWidth,
+                    pageScroll: document.documentElement.scrollWidth - window.innerWidth,
+                    shareOneLine: shareBtn.getBoundingClientRect().height < 50,
+                };
+            });
+            expect(res.outside).toEqual([]);
+            expect(res.overlaps).toEqual([]);
+            expect(res.dialogScroll).toBeLessThanOrEqual(0);
+            expect(res.pageScroll).toBeLessThanOrEqual(0);
+            expect(res.shareOneLine).toBe(true);
+            if (vp.touch) for (const h of res.buttons) expect(h).toBeGreaterThanOrEqual(44);
+            await context.close();
+        });
+    }
 }
 
 /**

@@ -198,6 +198,20 @@ export function coupleEventLabel(event: Pick<CoupleEvent, 'type' | 'customLabel'
     return strings.partnerEvents.types[event.type];
 }
 
+/**
+ * LifeEvent type -> GEDCOM tag. Types with no GEDCOM equivalent ('military',
+ * 'custom') ride on the generic EVEN tag with a TYPE label; birth and death
+ * are the person's own BIRT / DEAT (not events of the list).
+ */
+export const LIFE_EVENT_TAG: Readonly<Partial<Record<LifeEventType, string>>> = {
+    baptism: 'BAPM', burial: 'BURI', occupation: 'OCCU', residence: 'RESI',
+    emigration: 'EMIG', immigration: 'IMMI', education: 'EDUC', religion: 'RELI',
+    confirmation: 'CONF', firstCommunion: 'FCOM', barMitzvah: 'BARM',
+    batMitzvah: 'BASM', ordination: 'ORDN', adoption: 'ADOP',
+    naturalization: 'NATU', will: 'WILL', probate: 'PROB', cremation: 'CREM',
+    title: 'TITL', nationality: 'NATI', census: 'CENS',
+};
+
 /** The GEDCOM tag under FAM each type is written as ('custom' rides on EVEN + TYPE). */
 export const COUPLE_EVENT_TAG: Readonly<Record<CoupleEventType, string>> = {
     engagement: 'ENGA', banns: 'MARB', marriageLicence: 'MARL', marriageContract: 'MARC',
@@ -291,10 +305,10 @@ export function convertLegacyCensusEvents(data: StromData): number {
 
 /**
  * A census's `2 TYPE` while its note still begins with it
- * (LifeEvent.gedcomType): the text, and the rest of the note; null when the
- * event has none or its note no longer starts with it.
+ * (LifeEvent.gedcomType, CoupleEvent.gedcomType): the text, and the rest of
+ * the note; null when the event has none or its note no longer starts with it.
  */
-export function censusTypeText(ev: Pick<LifeEvent, 'type' | 'note' | 'gedcomType'>): { text: string; note?: string } | null {
+export function censusTypeText(ev: { type: string; note?: string; gedcomType?: string }): { text: string; note?: string } | null {
     const text = ev.gedcomType;
     if (ev.type !== 'census' || typeof text !== 'string' || !text.trim() || typeof ev.note !== 'string') return null;
     if (ev.note !== text && !ev.note.startsWith(`${text}\n`)) return null;

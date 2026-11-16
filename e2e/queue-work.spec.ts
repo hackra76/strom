@@ -8,8 +8,8 @@
  * A fake bridge with invented data (the Fíškovi of Smrkov).
  */
 
-import { test, expect, Page } from '@playwright/test';
-import { followManaged, launchedLinks, openOverview, overview } from './live-directions-bridge';
+import { test, expect, Locator, Page } from '@playwright/test';
+import { MANAGED_AGENT, followManaged, launchedLinks, openOverview, overview } from './live-directions-bridge';
 
 const WORK = ['work.link', 'run.tasks'];
 const QUEUE = [
@@ -20,6 +20,22 @@ const QUEUE = [
 const queueHead = (page: Page) => overview(page).locator('.live-section__head[aria-controls="ov-sec-queue"]');
 const workBtn = (page: Page) => overview(page).locator('.queue-work-btn');
 const dialog = (page: Page) => page.locator('#queue-work-modal [role="dialog"]');
+
+/**
+ * The box of the one element `l` matches, found and measured in one go in the
+ * page. The overview draws its controls anew with every status of the
+ * research (in the overview's own window several times a second): a
+ * boundingBox() takes a handle first and measures it after, and a handle
+ * drawn over in between is gone (null).
+ */
+async function boxOf(l: Locator): Promise<{ x: number; y: number; width: number; height: number }> {
+    const boxes = await l.evaluateAll(els => els.map((e) => {
+        const r = e.getBoundingClientRect();
+        return { x: r.x, y: r.y, width: r.width, height: r.height };
+    }));
+    expect(boxes).toHaveLength(1);
+    return boxes[0];
+}
 
 async function unfoldQueue(page: Page): Promise<void> {
     if (await queueHead(page).getAttribute('aria-expanded') === 'false') await queueHead(page).click();
@@ -56,11 +72,11 @@ test.describe('Work on the queue', () => {
         // The AI badge and the terminal's mark (an agent starts working there).
         await expect(btn.locator('.research-ai-badge')).toHaveCount(1);
         await expect(btn.locator('.research-open-mark')).toHaveCount(1);
-        expect(Math.round((await btn.boundingBox())!.height)).toBe(28);
+        expect(Math.round((await boxOf(btn)).height)).toBe(28);
         // The count in the title while the button is there, the button on the title's row.
         await expect(queueHead(page)).toContainText('Queue · 2');
-        const headBox = (await queueHead(page).boundingBox())!;
-        const btnBox = (await btn.boundingBox())!;
+        const headBox = await boxOf(queueHead(page));
+        const btnBox = await boxOf(btn);
         expect(Math.abs((btnBox.y + btnBox.height / 2) - (headBox.y + headBox.height / 2))).toBeLessThan(10);
         await btn.click();
         const d = dialog(page);
@@ -216,6 +232,112 @@ test.describe('Work on the queue', () => {
     });
 });
 
+const nowHead = (page: Page) => overview(page).locator('.live-section__head[aria-controls="ov-sec-now"]');
+const nowWork = (page: Page) => overview(page).locator('#ov-sec-now .research-overview__work');
+const nowFinish = (page: Page) => overview(page).locator('#ov-sec-now .research-overview__finish');
+
+async function unfoldNow(page: Page): Promise<void> {
+    if (await nowHead(page).getAttribute('aria-expanded') === 'false') await nowHead(page).click();
+    await expect(nowHead(page)).toHaveAttribute('aria-expanded', 'true');
+}
+
+/** Nothing runs: no session in Now, the research says it is idle. */
+const IDLE = { features: [...WORK, 'status.busy'], links: ['work'], queue: QUEUE, working: [], busy: { sessions: 0, runs: 0 } };
+/** An agent works: its session in Now, the research says so. */
+const AT_WORK = { features: [...WORK, 'status.busy'], links: ['work'], queue: QUEUE, busy: { sessions: 1, runs: 0 } };
+
+test.describe('Work on the queue in Now', () => {
+    for (const width of [1440, 1024]) {
+        test(`${width} px: offered in Now while nothing runs, the same dialog and link as the Queue's`, async ({ page }) => {
+            await followManaged(page, { ...IDLE, size: { width, height: 900 } });
+            await openOverview(page);
+            await unfoldNow(page);
+            const btn = nowWork(page);
+            await expect(btn).toBeVisible();
+            await expect(btn).toHaveText(/Work on the queue…/);
+            // The Queue's mark: the AI badge and the terminal's mark.
+            await expect(btn.locator('.research-ai-badge')).toHaveCount(1);
+            await expect(btn.locator('.research-open-mark')).toHaveCount(1);
+            await expect(nowFinish(page)).toHaveCount(0);
+            await btn.click();
+            const d = dialog(page);
+            await expect(d).toBeVisible();
+            await expect(d.locator('.queue-work__first-task')).toHaveText('T0101 Matriky Smrkov');
+            await d.getByRole('spinbutton', { name: 'Number of tasks' }).fill('3');
+            await d.locator('#queue-work-open').click();
+            await expect(page.locator('#queue-work-modal')).toHaveCount(0);
+            expect(await launchedLinks(page)).toEqual([expect.stringMatching(/^strom-research:\/\/work\?tree=[0-9a-f-]+&do=tasks&n=3$/)]);
+            await expect(nowWork(page)).toBeFocused();
+        });
+    }
+
+    test('while an agent works Now keeps Finish and stop only', async ({ page }) => {
+        await followManaged(page, AT_WORK);
+        await openOverview(page);
+        await unfoldNow(page);
+        await expect(nowFinish(page)).toBeVisible();
+        await expect(nowWork(page)).toHaveCount(0);
+    });
+
+    test('a run without a session in Now (status.busy): not offered either', async ({ page }) => {
+        await followManaged(page, { ...IDLE, busy: { sessions: 0, runs: 1 } });
+        await openOverview(page);
+        await unfoldNow(page);
+        await expect(overview(page).locator('#ov-sec-now')).toBeVisible();
+        await expect(nowWork(page)).toHaveCount(0);
+    });
+
+    test('without work.link: not offered', async ({ page }) => {
+        await followManaged(page, { ...IDLE, features: ['status.busy'] });
+        await openOverview(page);
+        await unfoldNow(page);
+        await expect(overview(page).locator('#ov-sec-now')).toBeVisible();
+        await expect(nowWork(page)).toHaveCount(0);
+    });
+
+    test('a phone (390 px): Now offers neither, as the Queue (the terminal opens on a computer)', async ({ page }) => {
+        await followManaged(page, { ...IDLE, size: { width: 390, height: 844 } });
+        await page.locator('#live-panel .live-panel-toggle').click();
+        await expect(overview(page)).toHaveClass(/research-overview--sheet/);
+        await unfoldNow(page);
+        await expect(overview(page).locator('#ov-sec-now')).toBeVisible();
+        await expect(nowWork(page)).toHaveCount(0);
+        await expect(nowFinish(page)).toHaveCount(0);
+    });
+
+    test('the overview\'s own window 390 px wide: in Now while nothing runs, the link handed to the main window; gone once an agent works', async ({ page }) => {
+        // The stream reconnects soon: the research's next status comes with its next hello.
+        const b = await followManaged(page, { ...IDLE, fastReconnect: true });
+        await page.locator('#view-window-btn').click();
+        const [popup] = await Promise.all([page.waitForEvent('popup'), page.locator('#view-window-menu [data-view="overview"]').click()]);
+        await popup.waitForLoadState('domcontentloaded');
+        await popup.setViewportSize({ width: 390, height: 844 });
+        const ov = popup.locator('#research-overview.research-overview--window');
+        await expect(ov).toBeVisible();
+        const head = ov.locator('.live-section__head[aria-controls="ov-sec-now"]');
+        if (await head.getAttribute('aria-expanded') === 'false') await head.click();
+        const btn = ov.locator('#ov-sec-now .research-overview__work');
+        await expect(btn).toBeVisible();
+        await expect(btn.locator('.research-ai-badge')).toHaveCount(1);
+        await expect(btn.locator('.research-open-mark')).toHaveCount(1);
+        // Within the window's width.
+        const box = await boxOf(btn);
+        expect(box.x + box.width).toBeLessThanOrEqual(390);
+        expect(await ov.evaluate(e => e.scrollWidth <= e.clientWidth)).toBe(true);
+        await btn.click();
+        const d = popup.locator('#queue-work-modal [role="dialog"]');
+        await expect(d).toBeVisible();
+        await d.locator('#queue-work-open').click();
+        await expect.poll(() => launchedLinks(page)).toEqual([expect.stringMatching(/^strom-research:\/\/work\?tree=[0-9a-f-]+&do=loop$/)]);
+        // The agent starts: Now shows its session and Finish and stop, no longer the offer.
+        b.working = [MANAGED_AGENT];
+        b.busy = { sessions: 1, runs: 0 };
+        await expect(ov.locator('#ov-sec-now .research-overview__finish')).toBeVisible({ timeout: 15000 });
+        await expect(btn).toHaveCount(0);
+        await popup.close();
+    });
+});
+
 test.describe('Work on the queue in the overview\'s own window', () => {
     test('the dialog in the window; Open terminal handed to the main window, never the bridge', async ({ page }) => {
         await followManaged(page, { features: WORK, links: ['work'], queue: QUEUE });
@@ -238,6 +360,137 @@ test.describe('Work on the queue in the overview\'s own window', () => {
         // The main window says the agent opens.
         await expect(page.locator('.toast').filter({ hasText: 'Opening the agent' })).toHaveCount(1);
         expect(bridgeAsks).toEqual([]);
+        await popup.close();
+    });
+});
+
+/**
+ * "More (n)" under First up (the queue's tasks after the first, in the
+ * research's order, not tied to "Only [n] tasks"): folded at every opening,
+ * unfolded in the dialog's body (no scroll area of its own), the focus kept
+ * on the button; with places and counts (`queue.page`) numbered "2.", "3." …
+ * and what lies beyond named with a way to the overview's Queue.
+ */
+test.describe('More under First up', () => {
+    const MORE_QUEUE = [
+        { id: 'T0101', text: 'Matriky Smrkov', state: 'next', research: 'G0001' },
+        { id: 'T0102', text: 'Kdo byl Josef Fíšek', state: 'next', research: 'G0002', kind: 'history' },
+        { id: 'T0103', text: 'Příběh Marie Fíškové', state: 'next', research: 'G0001', own: 'next', kind: 'story' },
+        { id: 'T0104', text: 'Sčítání lidu Smrkov 1880', state: 'next', research: 'G0001', own: 'next' },
+        { id: 'T0105', text: 'Pozemková kniha Smrkov', state: 'next', offLine: 'never' },
+        { id: 'T0106', text: 'Křest Jana Fíška', state: 'parked', research: 'G0001' },
+    ];
+    const moreBtn = (page: Page) => dialog(page).locator('#queue-work-more-btn');
+    const moreBox = (page: Page) => dialog(page).locator('#queue-work-more');
+    const rows = (page: Page) => moreBox(page).locator('.queue-work__more-row');
+
+    test('folded: More (3); unfolded in the research\'s order without places; the count does not change it; Escape closes; folded again', async ({ page }) => {
+        await follow(page, { features: [...WORK, 'queue.next', 'tasks.offLine'], queue: MORE_QUEUE });
+        await workBtn(page).click();
+        await expect(dialog(page).locator('.queue-work__first-task')).toHaveText('T0103 Příběh Marie Fíškové');
+        const btn = moreBtn(page);
+        await expect(btn).toHaveText('More (3)');
+        await expect(btn).toHaveAttribute('aria-expanded', 'false');
+        await expect(btn).toHaveAccessibleName('More tasks in the queue: 3');
+        await expect(btn.locator('.research-open-mark, .research-ai-badge')).toHaveCount(0);
+        await expect(moreBox(page)).toBeHidden();
+        // Under the task, above the session's line.
+        expect(await btn.evaluate(b => b.previousElementSibling?.classList.contains('queue-work__first-task'))).toBe(true);
+        await btn.click();
+        await expect(moreBox(page)).toBeVisible();
+        await expect(btn).toHaveAttribute('aria-expanded', 'true');
+        await expect(btn).toHaveText('Hide more');
+        await expect(btn).toBeFocused();
+        // Without places: "In queue order", the hint, dashes; the other one set next first, the kind; no "never", no parked.
+        await expect(moreBox(page).locator('.queue-work__more-head')).toHaveText('In queue order');
+        await expect(moreBox(page).locator('.queue-work__more-hint')).toHaveText('The agent may take them in another order.');
+        await expect(rows(page).locator('.queue-work__more-text')).toHaveText([
+            'T0104 Sčítání lidu Smrkov 1880 next', 'T0101 Matriky Smrkov', 'T0102 Kdo byl Josef Fíšek history',
+        ]);
+        await expect(rows(page).locator('.queue-work__pos')).toHaveText(['–', '–', '–']);
+        await expect(moreBox(page).locator('.queue-work__more-rest')).toHaveCount(0);
+        // The count chooses Only n tasks, the list stays.
+        await dialog(page).getByRole('spinbutton', { name: 'Number of tasks' }).fill('1');
+        await expect(rows(page)).toHaveCount(3);
+        // Folded again by the same button.
+        await btn.click();
+        await expect(moreBox(page)).toBeHidden();
+        await expect(btn).toHaveText('More (3)');
+        await btn.click();
+        await page.keyboard.press('Escape');
+        await expect(page.locator('#queue-work-modal')).toHaveCount(0);
+        await expect(workBtn(page)).toBeFocused();
+        // A new opening: folded.
+        await workBtn(page).click();
+        await expect(moreBtn(page)).toHaveAttribute('aria-expanded', 'false');
+        await expect(moreBox(page)).toBeHidden();
+    });
+
+    test('no more tasks: no button', async ({ page }) => {
+        await follow(page, { queue: [QUEUE[0]] });
+        await workBtn(page).click();
+        await expect(dialog(page).locator('.queue-work__first-task')).toHaveText('T0101 Matriky Smrkov');
+        await expect(moreBtn(page)).toHaveCount(0);
+        await expect(moreBox(page)).toHaveCount(0);
+    });
+
+    for (const width of [1440, 1024]) {
+        test(`${width} px, a long queue with places: numbered, the rest named, the foot in place, Research overview › to the Queue`, async ({ page }) => {
+            const queue = Array.from({ length: 57 }, (_, i) => ({
+                id: `T${String(201 + i).padStart(4, '0')}`, text: `Matriky Smrkov, svazek ${i + 1}`, state: 'next', research: 'G0001',
+            }));
+            await follow(page, { features: [...WORK, 'queue.page'], queue, paged: true, size: { width, height: 900 } });
+            await workBtn(page).click();
+            const btn = moreBtn(page);
+            // 57 up next, the first not counted.
+            await expect(btn).toHaveText('More (56)');
+            await btn.click();
+            await expect(moreBox(page).locator('.queue-work__more-head')).toHaveText('Then');
+            await expect(moreBox(page).locator('.queue-work__more-hint')).toHaveCount(0);
+            // The status's window: the first and 13 after it.
+            await expect(rows(page)).toHaveCount(13);
+            await expect(rows(page).first().locator('.queue-work__pos')).toHaveText('2.');
+            await expect(rows(page).last().locator('.queue-work__pos')).toHaveText('14.');
+            await expect(rows(page).first().locator('.queue-work__more-text')).toHaveText('T0202 Matriky Smrkov, svazek 2, 2 in the queue');
+            await expect(moreBox(page).locator('.queue-work__more-rest')).toHaveText('and 43 more tasks in the queue · Research overview ›');
+            await expect(btn).toBeFocused();
+            // Nothing wider than the dialog; the dialog within the window, its foot in view.
+            const modal = page.locator('#queue-work-modal .modal');
+            expect(await modal.evaluate(m => m.scrollWidth <= m.clientWidth)).toBe(true);
+            const box = (await modal.boundingBox())!;
+            expect(box.y + box.height).toBeLessThanOrEqual(900);
+            await expect(dialog(page).locator('#queue-work-open')).toBeInViewport();
+            const go = moreBox(page).locator('#queue-work-overview');
+            await expect(go.locator('.research-open-mark, .research-ai-badge')).toHaveCount(0);
+            await go.click();
+            await expect(page.locator('#queue-work-modal')).toHaveCount(0);
+            await expect(queueHead(page)).toBeFocused();
+            await expect(queueHead(page)).toHaveAttribute('aria-expanded', 'true');
+        });
+    }
+
+    test('the overview\'s own window 390 px wide: the unfolded list within it', async ({ page }) => {
+        const queue = Array.from({ length: 30 }, (_, i) => ({
+            id: `T${String(301 + i).padStart(4, '0')}`, text: `Matriky Smrkov, oddací kniha svazek ${i + 1} (1850–1860), farnost Smrkov`, state: 'next', research: 'G0001',
+        }));
+        await followManaged(page, { features: [...WORK, 'queue.page'], links: ['work'], queue, paged: true });
+        await page.locator('#view-window-btn').click();
+        const [popup] = await Promise.all([page.waitForEvent('popup'), page.locator('#view-window-menu [data-view="overview"]').click()]);
+        await popup.waitForLoadState('domcontentloaded');
+        await popup.setViewportSize({ width: 390, height: 844 });
+        const ov = popup.locator('#research-overview.research-overview--window');
+        await expect(ov).toBeVisible();
+        const head = ov.locator('.live-section__head[aria-controls="ov-sec-queue"]');
+        if (await head.getAttribute('aria-expanded') === 'false') await head.click();
+        await ov.locator('.queue-work-btn').click();
+        const d = popup.locator('#queue-work-modal [role="dialog"]');
+        await expect(d).toBeVisible();
+        await d.locator('#queue-work-more-btn').click();
+        await expect(d.locator('.queue-work__more-row')).toHaveCount(13);
+        const modal = popup.locator('#queue-work-modal .modal');
+        expect(Math.round((await modal.boundingBox())!.width)).toBe(366);
+        expect(await modal.evaluate(m => m.scrollWidth <= m.clientWidth)).toBe(true);
+        await expect(d.locator('#queue-work-open')).toBeInViewport();
         await popup.close();
     });
 });

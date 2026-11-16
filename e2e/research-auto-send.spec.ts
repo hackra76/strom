@@ -14,6 +14,17 @@ import {
  */
 
 const QUIET = 120_000;
+/** A clock start for the cases that read a time of day (never near midnight, where the time gets a date). */
+const MIDDAY = new Date('2026-11-13T10:30:00Z');
+/**
+ * "Changes will be sent at …" for an edit made in the first minute after MIDDAY: the quiet time
+ * after it, as the page's clock shows a time of the same day (its own time zone and language).
+ */
+async function sentAt(page: Page): Promise<RegExp> {
+    const times = await page.evaluate(([start, quiet]) => [0, 60_000].map(d =>
+        new Intl.DateTimeFormat('en', { hour: '2-digit', minute: '2-digit' }).format(new Date(start + quiet + d))), [MIDDAY.getTime(), QUIET]);
+    return new RegExp(`^Changes will be sent at (${times.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})$`);
+}
 const WRITE = { status: 200, body: { ok: true, inbox: false, changes: 6, applied: 6, input: 'I0042' } };
 
 /** The research writes at once and makes a new version (with `extra` lines on Jan, e.g. a conflict). */
@@ -27,9 +38,13 @@ function writesAtOnce(bridge: FakeBridge, extra: string[] = []): void {
     };
 }
 
-/** A research tree that sends by itself (the default), its bridge running. */
-async function autoTree(page: Page, init: Partial<FakeBridge> = {}): Promise<FakeBridge> {
-    await page.clock.install();
+/**
+ * A research tree that sends by itself (the default), its bridge running.
+ * `at`: the clock starts there (a case that reads a time of day: never "now", which may be just
+ * before midnight); otherwise at the real time.
+ */
+async function autoTree(page: Page, init: Partial<FakeBridge> = {}, at?: Date): Promise<FakeBridge> {
+    await page.clock.install(at ? { time: at } : undefined);
     await openResearch(page, { auto: true });
     const bridge = await fakeBridge(page, { accepts: { mode: 'research', sync: { auto: 'write' }, sources: true, verified: true, media: null }, ...init });
     // The first start's note is not what these tests are about.
@@ -109,6 +124,48 @@ test.describe('sending by itself', () => {
         await hide(page);
         await expect.poll(() => bridge.posts.length).toBe(2);
         expect(bridge.posts[1]).toContain('2 PLAC Kolín');
+    });
+
+    test('switching back to the research tree: nothing goes while it is read, then that tree with its own people (1115)', async ({ page }) => {
+        const bridge = await autoTree(page);
+        writesAtOnce(bridge);
+        const linked = await treeId(page);
+        await editJan(page);
+        const other = await page.evaluate(() => window.Strom.DataManager.importAsNewTree({ version: 11, persons: {
+            d1: { id: 'd1', firstName: 'Ukazek', lastName: 'Vzorovy', gender: 'male', partnerships: [], parentIds: [], childIds: [] },
+        }, partnerships: {} } as never, 'Example'));
+        await page.evaluate((id) => window.Strom.UI.switchToTree(id), other);
+        await expect.poll(() => bridge.posts.length).toBe(1);
+        // Reading the research tree is held until the test lets it go.
+        await page.evaluate((id) => {
+            const w = window as unknown as { __reading?: boolean; __open?: () => void; __switching?: Promise<void> };
+            const tm = window.Strom.TreeManager;
+            const read = tm.getTreeData.bind(tm);
+            const gate = new Promise<void>(resolve => { w.__open = resolve; });
+            tm.getTreeData = async (t: string) => {
+                if (t === id) { w.__reading = true; await gate; }
+                return read(t as never);
+            };
+            w.__switching = window.Strom.UI.switchToTree(id);
+        }, linked);
+        await expect.poll(() => page.evaluate(() => !!(window as unknown as { __reading?: boolean }).__reading)).toBe(true);
+        // An answer of the bridge and the page left while it is read: nothing goes.
+        await poll(page);
+        await page.evaluate(() => window.Strom.UI.researchAutoLeave());
+        expect(bridge.posts).toHaveLength(1);
+        await page.evaluate(() => {
+            const w = window as unknown as { __open: () => void; __switching: Promise<void> };
+            w.__open();
+            return w.__switching;
+        });
+        await expect(card(page, 'Jan')).toBeVisible();
+        // Read: the tree's own edit goes, with its own people.
+        await editJan(page, 'Kolín');
+        await page.evaluate(() => window.Strom.UI.researchAutoLeave());
+        await expect.poll(() => bridge.posts.length).toBe(2);
+        expect(bridge.posts[1]).toContain(`1 _STROM_APP_TREE ${linked}`);
+        expect(bridge.posts[1]).toContain('2 PLAC Kolín');
+        for (const post of bridge.posts) expect(post).not.toContain('Vzorovy');
     });
 
     test('the bridge not running: nothing fetched or opened; "not running" only after the quiet time; sent when it is back', async ({ page }) => {
@@ -281,9 +338,9 @@ test('a window narrower than the toolbar\'s mark (1100 px): a new conflict is to
 });
 
 test('waiting for the quiet time: the mark and the block say when the changes go', async ({ page }) => {
-    await autoTree(page);
+    await autoTree(page, {}, MIDDAY);
     await editJan(page);
-    await expect(mark(page)).toHaveAttribute('title', /^Changes will be sent at \d{1,2}:\d{2}/);
+    await expect(mark(page)).toHaveAttribute('title', await sentAt(page));
     await openResearchMenu(page);
     await expect(block(page)).toHaveAttribute('data-state', 'autoWaiting');
     await expect(block(page)).toContainText(/sent at \d{1,2}:\d{2}/);
@@ -2497,9 +2554,9 @@ test.describe('the research not running, at rest (audit 017 a-D6)', () => {
     });
 
     test('sent by itself, the browser started again with the research not running: never "will be sent at" — the changes wait, said with their number', async ({ page }) => {
-        const bridge = await autoTree(page);
+        const bridge = await autoTree(page, {}, MIDDAY);
         await editJan(page);
-        await expect(mark(page)).toHaveAttribute('title', /^Changes will be sent at \d{1,2}:\d{2}/);
+        await expect(mark(page)).toHaveAttribute('title', await sentAt(page));
         await page.evaluate(() => window.Strom.TreeManager.flush());
         bridge.down = true;
         await page.reload();

@@ -270,7 +270,11 @@ export const importExportMethods = uiModule({
             const research = metadata?.research && isFaithfulExport(privacy, resolveContentOptions(content))
                 ? { id: metadata.research.id, head: metadata.research.head, appTree: treeId, transcripts: this.researchTranscriptsLink(metadata.research).transcripts } : undefined;
             const backTo = this.exportGedcomBackTo(data);
-            const result = exportToGedcom(filtered, metadata?.name, { content, research, origins: true, confirmations: true, researchNote, backTo });
+            // A research tree's citations in the research's order when it orders them (spec 095); a main citation always marked.
+            const { citationFileOrder } = await import('../citation-gates.js');
+            const result = exportToGedcom(filtered, metadata?.name, {
+                content, research, origins: true, confirmations: true, researchNote, backTo, citationFileOrder: citationFileOrder(treeId),
+            });
 
             // Download file
             const blob = new Blob([result.content], { type: 'text/plain;charset=utf-8' });
@@ -1517,7 +1521,13 @@ export const importExportMethods = uiModule({
         // place) — unless the user already chose a card type; the Custom fields stay as they are.
         if (!SettingsManager.hasCardDensity()) SettingsManager.setCardDensity('register');
 
+        // Leaving the open tree as a switch does: its changes sent (when they go by themselves) first,
+        // the following of its research ended once the sample is open.
+        const from = await this.researchFollowBeforeSwitch(null);
         const newTreeId = await DataManager.importAsNewTree(data, strings.demo.treeName);
+        // The sample is never sent to a research nor tied to one.
+        TreeManager.markDemoTree(newTreeId);
+        this.researchFollowLeft(from.open);
 
         this.updateTreeSwitcher();
         this.updateTreeManagerList();

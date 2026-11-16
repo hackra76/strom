@@ -83,6 +83,7 @@ import { followNotice, researchNameBeside, FOLLOW_NOTICE_MS, FOLLOW_HIGHLIGHT_MS
 import { SettingsManager } from '../settings.js';
 import { countImages, stripMedia } from '../attachments.js';
 import { exportToGedcom, countFamilies } from '../ged-exporter.js';
+import { NO_CITATION_FEATURES, researchCitationsOut, type ResearchCitationsOut } from '../citation-gates.js';
 import { formatRelativeDateTime } from '../format.js';
 import { safeFileName } from '../filenames.js';
 import {
@@ -96,7 +97,7 @@ import { currentAppBrowser, appBrowserName } from '../research-transfer.js';
 import { localNetworkStatus } from '../local-network.js';
 import { pendingAdopt } from './pending-adopt.js';
 import { shownName, shownNameOrEmpty, fitNameHtml } from '../person-name.js';
-import { bindSectionMenu, sectionClickSwallowed, sectionMovedNow } from './live-section-edit-ui.js';
+import { bindSectionMenu, keepSectionControlFocus, sectionClickSwallowed, sectionMovedNow } from './live-section-edit-ui.js';
 import { BRIDGE_ANSWER_MS } from '../bridge-ask.js';
 import { bridgeGivesEtag, bridgeGivesImagesByHash, bridgeGivesStale, staleTreeUrl, storedTreeEtag, treeFamilyPartners, treeFileState, treeReplyEtag, treeReplyHeads, treeReplyImages, TREE_GED_TIMEOUT_MS, type TreeReplyHeads } from '../research-tree-file.js';
 import { findImageRefs, forgetHeldImages, imagesUrlOf, refTreeUrl, resolveImageRefs, sha256Hex, type ImageResolveDeps } from '../research-image-refs.js';
@@ -1266,16 +1267,16 @@ export function researchTitlesBase(loaded: StromData, research: StromData, knows
  * research and version. `titles`: how the names carry their titles, by what
  * the research said of itself (researchGedcomTitles).
  */
-export function researchGedcom(data: StromData, treeName: string, link: ResearchHeaderInfo, titles: TitlesInGedcom, readings = false, sourceFields = false): string {
-    return exportToGedcom(data, treeName, { research: link, titles, readings, sourceFields }).content;
+export function researchGedcom(data: StromData, treeName: string, link: ResearchHeaderInfo, titles: TitlesInGedcom, readings = false, sourceFields = false, citations: ResearchCitationsOut = NO_CITATION_FEATURES): string {
+    return exportToGedcom(data, treeName, { research: link, titles, readings, sourceFields, ...citations }).content;
 }
 
 /**
  * researchGedcom with the xrefs it gave the records (a send's `ids` answer by
  * them). `readings`: the sources' reading marks go along (researchSendsReadings).
  */
-export function researchGedcomExport(data: StromData, treeName: string, link: ResearchHeaderInfo, titles: TitlesInGedcom, readings = false, sourceFields = false): { content: string; xrefs: ExportXrefs } {
-    const r = exportToGedcom(data, treeName, { research: link, titles, readings, sourceFields });
+export function researchGedcomExport(data: StromData, treeName: string, link: ResearchHeaderInfo, titles: TitlesInGedcom, readings = false, sourceFields = false, citations: ResearchCitationsOut = NO_CITATION_FEATURES): { content: string; xrefs: ExportXrefs } {
+    const r = exportToGedcom(data, treeName, { research: link, titles, readings, sourceFields, ...citations });
     return { content: r.content, xrefs: r.xrefs };
 }
 
@@ -1343,7 +1344,10 @@ function readFileBuffer(file: Blob): Promise<ArrayBuffer> {
 
 /** A tree's stored data as the app would load it, or null when unreadable. */
 export async function readTree(treeId: TreeId): Promise<StromData | null> {
-    if (DataManager.getCurrentTreeId() === treeId && !DataManager.isLocked()) return DataManager.getData();
+    // The open tree's data only when they are this tree's (never another
+    // tree's beside this id while a switch reads it).
+    const open = DataManager.getDataFor(treeId);
+    if (open && !DataManager.isLocked()) return open;
     try {
         const data = await TreeManager.getTreeData(treeId);
         return data ? migrateData(data) : null;
@@ -2611,7 +2615,7 @@ export const researchUiMethods = uiModule({
         this.showToast(r.sending, 60000);
         let res: Response;
         try {
-            res = await postSync(bridge.sync, researchGedcom(data, tree.name, { id: link.id, head: link.head, appTree: tree.id, transcripts: this.researchTranscriptsLink(link).transcripts }, researchGedcomTitles(status), researchSendsReadings(status), researchSendsSourceFields(status)), 120000);
+            res = await postSync(bridge.sync, researchGedcom(data, tree.name, { id: link.id, head: link.head, appTree: tree.id, transcripts: this.researchTranscriptsLink(link).transcripts }, researchGedcomTitles(status), researchSendsReadings(status), researchSendsSourceFields(status), researchCitationsOut(status)), 120000);
         } catch (err) {
             console.warn('Sending to the research failed', err);
             document.querySelector('.toast')?.remove();
@@ -3120,7 +3124,7 @@ export const researchUiMethods = uiModule({
             return;
         }
         const research = { id: meta.research.id, head: meta.research.head, appTree: treeId, transcripts: this.researchTranscriptsLink(meta.research).transcripts };
-        const blob = new Blob([researchGedcom(data, meta.name, research, researchGedcomTitles(this.researchStatusOf(meta.research.id)), researchSendsReadings(this.researchStatusOf(meta.research.id)), researchSendsSourceFields(this.researchStatusOf(meta.research.id)))], { type: 'text/plain;charset=utf-8' });
+        const blob = new Blob([researchGedcom(data, meta.name, research, researchGedcomTitles(this.researchStatusOf(meta.research.id)), researchSendsReadings(this.researchStatusOf(meta.research.id)), researchSendsSourceFields(this.researchStatusOf(meta.research.id)), researchCitationsOut(this.researchStatusOf(meta.research.id)))], { type: 'text/plain;charset=utf-8' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -3864,7 +3868,7 @@ export const researchUiMethods = uiModule({
             this.endLiveFollow(s, 'ended');
             return null;
         }
-        const active = DataManager.getCurrentTreeId() === s.treeId;
+        let active = DataManager.getCurrentTreeId() === s.treeId;
         const previous = await readTree(s.treeId);
         // Images added in the app before following stay (the research has none of them).
         // Titles a research that does not know them dropped stay (T07), and those it never got (B18-1).
@@ -3877,11 +3881,11 @@ export const researchUiMethods = uiModule({
         if (active) {
             // Following replaces the tree again and again: one backup, before the first time.
             if (!s.backedUp) s.backedUp = !!await DataManager.snapshotNow('pre-research-load');
-            DataManager.replaceWithSourceData(stable);
-            this.refreshSearch();
-        } else {
-            TreeManager.updateTreeFromImport(s.treeId, stable);
+            if (DataManager.replaceWithSourceData(s.treeId, stable)) this.refreshSearch();
+            // Left while the backup was taken: stored for that tree, as for one not open.
+            else if (DataManager.getCurrentTreeId() !== s.treeId) active = false;
         }
+        if (!active) TreeManager.updateTreeFromImport(s.treeId, stable);
         if (fileHead || head) s.head = fileHead || head;
         // The tree of the research's head now (asked without `stale`): nothing newer is being built for it.
         s.preparing = false;
@@ -4297,6 +4301,7 @@ export const researchUiMethods = uiModule({
     renderLivePanel(): void {
         this.readWorkingFamilies();
         queueMicrotask(keepLineFocus());
+        queueMicrotask(keepSectionControlFocus());
         queueMicrotask(focusQueueMoved);
         syncResearchCardInfo();
         // A selected line drops with the tree it was made in or the end of following.

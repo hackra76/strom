@@ -4,7 +4,10 @@
  */
 
 import { rewriteStorySources, storySourceIds } from './story-sources.js';
-import { cleanCitationQuay, cleanTreeCitationQuay, joinQualityOnlySources, setCitationQuality, unionCitations } from './citation-quality.js';
+import { CitationRef, citationFact, cleanTreeSourceEvents } from './citation-order.js';
+import {
+    CitationHolder, citationMainOf, cleanCitationMain, cleanCitationQuay, cleanTreeCitationQuay, joinQualityOnlySources, putCitationMain, setCitationQuality, unionCitations,
+} from './citation-quality.js';
 import { normalizeSingleParents, looseSingleParents, isPurePlaceholder, fillPlaceholder, tidyPlaceholders } from './single-parent.js';
 import {
     Person,
@@ -179,6 +182,16 @@ export function personCitationField(fact?: CitedFact | null): PersonCitationFiel
     return fact === 'birth' ? 'birthSourceIds' : fact === 'death' ? 'deathSourceIds' : 'sourceIds';
 }
 
+/**
+ * The undo toast of one mutation when it says more than the history's entry
+ * (spec 095: "Main citation for the birth: …", "Citation removed from …"):
+ * `note` is a second sentence under it (the toast then wraps and stands 10 s).
+ */
+export interface MutationToast {
+    text: string;
+    note?: string;
+}
+
 /** One place that cites a source (see DataManager.listSourceCitations). */
 export type SourceCitationRef =
     | { kind: 'person'; personId: PersonId; fact?: CitedFact }
@@ -285,6 +298,8 @@ export function migrateData(data: unknown): StromData {
     // Preserve the source catalog if present.
     if (d.sources && typeof d.sources === 'object') {
         result.sources = d.sources as StromData['sources'];
+        // v21 (spec 095): the events a record records, only as tags.
+        cleanTreeSourceEvents(result.sources);
     }
 
     // v19 (spec 077): the sources an import of 3.26 made only for a citation
@@ -421,6 +436,9 @@ class DataManagerClass {
     };
 
     private currentTreeId: TreeId | null = null;
+    /** switchTree: the tree being read (null when no switch is under way), and the latest switch's number. */
+    private switchingTo: TreeId | null = null;
+    private switchSeq = 0;
 
     // Undo/redo: deep copy of the data taken at the start of the current mutation.
     private pendingBefore: StromData | null = null;
@@ -441,7 +459,7 @@ class DataManagerClass {
      * flows (import / merge / batch), which pass `silent` — those have their own
      * UI. Set by the UI layer at startup; a no-op until then.
      */
-    onMutationCommitted: ((description: string) => void) | null = null;
+    onMutationCommitted: ((description: string, toast?: MutationToast) => void) | null = null;
 
     /**
      * Notified after EVERY commit (single or silent bulk flow) and every
@@ -1123,19 +1141,23 @@ class DataManagerClass {
         if (startupTreeId) {
             // Set as active tree
             TreeManager.setActiveTree(startupTreeId);
-            this.currentTreeId = startupTreeId;
 
             // Load audit log cache for startup tree
             await AuditLogManager.loadForTree(startupTreeId);
 
             // Locked / undecryptable data loads as an empty stand-in, but
-            // TreeManager refuses to save over it (review K8).
+            // TreeManager refuses to save over it (review K8). The tree's id
+            // becomes the open one together with its data, never before
+            // (see switchTree).
             const treeData = await TreeManager.getTreeData(startupTreeId);
             if (treeData) {
                 await TreeManager.adoptStoredData(startupTreeId);
+                this.currentTreeId = startupTreeId;
                 this.data = migrateData(treeData);
+                TreeManager.markDemoTree(startupTreeId, this.data);
                 return;
             }
+            this.currentTreeId = startupTreeId;
             this.data = this.createEmptyData();
             return;
         }
@@ -1158,27 +1180,41 @@ class DataManagerClass {
 
     async switchTree(treeId: TreeId): Promise<boolean> {
         this.rollbackEditSession();   // whole-data replacement ends a staged dialog
-        // Flush pending writes (including the per-tree save queues) before
-        // switching (ensure current tree data is persisted)
-        await TreeManager.flush();
-
-        if (!TreeManager.setActiveTree(treeId)) {
-            return false;
+        // The open tree's id and its data change TOGETHER, in one step after
+        // the new tree is read: until then both stay the previous tree's.
+        // Setting the id first left a window (reading, decrypting, migrating
+        // the new tree) where the id was the new tree's and the data still the
+        // previous one's — a send to the research in it carried the previous
+        // tree under the new one's link, and a save wrote it over the new
+        // tree's storage. An edit made meanwhile stays the previous tree's
+        // and is saved there.
+        const seq = ++this.switchSeq;
+        this.switchingTo = treeId;
+        let treeData: StromData | null;
+        try {
+            // Flush pending writes (including the per-tree save queues) before
+            // switching (ensure current tree data is persisted)
+            await TreeManager.flush();
+            if (!TreeManager.getTreeMetadata(treeId)) return false;
+            treeData = await TreeManager.getTreeData(treeId);
+            if (treeData) await TreeManager.adoptStoredData(treeId);
+            // A later switch took over while this one read: it opens its tree.
+            if (seq !== this.switchSeq) return false;
+            if (!TreeManager.setActiveTree(treeId)) return false;
+            this.rollbackEditSession();   // a dialog staged on the previous tree meanwhile
+            this.currentTreeId = treeId;
+            this.data = treeData ? migrateData(treeData) : this.createEmptyData();
+            // An older sample tree is known by its content (never sent to a research).
+            if (treeData) TreeManager.markDemoTree(treeId, this.data);
+        } finally {
+            if (seq === this.switchSeq) this.switchingTo = null;
         }
-
-        this.currentTreeId = treeId;
-        const treeData = await TreeManager.getTreeData(treeId);
         if (treeData) {
-            await TreeManager.adoptStoredData(treeId);
             this.announceNewerData(treeId, treeData);
-            this.data = migrateData(treeData);
-        } else {
-            this.data = this.createEmptyData();
+        } else if (TreeManager.isTreeUnreadable(treeId) && typeof window !== 'undefined') {
             // Locked / wrong key: an empty stand-in that is never saved (K8);
             // let the UI offer unlocking.
-            if (TreeManager.isTreeUnreadable(treeId) && typeof window !== 'undefined') {
-                window.dispatchEvent(new CustomEvent('strom:tree-unreadable', { detail: { treeId } }));
-            }
+            window.dispatchEvent(new CustomEvent('strom:tree-unreadable', { detail: { treeId } }));
         }
 
         // Load audit log cache for the new tree
@@ -1235,6 +1271,29 @@ class DataManagerClass {
      */
     getCurrentTreeId(): TreeId | null {
         return this.currentTreeId;
+    }
+
+    /**
+     * The open tree's data when they are tree `treeId`'s, else null. What
+     * goes somewhere as "tree X" (the research, a file) takes its data here,
+     * never getData() beside an id read apart.
+     */
+    getDataFor(treeId: TreeId): StromData | null {
+        return this.currentTreeId === treeId ? this.data : null;
+    }
+
+    /** A switch to another tree is reading it (the open tree is still the previous one). */
+    isSwitchingTree(): boolean {
+        return this.switchingTo !== null;
+    }
+
+    /**
+     * A switch is reading tree `treeId` to open it. Only that tree waits for
+     * the switch: the open tree's data are its own until the switch ends
+     * (getDataFor), and any other tree is read from storage.
+     */
+    isSwitchingTo(treeId: TreeId): boolean {
+        return this.switchingTo === treeId;
     }
 
     private createEmptyData(): StromData {
@@ -1439,7 +1498,7 @@ class DataManagerClass {
      * stack with a description, then persist. Replaces this.save() at the end of
      * mutation methods. During a batch this defers to commitBatch (no push/save).
      */
-    private commitMutation(description: string, silent = false, mark?: UndoMark): void {
+    private commitMutation(description: string, silent = false, mark?: UndoMark, toast?: MutationToast): void {
         if (this.batchActive) {
             this.batchDirty = true;
             if (this.batchFirstDescription === null) this.batchFirstDescription = description;
@@ -1452,7 +1511,7 @@ class DataManagerClass {
             this.noteUserChange();
             this.windowSink.edit(description, this.windowEditContext ?? undefined);
             this.onUndoRedoChanged?.();
-            if (!silent) this.onMutationCommitted?.(description);
+            if (!silent) this.onMutationCommitted?.(description, toast);
             return;
         }
         UndoManager.setActiveTree(this.currentTreeId);
@@ -1471,7 +1530,7 @@ class DataManagerClass {
         this.onUndoRedoChanged?.();
         // Single user actions raise the Undo toast; bulk flows (import / merge /
         // batch) pass silent — they surface their own result UI instead.
-        if (!silent && !this.viewMode) this.onMutationCommitted?.(description);
+        if (!silent && !this.viewMode) this.onMutationCommitted?.(description, toast);
     }
 
     /** Description a single undo would reverse (for the ⋯ menu label), or null. */
@@ -2597,12 +2656,17 @@ class DataManagerClass {
             for (const f of SHARED_EVENT_COMMON_FIELDS) {
                 if (f in updates) (common as Record<string, unknown>)[f] = updates[f];
             }
-            for (const c of others) applyEventFields(c.event, common);
+            for (const c of others) {
+                applyEventFields(c.event, common);
+                cleanCitationMain(c.event, ['sourceIds']);
+            }
         }
         Object.assign(ev, updates);
         // An explicit undefined means "field emptied" — drop the key, or the
         // old value would survive the save (Object.assign never removes keys).
         dropUndefinedKeys(ev);
+        // A main citation of a source no longer cited goes.
+        cleanCitationMain(ev, ['sourceIds']);
         // An empty participants array means "all participants removed" — drop the
         // property so exported JSON stays clean (Object.assign would keep []).
         if (Array.isArray(updates.participants) && updates.participants.length === 0) {
@@ -2898,7 +2962,10 @@ class DataManagerClass {
         if (values.type !== undefined && (values.type === 'birth' || values.type === 'death' || !eventIsShareable(values.type))) return 0;
         const first = this.data.persons[copies[0].personId];
         this.beginMutation();
-        for (const c of copies) applyEventFields(c.event, values);
+        for (const c of copies) {
+            applyEventFields(c.event, values);
+            cleanCitationMain(c.event, ['sourceIds']);
+        }
         this.commitMutation(strings.undo.editEvent(auditPersonName(first)));
         AuditLogManager.log(this.currentTreeId, 'event.update', strings.auditLog.updatedEvent(auditPersonName(first)));
         return copies.length;
@@ -2944,7 +3011,10 @@ class DataManagerClass {
         const nextLabel = field === 'customLabel' ? value as string | undefined : ev.customLabel;
         if (nextType === 'custom' && !nextLabel?.trim()) return 0;
         this.beginMutation();
-        for (const c of copies) applyEventFields(c.event, { [field]: value } as SharedEventCommon);
+        for (const c of copies) {
+            applyEventFields(c.event, { [field]: value } as SharedEventCommon);
+            cleanCitationMain(c.event, ['sourceIds']);
+        }
         this.commitMutation(strings.undo.editEvent(auditPersonName(person)));
         AuditLogManager.log(this.currentTreeId, 'event.update', strings.auditLog.updatedEvent(auditPersonName(person)));
         return copies.length;
@@ -3197,7 +3267,7 @@ class DataManagerClass {
     }
 
     /** Remove a citation of `sourceId` from a person (or from their birth / death). */
-    uncitePerson(personId: PersonId, sourceId: string, fact?: CitedFact): boolean {
+    uncitePerson(personId: PersonId, sourceId: string, fact?: CitedFact, toast?: MutationToast): boolean {
         const person = this.data.persons[personId];
         const field = personCitationField(fact);
         if (!person?.[field]?.includes(sourceId)) return false;
@@ -3207,7 +3277,9 @@ class DataManagerClass {
         const kept = person[field]!.filter(id => id !== sourceId);
         if (kept.length > 0) person[field] = kept;
         else delete person[field];
-        this.commitMutation(strings.undo.uncite(auditPersonName(person)));
+        // The citation's own QUAY and its being the main one go with it.
+        cleanCitationQuay(person, PERSON_CITATION_FIELDS);
+        this.commitMutation(strings.undo.uncite(auditPersonName(person)), false, undefined, toast);
         AuditLogManager.log(this.currentTreeId, 'source.uncite', strings.auditLog.uncitedSource(auditPersonName(person)));
         return true;
     }
@@ -3229,7 +3301,7 @@ class DataManagerClass {
     }
 
     /** Remove a citation of `sourceId` from a partnership (or from its divorce). */
-    uncitePartnership(partnershipId: PartnershipId, sourceId: string, fact?: 'divorce'): boolean {
+    uncitePartnership(partnershipId: PartnershipId, sourceId: string, fact?: 'divorce', toast?: MutationToast): boolean {
         const partnership = this.data.partnerships[partnershipId];
         const field = fact === 'divorce' ? 'divorceSourceIds' : 'sourceIds';
         if (!partnership?.[field]?.includes(sourceId)) return false;
@@ -3239,9 +3311,53 @@ class DataManagerClass {
         const kept = partnership[field]!.filter(id => id !== sourceId);
         if (kept.length > 0) partnership[field] = kept;
         else delete partnership[field];
+        cleanCitationQuay(partnership, PARTNERSHIP_CITATION_FIELDS);
         const names = this.partnershipNames(partnership);
-        this.commitMutation(strings.undo.uncite(names));
+        this.commitMutation(strings.undo.uncite(names), false, undefined, toast);
         AuditLogManager.log(this.currentTreeId, 'source.uncite', strings.auditLog.uncitedSource(names));
+        return true;
+    }
+
+    /**
+     * The main citation of a fact (spec 095, data v21): the source id the
+     * fact's list marks as its main citation, if it is still cited there.
+     * Undefined for a person's own citations (no fact) or none marked.
+     */
+    citationMainAt(ref: CitationRef): string | undefined {
+        const info = citationFact(this.data, ref);
+        return info?.isFact ? citationMainOf(info.holder as CitationHolder & Partial<Record<string, string[]>>, info.field) : undefined;
+    }
+
+    /**
+     * Mark a fact's citation of `sourceId` as its main citation, or (null)
+     * take the mark away: one undo step. A fact has at most one main citation
+     * (a new one replaces the old); the stored order of the citations is not
+     * changed. A shared event's main citation is common to its copies (a
+     * locked person's copy is left as it is, as citeEvent). False when
+     * nothing changed or it is refused (a locked person or tree, a source not
+     * cited there, a person's own citations).
+     */
+    setCitationMain(ref: CitationRef, sourceId: string | null, toast?: MutationToast): boolean {
+        const info = citationFact(this.data, ref);
+        if (!info?.isFact) return false;
+        if (sourceId !== null && !info.sourceIds.includes(sourceId)) return false;
+        const now = citationMainOf(info.holder as CitationHolder & Partial<Record<string, string[]>>, info.field);
+        if ((now ?? null) === sourceId) return false;
+        if ('personId' in ref ? this.isPersonLocked(ref.personId) : this.isTreeLocked()) return false;
+
+        this.beginMutation();
+        const holders: CitationHolder[] = [info.holder];
+        if ('personId' in ref && ref.eventId) {
+            for (const c of this.eventCopies(ref.personId, ref.eventId) ?? []) {
+                if (c.event === info.event || this.isPersonLocked(c.personId)) continue;
+                if (sourceId !== null && !c.event.sourceIds?.includes(sourceId)) continue;
+                holders.push(c.event);
+            }
+        }
+        for (const h of holders) putCitationMain(h, info.field, sourceId);
+        const name = info.person ? auditPersonName(info.person) : this.partnershipNames(info.partnership!);
+        const fact = info.label ?? (info.word ? strings.events.typesOf[info.word] : '');
+        this.commitMutation(sourceId !== null ? strings.undo.citeMain(fact, name) : strings.undo.citeMainClear(fact, name), false, undefined, toast);
         return true;
     }
 
@@ -3430,7 +3546,7 @@ class DataManagerClass {
     }
 
     /** Remove a citation of `sourceId` from a person's life event (from every copy of a shared one, as citeEvent). */
-    unciteEvent(personId: PersonId, eventId: string, sourceId: string): boolean {
+    unciteEvent(personId: PersonId, eventId: string, sourceId: string, toast?: MutationToast): boolean {
         const person = this.data.persons[personId];
         const ev = person?.events?.find(e => e.id === eventId);
         if (!person || !ev?.sourceIds?.includes(sourceId)) return false;
@@ -3444,9 +3560,25 @@ class DataManagerClass {
             if (c.event.sourceIds.length === 0) delete c.event.sourceIds;
             cleanCitationQuay(c.event, ['sourceIds']);
         }
-        this.commitMutation(strings.undo.uncite(auditPersonName(person)));
+        this.commitMutation(strings.undo.uncite(auditPersonName(person)), false, undefined, toast);
         AuditLogManager.log(this.currentTreeId, 'source.uncite', strings.auditLog.uncitedSource(auditPersonName(person)));
         return true;
+    }
+
+    /**
+     * The persons whose copy of a person's event loses the citation of
+     * `sourceId` when unciteEvent removes it (a shared event: every copy
+     * citing it that is not locked; 0 when nothing would be removed).
+     */
+    unciteEventReach(personId: PersonId, eventId: string, sourceId: string): number {
+        const ev = this.data.persons[personId]?.events?.find(e => e.id === eventId);
+        if (!ev?.sourceIds?.includes(sourceId)) return 0;
+        const persons = new Set<PersonId>();
+        for (const c of this.eventCopies(personId, eventId) ?? [{ personId, event: ev }]) {
+            if (c.event !== ev && this.isPersonLocked(c.personId)) continue;
+            if (c.event.sourceIds?.includes(sourceId)) persons.add(c.personId);
+        }
+        return persons.size;
     }
 
     /**
@@ -3508,6 +3640,7 @@ class DataManagerClass {
         this.beginMutation();
         Object.assign(ev, updates);
         dropUndefinedKeys(ev);
+        cleanCitationMain(ev, ['sourceIds']);
         if (ev.participants?.length === 0) delete ev.participants;
         if (ev.ages && Object.keys(ev.ages).length === 0) delete ev.ages;
         const names = this.partnershipNames(partnership);
@@ -3544,7 +3677,7 @@ class DataManagerClass {
         return true;
     }
 
-    unciteCoupleEvent(partnershipId: PartnershipId, eventId: string, sourceId: string): boolean {
+    unciteCoupleEvent(partnershipId: PartnershipId, eventId: string, sourceId: string, toast?: MutationToast): boolean {
         const partnership = this.data.partnerships[partnershipId];
         const ev = partnership?.events?.find(e => e.id === eventId);
         if (!partnership || !ev?.sourceIds?.includes(sourceId) || this.isTreeLocked()) return false;
@@ -3554,7 +3687,7 @@ class DataManagerClass {
         if (ev.sourceIds.length === 0) delete ev.sourceIds;
         cleanCitationQuay(ev, ['sourceIds']);
         const names = this.partnershipNames(partnership);
-        this.commitMutation(strings.undo.uncite(names));
+        this.commitMutation(strings.undo.uncite(names), false, undefined, toast);
         AuditLogManager.log(this.currentTreeId, 'source.uncite', strings.auditLog.uncitedSource(names));
         return true;
     }
@@ -4403,9 +4536,12 @@ class DataManagerClass {
      * research bridge). Not an edit of the user's: no undo step — the history
      * before it described a state that no longer exists, so it is dropped.
      */
-    replaceWithSourceData(newData: StromData): void {
+    replaceWithSourceData(treeId: TreeId, newData: StromData): boolean {
+        // Data of tree `treeId` only ever replace that tree: another one open
+        // by now (a switch while they were fetched) is left as it is.
+        if (this.currentTreeId !== treeId) return false;
         this.rollbackEditSession();   // whole-data replacement ends a staged dialog
-        if (this.isReadOnly() || !this.currentTreeId) return;
+        if (this.isReadOnly() || !this.currentTreeId) return false;
         // The tree shown until now: the drawing goes from it to the new one (spec 055).
         const previous = this.data;
         this.data = migrateData(newData);
@@ -4417,6 +4553,7 @@ class DataManagerClass {
         if (typeof window !== 'undefined') {
             window.dispatchEvent(new CustomEvent<DataChangedDetail>('strom:data-changed', { detail: { source: 'live', previous } }));
         }
+        return true;
     }
 
     /**
@@ -4446,6 +4583,8 @@ class DataManagerClass {
         this.rollbackEditSession();   // whole-data replacement ends a staged dialog
         const migratedData = migrateData(data);
         const treeId = TreeManager.createTreeFromImport(migratedData, treeName);
+        // A copy of the sample tree (its JSON) is the sample tree too.
+        TreeManager.markDemoTree(treeId, migratedData);
         this.currentTreeId = treeId;
         this.data = migratedData;
         // Remove empty default tree(s) after import

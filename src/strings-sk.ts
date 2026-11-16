@@ -2603,7 +2603,7 @@ export function buildSlovakStrings(cz: StringsType): StringsType {
         derivedMidwife: 'Pôrodná baba · krst:',
         derivedInformant: 'Oznamovateľ · úmrtie:',
         derivedOther: (role: string, type: string) => `${role} · ${type}:`,
-        derivedRoles: { godparent: { m: 'Krstný otec', f: 'Krstná mama' }, witness: { m: 'Svedok', f: 'Svedkyňa' } },
+        derivedRoles: { godparent: { m: 'Krstný otec', f: 'Krstná mama' }, witness: { m: 'Svedok', f: 'Svedkyňa' }, officiant: { m: 'Sobášiaci', f: 'Sobášiaca' }, informant: { m: 'Oznamovateľ', f: 'Oznamovateľka' } },
         derivedWord: (label: string) => label.toLowerCase(),
         marriageWord: 'sobáš',
         derivedOpen: (type: string, names: string) => `Otvoriť ${type} (${names})`,
@@ -2790,7 +2790,7 @@ export function buildSlovakStrings(cz: StringsType): StringsType {
         unifyEmpty: '(prázdne)',
         sharedFields: {
             type: 'typ', customLabel: 'názov', date: 'dátum', place: 'miesto', address: 'dom', note: 'poznámka',
-            sourceIds: 'pramene', citationQuay: 'kvalita citácie',
+            sourceIds: 'pramene', citationQuay: 'kvalita citácie', citationMain: 'hlavný prameň',
         },
     };
 

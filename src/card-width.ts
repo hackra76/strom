@@ -36,7 +36,8 @@
  */
 
 import type { CardHeightMode, CardLine, CardLineStyle, CardValueLines } from './card-fields.js';
-import type { CardDensity } from './types.js';
+import type { CardDensity, CardPhotoSize } from './types.js';
+import { NORMAL_PHOTO_BOX } from './types.js';
 
 export const CUSTOM_CARD_MIN_WIDTH = 200;
 /** The medium width's cap: the card before the width choice, and the default. */
@@ -112,6 +113,12 @@ export interface CustomCardEntry<L extends CardLineText = CardLine> {
     lastLineReserve?: number;
     /** The room (px) the name's rows keep free at their right (the lock on a locked card, index.html). */
     nameReserve?: number;
+    /**
+     * The size of the photo the card shows (spec 096 §3, cardAvatarSize):
+     * a medium or large one makes the avatar beside the name 44 / 72px;
+     * absent (initials, the small photo) 30px.
+     */
+    photo?: CardPhotoSize;
 }
 
 export interface CustomCardMetrics {
@@ -234,7 +241,7 @@ export function customCardMetrics<L extends CardLineText>(entries: Iterable<Cust
     let content = 0;
     for (const e of list) {
         const head = Math.max(w(nameW, e.name), e.years ? w(yearsW, e.years) : 0);
-        content = Math.max(content, (e.avatar ? CARD_AVATAR_WIDTH + CARD_HEAD_GAP : 0) + head);
+        content = Math.max(content, (e.avatar ? cardAvatarSize(e.photo) + CARD_HEAD_GAP : 0) + head);
         for (const l of e.lines) {
             // Unwrapped: each piece of the place column on one row.
             // The place and its "+1" (set at 600) side by side.
@@ -526,6 +533,15 @@ export interface CardHead {
 
 /** The avatar: the header's content is at least this tall. */
 export const CARD_AVATAR_SIZE = 30;
+
+/**
+ * The avatar of a card of details by the size of the photo it shows (spec
+ * 096 §3, D5): 30px (initials, the small photo, no photo: null), 44px
+ * medium, 72px large. MUST match index.html body[data-card-fields][data-card-photo].
+ */
+export function cardAvatarSize(photo?: CardPhotoSize | null): number {
+    return photo === 'large' ? 72 : photo === 'medium' ? 44 : CARD_AVATAR_SIZE;
+}
 /** A row of the name (15px text). */
 export const CARD_NAME_ROW_HEIGHT = 19;
 /** The years under the name (11px text). */
@@ -583,10 +599,13 @@ export const CARD_HEAD_LINE_Y_YEARS = 10 + (CARD_NAME_ROW_HEIGHT + CARD_YEARS_RO
  * The height of a header's content: the name's rows (19px each), the birth
  * surname (14px) and the years (14px) when there are any, at least the
  * avatar's 30px. One row: 30; with years 33; two rows 38; two rows and years
- * 52; one row, the birth surname and years 47.
+ * 52; one row, the birth surname and years 47. `avatar`: the avatar's size
+ * (cardAvatarSize, spec 096 §3): beside a 44 or 72px photo the name, the
+ * birth surname and the years fit without a taller header (three rows and
+ * the years beside the 72px one).
  */
-export function cardHeadBlock(nameRows: number, years: boolean, birth = false): number {
-    return Math.max(CARD_AVATAR_SIZE, CARD_NAME_ROW_HEIGHT * Math.max(1, nameRows)
+export function cardHeadBlock(nameRows: number, years: boolean, birth = false, avatar: number = CARD_AVATAR_SIZE): number {
+    return Math.max(avatar, CARD_NAME_ROW_HEIGHT * Math.max(1, nameRows)
         + (birth ? CARD_BIRTH_ROW_HEIGHT : 0) + (years ? CARD_YEARS_ROW_HEIGHT : 0));
 }
 
@@ -720,14 +739,15 @@ export function customCardRows<L extends CardLineText>(entries: Iterable<CustomC
     // else one (shrunk on screen when long).
     const names = valueLines === 1 ? null : wrapCardTexts(list.map(e => ({
         text: e.name, kind: 'name' as const, maxLines: nameMaxRows,
-        width: Math.max(1, room - (e.avatar ? CARD_AVATAR_WIDTH + CARD_HEAD_GAP : 0) - (e.nameReserve ?? 0)),
+        width: Math.max(1, room - (e.avatar ? cardAvatarSize(e.photo) + CARD_HEAD_GAP : 0) - (e.nameReserve ?? 0)),
     })), measure);
     const heads: CardHead[] = list.map((e, i) => {
         const wrapped = names?.[i];
         const name = wrapped && wrapped.rows.length ? wrapped.rows.map(r => r.text) : [e.name];
         const years = e.years ?? '';
         const birth = e.birth ?? '';
-        return { name, cut: !!wrapped?.cut, years, birth, block: cardHeadBlock(name.length, !!years, !!birth) };
+        const avatar = e.avatar ? cardAvatarSize(e.photo) : CARD_AVATAR_SIZE;
+        return { name, cut: !!wrapped?.cut, years, birth, block: cardHeadBlock(name.length, !!years, !!birth, avatar) };
     });
     const detailGap = valueLines === 1 ? 0 : CARD_DETAIL_GAP;
     const heights = list.map((e, i) => customCardHeight(e.lines.map(l => valueLines === 1 ? 1 : rows.get(l)!.rows.length),
@@ -760,11 +780,13 @@ export function customCardHeight(rowCounts: readonly number[], headBlock: number
  * its own height (customCardRows heights, LayoutConfig.personHeights).
  */
 export function customCardViewHeight(detailsOn: number, valueLines: CardValueLines, heights: Iterable<number>,
-    years = false, birth = false): number {
+    years = false, birth = false, avatar: number = CARD_AVATAR_SIZE): number {
     if (valueLines === 1) {
         // `birth`: a card of the view has the birth surname under its name
         // (src/person-name.ts); the header of every card makes room for it.
-        return customCardHeight([], cardHeadBlock(1, years, birth)) + CARD_LINES_GAP + CARD_ROW_HEIGHT * Math.max(0, detailsOn);
+        // `avatar`: the view's largest avatar (a card with a medium or large
+        // photo, spec 096 §3); every card is as tall as that one.
+        return customCardHeight([], cardHeadBlock(1, years, birth, avatar)) + CARD_LINES_GAP + CARD_ROW_HEIGHT * Math.max(0, detailsOn);
     }
     let tallest = CARD_HEAD_HEIGHT;
     for (const h of heights) tallest = Math.max(tallest, h);
@@ -812,11 +834,34 @@ export const NORMAL_CARD_NAME_WIDTH_BARE = 168;
 /** A row of the Normal card's name on rows: 12.5px × 1.15 (index.html .name-fit-2lines). */
 export const NORMAL_CARD_NAME_ROW_HEIGHT = 14.375;
 
-/** One Normal card's name, as the card splits it: the given names, the surname, and whether the avatar stands beside it. */
+/**
+ * One Normal card's name, as the card splits it: the given names, the
+ * surname, and whether the avatar stands beside it. `textWidth`: the card's
+ * text column when the view's cards are not the small ones (spec 096 §2,
+ * normalCardTextWidth); absent = by `avatar`, 126 or 168px. `photo`: the
+ * size of the photo the card shows (absent: none, or the small one).
+ */
 export interface NormalCardName {
     given: string;
     surname: string;
     avatar: boolean;
+    textWidth?: number;
+    photo?: CardPhotoSize;
+}
+
+/**
+ * The Normal card's text column in a view of a photo size (spec 096 §2,
+ * types.ts NORMAL_PHOTO_BOX): beside a photo 126px in every size (the box
+ * grows with the photo); beside the initials (34px, padding 9) of a wider
+ * card 138 / 174px; a card without an avatar (a placeholder) the card's
+ * width less its border and padding of 9.
+ */
+export function normalCardTextWidth(view: CardPhotoSize, avatar: boolean, photo: boolean): number {
+    const box = NORMAL_PHOTO_BOX[view];
+    const small = NORMAL_PHOTO_BOX.small;
+    if (!avatar) return box.cardWidth - 2 - 2 * small.padX;
+    if (photo) return box.cardWidth - 2 - 2 * box.padX - box.avatar - 8;
+    return box.cardWidth - 2 - 2 * small.padX - small.avatar - 8;
 }
 
 /** The rows of a Normal card's name: the given names' rows, then the surname's. */
@@ -836,7 +881,7 @@ export interface NormalCardNameRows {
 export function normalCardNameRows(names: readonly NormalCardName[], measure: MeasureTexts): NormalCardNameRows[] {
     const requests: WrapRequest[] = [];
     for (const n of names) {
-        const width = n.avatar ? NORMAL_CARD_NAME_WIDTH : NORMAL_CARD_NAME_WIDTH_BARE;
+        const width = n.textWidth ?? (n.avatar ? NORMAL_CARD_NAME_WIDTH : NORMAL_CARD_NAME_WIDTH_BARE);
         requests.push({ text: n.given, width, maxLines: 0, kind: 'nameSmall' });
         requests.push({ text: n.surname, width, maxLines: 0, kind: 'nameSmall' });
     }
@@ -847,20 +892,34 @@ export function normalCardNameRows(names: readonly NormalCardName[], measure: Me
     }));
 }
 
+/** The large Normal card with a photo (spec 096 §2): its height, and where its text block starts and ends below the rows. */
+export const NORMAL_LARGE_PHOTO_HEIGHT = 96;
+const LARGE_TEXT_TOP = 15;      // the first row of the name, as on the 64px card (D13)
+const LARGE_META_ROW = 14;      // the row of the dates
+const LARGE_BOTTOM = 9;         // the bottom margin and the border
+
 /**
  * The Normal card's height for its name's rows: the card as it always was
  * (64px) for two rows or fewer, 14.375px more for each row after the second,
  * rounded up to whole pixels (the layout's card height, LayoutConfig.personHeights).
+ * With a large photo (spec 096 §2) 96px, the name's rows beside the photo
+ * from y = 15 and the dates under them; taller from the fifth row on.
+ * A medium photo fits the 64px card: as without one.
  */
-export function normalCardHeight(nameRows: number): number {
+export function normalCardHeight(nameRows: number, photo?: CardPhotoSize): number {
+    if (photo === 'large') {
+        return Math.max(NORMAL_LARGE_PHOTO_HEIGHT,
+            LARGE_TEXT_TOP + Math.ceil(nameRows * NORMAL_CARD_NAME_ROW_HEIGHT) + LARGE_META_ROW + LARGE_BOTTOM);
+    }
     if (nameRows <= 2) return NORMAL_CARD_HEIGHT;
     return NORMAL_CARD_HEIGHT + Math.ceil((nameRows - 2) * NORMAL_CARD_NAME_ROW_HEIGHT);
 }
 
 /**
- * The cards of a view whose name takes more than two rows and their height
- * (normalCardHeight); null when every name fits its two rows (the layout
- * then spaces every card by the one 64px height, as before).
+ * The cards of a view whose name takes more than two rows, or that show a
+ * large photo, and their height (normalCardHeight); null when every name fits
+ * its two rows and no card has a large photo (the layout then spaces every
+ * card by the one 64px height, as before).
  */
 export function normalCardHeights<K>(names: ReadonlyMap<K, NormalCardName>, measure: MeasureTexts): Map<K, number> | null {
     const keys = [...names.keys()];
@@ -868,8 +927,9 @@ export function normalCardHeights<K>(names: ReadonlyMap<K, NormalCardName>, meas
     let out: Map<K, number> | null = null;
     rows.forEach((r, i) => {
         const n = r.given.length + r.surname.length;
-        if (n <= 2) return;
-        (out ??= new Map()).set(keys[i], normalCardHeight(n));
+        const photo = names.get(keys[i])!.photo;
+        if (n <= 2 && photo !== 'large') return;
+        (out ??= new Map()).set(keys[i], normalCardHeight(n, photo));
     });
     return out;
 }

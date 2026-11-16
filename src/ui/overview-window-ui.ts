@@ -97,6 +97,7 @@ export const overviewWindowMethods = uiModule({
             };
             // The tree's "Verifying" as the docked overview draws it (its Stop and bulk verification are run here).
             extras.verify = this.treeVerifyNow();
+            extras.offLineSettings = this.offLineSettingsOffered(treeId);
         }
         // What the evidence pill lights up in the tree here (the window's rows say it).
         extras.highlight = this.evidenceHighlightNow();
@@ -186,6 +187,9 @@ export const overviewWindowMethods = uiModule({
                 // Today's "Verify facts in the tree…": its dialog here (this window comes forward).
                 if (!this.verifyBulkAvailable()) return false;
                 this.showVerifyBulkDialog();
+                return true;
+            case 'offline-settings':
+                this.openOffLineSettings();
                 return true;
             case 'verify-stop':
                 if (!this.treeVerifyNow()?.stop) return false;

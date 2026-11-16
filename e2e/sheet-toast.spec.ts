@@ -83,12 +83,21 @@ test.describe('a toast and a bottom sheet: the newer one wins', () => {
         await showMessage(page, OPENED);
         const opened = message(page, OPENED);
         await expect(opened).toBeVisible();
-        expect((await opened.boundingBox())!.height).toBeGreaterThan(40);
+        const toastBox = (await opened.boundingBox())!;
+        expect(toastBox.height).toBeGreaterThan(40);
 
         const more = row(page, 'T0103').locator('.live-queue-more');
         await more.click();
         await expect(backdrop(page)).toHaveClass(/\bactive\b/);
         const top = await settledTop(menu(page), 844);
+        // Where the toast stood, the backdrop or the sheet is on top (its middle and its second line), never the toast.
+        for (const y of [toastBox.y + toastBox.height / 2, toastBox.y + toastBox.height - 6]) {
+            const hit = await page.evaluate(([x, yy]) => {
+                const n = document.elementFromPoint(x, yy);
+                return n?.closest('.toast') ? 'toast' : n?.closest('#live-task-menu') ? 'sheet' : n?.closest('.bottom-sheet-overlay') ? 'backdrop' : n?.className ?? null;
+            }, [toastBox.x + toastBox.width / 2, y]);
+            expect(['sheet', 'backdrop']).toContain(hit);
+        }
         // Hidden under the sheet: nothing of it between the backdrop and the sheet, the sheet's title whole.
         await expect(opened).toBeHidden();
         await expect(opened).toHaveClass(/toast-under-sheet/);
@@ -178,6 +187,32 @@ test.describe('a toast and a bottom sheet: the newer one wins', () => {
         expect(await overflow(page)).toBeLessThanOrEqual(0);
         await undo.click();
         await expect.poll(() => orderWrites(b).map(w => (w[1] as { do: string }).do)).toEqual(['next', 'restore']);
+    });
+
+    test('390: the research\'s own "opened" toast at the start waits under the overview and under a task\'s sheet over it', async ({ page }) => {
+        // The order of the verification's finding (1113-app-dorovnani-052-okna N1): the research opens
+        // with its message on the screen, the overview opens over it, then a task's ⋯ sheet.
+        await followManaged(page, { features: NEXT, queue: QUEUE, size: { width: 390, height: 844 } });
+        const opened = page.locator('body > .toast', { hasText: /^Opened the research Fíškovi/ });
+        await expect(opened).toBeVisible();
+        await page.locator('#live-panel .live-panel-toggle').click();
+        await expect(overview(page)).toHaveClass(/research-overview--sheet/);
+        await expect(opened).toHaveClass(/toast-under-sheet/);
+        await expect(opened).toBeHidden();
+        await unfoldQueue(page);
+
+        await row(page, 'T0103').locator('.live-queue-more').click();
+        await expect(backdrop(page)).toHaveClass(/\bactive\b/);
+        const top = await settledTop(menu(page), 844);
+        await expect(opened).toBeHidden();
+        // The sheet's top edge and title whole: no toast between the backdrop and the sheet.
+        expect(await onTop(menu(page).locator('.live-task-menu__title'))).toBe(true);
+        const hit = await page.evaluate(([x, y]) => {
+            const n = document.elementFromPoint(x, y);
+            return n?.closest('.toast') ? 'toast' : n?.closest('#live-task-menu') ? 'sheet' : n?.closest('.bottom-sheet-overlay') ? 'backdrop' : null;
+        }, [195, top + 4]);
+        expect(hit).toBe('sheet');
+        expect(await overflow(page)).toBeLessThanOrEqual(0);
     });
 
     for (const size of [{ name: 'a phone held sideways', width: 844, height: 390 }, { name: 'a touch tablet', width: 1024, height: 768 }]) {

@@ -8,20 +8,23 @@
  * standing in) and arrows to reorder — no dragging, eight rows is few enough.
  * Any number of them can be on ("Turn all on" ticks every one). Under it,
  * "Card appearance": how the card is drawn (the line style, the detail
- * length, the width, the years under the name).
+ * length, the width, the years under the name). Between the row of types
+ * and the preview, "Photo on the card": its size and shape (spec 096 §1).
  */
 
 import { TreeRenderer } from '../renderer.js';
 import { SettingsManager, CardSignals } from '../settings.js';
 import { strings } from '../strings.js';
-import { CARD_SIZE, CardDensity, Person, PersonId, Partnership, PartnershipId, StromData } from '../types.js';
+import {
+    CARD_SIZE, CardDensity, CardPhotoShape, CardPhotoSize, NORMAL_PHOTO_BOX, Person, PersonId, Partnership, PartnershipId, StromData,
+} from '../types.js';
 import { ActionSignal, ACTION_GLYPH, storyFoldHtml } from '../card-signals.js';
 import { statusMarkHtml } from './fact-status.js';
 import {
     CardFieldKey, CardFieldSettings, CardHeightMode, CardLineStyle, CardValueLines, CardWidthCap, CARD_FIELD_KEYS,
     CARD_HEIGHT_MODES, CARD_LINE_STYLES, CARD_MARKS, CARD_VALUE_LINES, CARD_WIDTH_CAPS, PLACE_KEYS, cardLines,
     cardLineHtml, cardYears, cardDateReferences, isFieldCardDensity, CARD_DENSITIES, CardPresetKey, cardTypeForKey,
-    customCardSize, matchCardPreset, presetAsCustom,
+    customCardSize, matchCardPreset, presetAsCustom, CARD_PHOTO_SIZES, CARD_PHOTO_SHAPES,
 } from '../card-fields.js';
 import { CardHead, cardNameMaxRows, customCardMetrics, customCardRows, measureCardTexts } from '../card-width.js';
 import { uiModule } from './module.js';
@@ -37,26 +40,38 @@ function fieldLabel(key: CardFieldKey): string {
     return strings.events.types[key];
 }
 
+/** The sample's name in the UI language. */
+function sampleName(): string {
+    return `${strings.cardDensity.sampleFirstName} ${strings.cardDensity.sampleLastName}`;
+}
+
+/** The sample's initials for its avatar. */
+function sampleInitials(): string {
+    return `${strings.cardDensity.sampleFirstName.charAt(0)}${strings.cardDensity.sampleLastName.charAt(0)}`;
+}
+
 /** A made-up person for the preview: a miller who died of consumption, married once. */
 function samplePerson(): { person: Person; data: StromData } {
     const jan = 'sample_jan' as PersonId;
     const marie = 'sample_marie' as PersonId;
     const union = 'sample_union' as PartnershipId;
+    // Names and places in the UI language (a Czech sample read odd in English).
     const d = strings.cardDensity;
+    const place = d.samplePlace;
     const person: Person = {
-        id: jan, firstName: 'Jan', lastName: 'Vlk', gender: 'male', isPlaceholder: false,
-        birthDate: '1862', birthPlace: 'Horní Lhota',
-        deathDate: '1919-03-12', deathPlace: 'Horní Lhota', deathCause: d.sampleCause,
+        id: jan, firstName: d.sampleFirstName, lastName: d.sampleLastName, gender: 'male', isPlaceholder: false,
+        birthDate: '1862', birthPlace: place,
+        deathDate: '1919-03-12', deathPlace: place, deathCause: d.sampleCause,
         partnerships: [union], parentIds: [], childIds: [],
         events: [
-            { id: 'e1', type: 'baptism', date: '1862-03-02', place: 'Horní Lhota' },
-            { id: 'e2', type: 'burial', date: '1919-03-15', place: 'Horní Lhota' },
+            { id: 'e1', type: 'baptism', date: '1862-03-02', place },
+            { id: 'e2', type: 'burial', date: '1919-03-15', place },
             { id: 'e3', type: 'occupation', note: d.sampleOccupation },
         ],
     };
     const partnership: Partnership = {
         id: union, person1Id: jan, person2Id: marie, childIds: [], status: 'married',
-        startDate: '1888-02-14', startPlace: 'Dolní Lhota',
+        startDate: '1888-02-14', startPlace: d.sampleMarriagePlace,
     };
     return { person, data: { persons: { [jan]: person }, partnerships: { [union]: partnership } } };
 }
@@ -93,7 +108,7 @@ const LINES_LABEL: Record<CardValueLines, () => string> = {
  * view's one-row height, or the sample's own when its details wrap or the
  * height is "by content".
  */
-function samplePreview(density: CardPresetKey | 'custom', viewWidth: number | undefined): {
+function samplePreview(density: CardPresetKey | 'custom', viewWidth: number | undefined, photo: CardPhotoSize = 'small'): {
     html: string; head: CardHead; wrapped: boolean; width: number; height: number; dateColumn: number; labelColumn: number;
 } {
     // The card type's own lines (Detailed, Register), Custom's stored ones.
@@ -101,7 +116,8 @@ function samplePreview(density: CardPresetKey | 'custom', viewWidth: number | un
     const { person, data } = samplePerson();
     const lines = cardLines(person, data, fields);
     const years = fields.years ? cardYears(person, true) : '';
-    const entry = { name: 'Jan Vlk', avatar: true, lines, ...(years ? { years } : {}) };
+    // A medium or large photo: the header's avatar of that size (spec 096 §3).
+    const entry = { name: sampleName(), avatar: true, lines, ...(years ? { years } : {}), ...(photo !== 'small' ? { photo } : {}) };
     // The view's card width; the date (or label) column of the sample's own lines.
     const own = customCardMetrics([entry], measureCardTexts, fields.widthCap, fields.lines, fields.style,
         cardDateReferences(fields.fullDate));
@@ -111,18 +127,47 @@ function samplePreview(density: CardPresetKey | 'custom', viewWidth: number | un
     const html = `<div class="card-lines${wrapped ? ' card-lines--rows' : ''}">${lines.map(l =>
         cardLineHtml(l, esc, false, wrapped ? rows.get(l) : undefined, fields.style, !!rows.get(l)?.longDate)).join('')}</div>`;
     // The sample's own height when its details wrap or every card is as tall as its content.
-    const height = wrapped || fields.height === 'content' ? heights[0] : customCardSize(fields.on.length, fields.years).cardHeight;
+    const height = wrapped || fields.height === 'content' ? heights[0] : customCardSize(fields.on.length, fields.years, photo).cardHeight;
     return { html, head: heads[0], wrapped, width: metrics.cardWidth, height, dateColumn: own.dateColumn, labelColumn: own.labelColumn ?? 0 };
 }
 
-/** A row of "Card appearance": its label and a segment of choices (one pressed). */
-function lookSegment(name: string, label: string, options: { value: string; label: string; active: boolean }[]): string {
+/**
+ * A row of "Card appearance": its label and a segment of choices (one
+ * pressed); `glyph`: a small mark before an option's text (its HTML);
+ * `disabled`: shown, not choosable (the photo on the Compact card).
+ */
+function lookSegment(name: string, label: string, options: { value: string; label: string; active: boolean; glyph?: string }[],
+    disabled = false): string {
     const id = `card-look-${name}-label`;
     const buttons = options.map(o =>
-        `<button type="button" class="segment-btn sel-opt${o.active ? ' active' : ''}" data-sel-form="seg" data-value="${esc(o.value)}" aria-pressed="${o.active}">${esc(o.label)}</button>`).join('');
+        `<button type="button" class="segment-btn sel-opt${o.active ? ' active' : ''}" data-sel-form="seg" data-value="${esc(o.value)}" aria-pressed="${o.active}"${disabled ? ' disabled' : ''}>${o.glyph ?? ''}${esc(o.label)}</button>`).join('');
     return `<span class="card-look-label" id="${id}">${esc(label)}</span>
-        <div class="segment sel-seg card-look-segment card-look-${name}" role="group" aria-labelledby="${id}">${buttons}</div>`;
+        <div class="segment sel-seg card-look-segment card-look-${name}" role="group" aria-labelledby="${id}"${disabled ? ' aria-disabled="true"' : ''}>${buttons}</div>`;
 }
+
+/** The photo on the card (spec 096): its size and shape. */
+type CardPhoto = { size: CardPhotoSize; shape: CardPhotoShape };
+/** The card as it always was: a small photo in a circle. */
+const DEFAULT_PHOTO: CardPhoto = { size: 'small', shape: 'circle' };
+
+/**
+ * The preview's stand-in photo (spec 096 D12): a head and shoulders, drawn,
+ * so the preview shows the chosen size and shape without anyone's picture.
+ */
+const SAMPLE_PHOTO = 'data:image/svg+xml,' + encodeURIComponent(
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' fill='#efe7d8'/>"
+    + "<circle cx='32' cy='25' r='12' fill='#d9cfbd'/><path d='M7 64c1.5-14 11.5-21.5 25-21.5S55.5 50 57 64z' fill='#a99c84'/></svg>");
+
+/** The names of the photo's sizes and shapes. */
+const PHOTO_SIZE_LABEL: Record<CardPhotoSize, () => string> = {
+    small: () => strings.cardDensity.photoSmall,
+    medium: () => strings.cardDensity.photoMedium,
+    large: () => strings.cardDensity.photoLarge,
+};
+const PHOTO_SHAPE_LABEL: Record<CardPhotoShape, () => string> = {
+    circle: () => strings.cardDensity.photoCircle,
+    rounded: () => strings.cardDensity.photoRounded,
+};
 
 /**
  * The preview card shrinks to the panel when it is wider (a wide card on a
@@ -201,32 +246,45 @@ export function forgetCardTypeCopy(): void {
 /**
  * A made-up card of a type with the chosen signals, and its box: the fixed
  * size of Compact and Normal, the sample's own for a card of details (wrapped
- * for `viewWidth`, the drawn view's card width, when given).
+ * for `viewWidth`, the drawn view's card width, when given). With a photo
+ * other than small + circle (spec 096 D12) the sample shows the stand-in
+ * photo in that size and shape (the Normal card's box of that size); small +
+ * circle: the card as it always was, the initials.
  */
-function sampleCard(density: CardDensity, on: CardSignals, viewWidth: number | undefined): { html: string; width: number; height: number } {
+function sampleCard(density: CardDensity, on: CardSignals, viewWidth: number | undefined,
+    photo: CardPhoto = DEFAULT_PHOTO): { html: string; width: number; height: number } {
     // The status mark of a person with only some citations (●○) and a story's fold.
     const stripes = (on.status ? statusMarkHtml({ cls: 'cs-p1', source: 'evidence', facts: [] }) : '')
         + storyFoldHtml(on.story ? { kind: 'own', final: false } : null);
     const action: ActionSignal | null = on.waiting ? 'waiting' : on.conflict ? 'conflict' : on.question ? 'question' : null;
-    const badge = action ? `<span class="card-signal signal-${action}">${ACTION_GLYPH[action]}</span>` : '';
-    const dot = action ? `<span class="card-signal-dot signal-${action}"></span>` : '';
+    // Without a badge, the agent at work: its arc around the avatar (the ring at the corner on Compact), as in the tree.
+    const agent = !action && on.agent;
+    const badge = action ? `<span class="card-signal signal-${action}">${ACTION_GLYPH[action]}</span>`
+        : agent ? '<span class="card-agent-mark"><span class="card-agent"></span></span>' : '';
+    const dot = action ? `<span class="card-signal-dot signal-${action}"></span>`
+        : agent && density === 'compact' ? '<span class="card-agent-dot"></span>' : '';
+    // The card carries its own photo size and shape (index.html .card-signals-preview [data-photo]).
+    const touched = density !== 'compact' && (photo.size !== 'small' || photo.shape !== 'circle');
+    const photoAttrs = touched ? ` data-photo="${photo.size}" data-shape="${photo.shape}"` : '';
+    const photoClass = touched ? ' has-photo' : '';
     const avatar = (initials: string) =>
-        `<div class="card-avatar-wrap"><div class="card-avatar"><span class="avatar-initials">${initials}</span></div>${badge}</div>`;
+        `<div class="card-avatar-wrap"><div class="card-avatar">${touched ? `<img src="${SAMPLE_PHOTO}" alt="">`
+            : `<span class="avatar-initials">${initials}</span>`}</div>${badge}</div>`;
     if (isFieldCardDensity(density)) {
-        const sample = samplePreview(density, viewWidth);
+        const sample = samplePreview(density, viewWidth, touched ? photo.size : 'small');
         // The width it was wrapped for (the view's; before any view, the sample's own) and its height.
         const box = `--card-date-col: ${sample.dateColumn}px; --card-label-col: ${sample.labelColumn}px; `
             + `width: ${sample.width}px; height: ${sample.height}px`;
         const { head } = sample;
         const name = sample.wrapped
             ? `<div class="name name--rows"><span class="name-text">${head.name.map(r => `<span class="name-row">${esc(r)}</span>`).join('')}</span></div>`
-            : '<div class="name"><span class="name-text">Jan Vlk</span></div>';
+            : `<div class="name"><span class="name-text">${esc(sampleName())}</span></div>`;
         const years = head.years ? `<div class="card-years">${esc(head.years)}</div>` : '';
         return {
             width: sample.width, height: sample.height, html: `
-            <div class="person-card male preview-card${action ? ' has-signal' : ''}" data-density="${density}" data-fields style="${box}">
+            <div class="person-card male preview-card${photoClass}${action ? ' has-signal' : ''}" data-density="${density}" data-fields${photoAttrs} style="${box}">
                 <div class="card-body card-body--custom">
-                    <div class="card-head${head.years ? ' card-head--years' : ''}">${avatar('JV')}<div class="card-head-text">${name}${years}</div></div>
+                    <div class="card-head${head.years ? ' card-head--years' : ''}">${avatar(sampleInitials())}<div class="card-head-text">${name}${years}</div></div>
                     ${sample.html}
                 </div>
                 ${stripes}
@@ -235,14 +293,15 @@ function sampleCard(density: CardDensity, on: CardSignals, viewWidth: number | u
         };
     }
     const compact = density === 'compact';
-    const size = CARD_SIZE[compact ? 'compact' : 'normal'];
+    // The Normal card with the photo: the box of its size (types.ts NORMAL_PHOTO_BOX).
+    const size = compact ? CARD_SIZE.compact : touched ? NORMAL_PHOTO_BOX[photo.size] : CARD_SIZE.normal;
     return {
         width: size.cardWidth, height: size.cardHeight, html: `
-        <div class="person-card male preview-card${action ? ' has-signal' : ''}" data-density="${density}">
-            ${compact ? '' : avatar('JV')}
+        <div class="person-card male preview-card${photoClass}${action ? ' has-signal' : ''}" data-density="${density}"${photoAttrs}>
+            ${compact ? '' : avatar(sampleInitials())}
             <div class="card-body">
-                <div class="name"><span class="name-text">Jan Vlk</span></div>
-                ${compact ? '' : '<div class="birth-date"><span class="meta-text">1862 – 1919 · Horní Lhota</span></div>'}
+                <div class="name"><span class="name-text">${esc(sampleName())}</span></div>
+                ${compact ? '' : `<div class="birth-date"><span class="meta-text">1862 – 1919 · ${esc(strings.cardDensity.samplePlace)}</span></div>`}
             </div>
             ${stripes}
             ${dot}
@@ -347,7 +406,7 @@ export const cardFieldsUiMethods = uiModule({
         // A card of details is as wide as the drawn view needs (src/card-width.ts);
         // as tall as the sample's details when they wrap.
         const { html, width, height } = sampleCard(SettingsManager.getCardDensity(), SettingsManager.getCardSignals(),
-            TreeRenderer.getCustomCardMetrics()?.cardWidth);
+            TreeRenderer.getCustomCardMetrics()?.cardWidth, SettingsManager.getCardPhoto());
         host.innerHTML = `
             <div class="card-preview-head">
                 <span class="card-signals-preview-title">${esc(strings.cardDensity.cardPreview)}</span>
@@ -360,7 +419,51 @@ export const cardFieldsUiMethods = uiModule({
 
     /** A made-up card in the current type with the chosen signals. */
     cardPreviewHtml(on: CardSignals): string {
-        return sampleCard(SettingsManager.getCardDensity(), on, TreeRenderer.getCustomCardMetrics()?.cardWidth).html;
+        return sampleCard(SettingsManager.getCardDensity(), on, TreeRenderer.getCustomCardMetrics()?.cardWidth,
+            SettingsManager.getCardPhoto()).html;
+    },
+
+    /**
+     * "Photo on the card" (spec 096 §1, D1, D2): the photo's size and shape,
+     * for the Normal card and the cards of details; on the Compact card the
+     * row stays, its choices off, with the sentence why (the choice is kept).
+     * A choice draws the preview and the tree again.
+     */
+    renderCardPhotoSettings(): void {
+        const host = document.getElementById('card-photo-settings');
+        if (!host) return;
+        const d = strings.cardDensity;
+        const photo = SettingsManager.getCardPhoto();
+        const off = SettingsManager.getCardDensity() === 'compact';
+        host.classList.toggle('is-off', off);
+        const glyph = (shape: CardPhotoShape) => `<span class="card-photo-glyph is-${shape}" aria-hidden="true"></span>`;
+        host.innerHTML = `
+            <span class="settings-name card-photo-title">${esc(d.photoTitle)}</span>
+            <div class="card-look-grid card-photo-grid">
+                ${lookSegment('photo-size', d.photoSize, CARD_PHOTO_SIZES.map(size => ({
+                    value: size, label: PHOTO_SIZE_LABEL[size](), active: photo.size === size,
+                })), off)}
+                ${lookSegment('photo-shape', d.photoShape, CARD_PHOTO_SHAPES.map(shape => ({
+                    value: shape, label: PHOTO_SHAPE_LABEL[shape](), active: photo.shape === shape, glyph: glyph(shape),
+                })), off)}
+            </div>
+            <div class="card-photo-note">${esc(off ? d.photoCompact : d.photoScope)}</div>`;
+        if (off) return;
+        const choose = (next: CardPhoto, focus: string): void => {
+            SettingsManager.setCardPhoto(next);
+            this.renderCardPhotoSettings();
+            this.renderCardPreview();
+            void TreeRenderer.renderKeepingView();
+            host.querySelector<HTMLElement>(focus)?.focus();
+        };
+        host.querySelectorAll<HTMLButtonElement>('.card-look-photo-size [data-value]').forEach(btn => {
+            btn.onclick = () => choose({ ...SettingsManager.getCardPhoto(), size: btn.dataset.value as CardPhotoSize },
+                `.card-look-photo-size [data-value="${btn.dataset.value}"]`);
+        });
+        host.querySelectorAll<HTMLButtonElement>('.card-look-photo-shape [data-value]').forEach(btn => {
+            btn.onclick = () => choose({ ...SettingsManager.getCardPhoto(), shape: btn.dataset.value as CardPhotoShape },
+                `.card-look-photo-shape [data-value="${btn.dataset.value}"]`);
+        });
     },
 
     /** "Details on the card": only for the custom density. */

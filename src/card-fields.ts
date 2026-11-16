@@ -12,7 +12,7 @@
  * aria-label all read the same lines.
  */
 
-import { Person, StromData, LifeEvent, Partnership, CardDensity } from './types.js';
+import { Person, StromData, LifeEvent, Partnership, CardDensity, CardPhotoSize, CardPhotoShape } from './types.js';
 import { parseFlexDate, formatFlexDate, toCanonical, ageReached, AgeReached } from './dates.js';
 import { newestLifeEvent, sortLifeEvents } from './events.js';
 import { strings } from './strings.js';
@@ -163,6 +163,19 @@ export function normalizeCardDensity(value: unknown): CardDensity {
     return CARD_DENSITIES.includes(value as CardDensity) ? value as CardDensity : 'normal';
 }
 
+/** The photo sizes and shapes of Settings → Person card → Photo on the card (spec 096). */
+export const CARD_PHOTO_SIZES: readonly CardPhotoSize[] = ['small', 'medium', 'large'];
+export const CARD_PHOTO_SHAPES: readonly CardPhotoShape[] = ['circle', 'rounded'];
+
+/** The photo on the card as stored, repaired: anything unknown is small and a circle (the card as it always was). */
+export function normalizeCardPhoto(raw: unknown): { size: CardPhotoSize; shape: CardPhotoShape } {
+    const r = raw && typeof raw === 'object' ? raw as { size?: unknown; shape?: unknown } : {};
+    return {
+        size: CARD_PHOTO_SIZES.includes(r.size as CardPhotoSize) ? r.size as CardPhotoSize : 'small',
+        shape: CARD_PHOTO_SHAPES.includes(r.shape as CardPhotoShape) ? r.shape as CardPhotoShape : 'circle',
+    };
+}
+
 /** Whether a card type draws lines of details (the Custom card's way): Detailed, Register and Custom. */
 export function isFieldCardDensity(density: CardDensity): density is CardPresetKey | 'custom' {
     return density === 'detailed' || density === 'register' || density === 'custom';
@@ -245,9 +258,12 @@ export function cardTypeForKey(current: CardDensity, key: string): CardDensity |
  * detail; when details wrap the renderer measures the view's tallest card
  * instead (customCardViewHeight) and starts from this one.
  */
-export function customCardSize(lines: number, years = false): { cardWidth: number; cardHeight: number } {
+export function customCardSize(lines: number, years = false, photo: CardPhotoSize = 'small'): { cardWidth: number; cardHeight: number } {
     // The years under the name make the header 3px taller (19 + 14 instead of the avatar's 30).
-    return { cardWidth: 200, cardHeight: 56 + (years ? 3 : 0) + 17 * Math.max(0, lines) };
+    // A medium or large photo (spec 096 §3, src/card-width.ts cardAvatarSize) makes the header
+    // 44 / 72px; the years fit beside it.
+    const head = photo === 'large' ? 98 : photo === 'medium' ? 70 : 56 + (years ? 3 : 0);
+    return { cardWidth: 200, cardHeight: head + 17 * Math.max(0, lines) };
 }
 
 export interface CardLine {

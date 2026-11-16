@@ -80,6 +80,7 @@ export const plPart1: Pick<StringsType, 'toolbar' | 'treeSwitcher' | 'menu' | 'm
         tryDemoDesc: 'Zmyślona rodzina, która pokazuje, wszystko, co może zawierać drzewo',
         treeName: 'Przykład: ród Bergów',
         hint: 'Kliknięcie karty otwiera akcje. To zwykłe drzewo – można je usunąć w zarządzaniu drzewami.',
+        noResearch: 'Drzewo przykładowe służy do wypróbowania aplikacji i nigdy nie zostaje połączone z badaniem. Badanie zaczyna się od prawdziwego drzewa rodzinnego.',
         // The made-up family's words; its names and places read the same in every language.
         data: {
             farmer: 'Gospodarz',
@@ -705,10 +706,16 @@ export const plPart1: Pick<StringsType, 'toolbar' | 'treeSwitcher' | 'menu' | 'm
         derivedWitness: 'Świadek · ślub:',
         derivedWitnessF: 'Świadek · ślub:',
         derivedOfficiant: 'Udzielający ślubu · ślub:',
+        derivedOfficiantF: 'Udzielająca ślubu · ślub:',
         derivedMidwife: 'Akuszerka · chrzest:',
         derivedInformant: 'Zgłaszający · zgon:',
+        derivedInformantF: 'Zgłaszająca · zgon:',
         derivedOther: (role: string, type: string) => `${role} · ${type}:`,
-        derivedRoles: { godparent: { m: 'Chrzestny', f: 'Chrzestna' }, witness: { m: 'Świadek', f: 'Świadek' } },
+        // "Świadek" is the standard word for a woman too ("świadkowa" is colloquial, the bride's witness only).
+        derivedRoles: {
+            godparent: { m: 'Chrzestny', f: 'Chrzestna' }, witness: { m: 'Świadek', f: 'Świadek' },
+            officiant: { m: 'Celebrans', f: 'Celebrantka' }, informant: { m: 'Zgłaszający', f: 'Zgłaszająca' },
+        },
         derivedWord: (label: string) => label.toLowerCase(),
         marriageWord: 'ślub',
         derivedOpen: (type: string, names: string) => `Otwórz ${type} (${names})`,
@@ -795,7 +802,19 @@ export const plPart1: Pick<StringsType, 'toolbar' | 'treeSwitcher' | 'menu' | 'm
             census: 'Spis ludności',
             godparent: 'Chrzestny', weddingWitness: 'Świadek ślubu',
             custom: 'Własne'
-        }
+        },
+        /** A fact's words where it is named in a sentence (genitive: "cytat główny urodzenia"); a custom event says its own label. */
+        typesOf: {
+            birth: 'urodzenia', death: 'zgonu', baptism: 'chrztu', burial: 'pochówku',
+            occupation: 'zawodu', residence: 'miejsca zamieszkania', military: 'służby wojskowej', emigration: 'emigracji',
+            immigration: 'imigracji', education: 'wykształcenia', religion: 'wyznania', confirmation: 'bierzmowania',
+            firstCommunion: 'Pierwszej Komunii Świętej', barMitzvah: 'bar micwy', batMitzvah: 'bat micwy', ordination: 'święceń',
+            adoption: 'adopcji', naturalization: 'naturalizacji', will: 'testamentu', probate: 'postępowania spadkowego',
+            title: 'tytułu', nationality: 'narodowości', cremation: 'kremacji', census: 'spisu ludności',
+            godparent: 'roli chrzestnego', weddingWitness: 'świadka ślubu', custom: 'własnego wydarzenia', marriage: 'ślubu',
+            divorce: 'rozwodu', engagement: 'zaręczyn', banns: 'zapowiedzi', marriageLicence: 'zezwolenia na ślub',
+            marriageContract: 'kontraktu małżeńskiego', marriageSettlement: 'intercyzy', divorceFiled: 'pozwu o rozwód', annulment: 'unieważnienia małżeństwa',
+        },
     },
 
     factStatus: {
@@ -1061,6 +1080,30 @@ export const plPart1: Pick<StringsType, 'toolbar' | 'treeSwitcher' | 'menu' | 'm
         unsavedMessage: 'W tym źródle są niezapisane zmiany.',
         // Records: excerpt, transcription, viewer, picker
         chipOpen: (title: string) => `Pokaż źródło: ${title}`,
+        mainMark: 'cytat główny',
+        mainShort: 'główny',
+        chipOpenMain: (title: string) => `${title} – cytat główny, otwórz`,
+        // Pasek cytatu w przeglądarce źródła i komunikaty usunięcia (spec 095 §2, §3); {f}: strings.events.typesOf (dopełniacz)
+        citeAt: (fact: string, who: string) => `${fact} · ${who}`,
+        citePos: (i: number, n: number) => `${i}. z ${n} cytatów`,
+        citeFirstWhy: (why: string) => `jest pierwszy: ${why}`,
+        whyPrimary: (fact: string) => `zapis ${fact}, oryginał`,
+        whyOriginal: 'oryginał',
+        whyQuality: 'najwyższa wiarygodność',
+        citeMainAt: (fact: string) => `Cytat główny dla ${fact}`,
+        citeOnly: (fact: string) => `Jedyny cytat dla ${fact}`,
+        setMain: 'Oznacz jako główny',
+        clearMain: 'Usuń oznaczenie głównego',
+        mainSetToast: (fact: string, title: string) => `Cytat główny dla ${fact}: ${title}`,
+        mainClearedToast: (fact: string) => `Cytat główny dla ${fact} usunięty; kolejność znów automatyczna`,
+        uncitedToast: (fact: string, title: string) => `Cytat usunięty z ${fact}: ${title}`,
+        uncitedMainToast: (fact: string, title: string) => `Cytat usunięty z ${fact}, już nie główny: ${title}`,
+        uncitedSharedToast: (fact: string, n: number, title: string) => `Cytat usunięty z ${fact} u wszystkich ${n} osób: ${title}`,
+        sourceStays: 'źródło zostaje',
+        uncitedNotTaken: 'Badanie nie przejmie tego usunięcia; po wczytaniu jego wersji cytat wróci.',
+        uncitedNotTakenShort: 'badanie nie przejmie',
+        unciteNote: 'Badanie jeszcze nie przejmuje usunięć.',
+        citeGone: (fact: string) => `Odłączono od ${fact} · źródło zostaje w katalogu`,
         titleHint: 'Jeden konkretny zapis – chrzest, ślub, zgon.',
         excerptLabel: 'Wycinek zapisu',
         excerptEmpty: 'Wystarczy wkleić zrzut ekranu z przeglądarki archiwum albo wgrać skan.',

@@ -5,7 +5,7 @@
  * Pure: no DOM, no storage.
  */
 
-import { StromData, Person, Partnership, Source, EventParticipant, PersonId, LifeEvent, Attachment, PlaceGeo, isPrimaryName, personSourceIds } from './types.js';
+import { StromData, Person, Partnership, PartnershipId, Source, EventParticipant, PersonId, LifeEvent, Attachment, PlaceGeo, isPrimaryName, personSourceIds } from './types.js';
 import { isPurePlaceholder } from './single-parent.js';
 import { collectPlaces } from './places.js';
 import { factValueSignature, handedConfirmations } from './verify.js';
@@ -645,6 +645,16 @@ export interface NotWrittenItem {
     place?: string;
     /** `why: removed`: the research's send that removed the person ("I0042"). */
     removedBy?: string;
+    /** Its stable code (`sync.notWritten.codes`): the reason is worded by it (research-changes-ui `nwReason`). */
+    code?: string;
+    /** What it is about by the code (the research's ids, a fact's tag). */
+    params?: Record<string, string>;
+    /** The sources its fact cited that went unwritten with it (a new citation): the research's "S0012" or the file's "@S12@". */
+    cites?: string[];
+    /** Those sources in the app, in the order of `cites`, when the send's file told them ('' = by the research's number). */
+    citeIds?: string[];
+    /** A change the research wanted to write and could not (`skipped[]` of the answer), listed with the rest. */
+    skipped?: true;
 }
 
 /** A not-written item put to what it is about here. */
@@ -652,7 +662,16 @@ export type PairedNotWritten =
     /** `deleted`: a person this send removed here (by its number in the research), named as it was. */
     | { type: 'person'; item: NotWrittenItem; personId: PersonId | null; deleted?: { name: string } }
     | { type: 'source'; item: NotWrittenItem; sourceId: string; title: string }
-    | { type: 'places'; item: NotWrittenItem; place: string };
+    | { type: 'places'; item: NotWrittenItem; place: string }
+    /**
+     * An item with a code: one row "person · fact · source" with its reason, each part when known
+     * (`personId` — or a person removed here, `deleted` —, else `couple` by the research's family,
+     * `sourceId` with its title); never counted as not named.
+     */
+    | { type: 'coded'; item: NotWrittenItem; personId: PersonId | null; deleted?: { name: string };
+        couple: PartnershipId | null; sourceId: string | null; title: string;
+        /** More sources it cited (`cites`) the tree has, after the first (`sourceId`); absent = none. */
+        alsoCited?: { id: string; title: string }[] };
 
 /**
  * Put what the research did not write to its rows: a person (as before, also
@@ -676,6 +695,27 @@ export function pairNotWritten(items: readonly NotWrittenItem[], data: StromData
         return byRefn.get(ref) ?? null;
     };
     for (const item of items) {
+        if (item.code) {
+            const hit = item.person ? Object.values(data.persons ?? {}).find(p => p?.refn?.trim() === item.person) : undefined;
+            const removed = item.person && !hit ? sent.find(ch => ch.deleted && ch.refn === item.person) : undefined;
+            const ps = !item.person && item.family
+                ? Object.values(data.partnerships ?? {}).find(f => f?.researchId === item.family) : undefined;
+            const sid = item.source ? (item.sourceId && sources[item.sourceId] ? item.sourceId : sourceByRef(item.source)) : null;
+            // The sources a new citation cited (`cites`), each the tree has, once: the first where the item names none.
+            const cited: { id: string; title: string }[] = [];
+            (item.cites ?? []).forEach((ref, i) => {
+                const own = item.citeIds?.[i];
+                const id = own && sources[own] ? own : sourceByRef(ref);
+                if (id && sources[id] && id !== sid && !cited.some(c => c.id === id)) cited.push({ id, title: sources[id].title?.trim() || ref });
+            });
+            const first = sid && sources[sid] ? { id: sid, title: sources[sid].title?.trim() || item.source! } : cited.shift() ?? null;
+            rows.push({ type: 'coded', item, personId: removed ? removed.personId : hit ? hit.id : null,
+                ...(removed ? { deleted: { name: removed.name } } : {}),
+                couple: ps ? ps.id : null,
+                sourceId: first ? first.id : null, title: first ? first.title : '',
+                ...(cited.length ? { alsoCited: cited } : {}) });
+            continue;
+        }
         if (item.person) {
             const hit = Object.values(data.persons ?? {}).find(p => p?.refn?.trim() === item.person);
             const removed = hit ? undefined : sent.find(ch => ch.deleted && ch.refn === item.person);
