@@ -19,7 +19,8 @@ import { sortLifeEvents, eventValueIsOnTag, coupleEventLabel } from '../../event
 import { lifeEventLabel } from '../../person-sources.js';
 import { CARD_STATUS_CLASSES, cardStatus, factReliability, type ReliabilityStepName } from '../../reliability.js';
 import { cardStatusLabel } from '../fact-status.js';
-import { strings, type StringsType } from '../../strings.js';
+import { strings, getCurrentLanguage, type StringsType } from '../../strings.js';
+import { translateDataText } from '../../data-i18n.js';
 import { safeWebUrl } from '../../validation.js';
 import { sourceEntryText } from '../../source-location.js';
 import { factCitations, sourceOnline, sourceReaders, type CitedSource } from './table-sources.js';
@@ -237,7 +238,8 @@ function eventValues(p: Person, type: LifeEventType): CellValue {
     const seen = new Set<string>();
     const out: string[] = [];
     for (const e of list) {
-        const v = eventValue(e);
+        const raw = eventValue(e);
+        const v = type === 'occupation' ? translateDataText(raw, getCurrentLanguage()) : raw;
         if (v && !seen.has(v)) { seen.add(v); out.push(v); }
     }
     return textCell(out.join(', '));

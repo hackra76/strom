@@ -23,6 +23,7 @@ import { researchOpenSvg, historyKindSvg, HISTORY_KIND_OPTICAL_DY } from './hist
 import { researchLinkMark, type ResearchActionMark } from './research-link.js';
 import { lifelineGlyphOrDot } from './lifeline-glyphs.js';
 import { getStringsForLang, getCurrentLanguage, setLanguage, joinAnd, Language, PersonPageCaptionEvent, PersonPageRegister } from './strings.js';
+import { translateDataText } from './data-i18n.js';
 import { parseFlexDate, formatFlexDate, yearOf, ageBetween, toCanonical } from './dates.js';
 import { nameHtml, shownName, shownNameOrEmpty } from './person-name.js';
 import { asciiSlug, safeFileName } from './filenames.js';
@@ -1132,7 +1133,7 @@ function headerHtml(c: Ctx, differs: { birth: boolean; death: boolean } | null):
     }
     const jobs = shield ? [] : (person.events ?? []).filter(e => e.type === 'occupation').map(e => {
         // An occupation's name is its note (as the editor stores it).
-        const what = stripResearchIds(e.note?.trim() ?? '').text;
+        const what = translateDataText(stripResearchIds(e.note?.trim() ?? '').text, page.lang);
         const years = personPageYear(e.date, page.lang);
         return [what, years ? `(${years})` : ''].filter(Boolean).join(' ');
     }).filter(Boolean);
@@ -1993,7 +1994,7 @@ function notesHtml(c: Ctx): string {
     if (!notes) return '';
     const stripped = stripResearchIds(notes);
     stripped.ids.forEach(id => c.ids.add(id));
-    return section('notes', c.P.sec.notes, `<p class="pp-notes-text">${esc(stripped.text)}</p>`);
+    return section('notes', c.P.sec.notes, `<p class="pp-notes-text">${esc(translateDataText(stripped.text, c.page.lang))}</p>`);
 }
 
 // ── Timeline ──
@@ -2119,7 +2120,7 @@ function detailsLine(c: Ctx, pt: LifelinePoint, merged?: LifelinePoint): string 
     if (mergedAge) parts.push(esc(mergedAge));
     const note = pt.kind === 'event' && ev?.note?.trim() && !pt.detail ? ev.note.trim()
         : pt.kind === 'marriage' ? u?.note?.trim() : '';
-    if (note) parts.push(esc(stripResearchIds(note).text));
+    if (note) parts.push(esc(translateDataText(stripResearchIds(note).text, c.page.lang)));
     if (pt.details?.address) parts.push(esc(pt.details.address));
     if (!parts.length) return '';
     const line = parts.join(' · ');
@@ -2910,7 +2911,7 @@ function summaryHtml(c: Ctx): string {
         const d = parseFlexDate(e.date);
         const years = d?.end ? d.end.year - d.year : 0;
         if (years > 0 && (!job || years > job.years)) {
-            const what = stripResearchIds(e.note?.trim() ?? '').text.trim();
+            const what = translateDataText(stripResearchIds(e.note?.trim() ?? '').text.trim(), page.lang);
             job = { years, label: [what, e.place?.trim() ?? ''].filter(Boolean).join(', ') };
         }
     }

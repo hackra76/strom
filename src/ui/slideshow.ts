@@ -13,7 +13,8 @@
 import { DataManager } from '../data.js';
 import { TreeRenderer } from '../renderer.js';
 import { ZoomPan } from '../zoom.js';
-import { strings } from '../strings.js';
+import { strings, getCurrentLanguage } from '../strings.js';
+import { translateDataText } from '../data-i18n.js';
 import { PersonId, Person, STANDALONE_VIEWS } from '../types.js';
 import { formatFlexDate } from '../dates.js';
 import { uiModule } from './module.js';
@@ -152,7 +153,7 @@ export const slideshowMethods = uiModule({
         const years = [person.birthDate, person.deathDate]
             .map(d => (d ? formatFlexDate(d) : ''))
             .filter(Boolean).join(' – ');
-        const story = person.notes?.trim() ?? '';
+        const story = translateDataText(person.notes?.trim() ?? '', getCurrentLanguage());
         box.innerHTML = `
             ${person.photo ? `<div class="slideshow-photo"><img src="${this.escapeHtml(person.photo)}" alt=""></div>` : ''}
             <div class="slideshow-text">

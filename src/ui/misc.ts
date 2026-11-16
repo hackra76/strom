@@ -1646,6 +1646,16 @@ export const miscMethods = uiModule({
             }
         });
 
+        // Embedded chronicle back button (injected by scripts/embed-tree.ts)
+        const backBtn = document.getElementById('back-to-chronicle') as HTMLAnchorElement | null;
+        if (backBtn) {
+            const isEn = getCurrentLanguage() === 'en';
+            backBtn.href = isEn ? '/en/' : '/';
+            backBtn.title = isEn ? 'Return to Family Chronicle' : 'Návrat do rodinnej kroniky';
+            const backTxt = backBtn.querySelector('.btn-back-text');
+            if (backTxt) backTxt.textContent = isEn ? 'Back to Chronicle' : 'Späť na kroniku';
+        }
+
         // Set placeholder for data-i18n-placeholder elements
         document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
             const key = el.getAttribute('data-i18n-placeholder');
