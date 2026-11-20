@@ -176,6 +176,23 @@ const EXACT_EN: Record<string, string> = {
     'Úmrtie Štefan Andrássy, Lenartov 1891 (FamilySearch index)': 'Death of Štefan Andrássy, Lenartov 1891 (FamilySearch index)',
     'Sobáš Jána Andrássyho a Alžbety Jávorskej, Veľká Ida 1859': 'Marriage of Ján Andrássy and Alžbeta Jávorská, Veľká Ida 1859',
     'Krst Jána Andrássyho, Hídvégardó 1834': 'Baptism of Ján Andrássy, Hídvégardó 1834',
+    'Úmrtný list Jozefa Vatechu (* 18. 12. 1939 – † 3. 12. 2009), Bardejov': 'Death certificate of Jozef Vatecha (* 18 Dec 1939 – † 3 Dec 2009), Bardejov',
+    'Rodný list Margity Vavrekovej (* 18. 4. 1937), Raslavice': 'Birth certificate of Margita Vavreková (* 18 Apr 1937), Raslavice',
+    'Sobášny list Andreja Jurčáka a Margity Vavrekovej (10. 2. 1962), Vyšné Raslavice': 'Marriage certificate of Andrej Jurčák and Margita Vavreková (10 Feb 1962), Vyšné Raslavice',
+    'Rodný list Andreja Jurčáka (* 20. 9. 1935), Bardejov': 'Birth certificate of Andrej Jurčák (* 20 Sep 1935), Bardejov',
+    'Rodinné poznámky Bc. Jozefa Jurčáka (* 1962) o vetvách Jurčák a Vavrek': 'Family notes of Bc. Jozef Jurčák (* 1962) on the Jurčák and Vavrek branches',
+    'Sčítanie ľudu 1930 – Slovenské Raslavice č. 37 (Andrej Vavrek a rodina)': '1930 Census – Slovenské Raslavice No. 37 (Andrej Vavrek and family)',
+    'Sčítanie ľudu 1930 – Vaniškovce č. 20 (Ján Rodanič a rodina)': '1930 Census – Vaniškovce No. 20 (Ján Rodanič and family)',
+    'Družstevný roľník, Vyšné Raslavice č. 59': 'Cooperative farmer, Vyšné Raslavice No. 59',
+    'Vydatá Vavreková, družstevná roľníčka, Vyšné Raslavice č. 59': 'Married name Vavreková, cooperative farmer, Vyšné Raslavice No. 59',
+    'Syn Andreja Jurčáka st. a Žofie Čekajovej; leží v hrobe s Alžbetou Balážovou († 1966)': 'Son of Andrej Jurčák Sr. and Žofia Čekajová; buried in the same grave with Alžbeta Balážová († 1966)',
+    '2. partnerka/manželka Andreja Jurčáka st.; leží v hrobe s Pavlom Jurčákom (1932–1995)': '2nd partner/wife of Andrej Jurčák Sr.; buried in the same grave with Pavol Jurčák (1932–1995)',
+    'Vydatá Stašeková (manžel Ondrej Stašek z Abrahamoviec č. 25, svedok na sobáši sestry Margity 1962)': 'Married name Stašeková (husband Ondrej Stašek from Abrahamovce No. 25, witness at her sister Margita\'s 1962 wedding)',
+    'Majiteľ domu Slovenské (Vyšné) Raslavice č. 37': 'House owner in Slovenské (Vyšné) Raslavice No. 37',
+    'Rodné priezvisko neznáme (overiť sobáš 5. 9. 1894); 9 detí / 3 zomreli; prisťahovaná z Abrahamoviec v okt. 1896': 'Maiden surname unknown (verify marriage of 5 Sep 1894); 9 children / 3 died; moved from Abrahamovce in Oct 1896',
+    'Majiteľ domu Vaniškovce č. 20, roľník': 'House owner in Vaniškovce No. 20, farmer',
+    'Rodné priezvisko neznáme (overiť sobáš 10. 11. 1909); 6 detí / 1 zomrelo': 'Maiden surname unknown (verify marriage of 10 Nov 1909); 6 children / 1 died',
+    'Svedkovia: Ondrej Stašek (Abrahamovce č. 25), Jozef Serafín (Bardejov)': 'Witnesses: Ondrej Stašek (Abrahamovce No. 25), Jozef Serafín (Bardejov)',
 };
 
 function translateLineEn(line: string): string {
