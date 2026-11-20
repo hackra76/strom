@@ -12,6 +12,7 @@
  */
 
 import { researchActionLabel, researchBridgeAgentLabel } from './research-open-mark.js';
+import { barHtml } from './prog-bar.js';
 import { DataManager } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { strings, getCurrentLanguage } from '../strings.js';
@@ -49,6 +50,7 @@ import { onComputer, bridgeFailure } from './research-ui.js';
 import { onBridgeStatus } from './research-sync-ui.js';
 import { uiModule } from './module.js';
 import { helpMark } from './help-mark.js';
+import { activatedElement, busyToast, runBusy } from './busy.js';
 import {
     ReadChoiceModel, ReadChoices, ReaderChoice, ReadWho, ReadWithItem, readerDefault, readerWithAgent, readersFromStored, readersChanged, readerHeld, readWith,
     readWhoLabel, readWhoSame, readWhoOtherAgents,
@@ -126,6 +128,24 @@ export type SourceWhy = 'down' | 'older' | 'none' | 'archive' | 'unlinked' | 'co
  * `source`: a source read again from its original in the research (spec 059).
  */
 export type InputMode = 'document' | 'again' | 'source';
+
+/** How the dialog opens (showReadDocumentDialog). */
+export interface ReadDialogOpts {
+    personId?: string;
+    files?: File[];
+    readId?: string;
+    read?: LiveRead;
+    sourceId?: string;
+    entryId?: string;
+    again?: SourceAgain;
+    /**
+     * The element clicked, which says the work while a result is fetched before the dialog (default: the element of
+     * the click; null: none, the caller says it, e.g. a toast's "Show" working in the toast).
+     */
+    el?: HTMLElement | null;
+    /** The result fetched just before: not asked again. */
+    asked?: boolean;
+}
 
 /** A source to read again from its original (`POST sources/read`). */
 export interface SourceAgain {
@@ -234,6 +254,8 @@ const results = new Map<string, ReadResult>();
 const historyReads = new Map<string, LiveRead>();
 /** Why a reading's result could not be fetched last (by id). */
 const lastFailure = new Map<string, ReadFailure>();
+/** Results being fetched before their dialog opens (by id): a second ask meanwhile does nothing. */
+const resultsFirst = new Set<string>();
 let listening = false;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -770,7 +792,9 @@ export const readDocumentMethods = uiModule({
         if (r.state === 'done') {
             const res = await this.loadReadResult(researchId, r.id);
             const parts = res ? [docLabel(res), agreeText(res)].filter(Boolean).join(' · ') : '';
-            this.showToast(t.notice(parts), NOTICE_MS, { action: show, hold: true, kind: 'read' });
+            // Its result not had now: "Show" fetches it first, the toast says the work meanwhile (§4).
+            const fetchFirst = { ...show, run: () => this.readResultFirst({ readId: r.id, el: null }, researchId, r.id), work: { label: strings.busy.generic } };
+            this.showToast(t.notice(parts), NOTICE_MS, { action: res ? show : fetchFirst, hold: true, kind: 'read' });
             this.refreshReadSurfaces();
         } else if (r.state === 'unreadable') {
             this.showToast(t.noticeUnreadable, NOTICE_MS, { action: { ...show, label: t.showWhy }, hold: true, kind: 'read' });
@@ -836,7 +860,7 @@ export const readDocumentMethods = uiModule({
         chev.setAttribute('aria-hidden', 'true');
         row.append(dot, label, name, chev);
         row.setAttribute('aria-label', [label.textContent, what].filter(Boolean).join(', '));
-        row.onclick = () => this.showReadDocumentDialog({ readId: r.id });
+        row.onclick = () => this.showReadDocumentDialog({ readId: r.id, el: row });
         strip.appendChild(row);
         panel.appendChild(strip);
     },
@@ -848,7 +872,10 @@ export const readDocumentMethods = uiModule({
      * with a reading's id (the notice, the strip) on that reading; else on the
      * running reading, the one read and not opened, or a new input.
      */
-    showReadDocumentDialog(opts: { personId?: string; files?: File[]; readId?: string; read?: LiveRead; sourceId?: string; entryId?: string; again?: SourceAgain } = {}): void {
+    showReadDocumentDialog(opts: ReadDialogOpts = {}): void {
+        // A result not fetched yet: fetched first under the element clicked, then the dialog with it (B67, B69, B73).
+        const first = opts.asked ? null : this.readResultFirstDue(opts);
+        if (first) { void this.readResultFirst(opts, first.researchId, first.id); return; }
         const link = this.researchOriginalsLink();
         // A source's reading opens without a research too: its transcription then stands in.
         const source = opts.sourceId ? DataManager.getData().sources?.[opts.sourceId] : undefined;
@@ -906,13 +933,55 @@ export const readDocumentMethods = uiModule({
         } else if (target || readId) {
             st.readId = target?.id ?? readId;
             st.phase = 'progress';
-            if (target) this.followReadInDialog(target);
-            else void this.openReadResult(st.readId);
+            // Fetched just before (readResultFirst): its result as it came, not asked again.
+            if (target && !(opts.asked && target.state === 'done')) this.followReadInDialog(target);
+            else void this.openReadResult(st.readId, opts.asked);
         } else {
             if (opts.files?.length) this.addReadFiles(opts.files, false);
             this.renderReadDialog();
         }
         this.watchReads();
+    },
+
+    /**
+     * The reading whose result the dialog would fetch on opening (null: none, or it is here already): a result
+     * of a reading done, or of one known only by its id (the history, a source's link).
+     */
+    readResultFirstDue(opts: ReadDialogOpts): { researchId: string; id: string } | null {
+        const link = this.researchOriginalsLink();
+        if (!link || (st && document.getElementById(DIALOG_ID))) return null;
+        const sourceRead = opts.sourceId ? DataManager.getData().sources?.[opts.sourceId]?.reading ?? '' : '';
+        const id = sourceRead || opts.readId || '';
+        if (!id || (sourceRead && this.readSourceBlocked())) return null;
+        const target = this.readsOfResearch(link.researchId).find(r => r.id === id) ?? (opts.read?.id === id ? opts.read : null);
+        if (target && target.state !== 'done') return null;
+        const cached = results.get(id);
+        if ((cached && finalState(cached.state)) || !this.readBridgeBase(link.researchId)) return null;
+        return { researchId: link.researchId, id };
+    },
+
+    /**
+     * A reading's result fetched before its dialog opens (waiting buttons §1, §4): the element clicked says the
+     * work (the strip's row, a row of the history, "Result ›"; a toast's "Show" says it in the toast), the menu
+     * or list it stands in stays meanwhile; then the dialog with the result, or with why it could not be had.
+     * Without the element, a progress toast says it.
+     */
+    async readResultFirst(opts: ReadDialogOpts, researchId: string, id: string): Promise<void> {
+        if (resultsFirst.has(id)) return;
+        const el = opts.el !== undefined ? opts.el : activatedElement();
+        const open = async (signal?: AbortSignal): Promise<void> => {
+            resultsFirst.add(id);
+            try {
+                await this.loadReadResult(researchId, id);
+            } finally {
+                resultsFirst.delete(id);
+            }
+            if (signal?.aborted) return;
+            this.showReadDocumentDialog({ ...opts, el: null, asked: true });
+        };
+        if (el?.isConnected) await runBusy(el, ctl => open(ctl.signal), { label: strings.busy.generic, kind: 'local', toastWhenGone: true });
+        else if (opts.el === null) await open();
+        else await busyToast(strings.busy.generic, () => open());
     },
 
     /** A source's reading result (its link in the source's detail and a person's sources). */
@@ -1508,7 +1577,7 @@ export const readDocumentMethods = uiModule({
         // A source read again: its comparison with the transcript is named as such.
         const again = live?.source || s.srcAgain ? this.readSourceAgainNow() : null;
         const running = state === 'reading' || state === 'checking';
-        const title = s.sending ? t.sendingPage(s.sending.k, s.sending.n)
+        const title = s.sending ? t.sendingPages
             : state === 'queued' ? t.waitTitle
                 : state === 'checking' ? (again ? t.comparingSource : t.checking) : t.readingTitle;
         const done = state === 'checking' ? readers : Math.min(readers, live?.done ?? 0);
@@ -1517,15 +1586,19 @@ export const readDocumentMethods = uiModule({
         // Waiting is said only once the research lists the reading as queued (not while it is not listed yet).
         const text = live?.state === 'queued' ? t.waitText
             : running && readers >= 2 && !rows && done > 0 && done < readers ? t.readersSoFar(done, readers) : '';
-        // The share of readers done, never an empty bar.
-        const bar = running && readers >= 2
-            ? `<span class="batch-bar read-bar" role="progressbar" aria-valuemin="0" aria-valuemax="${readers}" aria-valuenow="${done}" aria-label="${esc(t.readersDone(done, readers))}"><span style="width:${Math.max(6, Math.round(done / readers * 100))}%"></span></span>`
-            : '';
+        // The share of readers done, never an empty bar; while the pages go, the page now (half sent) of all.
+        const bar = s.sending
+            ? barHtml((s.sending.k - 0.5) / s.sending.n, { cls: 'read-bar', attrs: `role="progressbar" aria-valuemin="0" aria-valuemax="${s.sending.n}" aria-valuenow="${s.sending.k - 1}" aria-label="${esc(t.sendingPages)}"` })
+            : running && readers >= 2
+                ? barHtml(Math.max(0.06, done / readers), { cls: 'read-bar', attrs: `role="progressbar" aria-valuemin="0" aria-valuemax="${readers}" aria-valuenow="${done}" aria-label="${esc(t.readersDone(done, readers))}"` })
+                : '';
+        // "k of n" at the right of the title: the page sent now, or the readers done.
+        const count = s.sending ? strings.busy.kOfN(s.sending.k, s.sending.n) : bar ? strings.busy.kOfN(done, readers) : '';
         return `
                 <div class="read-run" data-state="${state}">
                     <div class="read-run-head">
                         <h3 class="read-run-title">${esc(title)}</h3>
-                        <span class="read-progress-time" id="read-progress-time"${running ? '' : ' hidden'}></span>
+                        <span class="read-run-side">${count ? `<span class="read-run-k">${esc(count)}</span>` : ''}<span class="read-progress-time" id="read-progress-time"${running ? '' : ' hidden'}></span></span>
                     </div>
                     ${text ? `<p class="read-run-text">${esc(text)}</p>` : ''}
                     ${bar}
@@ -1687,10 +1760,11 @@ export const readDocumentMethods = uiModule({
     },
 
     /** Fetch and show a reading's result (opened: off the menu and the strip). */
-    async openReadResult(id: string): Promise<void> {
+    async openReadResult(id: string, asked = false): Promise<void> {
         const link = this.researchOriginalsLink();
         if (!link || !st) return;
-        const res = await this.loadReadResult(link.researchId, id);
+        // `asked`: fetched a moment ago (readResultFirst), what came (or why not) stands.
+        const res = asked ? results.get(id) ?? null : await this.loadReadResult(link.researchId, id);
         if (!st || st.readId !== id) return;
         markOpened(id);
         const failure = lastFailure.get(id);
@@ -3847,18 +3921,27 @@ export const readDocumentMethods = uiModule({
         this.renderReadDialog();
     },
 
-    /** "Cancel reading": at once, no question. A reading again cancelled: the previous result stands. */
-    async cancelReadDocument(): Promise<void> {
+    /**
+     * "Cancel reading": at once, no question. A reading again cancelled: the previous result stands. The button
+     * clicked (`el`, by default the element of the click) says "Cancelling…" until the research's answer (B57).
+     */
+    async cancelReadDocument(el: HTMLElement | null = activatedElement()): Promise<void> {
         const s = st;
         const link = this.researchOriginalsLink();
         if (!s?.readId || !link || s.busy) return;
         const base = this.readBridgeBase(link.researchId);
         if (!base) return;
         s.busy = true;
-        this.renderReadDialog();
-        const reply = await cancelRead(base, s.readId);
+        const ask = () => cancelRead(base, s.readId);
+        let reply: Awaited<ReturnType<typeof ask>> | undefined;
+        if (el?.isConnected) reply = await runBusy(el, ask, { label: strings.busy.cancelling, kind: 'local' });
+        else {
+            this.renderReadDialog();
+            reply = await ask();
+        }
         if (st !== s) return;
         s.busy = false;
+        if (!reply) { this.renderReadDialog(); return; }
         if (!reply.ok) { this.readFailed(reply.failure); return; }
         const id = s.readId;
         const reads = new Map(readsByResearch.get(link.researchId) ?? []);
@@ -3915,8 +3998,11 @@ export const readDocumentMethods = uiModule({
         await this.submitReadDocument();
     },
 
-    /** "Read again" (`POST read/<id>/again`). */
-    async readDocumentAgain(): Promise<void> {
+    /**
+     * "Read again" (`POST read/<id>/again`): the button clicked (`el`, by default the element of the click) says
+     * the work until the reading's progress takes the dialog, or why it did not start (B56).
+     */
+    async readDocumentAgain(el: HTMLElement | null = activatedElement()): Promise<void> {
         const s = st;
         const link = this.researchOriginalsLink();
         if (!s?.readId || !link || s.busy) return;
@@ -3924,9 +4010,13 @@ export const readDocumentMethods = uiModule({
         if (!base) { this.readFailed({ kind: 'down', code: '', status: 0, retryAfterMs: 0 }); return; }
         s.busy = true;
         const late = this.readLateStart(link.researchId, { pages: 0, doc: '', again: { id: s.readId, version: this.readLiveOf(s.readId)?.version ?? 0 } });
-        const reply = await readAgain(base, s.readId, s.readers, this.readWithNow());
+        const ask = () => readAgain(base, s.readId, s.readers, this.readWithNow());
+        const reply = el?.isConnected
+            ? await runBusy(el, ask, { label: strings.busy.starting, kind: 'local' })
+            : await ask();
         if (st !== s) return;
         s.busy = false;
+        if (!reply) return;
         if (!reply.ok && reply.failure.late) { this.readStartLate(link.researchId, late); return; }
         if (!reply.ok) { this.readFailed(reply.failure); return; }
         s.error = null;

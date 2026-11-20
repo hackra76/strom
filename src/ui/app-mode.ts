@@ -19,8 +19,12 @@ import {
     StromData,
     TreeId,
     LAST_FOCUSED,
-    LastFocusedMarker
+    LastFocusedMarker,
+    BranchMarker,
+    BRANCH_MARKERS
 } from '../types.js';
+import { applyBranchMarkerAttrs } from '../branch-marker-attrs.js';
+import { syncBranchMarkerSetting } from './branch-marker-ui.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { parseGedcom, convertToStrom, GedcomConversionResult } from '../ged-parser.js';
 import {
@@ -52,8 +56,20 @@ import { validateTreeData, ValidationResult as TreeValidationResult, ValidationI
 import * as CrossTree from '../cross-tree.js';
 import { AuditLogManager } from '../audit-log.js';
 import { uiModule } from './module.js';
+import { activatedElement, busyLocal, busyToast } from './busy.js';
 import { safeFileName } from '../filenames.js';
 import { forgetCardTypeCopy } from './card-fields-ui.js';
+import { canvasBusy } from './canvas-busy.js';
+
+/**
+ * C80, §8: an appearance choice that lays the tree out anew (card type, spacing, titles, surnames, full
+ * families). The choice is written at once; the view is drawn again under the canvas overlay ("Calculating the
+ * layout…" past 120 ms, painted first), as a switched view is (C5). Resolves when the view is drawn.
+ */
+export function redrawUnderOverlay(draw: () => Promise<void>): Promise<void> {
+    const label = TreeRenderer.getViewMode() === 'map' ? strings.busy.mapCalc : strings.busy.layout;
+    return canvasBusy(async ready => { await ready(); await draw(); }, { stateFirst: true, label });
+}
 
 export const appModeMethods = uiModule({
     // ---- EMBEDDED MODE INFO ----
@@ -166,9 +182,12 @@ export const appModeMethods = uiModule({
         this.closeExistingExportDialog();
         // The stored tree may be encrypted: unlock the LOCAL data first.
         if (!await this.ensureLocalUnlocked()) return;
-        await DataManager.switchToStoredVersion();
-        this.hideViewModeBanner();
-        await TreeRenderer.renderAsync();
+        // The dialog is gone with the choice: the reading as a progress toast past 120 ms (§1).
+        await busyToast(strings.busy.generic, async () => {
+            await DataManager.switchToStoredVersion();
+            this.hideViewModeBanner();
+            await TreeRenderer.renderAsync();
+        });
         ZoomPan.centerOnFocusWithContext();
     },
 
@@ -193,7 +212,7 @@ export const appModeMethods = uiModule({
             strings.viewMode.storedNewerConfirm(formatDateTime(newer.changedAt), formatDateTime(newer.exportedAt)),
             strings.viewMode.storedNewerTitle, { confirmLabel: strings.viewMode.updateStored, variant: 'danger' })) return;
         if (!await this.ensureLocalUnlocked()) return;
-        await DataManager.importFromViewMode('update');
+        await busyToast(strings.busy.saving, () => DataManager.importFromViewMode('update'));
         this.hideViewModeBanner();
         this.showToast(strings.viewMode.updateSuccess);
         await TreeRenderer.renderAsync();
@@ -246,8 +265,8 @@ export const appModeMethods = uiModule({
         // local session must be unlocked (the file's own password never is).
         if (!await this.ensureLocalUnlocked()) return;
 
-        // Import all embedded trees (works for single tree too)
-        const result = await DataManager.importAllEmbeddedTrees();
+        // Import all embedded trees (works for single tree too); the dialog is gone: a progress toast past 120 ms (§1).
+        const result = await busyToast(strings.busy.importing, () => DataManager.importAllEmbeddedTrees());
         this.hideViewModeBanner();
 
         if (result.imported > 1) {
@@ -267,7 +286,7 @@ export const appModeMethods = uiModule({
     async importAsCopy(): Promise<void> {
         this.closeImportViewModeDialog();
         if (!await this.ensureLocalUnlocked()) return;
-        await DataManager.importFromViewMode('copy');
+        await busyToast(strings.busy.importing, () => DataManager.importFromViewMode('copy'));
         this.hideViewModeBanner();
         this.showToast(strings.viewMode.importSuccess);
         this.updateTreeSwitcher();
@@ -720,21 +739,22 @@ export const appModeMethods = uiModule({
     },
 
     /** Card type: the cards change their size, the view keeps its anchor card in place (spec 069 D3). */
-    setCardDensity(density: string): void {
+    setCardDensity(density: string): Promise<void> {
         SettingsManager.setCardDensity(normalizeCardDensity(density));
         forgetCardTypeCopy();
-        void TreeRenderer.renderKeepingView();
+        const drawn = redrawUnderOverlay(() => TreeRenderer.renderKeepingView());
         this.renderCardSignalSettings();
+        return drawn;
     },
 
     /**
      * Settings > Person card > Spacing (spec 069 §1): the tree behind the
      * open dialog is drawn again at once, its anchor card kept in place (D3).
      */
-    setTreeSpacing(spacing: string): void {
+    setTreeSpacing(spacing: string): Promise<void> {
         SettingsManager.setTreeSpacing(spacing === 'dense' ? 'dense' : 'normal');
         this.syncTreeSpacingSetting();
-        void TreeRenderer.renderKeepingView();
+        return redrawUnderOverlay(() => TreeRenderer.renderKeepingView());
     },
 
     toggleFanKekule(enabled: boolean): void {
@@ -743,9 +763,9 @@ export const appModeMethods = uiModule({
     },
 
     /** Titles of the name on cards and in lists: the view is drawn again (card names, their widths). */
-    toggleShowTitles(enabled: boolean): void {
+    toggleShowTitles(enabled: boolean): Promise<void> {
         SettingsManager.setShowTitles(enabled);
-        TreeRenderer.render();
+        return redrawUnderOverlay(() => TreeRenderer.renderAsync());
     },
 
     /** The reliability marks on the person card (spec 066 §2f): an open card is marked again. */
@@ -755,12 +775,13 @@ export const appModeMethods = uiModule({
     },
 
     /** Settings > Surname display: redraw everything that shows names. */
-    setSurnameDisplay(display: SurnameDisplay): void {
+    setSurnameDisplay(display: SurnameDisplay): Promise<void> {
         SettingsManager.setSurnameDisplay(display);
         this.syncSurnameDisplaySetting();
-        TreeRenderer.render();
+        const drawn = redrawUnderOverlay(() => TreeRenderer.renderAsync());
         this.refreshSearch();
         if (this.relationshipsPanelPersonId) this.refreshRelationshipsPanel();
+        return drawn;
     },
 
     /** The ⇄ N pill (Settings → Show on card → Links): the switch there follows, the view is drawn again. */
@@ -771,19 +792,38 @@ export const appModeMethods = uiModule({
         TreeRenderer.render();
     },
 
-    toggleBranchColors(enabled: boolean): void {
-        SettingsManager.setBranchColors(enabled);
-        TreeRenderer.render();   // re-render to add/remove the stripes
+    /** Lineage marker shape (spec 112, R1): the cards are drawn again with it; the Settings' rows follow. */
+    setBranchMarker(marker: BranchMarker): void {
+        if (!(BRANCH_MARKERS as readonly string[]).includes(marker)) return;
+        SettingsManager.setBranchMarker(marker);
+        syncBranchMarkerSetting(marker, SettingsManager.isBranchTintOn());
+        this.applyBranchMarkerAttrs();
+        TreeRenderer.render();   // re-render to add/remove the markers
         this.updateViewModeUI(); // owns the legend visibility
     },
 
+    /** Tint the marked cards in their lineage colour, with any shape or alone. */
+    setBranchTint(on: boolean): void {
+        SettingsManager.setBranchTint(on);
+        syncBranchMarkerSetting(SettingsManager.getBranchMarker(), on);
+        this.applyBranchMarkerAttrs();
+        TreeRenderer.render();
+        this.updateViewModeUI();
+    },
+
+    /** The marker's state on <body> (shape, tint, tag letters, the screen reader's texts) from the settings. */
+    applyBranchMarkerAttrs(): void {
+        applyBranchMarkerAttrs(SettingsManager.getBranchMarker(), SettingsManager.isBranchTintOn());
+    },
+
     /** Badge toggle in the descendants view: flip ad hoc and re-render. */
-    toggleDescendantsFullFamilies(): void {
+    toggleDescendantsFullFamilies(): Promise<void> {
         TreeRenderer.setDescendantsFullFamilies(!TreeRenderer.isDescendantsFullFamilies());
         // The chart width changes markedly when step-families appear/vanish, so
         // re-frame once the new cards are in the DOM (keeps the focus visible).
-        void TreeRenderer.renderAsync().then(() => TreeRenderer.centerForViewMode());
-        this.updateViewModeUI(); // badge count + toggle state
+        const drawn = redrawUnderOverlay(() => TreeRenderer.renderAsync().then(() => TreeRenderer.centerForViewMode()));
+        this.updateViewModeUI(); // toggle state at once; the badge count again from the drawn view
+        return drawn.then(() => this.updateViewModeUI());
     },
 
     /** Settings default: also applies immediately as the current choice. */
@@ -791,7 +831,7 @@ export const appModeMethods = uiModule({
         SettingsManager.setDescendantsFullFamiliesDefault(enabled);
         TreeRenderer.setDescendantsFullFamilies(enabled);
         if (TreeRenderer.getViewMode() === 'descendants') {
-            TreeRenderer.render();
+            void redrawUnderOverlay(() => TreeRenderer.renderAsync()).then(() => this.updateViewModeUI());
             this.updateViewModeUI();
         }
     },
@@ -945,8 +985,10 @@ export const appModeMethods = uiModule({
         const treeId = modal?.dataset.treeId as TreeId;
         if (!treeId) return;
 
-        const log = await AuditLogManager.load(treeId);
-        if (log.entries.length === 0) return;
+        // The dialog's button carries the reading of the history (§1).
+        const log = await busyLocal(activatedElement(), strings.busy.saving, () => AuditLogManager.load(treeId),
+            () => ({ ok: false, kind: 'error', text: strings.busy.fileSaveFailed, retry: () => { void this.exportAuditLogTxt(); } }));
+        if (!log || log.entries.length === 0) return;
 
         const treeMeta = TreeManager.getTreeMetadata(treeId);
         const treeName = treeMeta?.name || 'tree';

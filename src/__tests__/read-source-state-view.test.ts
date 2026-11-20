@@ -154,7 +154,7 @@ describe('§2 the choices', () => {
 
     it('a choice on its way: a spinner at it, the others off; a failure under the choices, which stay', () => {
         const busy = row({ act: { how: 'save', busy: true } });
-        expect(busy).toContain('read-task-spin');
+        expect(busy).toContain('busy-spin');
         expect(busy).toContain(t.tBusySave);
         expect((busy.match(/data-read-how="[a-z]+" disabled/g) ?? []).length).toBe(3);
         expect(row({ act: { how: 'now', busy: true } })).toContain(t.tBusy);
@@ -302,7 +302,7 @@ describe('§3 the agent\'s proposal', () => {
 
     it('an answer on its way, a failure; after it the research\'s answer and Undo (only with its feature)', () => {
         const busy = block({ act: { take: 'proposal', busy: true } });
-        expect(busy).toContain('read-task-spin');
+        expect(busy).toContain('busy-spin');
         expect(busy).toMatch(/data-proposal-take="keep" disabled/);
         expect(block({ act: { take: 'keep', busy: false, failed: true } })).toContain(t.pFail);
         const accepted = block({ done: 'proposal' });
@@ -362,9 +362,20 @@ describe('§4 "Task from a new reading" in the research\'s settings', () => {
     });
 
     it('saving, confirmed, the bridge down', () => {
-        const busy = readTaskSettingHtml({ value: 'always', open: true, up: true, note: { kind: 'busy' } });
-        expect(busy).toContain(ts.rtBusy);
-        expect((busy.match(/ disabled/g) ?? []).length).toBe(3);
+        // Saving (6.1): the chosen one dashed with its words, the choices locked keeping their focus (no note under them).
+        const busy = readTaskSettingHtml({ value: 'always', open: true, up: true, note: { kind: 'busy', words: '<span class="busy-st">W</span>' } });
+        expect(busy).not.toContain(ts.rtBusy);
+        expect(busy).not.toContain('busy-spin');
+        expect((busy.match(/ disabled/g) ?? []).length).toBe(0);
+        expect((busy.match(/ aria-disabled="true"/g) ?? []).length).toBe(3);
+        expect((busy.match(/data-pend="1"/g) ?? []).length).toBe(1);
+        expect(busy).toMatch(/data-pend="1"[^>]*>\s*<input[^>]*value="always"/);
+        expect(busy).toContain('<span class="busy-st">W</span>');
+        // Refused: the sentence with Try again, an alert when first drawn only.
+        const refused = readTaskSettingHtml({ value: 'ask', open: true, up: true, note: { kind: 'text', text: 'No.', retry: true, alert: true } });
+        expect(refused).toContain('role="alert"');
+        expect(refused).toContain('id="research-readtask-retry"');
+        expect(readTaskSettingHtml({ value: 'ask', open: true, up: true, note: { kind: 'text', text: 'No.', retry: true } })).not.toContain('role="alert"');
         expect(readTaskSettingHtml({ value: 'always', open: true, up: true, note: { kind: 'ok' } })).toContain(ts.rtOk);
         const down = readTaskSettingHtml({ value: 'ask', open: true, up: false, note: { kind: 'text', text: strings.history.storiesBridgeDown } });
         expect(down).toContain('is-down');

@@ -1,5 +1,5 @@
 import { test, expect, Page } from '@playwright/test';
-import { cardAction, personModal, AFTER_HAND_OVER } from './helpers.js';
+import { cardAction, personModal, closeHandedOver } from './helpers.js';
 import { openResearch, openResearchMenu, editJan, poll, researchGed, dropFile, BRIDGE, UUID, HEAD, NEW_HEAD } from './research-bridge.js';
 
 /**
@@ -211,8 +211,9 @@ test.describe('the bridge of Strom Research 1.11.0', () => {
         const done = page.evaluate((u) => window.Strom.UI.sendChangesToResearch(u), BRIDGE);
         const dialog = page.locator('#confirmation-modal');
         await dialog.getByRole('button', { name: 'Send' }).click();
-        await expect(dialog).toContainText('Sent.');
-        await dialog.getByRole('button', { name: 'OK' }).click();
+        // The result in the send's progress toast, no dialog to dismiss (waiting buttons §2.3).
+        await expect(page.locator('.toast--progress')).toContainText('Sent.');
+        await expect(dialog).not.toHaveClass(/active/);
         await done;
         expect(b.syncPosts).toHaveLength(1);
         expect(b.syncPosts[0]).toContain(`1 _STROM_TREE ${UUID}`);
@@ -231,7 +232,7 @@ test.describe('the bridge of Strom Research 1.11.0', () => {
         const done = page.evaluate((u) => window.Strom.UI.sendChangesToResearch(u), BRIDGE);
         const confirm = page.locator('#confirmation-modal');
         await confirm.getByRole('button', { name: 'Send' }).click();
-        await confirm.getByRole('button', { name: 'OK' }).click();
+        await expect(page.locator('.toast--progress')).toContainText('Sent.');
         await done;
 
         // The research's next version, without that source (?import-url= / a dropped tree.ged).
@@ -261,7 +262,7 @@ test.describe('the bridge of Strom Research 1.11.0', () => {
         expect(b.adoptToken).toBeTruthy();
         await page.evaluate((u) => window.Strom.UI.openExternalRequest(new URLSearchParams({ adopt: u })), BRIDGE);
         await page.locator('#research-adopt-confirm').click();
-        await expect(page.locator('.toast')).toContainText('linked to the research', AFTER_HAND_OVER);
+        await closeHandedOver(page);
         expect(await page.evaluate(() => window.Strom.TreeManager.getActiveTreeMetadata()?.research?.id)).toBe(UUID);
         expect(b.requests.filter(r => r.method === 'POST' && r.path === 'adopt')).toHaveLength(1);
         // Its own version loaded right after (its numbers): the next send is the research's tree by its ids.

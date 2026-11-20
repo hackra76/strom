@@ -756,10 +756,12 @@ test.describe('Customize panel: ⋯, a section\'s menu, Settings (spec 044)', ()
 });
 
 /** A fixed clock at the real now, kept away from midnight UTC (the bridge's own times are real ones). */
-async function fixClock(page: Page): Promise<void> {
+async function fixClock(page: Page): Promise<Date> {
     const now = Date.now();
     const h = new Date(now).getUTCHours();
-    await page.clock.setFixedTime(new Date(h >= 22 ? now - 3 * 3600_000 : h < 2 ? now + 3 * 3600_000 : now));
+    const fixed = new Date(h >= 22 ? now - 3 * 3600_000 : h < 2 ? now + 3 * 3600_000 : now);
+    await page.clock.setFixedTime(fixed);
+    return fixed;
 }
 
 const DEFAULT_ORDER = ['working', 'waiting', 'directions', 'changes', 'queue', 'knows'];
@@ -1475,13 +1477,13 @@ test.describe('the agent at work', () => {
                     }, { photo, shape, size, src: PHOTO });
                     const at = `${photo ? 'photo' : 'initials'} ${shape} ${size}`;
                     await expect(anna.locator('.card-avatar-wrap img'), at).toHaveCount(photo ? 1 : 0);
-                    await expect.poll(async () => (await arc()).avatar, { message: at }).toBe(photo && size === 'large' ? 80 : 34);
+                    await expect.poll(async () => (await arc()).avatar, { message: at }).toBe(size === 'large' ? 80 : 34);
                     const m = await arc();
                     expect([m.ring, m.ringHeight, m.left, m.top], at).toEqual([m.avatar + 8, m.avatar + 8, 4, 4]);
                     expect(m.spin, at).toBe('agSpin');
                     expect(m.running, at).toBeGreaterThanOrEqual(1);
                     if (shape === 'rounded') {
-                        expect(m.avatarRadius, at).toBe(photo && size === 'large' ? '12px' : '5px');
+                        expect(m.avatarRadius, at).toBe(size === 'large' ? '12px' : '5px');
                         expect(m.markRadius, at).toBe(`${parseFloat(m.avatarRadius) + 4}px`);
                         expect(m.ringRadius, at).toBe(m.markRadius);
                     } else {
@@ -1491,13 +1493,14 @@ test.describe('the agent at work', () => {
             }
         }
         // Changed in the Settings while it works: the arc takes the new shape and goes on turning.
+        // The loop ends on the initials at the large size, which the initials take too (80px, the arc 88px).
         await page.evaluate(() => window.Strom.UI.showSettingsDialog());
         const shapeRow = page.locator('#card-photo-settings .card-look-photo-shape');
-        for (const [name, shape, radius] of [['Rounded square', 'rounded', '9px'], ['Circle', 'circle', '50%']]) {
+        for (const [name, shape, radius] of [['Rounded square', 'rounded', '16px'], ['Circle', 'circle', '50%']]) {
             await shapeRow.getByRole('button', { name, exact: true }).click();
             await expect(page.locator('body')).toHaveAttribute('data-card-photo-shape', shape);
             await expect.poll(async () => { const m = await arc(); return [m.ring, m.ringRadius === radius || m.avatarRadius === radius, m.spin, m.running > 0]; }, { message: name })
-                .toEqual([42, true, 'agSpin', true]);
+                .toEqual([88, true, 'agSpin', true]);
         }
     });
 
@@ -1524,13 +1527,64 @@ test.describe('the agent at work', () => {
         expect(m).toEqual({ size: 88, spin: 'agSpin', running: 1 });
     });
 
-    test('the amber badge comes first: no arc, the agent in the tooltip', async ({ page }) => {
-        // Jan has an open conflict.
+    test('beside the amber badge the arc shows too: a round and a square avatar, and compact', async ({ page }) => {
+        // Jan has an open conflict, and the agent works on him.
+        await page.emulateMedia({ reducedMotion: 'no-preference' });
         await follow(page, { width: 1440, height: 900 }, (b) => { b.waiting = []; });
         const jan = card(page, 'Jan');
         await expect(jan.locator('.card-tooltip .tt-agent')).toHaveText('Research working: Sčítání 1921');
-        await expect(jan.locator('.card-signal')).toHaveText('≠');
-        await expect(jan.locator('.card-agent')).toHaveCount(0);
+        await expect(jan).toHaveAttribute('aria-label', /conflicting sources; research is working on this person/);
+        // The badge keeps its corner (6px out of the avatar's top right), the arc circles the avatar 4px out.
+        const marks = () => page.evaluate(() => {
+            const c = [...document.querySelectorAll('#tree-canvas .person-card')]
+                .find(el => el.querySelector('.name-text')?.textContent?.includes('Jan'))!;
+            const av = c.querySelector<HTMLElement>('.card-avatar-wrap > .card-avatar')!;
+            const badge = c.querySelector<HTMLElement>('.card-avatar-wrap > :is(.card-signal, .card-signal-stack)');
+            const mark = c.querySelector<HTMLElement>('.card-avatar-wrap > .card-agent-mark');
+            const k = av.offsetWidth / av.getBoundingClientRect().width;
+            const a = av.getBoundingClientRect(), b = badge?.getBoundingClientRect(), m = mark?.getBoundingClientRect();
+            return {
+                badge: badge?.textContent ?? null,
+                badgeVisible: !!badge && getComputedStyle(badge).display !== 'none',
+                badgeTopRight: b && badge.classList.contains('card-signal') ? [Math.round((a.top - b.top) * k), Math.round((b.right - a.right) * k)] : null,
+                arc: !!mark && getComputedStyle(mark).display !== 'none',
+                arcOut: m ? [Math.round((a.left - m.left) * k), Math.round((a.top - m.top) * k)] : null,
+                arcRadius: mark ? getComputedStyle(mark).borderTopLeftRadius : null,
+            };
+        });
+        for (const [shape, radius] of [['circle', null], ['rounded', '9px']] as const) {
+            await page.evaluate(async (shape) => {
+                window.Strom.SettingsManager.setCardPhoto({ size: 'small', shape });
+                await window.Strom.TreeRenderer.renderAsync();
+            }, shape);
+            await expect.poll(marks, { message: shape }).toMatchObject({
+                badge: '≠', badgeVisible: true, badgeTopRight: [6, 6], arc: true, arcOut: [4, 4], ...(radius ? { arcRadius: radius } : {}),
+            });
+        }
+        // Compact: no avatar; the agent's ring goes around the badge's dot, both seen, the same centre.
+        await page.evaluate(() => window.Strom.UI.setCardDensity('compact'));
+        const dot = jan.locator('.card-signal-dot:not(.card-signal-dot--back)');
+        const ring = jan.locator('.card-agent-dot');
+        await expect(dot).toBeVisible();
+        await expect(ring).toBeVisible();
+        await expect(ring).toHaveClass(/card-agent-dot--badge/);
+        const centres = () => jan.evaluate(c => {
+            const box = (sel: string) => {
+                const el = c.querySelector<HTMLElement>(sel)!;
+                return { x: el.offsetLeft + el.offsetWidth / 2, y: el.offsetTop + el.offsetHeight / 2, w: el.offsetWidth };
+            };
+            const d = box('.card-signal-dot:not(.card-signal-dot--back)'), r = box('.card-agent-dot');
+            return { dx: r.x - d.x, dy: r.y - d.y, dot: d.w, ring: r.w };
+        });
+        await expect.poll(centres).toEqual({ dx: 0, dy: 0, dot: 12, ring: 16 });
+    });
+
+    test('beside a stack of badges the arc shows too', async ({ page }) => {
+        // Jan: what waits and an open conflict, and the agent works on him.
+        await follow(page, { width: 1440, height: 900 });
+        const jan = card(page, 'Jan');
+        await expect(jan.locator('.card-avatar-wrap > .card-signal-stack')).toBeVisible();
+        await expect(jan.locator('.card-avatar-wrap > .card-agent-mark > .card-agent')).toBeVisible();
     });
 
     test('reduced motion: the arc stands still but stays', async ({ page }) => {
@@ -1613,6 +1667,44 @@ test.describe('a run waiting for its gate', () => {
 });
 
 test.describe('Research overview', () => {
+    test('a manual step\'s whole instruction: two lines in the panel, whole in the item\'s detail (no overflow)', async ({ page }) => {
+        const INSTRUCTION = 'Stáhnout snímky křestní matriky Chlumy 1850–1871 (kniha 4521) ze Státního oblastního archivu: přihlásit se na portálu archivu, '
+            + 'otevřít knihu, vzít strany 12 až 48 v plném rozlišení a uložit je do složky images/chlumy-4521/ výzkumu; když nejde vzít celou knihu, '
+            + 'stačí strany kolem roku 1865 (křty od února do září). Pak tady krok označit jako hotový, agent strany přečte a pokračuje u rodiny Fíškových, konec zadání.';
+        // A fixed clock away from midnight UTC, set before the page loads; the item's time from it.
+        const now = await fixClock(page);
+        await follow(page, { width: 1440, height: 900 }, (b) => {
+            b.waiting = [{ id: 'T0004', what: 'Stáhnout snímky matriky', on: INSTRUCTION, person: 'P0012', at: new Date(now.getTime() - 20 * 60_000).toISOString() }];
+        });
+        expect(INSTRUCTION.length).toBeGreaterThan(400);
+        // The panel's row: the whole text, clamped to two lines by the style (on hover in its title).
+        const on = page.locator('#live-panel .live-waiting-row .live-waiting-on');
+        await expect(on).toHaveText(`waiting on: ${INSTRUCTION}`);
+        await expect(on).toHaveAttribute('title', `waiting on: ${INSTRUCTION}`);
+        // The panel redraws when the change comes: measured until it holds.
+        await expect.poll(() => on.evaluate((n) => {
+            const ems = n.getBoundingClientRect().height / parseFloat(getComputedStyle(n).fontSize);
+            return ems > 0 && ems <= 3.2 && n.scrollHeight > n.clientHeight + 1;
+        }).catch(() => false)).toBe(true);
+        // The overview's detail: the whole text, wrapped, the end visible.
+        const ov = await openOverview(page);
+        const item = ov.locator('.research-overview__waiting-item').first();
+        await item.locator('.research-overview__waiting-row').click();
+        const whole = item.locator('.research-overview__waiting-on-box .research-overview__waiting-on');
+        await expect(whole).toHaveText(INSTRUCTION);
+        // The overview may still move (it opens, it is drawn anew with a status): scrolled to without waiting for a still box, until it stays in view.
+        await expect(async () => {
+            await whole.evaluate((n) => n.scrollIntoView({ block: 'nearest' }));
+            await expect(whole).toBeInViewport({ timeout: 1000 });
+        }).toPass({ timeout: 10000 });
+        const wide = await item.evaluate((n) => [...n.querySelectorAll<HTMLElement>('*')]
+            .filter(e => e.scrollWidth > e.clientWidth + 1 && getComputedStyle(e).overflowX !== 'visible').map(e => e.className));
+        expect(wide).toEqual([]);
+        const box = await whole.boundingBox();
+        const ovBox = await ov.boundingBox();
+        expect(box!.x + box!.width).toBeLessThanOrEqual(ovBox!.x + ovBox!.width + 0.5);
+    });
+
     test('desktop: beside a narrower tree; summary, waiting, progress, filters, hover, changed, Escape', async ({ page }) => {
         await follow(page);
         const panel = page.locator('#live-panel');
@@ -1846,9 +1938,12 @@ test.describe('Awaiting action from a research with waiting.groups', () => {
                 await page.evaluate((l) => window.Strom.UI.setLanguage(l as never), lang);
                 const bar = ov.locator('.research-overview__waiting-filters');
                 await expect(bar.locator('.research-overview__filter')).toHaveCount(6);
-                const m = await bar.evaluate(row => {
+                // Read from the overview, which outlives its redraws: the bar found first may be drawn anew
+                // (an answer of the bridge) before it is read, and out of the page then.
+                const m = await ov.evaluate(root => {
+                    const row = root.querySelector('.research-overview__waiting-filters')!;
                     const r = row.getBoundingClientRect();
-                    const panel = row.closest('#research-overview')!.getBoundingClientRect();
+                    const panel = root.getBoundingClientRect();
                     const chips = [...row.querySelectorAll('.research-overview__filter')].map(c => c.getBoundingClientRect());
                     return {
                         overflow: row.scrollWidth - row.clientWidth,
@@ -1961,7 +2056,7 @@ test.describe('Awaiting action from a research with waiting.groups', () => {
         await expect(actions.nth(1)).toBeVisible();
         await expect(actions.nth(1)).not.toHaveClass(/is-primary/);
         await expect(letter.locator('.research-overview__waiting-hint')).toHaveText('The answer is saved with the task; the agent takes it up in its next work.');
-        await expect(letter.locator('.research-overview__waiting-on')).toContainText('to: MěÚ Vzorov');
+        await expect(letter.locator('.research-overview__waiting-to')).toHaveText('To MěÚ Vzorov');
         const task = await letter.getAttribute('data-id');
         await actions.nth(0).click();
         await actions.nth(1).click();
@@ -1980,14 +2075,19 @@ test.describe('Awaiting action from a research with waiting.groups', () => {
         await webItem.locator('.research-overview__waiting-row').click();
         const web = webItem.locator('a.research-overview__waiting-web');
         await expect(web).toHaveText('Open website ↗');
+        // Its target's host beside it and in its name (spec 105 U4 §2).
+        await expect(web).toHaveAttribute('aria-label', 'Open the website rodokmen.example in a new window');
+        await expect(webItem.locator('.research-overview__waiting-host')).toHaveText('rodokmen.example');
         await expect(web).toHaveAttribute('href', 'https://rodokmen.example/zaznam/1');
         await expect(web).toHaveAttribute('target', '_blank');
         await expect(web).toHaveAttribute('rel', 'noopener noreferrer');
-        const inText = webItem.locator('.research-overview__waiting-text a.live-text-link');
+        // The text once, in the open row; its addresses as links in the body (spec 105 U4 §3).
+        await expect(webItem.locator('.research-overview__waiting-text')).toHaveCount(0);
+        const inText = webItem.locator('.research-overview__waiting-links a.live-text-link');
         await expect(inText).toHaveText('https://rodokmen.example/hledat?q=1');
         await expect(inText).toHaveAttribute('href', 'https://rodokmen.example/hledat?q=1');
         await expect(inText).toHaveAttribute('rel', 'noopener noreferrer');
-        // The row itself holds no link (the text is clamped there).
+        // The row itself holds no link (it is a button).
         await expect(webItem.locator('.research-overview__waiting-row a')).toHaveCount(0);
 
         // Awaiting a reply: unfolds to its places; the rows say when they were sent.
@@ -2181,11 +2281,23 @@ test.describe('Awaiting action written through the bridge', () => {
         // The menu counts what is left to do.
         await expect(page.locator('#research-menu-signal')).toHaveText('29');
 
-        // Undo: back to do.
-        await toast.locator('.toast-action', { hasText: 'Undo' }).click();
+        // Undo works in the toast (4d): it stays, "Undoing…" with the item while the bridge writes, then ✓ "Back in To do".
+        let letGo!: () => void;
+        const gate = new Promise<void>(r => { letGo = r; });
+        const undoRoute = (u: URL) => u.pathname.endsWith('/waiting/T0018');
+        await page.route(undoRoute, async route => { await gate; await route.fallback(); });
+        await toast.locator('.toast-action', { hasText: 'Undo' }).evaluate((b: HTMLButtonElement) => { b.click(); b.click(); });
+        await expect(toast.locator('.toast-title')).toHaveText('Undoing…');
+        await expect(toast.locator('.busy-spin.s16')).toBeVisible();
+        await expect(toast.locator('.t-sub')).toHaveText('Napsat matrice o zápis 1');
+        await expect(toast).toHaveAttribute('aria-busy', 'true');
+        letGo();
         await expect(todoHead(page)).toHaveText(/To do · 30/);
-        await expect(page.locator('.toast[data-kind="waiting-unsent"]')).toHaveText('Back in To do');
+        await expect(toast).toHaveText('✓Back in To do');
+        await expect(toast).not.toHaveAttribute('aria-busy', 'true');
+        await expect(page.locator('.toast[data-kind="waiting-unsent"]')).toHaveCount(0);
         expect(bridge.writes.map(w => [w.path, w.body])).toEqual([['waiting/T0018', '{"do":"sent"}'], ['waiting/T0018', '{"do":"unsent"}']]);
+        await page.unroute(undoRoute);
 
         // A sent item offers Back to To do (and is not marked sent again).
         await sentHead(page).click();
@@ -2219,8 +2331,17 @@ test.describe('Awaiting action written through the bridge', () => {
             Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (t: string) => { copied.push(t); } } });
         });
 
-        // The queries' text: a small window over the overview, the text as text with its lines.
-        await office.locator('.research-overview__waiting-groupnote').click();
+        // The queries' text: the button says "Loading…" while the bridge reads it, a double click reads once;
+        // then a small window over the overview, the text as text with its lines.
+        let letGo!: () => void;
+        const gate = new Promise<void>(r => { letGo = r; });
+        const noteRoute = (u: URL) => u.pathname.endsWith('/note');
+        await page.route(noteRoute, async route => { await gate; await route.fallback(); });
+        const noteBtn = office.locator('.research-overview__waiting-groupnote');
+        await noteBtn.evaluate((b: HTMLButtonElement) => { b.click(); b.click(); });
+        await expect(noteBtn).toHaveAttribute('aria-busy', 'true');
+        await expect(noteBtn).toContainText('Loading…');
+        letGo();
         const dialog = page.locator('#waiting-note-modal');
         await expect(dialog).toBeVisible();
         await expect(dialog.locator('#waiting-note-title')).toHaveText('All queries\' text');
@@ -2233,6 +2354,7 @@ test.describe('Awaiting action written through the bridge', () => {
         expect(await page.evaluate(() => (window as unknown as { __copied: string[] }).__copied)).toEqual([bridge.note!.text]);
         await expect(page.locator('.toast[data-kind="waiting-copied"]')).toHaveText('Copied');
         expect(bridge.writes.map(w => [w.method, w.path])).toEqual([['GET', `group/${encodeURIComponent('to:MěÚ Vzorov')}/note`]]);
+        await page.unroute(noteRoute);
         // Escape closes the window alone.
         await page.keyboard.press('Escape');
         await expect(dialog).toHaveCount(0);
@@ -2262,7 +2384,8 @@ test.describe('Awaiting action written through the bridge', () => {
         await toast.locator('.toast-action', { hasText: 'Undo' }).evaluate((b: HTMLButtonElement) => { b.click(); b.click(); });
         await expect(todoHead(page)).toHaveText(/To do · 30/);
         await expect(sentHead(page)).toHaveText(/Awaiting a reply · 5/);
-        await expect(page.locator('.toast[data-kind="waiting-unsent"]')).toHaveText('Back in To do');
+        // It works in its toast: ✓ "Back in To do" there.
+        await expect(toast).toHaveText('✓Back in To do');
         const key = encodeURIComponent('to:MěÚ Vzorov');
         expect(bridge.writes.map(w => [w.method, w.path, w.body])).toEqual([
             ['POST', `group/${key}`, '{"do":"sent"}'],
@@ -2307,7 +2430,11 @@ test.describe('Awaiting action written through the bridge', () => {
         await expect.poll(() => bridge.writes.length).toBe(1);
         bridge.refuse = { status: 400, code: 'waiting.bad-body' };
         await page.locator('.toast[data-kind="waiting-sent"] .toast-action').click();
-        await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveText('Not recorded: the research did not take the request.');
+        // Said in the same toast, which stays (no auto-close) with Try again.
+        const toast = page.locator('.toast[data-kind="waiting-sent"]');
+        await expect(toast).toContainText('Not recorded: the research did not take the request.');
+        await expect(toast.locator('.toast-action')).toHaveText('Try again');
+        await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveCount(0);
         await expect(todoHead(page)).toHaveText(/To do · 24/);
         await expect(sentHead(page)).toHaveText(/Awaiting a reply · 11/);
         expect(bridge.writes.at(-1)).toMatchObject({ method: 'POST', body: expect.stringContaining('"do":"unsent"') });
@@ -2361,6 +2488,23 @@ test.describe('Awaiting action written through the bridge', () => {
         expect(put?.headers['x-strom-name']).toBe('odpoved-uradu.pdf');
         expect(put?.headers['content-type']).toBe('application/pdf');
         expect(await launched(page)).toEqual([]);
+    });
+
+    test('Add a file called off: nothing shown while the dialog is open, the button back at once, a second press opens it again (9c)', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, writable([], { media: { task: true } }));
+        await openOverview(page);
+        const letter = await openLetter(page);
+        const add = letter.locator('.research-overview__waiting-action[data-action="file"]');
+        let chooser = page.waitForEvent('filechooser');
+        await add.click();
+        await chooser;
+        await expect(add).not.toHaveAttribute('aria-busy', 'true');
+        await page.locator('input.waiting-file-input').dispatchEvent('cancel');
+        // At once, not after the next redraw of the list.
+        await expect(add).toBeEnabled({ timeout: 300 });
+        chooser = page.waitForEvent('filechooser', { timeout: 3000 });
+        await add.click();
+        await chooser;
     });
 
     test('Sent at an item the research already has sent (sent: [], phase sent): it stays in Awaiting a reply, no error', async ({ page }) => {
@@ -2473,21 +2617,88 @@ test.describe('Awaiting action written through the bridge', () => {
         expect(bridge.writes).toHaveLength(0);
     });
 
-    test('a refused or unanswered write puts the row back and says so', async ({ page }) => {
+    for (const vp of [{ name: 'desktop', width: 1440, height: 900 }, { name: 'phone', width: 390, height: 844 }]) {
+        test(`Sent at an item (${vp.name}): the row says "saving" where it went until the research confirms, then nothing; no dimming`, async ({ page }) => {
+            const bridge = await follow(page, vp, writable(['waiting.sent']));
+            if (vp.width > 640) await openOverview(page);
+            else {
+                await page.locator('#live-panel .live-panel-toggle').click();
+                await expect(page.locator('#research-overview')).toHaveClass(/research-overview--sheet/);
+            }
+            const ov = page.locator('#research-overview');
+            await sentHead(page).click();
+            await placeHead(page, 'sent', 'MěÚ Vzorov').locator('.research-overview__waiting-group').click();
+            const letter = await openLetter(page);
+            let letGo!: () => void;
+            const gate = new Promise<void>(r => { letGo = r; });
+            const sentRoute = (u: URL) => u.pathname.endsWith('/waiting/T0018');
+            await page.route(sentRoute, async route => { await gate; await route.fallback(); });
+            await letter.locator('.research-overview__waiting-action[data-action="sent"]').click();
+            // Moved at once (optimistic), carrying "saving" at its end; the row keeps its full look.
+            const moved = ov.locator('.research-overview__phase[data-phase="sent"] .research-overview__waiting-item[data-id="T0018"]');
+            await expect(moved.locator('.busy-st')).toHaveText('saving');
+            await expect(moved.locator('.busy-st .busy-spin')).toBeVisible();
+            await expect(moved).toHaveCSS('opacity', '1');
+            await expect(page.locator('#busy-announce')).toHaveText('saving');
+            expect((await moved.locator('.busy-st').boundingBox())!.width).toBeGreaterThan(0);
+            letGo();
+            // Confirmed: the state goes, no ✓, the row stays where it went.
+            await expect(page.locator('.toast[data-kind="waiting-sent"]')).toBeVisible();
+            await expect(moved.locator('.busy-st')).toHaveCount(0);
+            await expect(moved).not.toContainText('✓');
+            await expect(moved).not.toHaveClass(/is-refused/);
+            expect(bridge.writes.map(w => w.path)).toEqual(['waiting/T0018']);
+            await page.unroute(sentRoute);
+            expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+        });
+
+        test(`a refused Sent (${vp.name}): the row back, tinted, its sentence (role=alert) and Try again in it, the focus on it; no toast`, async ({ page }) => {
+            const bridge = await follow(page, vp, writable(['waiting.sent']));
+            bridge.refuse = { status: 423, code: 'locked' };
+            if (vp.width > 640) await openOverview(page);
+            else await page.locator('#live-panel .live-panel-toggle').click();
+            const letter = await openLetter(page);
+            await letter.locator('.research-overview__waiting-action[data-action="sent"]').click();
+            const back = page.locator('#research-overview .research-overview__phase[data-phase="todo"] .research-overview__waiting-item[data-id="T0018"]');
+            const note = back.locator('.research-overview__waiting-note');
+            await expect(note).toContainText('Not recorded: another session holds the tree in the research.');
+            await expect(note).toHaveAttribute('role', 'alert');
+            await expect(back).toHaveClass(/is-refused/);
+            await expect(todoHead(page)).toHaveText(/To do · 30/);
+            await expect(note).toBeFocused();
+            await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveCount(0);
+            // The research did not answer: the same row says that instead.
+            bridge.refuse = 'abort';
+            await back.locator('.research-overview__waiting-action[data-action="sent"]').click();
+            await expect(note).toContainText('Not recorded: the research did not answer.');
+            await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveCount(0);
+            // Try again writes once more; taken now, the row goes, its sentence with it.
+            const writes = bridge.writes.length;
+            delete bridge.refuse;
+            await note.locator('[data-action="write-retry"]').click();
+            await expect(back).toHaveCount(0);
+            await expect(todoHead(page)).toHaveText(/To do · 29/);
+            await expect.poll(() => bridge.writes.slice(writes).map(w => w.body)).toEqual(['{"do":"sent"}']);
+            expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+        });
+    }
+
+    test('a refused write of a row not seen (its section folded) says so by a toast as before', async ({ page }) => {
         const bridge = await follow(page, { width: 1440, height: 900 }, writable(['waiting.sent']));
         bridge.refuse = { status: 423, code: 'locked' };
-        await openOverview(page);
-        let letter = await openLetter(page);
-        await letter.locator('.research-overview__waiting-action[data-action="sent"]').click();
+        const ov = await openOverview(page);
+        const letter = await openLetter(page);
+        const sent = letter.locator('.research-overview__waiting-action[data-action="sent"]');
+        // Folded meanwhile (the place's head): the row back is not seen.
+        await sent.evaluate((b: HTMLButtonElement) => {
+            b.click();
+            const heads = [...document.querySelectorAll<HTMLElement>('#research-overview .research-overview__phase[data-phase="todo"] .research-overview__waiting-grouphead')];
+            heads.find(h => h.querySelector('.research-overview__group-title')?.textContent === 'MěÚ Vzorov')!.querySelector<HTMLElement>('.research-overview__waiting-group')!.click();
+        });
         await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveText('Not recorded: another session holds the tree in the research.');
         await expect(todoHead(page)).toHaveText(/To do · 30/);
-        await expect(letter).toBeVisible();
-        bridge.refuse = 'abort';
-        letter = page.locator('#research-overview .research-overview__waiting-item', { hasText: 'Napsat matrice o zápis 1' });
-        await letter.locator('.research-overview__waiting-action[data-action="sent"]').click();
-        await expect(page.locator('.toast[data-kind="waiting-failed"]')).toHaveText('Not recorded: the research did not answer.');
-        await expect(todoHead(page)).toHaveText(/To do · 30/);
-        expect(bridge.writes).toHaveLength(2);
+        await expect(ov.locator('.research-overview__waiting-note')).toHaveCount(0);
+        expect(bridge.writes).toHaveLength(1);
     });
 
     test('phone: the sheet writes through the bridge (Sent, a file, the queries\' text), no way into the research', async ({ page }) => {
@@ -2519,5 +2730,93 @@ test.describe('Awaiting action written through the bridge', () => {
             ['GET', `group/${encodeURIComponent('to:MěÚ Vzorov')}/note`], ['POST', 'waiting/T0018'],
         ]);
         expect(await launched(page)).toEqual([]);
+    });
+});
+
+test.describe('Open the research in the overview\'s foot (waiting buttons §3.1)', () => {
+    test('the overview drawn anew keeps "Opening the research…" on its button; no proof in 10 s: the sentence under it', async ({ page }) => {
+        await page.clock.install();
+        // A research that says the links it took (handoffs): no proof in 10 s, so the terminal did not open.
+        await follow(page, undefined, (b) => { b.features = ['handoffs']; });
+        await openOverview(page);
+        const open = page.locator('#research-overview [data-action="open-research"]');
+        await open.click();
+        await expect(open).toHaveAttribute('aria-busy', 'true');
+        await expect(open).toContainText('Opening the research…');
+        // A new status draws the overview anew: the new button carries the state, no toast takes it.
+        await page.evaluate(() => (window.Strom.UI as unknown as { renderResearchOverview: () => void }).renderResearchOverview());
+        await expect(open).toHaveAttribute('aria-busy', 'true');
+        await expect(open).toHaveAttribute('aria-disabled', 'true');
+        await expect(page.locator('.toast--progress')).toHaveCount(0);
+        expect(await launched(page)).toHaveLength(1);
+        for (let i = 0; i < 11; i++) {
+            await page.clock.fastForward(1000);
+            await page.waitForTimeout(30);
+        }
+        // A line of the foot under its links (not a column of the overview that pushes its sections away).
+        const msg = page.locator('#research-overview .research-overview__foot > .busy-msg');
+        await expect(msg).toContainText('Did the terminal not open?');
+        await expect(msg.getByRole('button', { name: 'Try again' })).toBeVisible();
+        expect((await msg.boundingBox())!.height).toBeLessThan(80);
+        await expect(open).not.toHaveAttribute('aria-busy', 'true');
+        // Drawn anew once more: the sentence stays under the button.
+        await page.evaluate(() => (window.Strom.UI as unknown as { renderResearchOverview: () => void }).renderResearchOverview());
+        await expect(msg).toContainText('Did the terminal not open?');
+    });
+
+    test('the bridge\'s answers draw the overview anew again and again: its button never at rest between them, no second start; an older research: a quiet limit', async ({ page }) => {
+        await page.clock.install();
+        // An older research (no handoffs) whose stand-in says the session's start relative to its own clock.
+        await follow(page);
+        await openOverview(page);
+        const sel = '#research-overview [data-action="open-research"]';
+        const open = page.locator(sel);
+        await open.click();
+        await page.clock.fastForward(200);
+        await expect(open).toHaveAttribute('aria-busy', 'true');
+        // Every change of the page seen as it comes (before the page is painted or takes a click): the button in
+        // the overview's foot, a new one after each redraw, is locked and working each time.
+        await page.evaluate((s) => {
+            const w = window as unknown as { __redraws: number; __gaps: string[]; __stop?: boolean };
+            w.__redraws = 0;
+            w.__gaps = [];
+            let last = document.querySelector(s);
+            new MutationObserver(() => {
+                const b = document.querySelector(s);
+                if (!b || w.__stop) return;
+                if (b !== last) { w.__redraws++; last = b; }
+                if (b.getAttribute('aria-busy') !== 'true' || b.getAttribute('aria-disabled') !== 'true') {
+                    w.__gaps.push(`${b.getAttribute('aria-busy')}/${b.getAttribute('aria-disabled')} ${b.textContent}`);
+                }
+            }).observe(document.body, { childList: true, subtree: true, attributes: true });
+        }, sel);
+        // Within the 10 s limit: the bridge asked each second, the overview drawn anew with its answers.
+        for (let i = 0; i < 8; i++) {
+            await page.clock.fastForward(1000);
+            await page.waitForTimeout(40);
+            await expect(open).toHaveAttribute('aria-busy', 'true');
+        }
+        const seen = await page.evaluate(() => {
+            const w = window as unknown as { __redraws: number; __gaps: string[]; __stop?: boolean };
+            w.__stop = true;
+            return { redraws: w.__redraws, gaps: w.__gaps };
+        });
+        expect(seen.redraws).toBeGreaterThanOrEqual(3);
+        expect(seen.gaps).toEqual([]);
+        await expect(open).toContainText('Opening the research…');
+        // A click on the new button meanwhile starts nothing.
+        await open.click({ force: true });
+        expect(await launched(page)).toHaveLength(1);
+        await expect(page.locator('.toast--progress')).toHaveCount(0);
+        // Its limit: it cannot say whether the terminal came up (no session for its menu), so the button is at rest
+        // again without a sentence.
+        for (let i = 0; i < 3; i++) {
+            await page.clock.fastForward(1000);
+            await page.waitForTimeout(40);
+        }
+        await expect(open).not.toHaveAttribute('aria-busy', 'true');
+        await expect(open).not.toHaveAttribute('aria-disabled', 'true');
+        await expect(page.locator('#research-overview .busy-msg')).toHaveCount(0);
+        await expect(page.locator('.toast', { hasText: 'Did the terminal not open?' })).toHaveCount(0);
     });
 });

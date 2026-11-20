@@ -75,6 +75,10 @@ interface Bridge {
  * Follow the bridge. `quick`: the app reconnects every 250 ms instead of 2 s
  * (__LIVE_RECONNECT_MS), so its next status comes soon (nextStatus).
  */
+/** The help of Settings › Following research › Follow the agent in (spec 097 §8). */
+const HELP_WINDOWS = 'Applies to the main window when following starts and on Back to the agent. Other windows follow in their own view.';
+const HELP_ONE_WINDOW = 'Used when following starts and on Back to the agent. The view can be switched while following.';
+
 async function follow(page: Page, o: { size?: { width: number; height: number }; gap?: number; idle?: number; on?: boolean; quick?: boolean; ged?: string } = {}): Promise<Bridge> {
     await page.setViewportSize(o.size ?? { width: 1440, height: 900 });
     await page.addInitScript(([links, gap, idle, on, quick]) => {
@@ -264,10 +268,12 @@ test.describe('follow the agent in the tree', () => {
         await expect.poll(() => page.evaluate(() => window.Strom.TreeRenderer.getViewMode())).toBe('family');
         await expect.poll(() => focusRefn(page)).toBe('P0012');
         await expect.poll(() => offCentre(page, 'P0012')).toBeLessThan(3);
-        await expect(btn(page)).toHaveAttribute('aria-label', 'Stop following');
+        await expect(btn(page)).toHaveAttribute('aria-label', 'Stop following here');
     });
 
     test('a new target: one jump after the brake, to the latest one', async ({ page }) => {
+        // The brake's 6 s run on Playwright's clock (it ticks as ever).
+        await page.clock.install();
         const bridge = await follow(page, { gap: 6000, on: true, quick: true });
         await expect.poll(() => focusRefn(page)).toBe('P0012');
         await page.evaluate(() => {
@@ -280,11 +286,17 @@ test.describe('follow the agent in the tree', () => {
         // Read within the brake, then the next one comes.
         await nextStatus(bridge);
         bridge.person = 'P0002';
+        // Read within the brake too, then the brake runs out.
+        await nextStatus(bridge);
+        expect(await focusRefn(page)).toBe('P0012');
+        await page.clock.runFor(6000);
         await expect.poll(() => focusRefn(page), { timeout: 10000 }).toBe('P0002');
         expect(await page.evaluate(() => (window.Strom.TreeRenderer as unknown as { __calls: number }).__calls)).toBe(1);
     });
 
     test('moving the tree pauses (pill, no jump); back by itself after a while without touching; a touch counts again', async ({ page }) => {
+        // The pause's 3 s and the reconnects run on Playwright's clock (it ticks as ever).
+        await page.clock.install();
         const bridge = await follow(page, { idle: 3000, on: true });
         await expect.poll(() => focusRefn(page)).toBe('P0012');
         await dragTree(page);
@@ -293,12 +305,17 @@ test.describe('follow the agent in the tree', () => {
         await expect(btn(page)).toHaveClass(/is-paused/);
         await expect(btn(page)).toHaveAttribute('aria-pressed', 'true');
         bridge.person = 'P0001';
-        await page.waitForTimeout(2000);
+        const asked = bridge.chain;
+        await page.clock.runFor(2000);
+        // The new target was said meanwhile (the bridge asked again), and not jumped to.
+        await expect.poll(() => bridge.chain).toBeGreaterThan(asked);
+        expect(await focusRefn(page)).toBe('P0012');
         // A wheel over the tree starts the wait again.
         await page.mouse.wheel(0, 100);
-        await page.waitForTimeout(2000);
+        await page.clock.runFor(2000);
         expect(await focusRefn(page)).toBe('P0012');
         await expect(pill).toBeVisible();
+        await page.clock.runFor(1500);
         await expect.poll(() => focusRefn(page), { timeout: 6000 }).toBe('P0001');
         await expect(pill).toHaveCount(0);
     });
@@ -401,6 +418,44 @@ test.describe('follow the agent in the tree', () => {
         await expect(page.locator('#live-follow-pill')).toBeVisible();
     });
 
+    test('⌂ pauses like a focus by hand; the pills stand clear (de, a long name, 1025–1280) (spec 111 §9)', async ({ page }) => {
+        await follow(page, { idle: 60_000, on: true, size: { width: 1100, height: 800 }, ged: LINE_GED });
+        await page.evaluate(() => window.Strom.UI.setLanguage('de'));
+        await expect.poll(() => focusRefn(page)).toBe('P0012');
+        const first = await page.evaluate(() => Object.keys(window.Strom.DataManager.getData().persons)[0]);
+        const home = page.locator('#focus-home-btn');
+        await expect(home).toHaveAttribute('data-state', first === await idOf(page, 'P0012') ? 'home' : 'active');
+        await home.click();
+        await expect.poll(() => page.evaluate(() => window.Strom.TreeRenderer.getFocusPersonId())).toBe(first);
+        await expect(page.locator('#live-follow-pill')).toBeVisible();
+        for (const width of [1100, 1025, 1280]) {
+            await page.setViewportSize({ width, height: 800 });
+            await expect.poll(() => page.evaluate(() => {
+                const a = document.getElementById('focus-controls')!.getBoundingClientRect();
+                const b = document.getElementById('live-follow-pill')!.getBoundingClientRect();
+                return a.width > 0 && b.width > 0 && !(a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom);
+            }), `${width}`).toBe(true);
+        }
+    });
+
+    test('⌂ at home: nothing happens, following is not paused (spec 111 §4, §9)', async ({ page }) => {
+        await follow(page, { idle: 60_000, on: true });
+        await expect.poll(() => focusRefn(page)).toBe('P0012');
+        const jan = await idOf(page, 'P0012');
+        await page.evaluate((id) => {
+            window.Strom.DataManager.setDefaultPerson(id as never);
+            window.Strom.TreeRenderer.render();
+        }, jan);
+        const home = page.locator('#focus-home-btn');
+        await expect(home).toHaveAttribute('data-state', 'home');
+        await home.click({ force: true });
+        await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+        await page.keyboard.press('h');
+        await page.waitForTimeout(300);
+        await expect(page.locator('#live-follow-pill')).toHaveCount(0);
+        expect(await focusRefn(page)).toBe('P0012');
+    });
+
     test('an open dialog holds the jump until it closes', async ({ page }) => {
         // No brake (gap 0): only the dialog can hold the jump.
         const bridge = await follow(page, { on: true, gap: 0, quick: true });
@@ -420,7 +475,7 @@ test.describe('follow the agent in the tree', () => {
         await nextStatus(bridge);
         const before = await focusRefn(page);
         await btn(page).click();
-        await expect(btn(page)).toHaveAttribute('title', 'Stop following · waiting for the agent to work on someone');
+        await expect(btn(page)).toHaveAttribute('title', 'Stop following here · waiting for the agent to work on someone');
         bridge.person = 'P0013';
         bridge.paused = true;
         await nextStatus(bridge);
@@ -838,7 +893,7 @@ test.describe('following: the person menu says why it does not edit (063 U3 A5)'
         await expect(page.locator('#person-modal.active, .modal-overlay.active')).toHaveCount(0);
         // The way out, right under it.
         const stop = menu.locator('[data-action="live-stop"]');
-        await expect(stop).toHaveText('Stop following');
+        await expect(stop).toHaveText('End following');
         expect(await menu.locator('[role="menuitem"]').evaluateAll((els) => {
             const i = els.findIndex(e => e.getAttribute('aria-disabled') === 'true');
             return (els[i + 1] as HTMLElement | undefined)?.dataset.action ?? null;
@@ -858,7 +913,10 @@ test.describe('following: the person menu says why it does not edit (063 U3 A5)'
         test.use({ hasTouch: true });
 
         test('the sheet: Edit greyed with why, a tap keeps the sheet; Stop following ends following', async ({ page }) => {
+            await page.clock.install();
             await follow(page, { size: { width: 390, height: 844 }, idle: 60_000 });
+            // The research's opening message (6 s) lies over the card at 390: its time passes on Playwright's clock.
+            await page.clock.runFor(6500);
             await (await cardOf(page, 'P0013')).tap();
             const sheet = page.locator('.bottom-sheet-overlay');
             const edit = sheet.locator('.bottom-sheet-item.is-disabled');
@@ -875,7 +933,7 @@ test.describe('following: the person menu says why it does not edit (063 U3 A5)'
             await expect(edit).toBeVisible();
             await expect(page.locator('#person-modal.active')).toHaveCount(0);
             const stop = sheet.locator('.bottom-sheet-item.is-link[data-action="live-stop"]');
-            await expect(stop).toHaveText('Stop following');
+            await expect(stop).toHaveText('End following');
             const box = (await stop.boundingBox())!;
             expect(box.height).toBeGreaterThanOrEqual(44);
             await stop.tap();
@@ -1162,6 +1220,34 @@ test.describe('follow the agent in the fan (spec 043)', () => {
         await expect(page.locator('#fan-center-pin')).toBeHidden();
     });
 
+    test('⌂ joins the front of the pinned centre\'s pill; a click releases the pin and centres the default person, following goes on (spec 111 §7)', async ({ page }) => {
+        await follow(page, { idle: 60_000, on: true });
+        await expect.poll(() => focusRefn(page)).toBe('P0012');
+        const first = await page.evaluate(() => Object.keys(window.Strom.DataManager.getData().persons)[0]);
+        const anna = await idOf(page, 'P0002'), josef = await idOf(page, 'P0001');
+        const pinned = first === anna ? josef : anna;
+        await page.evaluate(() => window.Strom.UI.setLiveFollowView('fan'));
+        await expect(page.locator('#fan-chart .fan-svg')).toBeVisible();
+        await page.evaluate((id) => window.Strom.UI.pinFanCenter(id as never), pinned);
+        await expect.poll(() => centre(page)).toBe(pinned);
+        const home = page.locator('#fan-home-btn');
+        const pin = page.locator('#fan-center-pin');
+        await expect(pin).toBeVisible();
+        await expect(pin.locator('#fan-home-btn')).toBeVisible();
+        await expect(page.locator('#fan-home-pill')).toBeHidden();
+        expect(await pin.evaluate(el => el.firstElementChild?.id)).toBe('fan-home-btn');
+        await expect(home).toHaveAttribute('data-state', 'active');
+        await home.click();
+        await expect.poll(() => centre(page)).toBe(first);
+        expect(await page.evaluate(() => window.Strom.UI.liveFollowPinned())).toBeNull();
+        await expect(pin).toBeHidden();
+        await expect(page.locator('#fan-home-pill #fan-home-btn')).toBeVisible();
+        await expect(home).toHaveAttribute('data-state', 'home');
+        // A tap in the fan keeps following; so does ⌂ there.
+        await expect(page.locator('#live-follow-pill')).toHaveCount(0);
+        expect(await page.evaluate(() => window.Strom.TreeRenderer.getViewMode())).toBe('fan');
+    });
+
     test('a label of a person beyond the fan stands clear of the research\'s card (1440) (1105)', async ({ page }) => {
         const bridge = await follow(page, { idle: 60_000, on: true, ged: DEEP_GED });
         bridge.person = 'P0109';
@@ -1248,6 +1334,8 @@ test.describe('follow the agent in the fan (spec 043)', () => {
         await expect(group).toBeVisible();
         const set = (key: string) => group.locator(`.live-sec-set__row[data-key="${key}"]`);
         await expect(set('follow-view').locator('[aria-checked="true"]')).toHaveText('Family');
+        // A computer with a mouse: other windows follow in their own view (spec 097 §8).
+        await expect(set('follow-view').locator('.settings-desc')).toHaveText(HELP_WINDOWS);
         await expect(set('follow-fan-center').locator('[aria-checked="true"]')).toHaveText('Focused person');
         await expect(set('follow-fan-person')).toHaveCount(0);
         await expect(group.locator('[data-key="follow-trail"] input[type="checkbox"]')).toBeChecked();
@@ -1284,7 +1372,26 @@ test.describe('follow the agent in the fan (spec 043)', () => {
         expect(await followView(page)).toBe('fan');
     });
 
+    test('Settings at a phone\'s width: the help of the follow view without other windows (spec 097 §8)', async ({ page }) => {
+        await follow(page, { idle: 60_000, size: { width: 600, height: 900 } });
+        await page.evaluate(() => window.Strom.UI.showSettingsDialog());
+        const row = page.locator('#settings-group-research-follow .live-sec-set__row[data-key="follow-view"]');
+        await expect(row.locator('.settings-desc')).toHaveText(HELP_ONE_WINDOW);
+    });
+
+    test.describe('a touch tablet (spec 097 §8)', () => {
+        test.use({ hasTouch: true, isMobile: true });
+        test('Settings: the help of the follow view without other windows', async ({ page }) => {
+            await follow(page, { idle: 60_000, size: { width: 820, height: 1180 } });
+            await page.evaluate(() => window.Strom.UI.showSettingsDialog());
+            const row = page.locator('#settings-group-research-follow .live-sec-set__row[data-key="follow-view"]');
+            await expect(row.locator('.settings-desc')).toHaveText(HELP_ONE_WINDOW);
+        });
+    });
+
     test('the overview: the line about the switch has the same gap above and below; once it goes the summary closes up to "Follow in" (1105)', async ({ page }) => {
+        // The line's FOLLOW_NOTICE_MS (6 s) run on Playwright's clock (it ticks as ever).
+        await page.clock.install();
         await follow(page, { idle: 60_000, on: true });
         await expect.poll(() => focusRefn(page)).toBe('P0012');
         await page.evaluate(() => window.Strom.UI.openResearchOverview());
@@ -1312,7 +1419,8 @@ test.describe('follow the agent in the fan (spec 043)', () => {
         expect(shown.above!).toBeGreaterThan(4);
         expect(Math.abs(shown.above! - shown.below!)).toBeLessThanOrEqual(1);
         // The line goes by itself (FOLLOW_NOTICE_MS): the gap is the one of an overview drawn without it.
-        await expect(note).toHaveCount(0, { timeout: 10_000 });
+        await page.clock.runFor(6000);
+        await expect(note).toHaveCount(0);
         const after = await gaps();
         await page.evaluate(() => (window.Strom.UI as unknown as { renderResearchOverview(): void }).renderResearchOverview());
         const plain = await gaps();
@@ -1535,6 +1643,32 @@ test.describe('follow the agent on the map (spec 043 §5, §6)', () => {
         await page.evaluate(() => new Promise(requestAnimationFrame));
         await expect(notice.locator('.map-follow-research')).toHaveCount(0);
         await expect(notice.locator('.map-follow-locate')).toBeVisible();
+    });
+
+    test('Look up in the research on a notice works from the click until the bridge answers (B169)', async ({ page }) => {
+        await stubTiles(page);
+        const bridge = await follow(page, { idle: 60_000, on: true, quick: true });
+        bridge.features = ['working.place', 'places.identify'];
+        bridge.person = 'P0013';
+        const places = await queueingPlaces(page);
+        await expect.poll(() => focusRefn(page)).toBe('P0013');
+        await seedMapPlaces(page);
+        await nextStatus(bridge);
+        await page.evaluate(() => window.Strom.UI.setLiveFollowView('map'));
+        const notice = page.locator('#map-container .map-follow-notice');
+        const look = notice.locator('.map-follow-research');
+        await expect(look).toBeVisible();
+        let release = (): void => undefined;
+        const held = new Promise<void>(r => { release = r; });
+        await page.route(u => u.pathname.endsWith('/places/identify') || u.pathname.endsWith('/places'), async (route) => {
+            if (route.request().method() === 'POST') await held;
+            await route.fallback();
+        });
+        await look.click();
+        await expect(look).toHaveAttribute('data-busy', 'busy');
+        release();
+        await expect.poll(() => places.posted.length).toBe(1);
+        await expect(page.locator('.toast')).toContainText('1 place queued for the research.');
     });
 
     test('Look up in the research: a read of the research\'s places answered before the step does not offer it again (spec 058)', async ({ page }) => {

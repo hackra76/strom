@@ -32,7 +32,7 @@ import type { HighlightGroup } from './evidence-ui.js';
 import { uiModule } from './module.js';
 
 /** Where a line was chosen: from memory ('restore') the focus stays. */
-export type RodOrigin = 'picker' | 'menu' | 'pill' | 'overview' | 'person' | 'restore';
+export type RodOrigin = 'picker' | 'menu' | 'pill' | 'overview' | 'person' | 'legend' | 'restore';
 
 /** What the state needs of the app (the UI; a fake in tests). */
 export interface RodViewHost {
@@ -300,6 +300,31 @@ function viewPickerHtml(items: RodPickerItem[], current: RodId | null): string {
     });
 }
 
+/**
+ * The choice's last row (spec 084 §6, 6d): "Save the X family line as a
+ * list…" for the line chosen, behind a line of its own; only in a tree
+ * whose lists can change. The saved family pages share the list's markup
+ * and never get this row.
+ */
+function appendSaveListRow(pick: HTMLDetailsElement, current: RodId | null, onSave: (rod: RodId) => void): void {
+    if (!current || DataManager.listsReadOnly()) return;
+    const list = pick.querySelector('.sp-rodpick-list');
+    if (!list) return;
+    const li = document.createElement('li');
+    li.className = 'sp-rodpick-save';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'sp-rodpick-savebtn';
+    btn.textContent = strings.rodView.saveList(rodLabel(current));
+    btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onSave(current);
+    });
+    li.appendChild(btn);
+    list.appendChild(li);
+}
+
 /** What a pick does: the whole tree, or the line chosen. */
 function pickRod(rod: string): void {
     if (rod === 'tree') clearRodSelection();
@@ -341,6 +366,12 @@ export const rodViewMethods = uiModule({
     /** The chosen line (the fan's legend marks its row). */
     selectedRod(): RodId | null {
         return getSelectedRod();
+    },
+
+    /** A row of the fan's legend or a sector's menu (spec 114 §5): the tree's chosen line, null: the whole tree. */
+    selectRodFromFan(id: string | null): void {
+        if (id) setRodSelection(id, 'legend');
+        else clearRodSelection();
     },
 
     /** The choice or the data changed: the toolbar's choice and the fan's legend follow. */
@@ -439,6 +470,10 @@ export const rodViewMethods = uiModule({
             // Built again once closed when something changed while it was open.
             if (!pick.open) this.syncRodPickerHost();
         });
+        appendSaveListRow(pick, current, (rod) => {
+            pick.open = false;
+            this.showNewPersonList({ source: 'rod', rule: { kind: 'rods', rodIds: [rod] } });
+        });
         hostAbort = new AbortController();
         wireRodPicker(el, pickRod, { pick, signal: hostAbort.signal, outside: document, markFirst: true });
         el.hidden = false;
@@ -495,6 +530,10 @@ export const rodViewMethods = uiModule({
         sheet.querySelector('.rod-pick-sheet-x')?.addEventListener('click', close);
         // The list stays open in the sheet: a pick, Escape (its own) and nothing else closes it — and the sheet with it.
         wireRodPicker(sheet, (rod) => { close(); pickRod(rod); }, { pick, outside: new EventTarget(), markFirst: true });
+        appendSaveListRow(pick, getSelectedRod(), (rod) => {
+            close();
+            this.showNewPersonList({ source: 'rod', rule: { kind: 'rods', rodIds: [rod] } });
+        });
         pick.addEventListener('toggle', () => { if (!pick.open) close(); });
         pick.querySelector('summary')?.addEventListener('click', (e) => e.preventDefault());
         // Swipe down from the head closes (as the other sheets; the list scrolls on its own).

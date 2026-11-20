@@ -3,6 +3,7 @@
  * Executes the merge operation based on user decisions
  */
 
+import { earlierAddedAt } from '../person-lists-data.js';
 import { rewriteStorySources } from '../story-sources.js';
 import { remapCitations, unionCitations } from '../citation-quality.js';
 import {
@@ -19,12 +20,16 @@ import {
     generateLifeEventId,
     partnershipParticipants,
     Attachment,
+    MediaPlace,
     Source,
     generatePersonId,
     generatePartnershipId,
     PERSON_CITATION_FIELDS, PARTNERSHIP_CITATION_FIELDS, isGender, gendersCompatible, mergedPrimaryName,
     ImportRecord,
+    PortraitSource,
 } from '../types.js';
+import { allMedia, findMedia, personMedia, putMedia, samePlace } from '../media.js';
+import { dropDanglingPortraitSources } from '../photo.js';
 import { importProgramName } from '../import-next.js';
 import { addSurnameGroup, surnameKey } from '../surnames.js';
 import { cleanLineageOverrides } from '../lineage.js';
@@ -468,6 +473,10 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
             if (decision.type === 'skip') skippedCount++;
         }
 
+        // When this merge brings people into the tree (spec 084 §8).
+        const mergedAt = new Date().toISOString();
+        /** Incoming persons whose data came into the tree (merged or added): their files come along. */
+        const carriedPersons = new Set<PersonId>();
         // Process confirmed matches - merge person data
         for (const match of state.matches) {
             const decision = state.decisions.get(match.incomingId);
@@ -477,14 +486,18 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
                 if (existingPerson) {
                     // Merge data according to conflict resolutions
                     mergePersonData(existingPerson, shared(match.incomingPerson), match.conflicts, mapping.persons, state.incomingData.persons);
+                    carriedPersons.add(match.incomingId);
                     carryMergedImports(existingPerson, state.existingData.persons[match.existingId], match.incomingPerson, importMap);
+                    keepEarlierAddedAt(existingPerson, match.incomingPerson);
                     mergedCount++;
                 }
             } else if (decision?.type === 'manual_match') {
                 const existingPerson = mergedData.persons[decision.targetId];
                 if (existingPerson) {
                     mergePersonData(existingPerson, shared(match.incomingPerson), match.conflicts, mapping.persons, state.incomingData.persons);
+                    carriedPersons.add(match.incomingId);
                     carryMergedImports(existingPerson, state.existingData.persons[decision.targetId], match.incomingPerson, importMap);
+                    keepEarlierAddedAt(existingPerson, match.incomingPerson);
                     mergedCount++;
                 }
             }
@@ -499,6 +512,7 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
             const existingPerson = mergedData.persons[existingId];
             if (!existingPerson?.isPlaceholder) continue;
             mergePersonData(existingPerson, shared(incoming), [], mapping.persons, state.incomingData.persons);
+            carriedPersons.add(incomingId);
             carryMergedImports(existingPerson, state.existingData.persons[existingId], incoming, importMap);
         }
 
@@ -532,6 +546,7 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
             if (!incoming) continue;
 
             const newId = mapping.persons.get(incomingId)!;
+            carriedPersons.add(incomingId);
 
             // Create new person with remapped IDs
             const newPerson: Person = {
@@ -562,6 +577,9 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
                 remapEventParticipants(newPerson.events, mapping.persons, state.incomingData.persons);
             }
             adoptIncomingMarks(newPerson, mapping.persons, importMap);
+            // A person new to this tree comes into it now (spec 084 §8).
+            if (!newPerson.isPlaceholder) newPerson.addedAt = mergedAt;
+            else delete newPerson.addedAt;
 
             mergedData.persons[newId] = newPerson;
             addedCount++;
@@ -711,6 +729,10 @@ export async function executeMerge(state: MergeState): Promise<MergeResult> {
             }
         }
 
+        // The incoming tree's files at the persons, couples and sources that came along (data v24).
+        carryIncomingMedia(mergedData, state.incomingData, mapping.persons, carriedPersons, unionTarget, sourceRemap);
+        // The original of each portrait that came from the incoming tree (spec 107).
+        carryPortraitSources(mergedData, state, mapping.persons, unionTarget);
         carryAlsoChildOf(mergedData, state, mapping, unionTarget);
         // Own godparent / witness events of the incoming tree point at the merged couples and events.
         resolveIncomingRoleAt(mergedData, state.incomingData, unionTarget);
@@ -1247,14 +1269,99 @@ function absorbSourceDetails(kept: Source, incoming: Source): void {
 }
 
 /**
+ * The original a portrait was cut from follows the portrait that won (spec
+ * 107): a person whose portrait is the incoming one takes the incoming
+ * photoSource, its attachment found among the merged person's by its bytes
+ * (an attachment kept under another id) and its union by where the incoming
+ * union went — when that union shows the same photo. A person who kept the
+ * tree's own portrait keeps its own source. One that no longer leads to its
+ * original goes (dropDanglingPortraitSources).
+ */
+function carryPortraitSources(
+    data: StromData,
+    state: MergeState,
+    personMap: ReadonlyMap<PersonId, PersonId>,
+    unionTarget: ReadonlyMap<PartnershipId, PartnershipId>,
+): void {
+    for (const [incomingId, incoming] of Object.entries(state.incomingData.persons) as [PersonId, Person][]) {
+        const targetId = personMap.get(incomingId);
+        const target = targetId ? data.persons[targetId] : undefined;
+        if (!target) continue;
+        const own = state.existingData.persons[target.id];
+        delete target.photoSource;
+        // The tree's own portrait stayed: its own source, if it has one.
+        if (own?.photoSource && target.photo && own.photo === target.photo) {
+            target.photoSource = structuredClone(own.photoSource);
+            continue;
+        }
+        const src = incoming.photoSource;
+        if (!src || !incoming.photo || incoming.photo !== target.photo) continue;
+        const next: PortraitSource = structuredClone(src);
+        if (src.attachmentId) {
+            const att = findMedia(state.incomingData, src.attachmentId);
+            const kept = att && personMedia(data, target.id).find(a => a.dataUrl === att.dataUrl && !a.originalOnly);
+            if (!kept) continue;
+            next.attachmentId = kept.id;
+        } else if (src.partnershipId) {
+            const union = unionTarget.get(src.partnershipId);
+            const photo = state.incomingData.partnerships[src.partnershipId]?.photo;
+            if (!union || !photo || data.partnerships[union]?.photo !== photo) continue;
+            next.partnershipId = union;
+        }
+        target.photoSource = next;
+    }
+    dropDanglingPortraitSources(data);
+}
+
+/**
+ * The incoming tree's files (data v24) at what came into the tree: a place at
+ * a merged or added person, a couple that came along or a source (the kept
+ * one when deduplicated). A file the tree already holds (same id, or the same
+ * bytes) takes the places; otherwise it comes as its own record. Places at
+ * what stayed behind go.
+ */
+function carryIncomingMedia(
+    data: StromData,
+    incoming: StromData,
+    personMap: ReadonlyMap<PersonId, PersonId>,
+    carriedPersons: ReadonlySet<PersonId>,
+    unionTarget: ReadonlyMap<PartnershipId, PartnershipId>,
+    sourceRemap: ReadonlyMap<string, string>,
+): void {
+    for (const att of allMedia(incoming)) {
+        const places: MediaPlace[] = [];
+        for (const pl of att.places) {
+            const by = pl.by ? { by: pl.by } : {};
+            if ('personId' in pl) {
+                const target = carriedPersons.has(pl.personId) ? personMap.get(pl.personId) : undefined;
+                if (target && data.persons[target]) places.push({ ...pl, personId: target, ...by });
+            } else if ('partnershipId' in pl) {
+                const target = unionTarget.get(pl.partnershipId);
+                if (target && data.partnerships[target]) places.push({ ...pl, partnershipId: target, ...by });
+            } else {
+                const target = sourceRemap.get(pl.sourceId) ?? pl.sourceId;
+                if (data.sources?.[target]) places.push({ ...pl, sourceId: target, ...by });
+            }
+        }
+        if (places.length === 0) continue;
+        const same = allMedia(data).find(a => sameAttachment(a, att));
+        if (same) {
+            for (const pl of places) if (!same.places.some(o => samePlace(o, pl))) same.places.push(pl);
+            continue;
+        }
+        const copy: Attachment = structuredClone(att);
+        delete copy.removed;
+        copy.places = places;
+        putMedia(data, copy);
+    }
+}
+
+/**
  * Excerpts whose full-page attachment did not survive the merge (dropped as a
  * duplicate of the same bytes under another id) lose only their re-crop link.
  */
 function unlinkOrphanExcerpts(data: StromData): void {
-    const attachmentIds = new Set<string>();
-    for (const person of Object.values(data.persons)) {
-        for (const att of person.attachments ?? []) attachmentIds.add(att.id);
-    }
+    const attachmentIds = new Set(allMedia(data).map(a => a.id));
     for (const src of Object.values(data.sources ?? {})) {
         for (const exc of src.excerpts ?? []) {
             if (exc.fromAttachmentId && !attachmentIds.has(exc.fromAttachmentId)) {
@@ -1274,10 +1381,11 @@ function unlinkOrphanExcerpts(data: StromData): void {
 function remapSourceReferences(data: StromData, remap: Map<string, string>, incoming: Record<string, Source> | undefined): void {
     if (remap.size === 0) return;
     remapCitations(data, remap, incoming);
+    for (const att of allMedia(data)) {
+        const places = att.places.map(pl => ('sourceId' in pl && remap.has(pl.sourceId) ? { ...pl, sourceId: remap.get(pl.sourceId)! } : pl));
+        att.places = places.filter((pl, i) => places.findIndex(o => samePlace(o, pl)) === i);
+    }
     for (const person of Object.values(data.persons)) {
-        for (const att of person.attachments ?? []) {
-            if (att.sourceId && remap.has(att.sourceId)) att.sourceId = remap.get(att.sourceId);
-        }
         rewriteStorySources(person.story, ids => ids.map(id => remap.get(id) ?? id));
     }
     for (const partnership of Object.values(data.partnerships)) {
@@ -1482,6 +1590,9 @@ export function mergePersonData(
                     else delete existing.photoOriginalName;
                     if (incoming.photoDate) existing.photoDate = incoming.photoDate;
                     else delete existing.photoDate;
+                    // The original of the losing portrait goes with it; the
+                    // winner's comes in carryPortraitSources (spec 107).
+                    delete existing.photoSource;
                 }
                 break;
             default:
@@ -1589,16 +1700,6 @@ export function mergePersonData(
         }
     }
 
-    // Merge attachments: union by id, keeping the existing one on id clash.
-    // The same document under a fresh id (identical data URL) is not added twice.
-    if (incoming.attachments && incoming.attachments.length > 0) {
-        if (!existing.attachments) existing.attachments = [];
-        for (const att of incoming.attachments) {
-            if (existing.attachments.some(a => sameAttachment(a, att))) continue;
-            existing.attachments.push({ ...att });
-        }
-    }
-
     // Update placeholder status
     if (existing.isPlaceholder && !incoming.isPlaceholder) {
         existing.isPlaceholder = false;
@@ -1649,6 +1750,17 @@ export function mergePartnershipData(
     }
     if (!existing.endPlace && incoming.endPlace) existing.endPlace = incoming.endPlace;
     if (!existing.address && incoming.address) existing.address = incoming.address;
+    // The couple's photo (spec 107): the tree's own stays, the incoming one
+    // fills a gap, its name, date and original riding along.
+    if (!existing.photo && incoming.photo) {
+        existing.photo = incoming.photo;
+        if (incoming.photoOriginalName) existing.photoOriginalName = incoming.photoOriginalName;
+        else delete existing.photoOriginalName;
+        if (incoming.photoDate) existing.photoDate = incoming.photoDate;
+        else delete existing.photoDate;
+        if (incoming.photoOriginal) existing.photoOriginal = incoming.photoOriginal;
+        else delete existing.photoOriginal;
+    }
     // Ages are keyed by person: incoming ids become the merged tree's ids.
     for (const [pid, age] of Object.entries(incoming.ages ?? {})) {
         const key = personIdMap?.get(pid as PersonId) ?? pid;
@@ -1883,4 +1995,12 @@ function validateMergedData(data: StromData): string[] {
     }
 
     return errors;
+}
+
+/**
+ * The same person in both trees keeps the earlier date of coming into a tree;
+ * without one here the person is older than the date (it stays without).
+ */
+function keepEarlierAddedAt(kept: Person, incoming: Person): void {
+    if (kept.addedAt && incoming.addedAt) kept.addedAt = earlierAddedAt(kept.addedAt, incoming.addedAt);
 }

@@ -14,6 +14,7 @@
  * pattern.
  */
 
+import { canvasBusy } from './canvas-busy.js';
 import { stampedGeo } from '../place-find.js';
 import { DataManager } from '../data.js';
 import { TreeRenderer } from '../renderer.js';
@@ -43,12 +44,14 @@ import {
     fitBounds, panCenter, pinchZoomStep, pointInViewport, tileUrl, tilesForViewport, zoomAround,
     TILE_ATTRIBUTION, TILE_ATTRIBUTION_URL,
 } from '../map.js';
-import { GEOCODER_NAME, geocodePlaces, placesCentroid } from '../geocode.js';
+import { GEOCODER_NAME, GEOCODE_TIMEOUT_MS, geocodePlaces, placesCentroid, type GeocodeFailure } from '../geocode.js';
+import { serviceFailText } from './busy.js';
 import { uiModule } from './module.js';
-import { loadMapTile, mapTilesBlocked, onMapTilesChange, releaseMapTile } from './map-tiles.js';
+import { loadMapTile, mapTilesBlocked, mapTilesFailedIn, onMapTilesChange, releaseMapTile, retryMapTiles, tilesFailedNote } from './map-tiles.js';
 
 import { iconSvg } from '../icons.js';
 import { shownName } from '../person-name.js';
+import { barHtml } from './prog-bar.js';
 /** A place that has coordinates and therefore something to draw. */
 export interface MappedPlace {
     key: string;
@@ -95,6 +98,8 @@ let mapTilesBound = false;
 
 /** Per tree: the places the map's own lookup asked for and did not find (this page's life). */
 const geocodeMissed = new Map<string, Set<string>>();
+/** A lookup run stopped by a request without an answer (§10.3), by tree: the bar says why, with Try again. */
+const geocodeFailed = new Map<string, GeocodeFailure>();
 /** How old the research's places may be when the map opens before it reads them again. */
 const LIVE_MAX_AGE_MS = 15000;
 
@@ -208,7 +213,7 @@ export const mapMethods = uiModule({
                             aria-label="${strings.map.zoomIn}" title="${strings.map.zoomIn}">+</button>
                     <button type="button" class="map-zoom-out" onclick="window.Strom.UI.zoomMap(-1)"
                             aria-label="${strings.map.zoomOut}" title="${strings.map.zoomOut}">−</button>
-                    <button type="button" class="map-fit" onclick="window.Strom.UI.fitMapToPlaces(true)"
+                    <button type="button" class="map-fit" onclick="window.Strom.UI.fitMapByUser()"
                             aria-label="${strings.map.fit}" title="${strings.map.fit}">⤢</button>
                     <button type="button" class="map-time-toggle sel-opt" onclick="window.Strom.UI.toggleMapTime()"
                             aria-pressed="false" aria-label="${strings.map.timeMode}" title="${strings.map.timeMode}"><span class="map-time-toggle-icon" aria-hidden="true">${iconSvg('timer')}</span><span class="map-time-toggle-text" aria-hidden="true">${strings.map.timeModeShort}</span></button>
@@ -599,9 +604,28 @@ export const mapMethods = uiModule({
 
         if (this.mapGeocoding) {
             const { done, total, place } = this.mapGeocoding;
+            // 2h: what runs with "k of n" at the right, the bar, the place asked now with Cancel at the right.
             box.innerHTML = `
-                <span class="map-status-text">${strings.map.geocodingProgress(done, total, this.escapeHtml(place))}</span>
-                <button type="button" class="secondary" onclick="window.Strom.UI.cancelGeocoding()">${strings.buttons.cancel}</button>`;
+                <div class="prog map-geo-prog">
+                    <div class="prog-line" role="status"><span class="prog-t map-status-text">${this.escapeHtml(strings.map.geocodingTitle)}</span>
+                        <span class="prog-k">${this.escapeHtml(strings.busy.kOfN(done, total))}</span></div>
+                    ${barHtml(total ? done / total : 0)}
+                    <div class="prog-line"><span class="map-geo-place">${this.escapeHtml(place)}</span>
+                        <span class="prog-acts"><button type="button" class="secondary" onclick="window.Strom.UI.cancelGeocoding()">${strings.buttons.cancel}</button></span></div>
+                </div>`;
+            box.style.display = 'flex';
+            return;
+        }
+
+        // The last lookup run got no answer (§10.3): why, with Try again (the run goes on from the places left).
+        const failedTree = DataManager.getCurrentTreeId();
+        const failure = failedTree ? geocodeFailed.get(failedTree) : undefined;
+        if (failure) {
+            box.innerHTML = `
+                <div class="busy-msg is-err map-geo-failed" role="alert"><span class="busy-msg__text">${this.escapeHtml(serviceFailText(failure, GEOCODE_TIMEOUT_MS))}</span>
+                    <button type="button" class="link busy-msg__retry" onclick="window.Strom.UI.startGeocoding()">${this.escapeHtml(strings.busy.retry)}</button></div>
+                <button type="button" class="secondary" onclick="window.Strom.UI.showPlacesManager()">${strings.map.managePlaces}</button>`;
+            box.classList.remove('is-after');
             box.style.display = 'flex';
             return;
         }
@@ -723,13 +747,29 @@ export const mapMethods = uiModule({
             }
         }
         this.renderMapTilesBlocked(container);
+        this.renderMapTilesFailed(container);
         if (!mapTilesBound) {
             mapTilesBound = true;
             onMapTilesChange(() => {
                 const open = document.getElementById('map-container');
-                if (open?.querySelector('.map-canvas')) this.renderMapTilesBlocked(open);
+                if (!open?.querySelector('.map-canvas')) return;
+                this.renderMapTilesBlocked(open);
+                this.renderMapTilesFailed(open);
             });
         }
+    },
+
+    /**
+     * Tiles of the view did not come (the network, the server's request limit, no answer in 15 s, §10.3): one
+     * sentence in the map's top left corner, under its chips, with Try again; it goes once none is left failed.
+     */
+    renderMapTilesFailed(container: HTMLElement): void {
+        const corner = container.querySelector('.map-topleft');
+        const note = container.querySelector('.map-tiles-failed');
+        const tiles = container.querySelector('.map-tiles');
+        if (!corner || !tiles || !mapTilesFailedIn(tiles)) { note?.remove(); return; }
+        if (note) return;
+        corner.appendChild(tilesFailedNote(() => retryMapTiles(tiles)));
     },
 
     /**
@@ -1684,11 +1724,11 @@ export const mapMethods = uiModule({
             if (act.classList.contains('map-popup-keep')) this.keepPlaceOnMap(key);
             else if (act.classList.contains('map-popup-change')) this.showPlacesManager(key);
             else if (act.classList.contains('map-popup-whymore')) this.showPlacesManager(key, undefined, undefined, { focus: 'why' });
-            else if (act.classList.contains('map-popup-checkres')) void this.queuePlaces([key], true);
+            else if (act.classList.contains('map-popup-checkres')) void this.queuePlacesFrom(act, [key], true);
             else {
                 let keys: string[] = [];
                 try { keys = JSON.parse(act.dataset.keys ?? '[]') as string[]; } catch { /* none */ }
-                void this.queuePlaces(keys, false);
+                void this.queuePlacesFrom(act, keys, false);
             }
         });
         // A click on the map itself (not a drag) closes the bubble.
@@ -1736,7 +1776,15 @@ export const mapMethods = uiModule({
         this.mapScope = scope;
         this.closeMapPopup();
         this.mapCenter = null;  // reframe for the new set of places
-        TreeRenderer.render();
+        // B166, §8: the choice at once, the places computed anew under the canvas overlay ("Calculating the map…").
+        document.getElementById('map-scope-view')?.classList.toggle('active', scope !== 'tree');
+        document.getElementById('map-scope-tree')?.classList.toggle('active', scope === 'tree');
+        void canvasBusy(() => TreeRenderer.renderAsync(), { label: strings.busy.mapCalc });
+    },
+
+    /** B165, §8: the Fit button: every place framed under the canvas overlay ("Calculating the map…", past 120 ms). */
+    fitMapByUser(): void {
+        void canvasBusy(() => this.fitMapToPlaces(true), { label: strings.busy.mapCalc });
     },
 
     /** Frame every place; `byUser`: the Fit button (following there then stops panning the map). */
@@ -1930,6 +1978,8 @@ export const mapMethods = uiModule({
 
         const controller = new AbortController();
         this.mapGeocodeAbort = controller;
+        if (treeId) geocodeFailed.delete(treeId);
+        let failure: GeocodeFailure | null = null;
         this.mapGeocoding = { done: 0, total: missing.length, place: missing[0].usage.display };
         this.renderMapStatus(this.mapPlaces());
 
@@ -1947,6 +1997,7 @@ export const mapMethods = uiModule({
             townFallback: { centroid: placesCentroid(data.places), known: knownStreets(data) },
             // Of several towns of a place's name, the one nearest the tree's other places (A6.5.1).
             treePlaces: data.places,
+            onFailure: kind => { failure = kind; },
             onProgress: (done, total) => {
                 this.mapGeocoding = { done, total, place: names[Math.min(done, total - 1)] };
                 this.renderMapStatus(this.mapPlaces());
@@ -1973,6 +2024,14 @@ export const mapMethods = uiModule({
                 else if (key) missed.delete(key);
             }
             geocodeMissed.set(treeId, missed);
+        }
+
+        if (failure) {
+            // The places from the failure on are neither found nor "not found": the bar says why, with Try again.
+            if (treeId) geocodeFailed.set(treeId, failure);
+            this.mapCenter = null;
+            TreeRenderer.render();
+            return;
         }
 
         const notFound = results.size - found.size;

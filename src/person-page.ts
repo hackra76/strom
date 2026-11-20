@@ -12,6 +12,8 @@
  * the output.
  */
 
+import { mediaSourceId, personMedia, personMediaById, placePersonId } from './media.js';
+import { unionPhotoCaption } from './union-photo.js';
 import { StromData, Person, PersonId, Partnership, PartnershipId, Source, SourceExcerpt, LifeEvent, EventParticipant, Story, Attachment, PlaceGeo, FactStatus } from './types.js';
 import { applyLivingPrivacy, stripResearchWork, isLivingPerson, inferBirthUpperBounds, PrivacyMode } from './privacy.js';
 import { computePersonLifeline, LifelinePoint } from './timeline.js';
@@ -29,6 +31,7 @@ import { parseFlexDate, formatFlexDate, yearOf, ageBetween, toCanonical } from '
 import { nameHtml, shownName, shownNameOrEmpty } from './person-name.js';
 import { asciiSlug, safeFileName } from './filenames.js';
 import { isSafeExcerptDataUrl, safeHttpUrl, isOriginalOnlyAttachment } from './validation.js';
+import { dataUrlImageSize } from './photo.js';
 import { nameSourceCodes, storyBasisBodyHtml, storyBasisEmpty, storyBasisHead, storyBasisShown, storyBasisWords, storyFactText } from './story-sources.js';
 import { storyProseHtml, coupleStories, coupleStoryYears, splitProseLead, partnershipsInOrder, partnershipSortKey } from './story-text.js';
 import { excerptImageUrl } from './excerpts.js';
@@ -507,9 +510,13 @@ export function preparePersonPageData(data: StromData, opts: PersonPageOptions, 
         };
     }
     const person: Person = structuredClone(src);
-    if (person.attachments) {
-        person.attachments = person.attachments.filter(a => (isPdfAttachment(a) ? groups.pdf : groups.materials));
-        if (!person.attachments.length) delete person.attachments;
+    // The person's own files only, at the person alone (data v24: StromData.media).
+    for (const a of personMedia(full, id)) {
+        if (!(isPdfAttachment(a) ? groups.pdf : groups.materials)) continue;
+        const own = structuredClone(a);
+        own.places = own.places.filter(pl => placePersonId(pl) === id || 'sourceId' in pl);
+        delete own.removed;
+        (tree.media ??= {})[own.id] = own;
     }
     if (!groups.research) delete person.research;
     tree.persons[id] = person;
@@ -689,8 +696,10 @@ function countGroups(page: PersonPageData): PersonPageGroupCounts {
                 .reduce((n, s) => n + s.rows.filter(r => r.kind === 'kid').length, 0)
             : 0,
         excerpts: sources.reduce((n, s) => n + (s.excerpts?.length ?? 0), 0),
-        materials: (person?.attachments ?? []).filter(a => !isPdfAttachment(a) && !!safeImage(a.dataUrl) && !isOriginalOnlyAttachment(a)).length,
-        pdf: (person?.attachments ?? []).filter(a => !!safePdf(a)).length,
+        materials: personMedia(page.tree, page.personId).filter(a => !isPdfAttachment(a) && !!safeImage(a.dataUrl) && !isOriginalOnlyAttachment(a)).length
+            // The couples' photos (spec 107 §8).
+            + (page.groups.materials ? (person?.partnerships ?? []).filter(id => !!safeImage(page.tree.partnerships[id]?.photo)).length : 0),
+        pdf: personMedia(page.tree, page.personId).filter(a => !!safePdf(a)).length,
         sources: page.groups.sources ? sources.length : 0,
         research: researchItems(page, page.lang).count + researchIdCount(page),
     };
@@ -2525,49 +2534,8 @@ export function personBookResearchHtml(page: PersonPageData, _opts: PersonPageOp
 
 // ── Images embedded once (§3.2: the file's <style> holds each image, everything else names its class) ──
 
-/** An image's pixel size from its data URL's header (PNG, GIF, JPEG, WebP), else null. */
-export function dataUrlImageSize(url: string): { w: number; h: number } | null {
-    const comma = url.indexOf(',');
-    if (comma < 0) return null;
-    let bytes: Uint8Array;
-    try {
-        const b64 = url.slice(comma + 1, comma + 1 + 90_000).replace(/\s+/g, '');
-        const bin = atob(b64.slice(0, b64.length - (b64.length % 4)));
-        bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    } catch {
-        return null;
-    }
-    const b = bytes;
-    const be16 = (i: number) => (b[i] << 8) | b[i + 1];
-    const le16 = (i: number) => b[i] | (b[i + 1] << 8);
-    const ok = (w: number, h: number) => (w > 0 && h > 0 ? { w, h } : null);
-    if (b.length > 24 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) {
-        return ok(((b[16] << 24) | (b[17] << 16) | be16(18)) >>> 0, ((b[20] << 24) | (b[21] << 16) | be16(22)) >>> 0);
-    }
-    if (b.length > 10 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return ok(le16(6), le16(8));
-    if (b.length > 4 && b[0] === 0xff && b[1] === 0xd8) {
-        let i = 2;
-        while (i + 9 < b.length) {
-            if (b[i] !== 0xff) { i++; continue; }
-            const m = b[i + 1];
-            if (m === 0xd8 || m === 0x01 || (m >= 0xd0 && m <= 0xd7) || m === 0xff) { i += m === 0xff ? 1 : 2; continue; }
-            if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return ok(be16(i + 7), be16(i + 5));
-            i += 2 + be16(i + 2);
-        }
-        return null;
-    }
-    if (b.length > 30 && b[0] === 0x52 && b[1] === 0x49 && b[8] === 0x57 && b[9] === 0x45) {
-        const tag = String.fromCharCode(b[12], b[13], b[14], b[15]);
-        if (tag === 'VP8 ') return ok(le16(26) & 0x3fff, le16(28) & 0x3fff);
-        if (tag === 'VP8L') {
-            const v = b[21] | (b[22] << 8) | (b[23] << 16) | (b[24] << 24);
-            return ok((v & 0x3fff) + 1, ((v >>> 14) & 0x3fff) + 1);
-        }
-        if (tag === 'VP8X') return ok((b[24] | (b[25] << 8) | (b[26] << 16)) + 1, (b[27] | (b[28] << 8) | (b[29] << 16)) + 1);
-    }
-    return null;
-}
+/** An image's pixel size from its data URL's header (moved to photo.ts, used here and by family-pages). */
+export { dataUrlImageSize };
 
 const CSS_SAFE_IMAGE = /^data:image\/[\w.+-]+;base64,[A-Za-z0-9+/=]+$/;
 
@@ -2683,7 +2651,24 @@ function excerptEvent(c: Ctx, sid: string): { event: PersonPageCaptionEvent | nu
     return null;
 }
 
-/** Every image of the person: the excerpts of the person's sources and the image attachments, by year (none last). */
+/**
+ * The photos of the person's couples (spec 107 §8), first in the gallery in
+ * the order of the unions: a couple with a living partner has none in a
+ * protected page (the privacy took it).
+ */
+function couplePhotoItems(c: Ctx): GalleryItem[] {
+    if (!c.page.groups.materials) return [];
+    const unions = partnershipsInOrder(c.tree, c.person.partnerships.map(id => c.tree.partnerships[id]).filter((u): u is Partnership => !!u));
+    const out: GalleryItem[] = [];
+    for (const u of unions) {
+        const src = safeImage(u.photo);
+        if (!src) continue;
+        out.push({ src, kind: 'photo', caption: unionPhotoCaption(c.tree, u, c.S), sub: '', year: yearOf(u.startDate), wide: false });
+    }
+    return out;
+}
+
+/** Every image of the person: the couples' photos, then the excerpts of the person's sources and the image attachments by year (none last). */
 function galleryItems(c: Ctx, rows: PersonSourceRow[]): GalleryItem[] {
     const { P } = c;
     const out: GalleryItem[] = [];
@@ -2708,23 +2693,28 @@ function galleryItems(c: Ctx, rows: PersonSourceRow[]): GalleryItem[] {
             }
         }
     }
-    for (const a of c.person.attachments ?? []) {
+    for (const a of personMedia(c.tree, c.person.id)) {
         if (isPdfAttachment(a) || isOriginalOnlyAttachment(a) || !a.mimeType.startsWith('image/')) continue;
         const src = safeImage(a.dataUrl);
         if (!src) continue;
-        const caption = stripResearchIds(a.note?.trim() || a.name.replace(/\.[^.]+$/, '')).text.trim() || a.name;
-        const m = YEAR_IN_TEXT.exec(`${a.note ?? ''} ${a.name}`);
+        // A titled file: its title, whole (spec 102 §2, Q1), its kind and its date's year.
+        const title = a.title?.trim();
+        const caption = title || stripResearchIds(a.note?.trim() || a.name.replace(/\.[^.]+$/, '')).text.trim() || a.name;
+        const m = YEAR_IN_TEXT.exec(a.date ?? '') ?? YEAR_IN_TEXT.exec(`${title ?? ''} ${a.note ?? ''} ${a.name}`);
         const year = m ? Number(m[1]) : null;
-        const s = a.sourceId ? c.tree.sources?.[a.sourceId] : undefined;
+        const sourceId = mediaSourceId(a);
+        const s = sourceId ? c.tree.sources?.[sourceId] : undefined;
         const sub = [s ? peekTitle(s.title) : '', year !== null && !caption.includes(String(year)) ? String(year) : ''].filter(Boolean).join(', ');
-        const kind: GalleryItem['kind'] = a.sourceId || DOCUMENT_WORDS.test(`${a.name} ${a.note ?? ''}`) ? 'document' : 'photo';
+        const kind: GalleryItem['kind'] = a.kind === 'photo' || a.kind === 'document' || a.kind === 'record' ? a.kind
+            : sourceId || DOCUMENT_WORDS.test(`${a.name} ${a.note ?? ''}`) ? 'document' : 'photo';
         const size = dataUrlImageSize(src);
         out.push({ src, kind, caption, sub, year, wide: !!size && isWide(kind, size.w, size.h) });
     }
-    return out
+    const sorted = out
         .map((it, i) => ({ it, i }))
         .sort((x, y) => (x.it.year ?? Infinity) - (y.it.year ?? Infinity) || x.i - y.i)
         .map(x => x.it);
+    return [...couplePhotoItems(c), ...sorted];
 }
 
 /** Pages of a PDF data URL (its page objects), null when it cannot be read. */
@@ -2742,10 +2732,11 @@ function pdfPages(dataUrl: string): number | null {
 
 function pdfItems(c: Ctx): PdfItem[] {
     if (!c.page.groups.pdf) return [];
-    return (c.person.attachments ?? []).filter(isPdfAttachment).map(a => {
+    return personMedia(c.tree, c.person.id).filter(isPdfAttachment).map(a => {
         const href = safePdf(a);
-        const m = YEAR_IN_TEXT.exec(`${a.note ?? ''} ${a.name}`);
-        const name = stripResearchIds(a.note?.trim() || a.name).text.trim() || a.name;
+        const title = a.title?.trim();
+        const m = YEAR_IN_TEXT.exec(a.date ?? '') ?? YEAR_IN_TEXT.exec(`${title ?? ''} ${a.note ?? ''} ${a.name}`);
+        const name = title || stripResearchIds(a.note?.trim() || a.name).text.trim() || a.name;
         return { name, href, pages: href ? pdfPages(href) : null, year: m ? Number(m[1]) : null };
     });
 }
@@ -2819,14 +2810,38 @@ function lightboxHtml(c: Ctx): string {
     }).join('');
 }
 
-/** The file's light box of the portrait. */
+/**
+ * The whole photo the person's portrait is cut from, when the file carries it
+ * (an attachment of the person or the couple's photo; a file without
+ * attachments has no portrait source at all).
+ */
+export function portraitWholeImage(tree: Pick<StromData, 'partnerships' | 'media'>, person: Person): string | null {
+    const src = person.photo ? person.photoSource : undefined;
+    if (!src) return null;
+    if (src.attachmentId) {
+        const att = personMediaById(tree, person.id, src.attachmentId);
+        return att && !att.originalOnly && att.mimeType.startsWith('image/') ? safeImage(att.dataUrl) : null;
+    }
+    if (src.partnershipId) return safeImage(tree.partnerships[src.partnershipId]?.photo);
+    return null;
+}
+
+/** The file's light box of the portrait, and of the whole photo it is cut from (Portrait | Whole photo, spec 107 §2). */
 function portraitLightbox(c: Ctx, photo: string | null): string {
     if (!c.imgs || !photo) return '';
     const name = nameOf(c, c.person.id);
-    return `<div class="pp-lb" id="obr-p" role="dialog" aria-label="${esc(name)}">`
+    const wholeSrc = portraitWholeImage(c.tree, c.person);
+    const whole = wholeSrc ? imgHtml(c, wholeSrc, name, 'pp-lb-img') : '';
+    const box = (id: string, img: string, nav: string): string =>
+        `<div class="pp-lb" id="${id}" role="dialog" aria-label="${esc(name)}">`
         + `<div class="pp-lb-top"><span class="pp-lb-count"></span><a class="pp-lb-close" href="#pp-sec-facts" data-pp-lb="close">${esc(c.P.gal.closeZoom)}</a></div>`
-        + imgHtml(c, photo, name, 'pp-lb-img')
-        + `<div class="pp-lb-foot"><span class="pp-lb-cap">${esc(name)}</span></div></div>`;
+        + img
+        + `<div class="pp-lb-foot"><span class="pp-lb-cap">${esc(name)}</span>${nav}</div></div>`;
+    if (!whole) return box('obr-p', imgHtml(c, photo, name, 'pp-lb-img'), '');
+    return box('obr-p', imgHtml(c, photo, name, 'pp-lb-img'),
+        `<span class="pp-lb-navs"><a class="pp-lb-nav" href="#obr-p-full" data-pp-lb="whole">${esc(c.P.wholePhoto)}</a></span>`)
+        + box('obr-p-full', whole,
+            `<span class="pp-lb-navs"><a class="pp-lb-nav" href="#obr-p" data-pp-lb="portrait">${esc(c.P.portrait)}</a></span>`);
 }
 
 // ── In brief (§0.3) ──
@@ -2927,7 +2942,7 @@ function summaryHtml(c: Ctx): string {
     if (job) {
         cells.push([P.summary.years(job.years), job.label]);
     } else {
-        const points = residencePoints(computePersonLifeline(tree, person.id, { childEvents: false }));
+        const points = residencePoints(computePersonLifeline(tree, person.id, { childEvents: false }), person.birthPlace);
         const places = new Set(points.map(p => placeKey(p.place)).filter(Boolean));
         if (places.size >= 3) cells.push([P.summary.places(places.size), P.summary.lifelong]);
     }

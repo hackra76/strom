@@ -116,7 +116,7 @@ test.describe('Materials at the person', () => {
         await expect(section(page).locator('.materials-all')).toHaveText('All materials ›');
         expect(material.asks).toContain('person=P0003');
         // The tree's attachments are untouched.
-        expect(await page.evaluate((id) => window.Strom.DataManager.getPerson(id as never)!.attachments!.length, await janId(page))).toBe(2);
+        expect(await page.evaluate((id) => window.Strom.DataManager.personMedia(id as never).length, await janId(page))).toBe(2);
     });
 
     test('the first 6 rows, then "All materials of this person (8)" opens the window filtered', async ({ page }) => {
@@ -140,7 +140,7 @@ test.describe('Materials at the person', () => {
         await setup(page, { files: [materialFile(1, { persons: ['P0001'] })] });
         await editJanModal(page);
         await expect(rows(page)).toHaveCount(0);
-        await expect(section(page).locator('.materials-empty')).toContainText('Originals are kept in the research.');
+        await expect(section(page).locator('.materials-empty')).toContainText('The research does not keep portraits or couple photos; a backup to a file protects them.');
         await expect(section(page).locator('.materials-empty .materials-add')).toHaveText('Add material…');
         await expect(section(page).locator('.materials-all')).toHaveCount(0);
     });
@@ -205,7 +205,7 @@ test.describe('Materials at the person', () => {
         await expect(rows(page)).toHaveCount(1);
         await rows(page).first().locator('.material-more').click();
         const menu = page.locator('#materials-item-menu');
-        await expect(menu.locator('[data-action="assign"]')).toHaveAttribute('aria-disabled', 'true');
+        await expect(menu.locator('[data-action="attach"]')).toHaveAttribute('aria-disabled', 'true');
         await expect(menu.locator('[data-action="hide"]')).toHaveAttribute('aria-disabled', 'true');
         await expect(menu.locator('[data-action="open"]')).not.toHaveAttribute('aria-disabled', 'true');
     });
@@ -220,7 +220,7 @@ test.describe('Materials at the person', () => {
         await expect(section(page).locator('.materials-bar')).toContainText('Materials from the archive load once the research runs.');
     });
 
-    test('person menu "Materials N" opens the editor at the materials; the tooltip says "Materials N"', async ({ page }) => {
+    test('person menu "Materials N" opens the window filtered to the person; the tooltip says "Materials N"', async ({ page }) => {
         await setup(page, { files: [materialFile(1, { persons: ['P0003'] }), materialFile(2, { persons: ['P0003'] })] });
         await expect(card(page, 'Jan').locator('.card-tooltip .tt-story')).toHaveText('Materials 2');
         await card(page, 'Jan').click();
@@ -228,9 +228,9 @@ test.describe('Materials at the person', () => {
         await expect(row).toContainText('Materials');
         await expect(row).toContainText('2');
         await row.click();
-        await expect(page.locator('#person-modal')).toBeVisible();
-        await expect(section(page)).toBeVisible();
-        await expect(rows(page)).toHaveCount(2);
+        await expect(page.locator('#materials-modal')).toBeVisible();
+        await expect(page.locator('#materials-modal .mw-canvas .mw-tile')).toHaveCount(2);
+        await expect(page.locator('#person-modal')).not.toHaveClass(/active/);
     });
 
     test('Research menu "Materials N" and the block\'s batch line open the window', async ({ page }) => {
@@ -283,7 +283,7 @@ test.describe('Add material… (Strom archive)', () => {
         await expect(dialog.locator('h2')).toHaveText('Save material to the Strom archive');
         return dialog;
     };
-    const janAttachments = async (page: Page) => page.evaluate((id) => window.Strom.DataManager.getPerson(id as never)!.attachments?.length ?? 0, await janId(page));
+    const janAttachments = async (page: Page) => page.evaluate((id) => window.Strom.DataManager.personMedia(id as never).length, await janId(page));
 
     test('"Also save to the tree" checked: the image goes to the archive and the tree; the toast shows it', async ({ page }) => {
         const { bridge, material } = await setup(page, { archive: true });
@@ -469,23 +469,24 @@ test.describe('Materials follow the tree\'s attachments', () => {
         await expect(rows(page)).toHaveCount(3);
         await page.evaluate(() => (window.Strom.UI as unknown as { openMaterials(o: unknown): void }).openMaterials({}));
         const win = page.locator('#materials-modal');
-        const treeCount = win.locator('.mw-canvas .mw-group', { has: page.locator('.mw-group-name', { hasText: 'In the tree' }) })
+        // The tree's files stand among the single files (one item per file, no group of their own).
+        const treeCount = win.locator('.mw-canvas .mw-group', { has: page.locator('.mw-group-name', { hasText: 'Single files' }) })
             .locator('.mw-group-count');
-        await expect(treeCount).toHaveText('2');
+        await expect(treeCount).toHaveText('3');
         // From now on the research's list does not change (no answers): only the tree does.
         await page.route(url => url.href.startsWith(`${BRIDGE}/material`), () => { /* never answered */ });
         // Removed elsewhere: both follow.
         const id = await janId(page);
         await page.evaluate((id) => {
             const dm = window.Strom.DataManager;
-            const att = dm.getPerson(id as never)!.attachments!.find(a => a.name === 'b.png')!;
+            const att = dm.personMedia(id as never).find(a => a.name === 'b.png')!;
             dm.removeAttachment(id as never, att.id);
         }, id);
-        await expect(treeCount).toHaveText('1');
+        await expect(treeCount).toHaveText('2');
         await expect(rows(page)).toHaveCount(2);
         // Undo brings it back into both.
         await page.evaluate(() => (window.Strom.UI as unknown as { performUndo(): void }).performUndo());
-        await expect(treeCount).toHaveText('2');
+        await expect(treeCount).toHaveText('3');
         await expect(rows(page)).toHaveCount(3);
     });
 });

@@ -26,7 +26,7 @@ const REFUSALS = [
     { code: 'disk.full', feature: 'disk.full', status: 507, error: DISK, params: { where: '/Users/x/Strom' }, title: 'No room left on the disk' },
 ];
 
-const KEPT = 'The changes made here wait unsent; nothing is lost.';
+const KEPT = 'The changes made here wait unsent in this browser.';
 const dialog = (page: Page) => page.locator('#confirmation-modal');
 const pill = (page: Page) => page.locator('#research-sync-pill');
 const sealUrl = `strom-research://seal?tree=${UUID}`;
@@ -78,7 +78,8 @@ test.describe('a send the research holds back', () => {
             // Settled there: sent by hand, it goes.
             bridge.syncReply = { status: 200, body: { ok: true, input: 'I0042', changes: 6, inbox: true } };
             await page.evaluate(() => window.Strom.UI.researchSendNow());
-            await expect(page.locator('.toast')).toContainText('Sent to the research');
+            // The message (beside it "Opening the research…" of Take over may still run).
+            await expect(page.locator('.toast:not(.toast--progress)')).toContainText('Sent to the research');
             expect(bridge.posts).toHaveLength(2);
             await openResearchMenu(page);
             await expect(block(page)).not.toHaveAttribute('data-state', 'writeHeld');
@@ -158,8 +159,14 @@ test.describe('a send the research holds back', () => {
         bridge.syncReply = { status: 200, body: { ok: true, inbox: false, changes: 6, applied: 6, input: 'I0042' } };
         await poll(page);
         await expect(pill(page)).not.toContainText('Sealed on another computer');
-        await page.clock.fastForward(QUIET + 1000);
+        // What waited goes at that answer; the clock moves only once its reply is taken in (a jump past the
+        // send's two-minute limit while the reply was on its way aborted it, and it went a third time).
         await expect.poll(() => bridge.posts.length).toBe(2);
+        await expect.poll(() => page.evaluate(() => {
+            const U = window.Strom.UI;
+            const c = U.researchSyncLink();
+            return !!c && c.link.sent?.fingerprint === U.researchSyncFingerprints(c.treeId, c.link).current;
+        })).toBe(true);
         await page.clock.fastForward(QUIET * 3);
         await poll(page);
         expect(bridge.posts).toHaveLength(2);
@@ -239,7 +246,7 @@ test.describe('said ahead by /status', () => {
         await openResearchMenu(page);
         await expect(block(page)).toHaveAttribute('data-state', 'writeHeld');
         await expect(block(page)).toContainText('This tree was sealed on another computer: nothing can be written to it here until it is taken over on this computer.');
-        await expect(block(page)).toContainText('Changes made here wait unsent until then; nothing is lost.');
+        await expect(block(page)).toContainText('Changes made here wait unsent in this browser until then.');
         await block(page).getByRole('menuitem', { name: 'Take over on this computer, opens in the research' }).click();
         expect(await links(page)).toContain(sealUrl);
         // Taken over there: the next answer says so, the edits go by themselves.

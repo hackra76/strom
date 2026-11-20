@@ -3,7 +3,8 @@
  * Settings are NOT exported with tree data - they are local preferences
  */
 
-import { AppSettings, ThemeMode, SurnameDisplay, SURNAME_DISPLAYS, LanguageSetting, CardDensity, TreeSpacing, SETTINGS_KEY, StromData, personSourceIds, CARD_SIZE, CardPhotoSize, CardPhotoShape, NORMAL_PHOTO_BOX } from './types.js';
+import { personMediaCount } from './media.js';
+import { AppSettings, BranchMarker, BRANCH_MARKERS, ThemeMode, SurnameDisplay, SURNAME_DISPLAYS, LanguageSetting, CardDensity, TreeSpacing, SETTINGS_KEY, StromData, personSourceIds, CARD_SIZE, CardPhotoSize, CardPhotoShape, NORMAL_PHOTO_BOX } from './types.js';
 import { CardFieldSettings, normalizeCardFields, customCardSize, normalizeCardDensity, effectiveCardFields, normalizeCardPhoto } from './card-fields.js';
 import { initLanguage, Language } from './strings.js';
 import { MapKind, MAP_KINDS, isMapKind, readPlacesSort, type PlacesSort } from './places.js';
@@ -150,6 +151,12 @@ class SettingsManagerClass {
 
     private save(): void {
         if (this.readOnly) return;
+        // Lineage markers (spec 112, R1): the first write stores the migrated choice instead of the old flag.
+        if (this.settings.branchMarker === undefined || 'branchColors' in this.settings
+            || (this.settings.branchMarker as string) === 'off') {
+            this.settings.branchMarker = this.getBranchMarker();
+            delete this.settings.branchColors;
+        }
         localStorage.setItem(SETTINGS_KEY, JSON.stringify(this.settings));
     }
 
@@ -476,7 +483,7 @@ class SettingsManagerClass {
         if (this.settings.advancedFields !== undefined) return;
         const researchInUse = Object.keys(data.sources ?? {}).length > 0
             || Object.values(data.persons).some(p =>
-                personSourceIds(p).length > 0 || (p.attachments?.length ?? 0) > 0
+                personSourceIds(p).length > 0 || personMediaCount(data, p.id) > 0
                 || !!p.refn || !!p.question || (p.nameVariants?.length ?? 0) > 0);
         if (researchInUse) {
             this.settings.advancedFields = true;
@@ -523,13 +530,40 @@ class SettingsManagerClass {
         this.save();
     }
 
-    /** Branch colour coding default ON (undefined = enabled). */
-    isBranchColorsEnabled(): boolean {
-        return this.settings.branchColors !== false;
+    /**
+     * Shape of the lineage marker (spec 112, R1), default the arc. Settings
+     * from before it keep their choice: branch colours off → 'none' (no tint),
+     * on → 'arc'. The 'off' of 3.30.0-beta.6 reads as 'none'.
+     */
+    getBranchMarker(): BranchMarker {
+        const m = this.settings.branchMarker;
+        if (m && (BRANCH_MARKERS as readonly string[]).includes(m)) return m;
+        if ((m as string | undefined) === 'off') return 'none';
+        return this.settings.branchColors === false ? 'none' : 'arc';
     }
 
-    setBranchColors(enabled: boolean): void {
-        this.settings.branchColors = enabled;
+    setBranchMarker(marker: BranchMarker): void {
+        this.settings.branchMarker = marker;
+        delete this.settings.branchColors;
+        this.save();
+    }
+
+    /** Cards tinted in the lineage colour: its own switch, with any shape or alone (Milan 19 Nov 2026). */
+    isBranchTintOn(): boolean {
+        return this.settings.branchTint === true;
+    }
+
+    /**
+     * Any lineage marking on the cards: a shape, the tint, or both. The cards'
+     * line classes, the legend, the Timeline, the Table, the Fan, the Map and
+     * the image export follow it ('none' without the tint = no marking).
+     */
+    isBranchMarkingOn(): boolean {
+        return this.getBranchMarker() !== 'none' || this.isBranchTintOn();
+    }
+
+    setBranchTint(on: boolean): void {
+        this.settings.branchTint = on;
         this.save();
     }
 
@@ -613,13 +647,24 @@ class SettingsManagerClass {
         this.save();
     }
 
-    /** The export dialog's scope: the whole tree or only the current view. */
-    getExportScope(): 'tree' | 'view' {
-        return this.settings.exportScope === 'view' ? 'view' : 'tree';
+    /** The export dialog's scope: the whole tree, only the current view or a list of people (spec 084 §12). */
+    getExportScope(): 'tree' | 'view' | 'list' {
+        const s = this.settings.exportScope;
+        return s === 'view' || s === 'list' ? s : 'tree';
     }
 
-    setExportScope(scope: 'tree' | 'view'): void {
+    setExportScope(scope: 'tree' | 'view' | 'list'): void {
         this.settings.exportScope = scope;
+        this.save();
+    }
+
+    /** The list of the export dialog's list scope (an id of the tree's list; another tree's falls back). */
+    getExportListId(): string | null {
+        return typeof this.settings.exportListId === 'string' ? this.settings.exportListId : null;
+    }
+
+    setExportListId(id: string): void {
+        this.settings.exportListId = id;
         this.save();
     }
 
@@ -670,18 +715,19 @@ class SettingsManagerClass {
     /**
      * The card box for the current density (the layout spaces cards by it).
      * The Normal card with a medium or large photo (spec 096 §2) is wider,
-     * only in a view where someone drawn has a photo (`viewHasPhoto`, D3);
-     * its base height stays 64 (a large card's own height: personHeights).
+     * only in a view where someone drawn has an avatar, a photo or the
+     * initials (`viewHasAvatar`, D3, spec 103 K2.1); its base height stays 64
+     * (a large card's own height: personHeights).
      */
-    getCardSize(viewHasPhoto = false): { cardWidth: number; cardHeight: number } {
+    getCardSize(viewHasAvatar = false): { cardWidth: number; cardHeight: number } {
         const density = this.getCardDensity();
         const fields = this.getEffectiveCardFields(density);
         if (density === 'normal') {
-            const box = NORMAL_PHOTO_BOX[viewHasPhoto ? this.getCardPhoto().size : 'small'];
+            const box = NORMAL_PHOTO_BOX[viewHasAvatar ? this.getCardPhoto().size : 'small'];
             return { cardWidth: box.cardWidth, cardHeight: CARD_SIZE.normal.cardHeight };
         }
         if (!fields) return CARD_SIZE[density as 'compact' | 'normal'];
-        return customCardSize(fields.on.length, fields.years, viewHasPhoto ? this.getCardPhoto().size : 'small');
+        return customCardSize(fields.on.length, fields.years, viewHasAvatar ? this.getCardPhoto().size : 'small');
     }
 
     /** The stored card signals as they are (older builds' keys kept), brought to version 2 once (spec 066 P4 §8). */

@@ -9,6 +9,7 @@
  * step, nothing to send, no new version.
  */
 
+import { canvasBusy } from './canvas-busy.js';
 import { DataManager, auditPersonName } from '../data.js';
 import { AuditLogManager } from '../audit-log.js';
 import { TreeRenderer } from '../renderer.js';
@@ -100,13 +101,17 @@ export const viewLinksUiMethods = uiModule({
             saveViewLinks(treeId, change.links);
             if (!isViewLinksMaster(treeId)) setViewLinksMaster(treeId, true);
         };
-        if (opts.returnToTree) {
-            apply();
-            if (TreeRenderer.canGoBack()) await TreeRenderer.goBack();
-            if (!TreeRenderer.isVisible(choice.anchorId)) await TreeRenderer.setFocus(choice.anchorId);
-        } else {
-            await TreeRenderer.refreshViewLinks(apply);
-        }
+        // A195, 8a: the choice written at once; the tree laid out anew with the family under the canvas overlay.
+        if (opts.returnToTree) apply();
+        else TreeRenderer.applyViewLinks(apply);
+        await canvasBusy(async () => {
+            if (opts.returnToTree) {
+                if (TreeRenderer.canGoBack()) await TreeRenderer.goBack();
+                if (!TreeRenderer.isVisible(choice.anchorId)) await TreeRenderer.setFocus(choice.anchorId);
+            } else {
+                await TreeRenderer.renderAsync();
+            }
+        });
         ZoomPan.fitPersons([choice.anchorId, ...viewLinkIsland(data, choice, ctx)].filter(id => TreeRenderer.isVisible(id)));
         if (opts.focusLabel) {
             document.querySelector<HTMLElement>(`.view-link-label[data-view-hypo="${CSS.escape(choice.hypo)}"]`)?.focus({ preventScroll: true });
@@ -131,9 +136,10 @@ export const viewLinksUiMethods = uiModule({
      * person stands in the family it shows), a small confirmation names them
      * first and they go off with it. The notice offers to undo. `near`: where
      * the confirmation opens; `restoreFocus`: the keyboard goes back to the
-     * person's stub or "+ family" once drawn again. False: cancelled.
+     * person's stub or "+ family" once drawn again; `beforeLayout`: runs once confirmed, before the layout
+     * (the switch's working state painted first). False: cancelled.
      */
-    async viewLinkUnlink(hypo: string, opts: { near?: HTMLElement | null; restoreFocus?: boolean } = {}): Promise<boolean> {
+    async viewLinkUnlink(hypo: string, opts: { near?: HTMLElement | null; restoreFocus?: boolean; beforeLayout?: () => Promise<void> } = {}): Promise<boolean> {
         const treeId = DataManager.getCurrentTreeId();
         if (!treeId) return false;
         const data = DataManager.getData();
@@ -146,7 +152,10 @@ export const viewLinksUiMethods = uiModule({
         if (dependents.length > 0 && !(await this.confirmViewLinkChain(link, dependents, opts.near ?? null))) return false;
         const change = unlinkViewLink(data, before, hypo, ctx);
         this.hideResearchEdgeBubble();
-        await TreeRenderer.refreshViewLinks(() => saveViewLinks(treeId, change.links));
+        await opts.beforeLayout?.();
+        // A196, 8a: the layout without the family under the canvas overlay.
+        TreeRenderer.applyViewLinks(() => saveViewLinks(treeId, change.links));
+        await canvasBusy(() => TreeRenderer.renderAsync());
         if (opts.restoreFocus) {
             const card = `.person-card[data-id="${CSS.escape(link.anchorId)}"]`;
             (document.querySelector<HTMLElement>(`${card} .research-edge`)
@@ -166,7 +175,8 @@ export const viewLinksUiMethods = uiModule({
         const treeId = DataManager.getCurrentTreeId();
         if (!treeId) return;
         this.closeViewLinkPopups();
-        await TreeRenderer.refreshViewLinks(() => saveViewLinks(treeId, links));
+        TreeRenderer.applyViewLinks(() => saveViewLinks(treeId, links));
+        await canvasBusy(() => TreeRenderer.renderAsync());
     },
 
     /**

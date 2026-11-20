@@ -112,6 +112,39 @@ test.describe('History of places: the manager', () => {
         await expect(page.locator('#settings-modal')).toBeVisible();
     });
 
+    test('a first read without an answer in 15 s: the sentence with Try again instead of "Loading…" for ever (§10.3)', async ({ page }) => {
+        await page.clock.install({ time: new Date('2026-11-18T10:00:00Z') });
+        const history = fakeHistoryR1();
+        const ged = historyGed();
+        await fakeBridge(page, { features: HISTORY_R1_FEATURES, history, treeGed: ged, links: LINKS });
+        const isRead = (url: URL) => url.pathname.endsWith('/history');
+        // The research's bridge answers its status but not the read.
+        let asked = 0;
+        await page.route(isRead, () => { asked++; /* never answers */ });
+        await openResearch(page, { ged });
+        await poll(page);
+        // The status's own read on its way first (after the device copy is loaded): the manager's read on opening
+        // joins it. Opened before it, the status's read (with its rev) would follow the timed-out one and hang,
+        // and Try again below would only join that one ("Loading…" until it times out too).
+        await expect.poll(() => asked).toBe(1);
+        await page.evaluate(() => (window.Strom.UI as unknown as { openHistoryManage(o: object): void }).openHistoryManage({}));
+        await expect(modal(page)).toBeVisible();
+        await expect(stateText(page)).toHaveText('Loading history…');
+        await page.clock.runFor(16_000);
+        const msg = modal(page).locator('#history-manage-state .busy-msg.is-err[role="alert"]');
+        await expect(msg).toContainText('The research did not answer within 15 s.');
+        await page.unroute(isRead);
+        // Not reached at all: the research is not running.
+        await page.route(isRead, route => route.abort());
+        await msg.getByRole('button', { name: 'Try again' }).click();
+        await expect(msg).toContainText('The research is not running. Strom Research needs to be started.');
+        await page.unroute(isRead);
+        await msg.getByRole('button', { name: 'Try again' }).click();
+        await expect(msg).toHaveCount(0);
+        await expect(stateText(page)).not.toHaveText('Loading history…');
+        await expect(modal(page).locator('.hm-region').first()).toBeVisible();
+    });
+
     test('the header follows the research: next in the queue, all done, matching places, pace', async ({ page }) => {
         const history = fakeHistoryR1({ pace: 'rare' });
         const { bridge } = await setup(page, { history });
@@ -170,6 +203,39 @@ test.describe('History of places: the manager', () => {
         await sw('regions').getByRole('button', { name: 'Turn on in the research' }).click();
         await expect.poll(async () => (await links(page)).at(-1)).toMatch(/^strom-research:\/\/experiment\?tree=.+&name=regions&do=on$/);
         expect(history.offs).toEqual([{ regions: false }]);
+    });
+
+    test('6.1 (B197): Turn off is dashed with "Turning off…" until the research answers; refused, its sentence with Try again, no toast', async ({ page }) => {
+        const history = fakeHistoryR1({ split: { regions: true, places: true } });
+        await setup(page, { history, features: [...HISTORY_R1_FEATURES, 'experiments.split'] });
+        await openManager(page);
+        const sw = (key: string) => modal(page).locator(`.hm-switch[data-switch="${key}"]`);
+        let answer: () => void = () => {};
+        let gate = new Promise<void>(r => { answer = r; });
+        await page.route(/\/experiments(\?|$)/, async (route) => { await gate; await route.fallback(); });
+        // Refused first.
+        history.offReply = { status: 409, body: { error: 'refused', code: 'experiments.refused', text: 'a history read is running' } };
+        const off = sw('places').getByRole('button', { name: 'Turn off' });
+        await off.click();
+        await expect(off).toHaveAttribute('data-pend', '1');
+        await expect(off).toHaveAttribute('aria-disabled', 'true');
+        await expect(sw('places').locator('.busy-st')).toHaveText('Turning off…');
+        await off.click({ force: true });
+        answer();
+        const msg = sw('places').locator('.pend-msg');
+        await expect(msg).toContainText('Unchanged: a history read is running');
+        await expect(msg).toHaveAttribute('role', 'alert');
+        await expect(off).not.toHaveAttribute('data-pend', '1');
+        await expect(sw('places').locator('.busy-st')).toHaveCount(0);
+        await expect(page.locator('.toast', { hasText: 'history read' })).toHaveCount(0);
+        expect(history.offs).toEqual([{ places: false }]);
+        // Try again: it goes through now.
+        delete history.offReply;
+        gate = Promise.resolve();
+        await msg.getByRole('button', { name: 'Try again' }).click();
+        await expect.poll(() => history.offs.length).toBe(2);
+        await expect(sw('places').locator('.pend-msg')).toHaveCount(0);
+        await expect(modal(page).locator('.hm-switch-text')).toHaveText(['Regional history: on', 'Local history: off']);
     });
 
     test('split: a region first refused with 409 history.off leads to the link of that switch', async ({ page }) => {
@@ -331,6 +397,39 @@ test.describe('History of places: the manager', () => {
         await expect(tab(page, 'deleted').locator('.hm-tab-count')).toHaveText('1');
     });
 
+    test('a row\'s write on its way: Restore and the row\'s ⋯ say it (spinner, locked, focus kept), a second click sends nothing', async ({ page }) => {
+        const { history } = await setup(page);
+        let release!: () => void;
+        let held = new Promise<void>(r => { release = r; });
+        await page.route(url => /\/history\/(delete|first)$/.test(url.pathname), async route => {
+            if (route.request().method() === 'POST') await held;
+            await route.fallback();
+        });
+        await openManager(page, { tab: 'deleted' });
+        const restore = modal(page).locator('.hm-deleted').nth(0).locator('[data-hm="restoreDeleted"]');
+        await restore.click();
+        await expect(restore).toHaveAttribute('data-busy', 'busy');
+        await expect(restore).toHaveAttribute('aria-disabled', 'true');
+        await expect(restore.locator('.busy-slot .busy-spin')).toHaveCount(1);
+        await restore.click({ force: true });
+        release();
+        await expect(toast(page, 'The event is restored.')).toBeVisible();
+        expect(history.writes.delete).toEqual([{ event: 'E9', do: 'restore' }]);
+
+        held = new Promise<void>(r => { release = r; });
+        await tab(page, 'regions').click();
+        expect(await rowMenu(page, 'at-lower-austria')).toEqual(['first', 'hideAll', 'skip']);
+        await page.locator('.hm-menu [data-scope="first"]').click();
+        const dots = region(page, 'at-lower-austria').locator('.hm-dots');
+        await expect(dots).toHaveAttribute('data-busy', 'busy');
+        await expect(dots).toHaveAttribute('aria-busy', 'true');
+        await dots.click({ force: true });
+        await expect(page.locator('.hm-menu')).toHaveCount(0);
+        release();
+        await expect(dots).not.toHaveAttribute('data-busy', 'busy');
+        expect(history.writes.first).toEqual([{ region: 'at-lower-austria' }]);
+    });
+
     test('Find first: the research\'s queue, the sentence under the row with the pace', async ({ page }) => {
         const { history } = await setup(page, { history: fakeHistoryR1({ pace: 'rare' }) });
         await openManager(page);
@@ -392,9 +491,21 @@ test.describe('History of places: the manager', () => {
         await expect(toast(page, 'Moravia is not searched for this tree.')).toBeVisible();
         expect(history.writes.skip).toEqual([{ region: 'cz-moravia' }]);
         await expect(modal(page).locator('.hm-group[data-group="skip"] .hm-r-title')).toHaveText(['Austrian Empire', 'Moravia', 'Prussia']);
-        await toast(page, 'Moravia is not searched for this tree.').getByRole('button', { name: 'Undo' }).click();
+        // Undo works in the toast (§4): "Undoing…" until the research answers, then its end there.
+        let release!: () => void;
+        const held = new Promise<void>(r => { release = r; });
+        const skipping = (u: URL) => /\/history\/skip$/.test(u.pathname);
+        await page.route(skipping, async route => { await held; await route.fallback(); });
+        const skipped = toast(page, 'Moravia is not searched for this tree.');
+        await skipped.getByRole('button', { name: 'Undo' }).click();
+        const working = page.locator('.toast[aria-busy="true"]');
+        await expect(working).toContainText('Undoing…');
+        await expect(working).toContainText('Moravia');
+        release();
         await expect.poll(() => history.writes.skip.length).toBe(2);
         expect(history.writes.skip[1]).toEqual({ region: 'cz-moravia', do: 'undo' });
+        await expect(toast(page, 'Moravia is searched again for this tree.')).toBeVisible();
+        await page.unroute(skipping);
         await expect(region(page, 'cz-moravia').locator('.hm-r-state-line > span:last-child')).toHaveText('First');
 
         // A place: from its "⋯".
@@ -418,6 +529,32 @@ test.describe('History of places: the manager', () => {
         await region(page, 'de-prussia').locator('[data-hm="searchAgain"]').click();
         await expect(toast(page, 'Prussia is searched again for this tree.')).toBeVisible();
         await expect(modal(page).locator('.hm-row-note[data-note="de-prussia"]')).toHaveCount(0);
+    });
+
+    test('Search again on its way (§5, 5b): the link keeps its text and focus, its 12 px spinner after the text in its slot, the line does not move', async ({ page }) => {
+        await setup(page);
+        await openManager(page);
+        const link = region(page, 'de-prussia').locator('[data-hm="searchAgain"]');
+        const slot = link.locator('.busy-slot');
+        await expect(slot).toHaveCount(1);
+        const before = await link.boundingBox();
+        let letGo!: () => void;
+        const gate = new Promise<void>(r => { letGo = r; });
+        const write = (u: URL) => u.pathname.endsWith('/history/skip');
+        await page.route(write, async route => { await gate; await route.fallback(); });
+        await link.focus();
+        await page.keyboard.press('Enter');
+        await expect(link).toHaveAttribute('aria-busy', 'true');
+        await expect(link).toHaveAttribute('aria-disabled', 'true');
+        await expect(link).not.toHaveAttribute('disabled');
+        await expect(link).toBeFocused();
+        await expect(link).toHaveText('Search again');
+        await expect(slot.locator('.busy-spin.s12')).toBeVisible();
+        const during = await link.boundingBox();
+        expect(Math.round(during!.width)).toBe(Math.round(before!.width));
+        letGo();
+        await expect(toast(page, 'Prussia is searched again for this tree.')).toBeVisible();
+        await page.unroute(write);
     });
 
     test('a region\'s detail opens on its row: title focused, state with the gaps, the events by centuries; back to the row', async ({ page }) => {

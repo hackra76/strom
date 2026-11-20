@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { defaultFollowMode, effectiveFollowMode, followChoiceToStore, followModesFor, parseFollowChoice, viewRecenters } from '../follow-mode.js';
+import { defaultFollowMode, effectiveFollowMode, followChoiceToStore, followModesFor, getSendMode, defaultSendMode, getSendModeChoice, parseFollowChoice, parseSendMode, sendModeAvailable, sendModeKey, setSendMode, viewRecenters } from '../follow-mode.js';
 
 describe('follow mode', () => {
     it('switch in Family, Descendants and the Fan; mark in the Timeline, the Map, the Table and the overview', () => {
@@ -34,5 +34,45 @@ describe('follow mode', () => {
         expect(followChoiceToStore('mark', 'family')).toBe('mark');
         expect(followChoiceToStore('mark', 'map')).toBe('');
         expect(followChoiceToStore('off', 'map')).toBe('off');
+    });
+});
+
+describe('send mode (spec 110 §1)', () => {
+    const store = () => {
+        const m = new Map<string, string>();
+        return { m, s: { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => { m.set(k, v); } } };
+    };
+
+    it('offered in the Table, the Timeline and the Map; not in the charts', () => {
+        expect(['table', 'timeline', 'map'].map(sendModeAvailable)).toEqual([true, true, true]);
+        expect(['family', 'descendants', 'fan', 'overview'].map(sendModeAvailable)).toEqual([false, false, false, false]);
+    });
+
+    it('until one is chosen the view decides: a Table focuses, the Timeline and the Map mark; a choice is kept per window; a view without it marks only', () => {
+        const { m, s } = store();
+        expect(defaultSendMode('table')).toBe('focus');
+        expect(['timeline', 'map', 'family'].map(defaultSendMode)).toEqual(['mark', 'mark', 'mark']);
+        expect(getSendModeChoice('w1', 'table', s)).toBe('focus');
+        expect(getSendModeChoice('w1', 'timeline', s)).toBe('mark');
+        expect(getSendMode('w1', 'table', s)).toBe('focus');
+        expect(getSendMode('w1', 'map', s)).toBe('mark');
+        expect(getSendMode('w1', 'fan', s)).toBe('mark');
+        setSendMode('w1', 'focus', s);
+        expect(m.get(sendModeKey('w1'))).toBe('focus');
+        expect(getSendModeChoice('w1', 'timeline', s)).toBe('focus');
+        expect(getSendModeChoice('w2', 'timeline', s)).toBe('mark');
+        expect(getSendMode('w1', 'fan', s)).toBe('mark');
+        // Mark chosen in a Table is kept as chosen, not as the view's default.
+        setSendMode('w1', 'mark', s);
+        expect(m.get(sendModeKey('w1'))).toBe('mark');
+        expect(getSendModeChoice('w1', 'table', s)).toBe('mark');
+        expect(getSendMode('w1', 'table', s)).toBe('mark');
+        expect(parseSendMode('anything', 'table')).toBe('focus');
+        expect(parseSendMode('anything', 'map')).toBe('mark');
+        expect(parseSendMode('')).toBe('mark');
+        // No storage (a private window that throws): the view's default.
+        const broken = { getItem: () => { throw new Error('no'); }, setItem: () => {} };
+        expect(getSendModeChoice('w1', 'table', broken)).toBe('focus');
+        expect(getSendModeChoice('w1', 'timeline', broken)).toBe('mark');
     });
 });

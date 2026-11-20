@@ -14,10 +14,12 @@ import { strings } from '../../strings.js';
 import { columnLabel, type ColumnDef } from './table-columns.js';
 import { ROW_KEY, type RowType, type TableModel } from './table-model.js';
 import {
-    activeFilterCount, availableChips, CHECK_CHIPS, chipItem, chipLabel, columnItemLabel, columnValues, filterKindOf, isEqualityItem,
-    generationSpan, newWindowOf, rodChoices, shownColumnItems, type ChipFilter, type ChipId, type ColumnFilter, type TableFilter,
+    activeFilterCount, availableChips, CHECK_CHIPS, chipItem, chipLabel, columnItemLabel, columnValues, equalChoices, equalsOf,
+    filterKindOf, isEqualityItem, generationSpan, newWindowOf, rodChoices, shownColumnItems,
+    type ChipFilter, type ChipId, type ColumnFilter, type EqualValue, type TableFilter,
 } from './table-filter.js';
 import { closeHeadMenu, openHeadMenu, type HeadMenuEntry, type MenuEntry } from './table-headmenu.js';
+import { pinSvg } from './table-pins.js';
 import {
     type ResearchChipId, type ResearchChipOffer, type ResearchNewWindow,
 } from './table-research.js';
@@ -47,6 +49,10 @@ export interface FilterBarState {
     phone: boolean;
     /** The research's chips (§16.5); absent without research. */
     research?: ResearchBarState;
+    /** Rows pinned under the table's head (spec 103 §3): the row's first chip says how many (none on a phone). */
+    pinned?: number;
+    /** The rows' grouping (spec 084 §10): the chip "Grouped: <value> ×" before the pinned rows' (none on a phone). */
+    grouped?: string | null;
 }
 
 /** The research's part of the chips' row (§16.5, 16a0, 16n–16p, 16z, 16zk). */
@@ -79,12 +85,33 @@ export interface FilterBarHandlers {
     onChoiceChip(chip: ChipId, anchor: HTMLElement): void;
     /** "New from research" in a window, or off (16zk). */
     onResearchNew(window: ResearchNewWindow | null): void;
-    /** A column filter's chip: its form. */
-    onEditColumn(col: string, anchor: HTMLElement): void;
-    onRemoveColumn(col: string): void;
+    /** A column filter's chip: its form (`at`: the item's place in the filter's items). */
+    onEditColumn(col: string, at: number, anchor: HTMLElement): void;
+    /** A column filter's ×: that one item (spec 103 K1.2). */
+    onRemoveColumn(at: number): void;
     onClear(): void;
+    /** The pinned rows' chip's × (spec 103 3a): all unpinned. */
+    onUnpinAll?(): void;
+    /** The grouping chip's × (spec 084 §10): no grouping. */
+    onUngroup?(): void;
     /** The phone's Filters button. */
     onSheet(): void;
+}
+
+/** The grouping's chip (spec 084 §10): "Grouped: <value>", × ends the grouping; an outline like the pinned rows'. */
+function groupChipHtml(label: string): string {
+    const t = strings.table;
+    return `<span class="tv-pinchip tv-grpchip" data-grpchip><span class="tv-pinchip-text">${esc(t.grouped(label))}</span>`
+        + `<button type="button" class="tv-pinchip-x tv-grpchip-x" aria-label="${esc(t.groupNone)}" title="${esc(t.groupNone)}">×</button></span>`;
+}
+
+/** The pinned rows' chip (spec 103 3a): the pin, "Pinned rows (n)", × unpins all; a separator after it. */
+function pinChipHtml(n: number): string {
+    const t = strings.table.pinRow;
+    return `<span class="tv-pinchip" data-pinchip><span class="tv-pinchip-icon" aria-hidden="true">${pinSvg(13)}</span>`
+        + `<span class="tv-pinchip-text">${esc(t.chip(n))}</span>`
+        + `<button type="button" class="tv-pinchip-x" aria-label="${esc(t.unpinAll)}" title="${esc(t.unpinAll)}">×</button></span>`
+        + '<span class="tv-bar-sep tv-pinsep" aria-hidden="true"></span>';
 }
 
 /** The participant filter's chip (§14.1: "Godparent: {name} ×"), when it is on. */
@@ -176,9 +203,13 @@ export class FilterBar {
 
         const chips = availableChips(model, type);
         const cols = shownColumnItems(type, filter);
-        this.row.hidden = state.phone || (!chips.length && !cols.length);
+        const pinned = state.phone ? 0 : state.pinned ?? 0;
+        const grouped = state.phone ? null : state.grouped ?? null;
+        this.row.hidden = state.phone || (!chips.length && !cols.length && !pinned && !grouped);
         if (this.row.hidden) { this.row.innerHTML = ''; return; }
-        let html = '';
+        // The pinned rows (spec 103 3a): first, fixed (it never gives way to "More filters"), not a filter;
+        // the grouping's chip (spec 084 §10) before it.
+        let html = (grouped ? groupChipHtml(grouped) : '') + (pinned ? pinChipHtml(pinned) : grouped ? '<span class="tv-bar-sep tv-pinsep" aria-hidden="true"></span>' : '');
         for (const chip of chips) {
             const item = chipItem(filter, chip);
             const waits = state.checking && CHECK_CHIPS.includes(chip);
@@ -189,11 +220,13 @@ export class FilterBar {
                 + `>${item ? '✓ ' : ''}${esc(chipLabel(model, item, chip))}${choice ? ' ▾' : ''}</button>`;
         }
         html += participantChipHtml(model, type, filter);
+        // Every column filter is a chip of its own, each exclusion too (spec 103 K1.2); `data-at` is its place in the items.
         for (const c of cols) {
-            const label = columnItemLabel(type, c);
+            const label = columnItemLabel(type, c, model);
+            const at = filter.items.indexOf(c);
             html += `<span class="tv-chip sel-opt tv-chip--col is-active" data-colchip="${esc(c.col)}">`
-                + `<button type="button" class="tv-chip-edit" data-col="${esc(c.col)}" aria-haspopup="dialog" aria-label="${esc(strings.table.filterOf(label))}">${esc(label)}</button>`
-                + `<button type="button" class="tv-chip-x" data-x="${esc(c.col)}" aria-label="${esc(strings.table.removeFilter(label))}">×</button></span>`;
+                + `<button type="button" class="tv-chip-edit" data-col="${esc(c.col)}" data-at="${at}" aria-haspopup="dialog" aria-label="${esc(strings.table.filterOf(label))}" title="${esc(label)}">${esc(label)}</button>`
+                + `<button type="button" class="tv-chip-x" data-x="${at}" aria-label="${esc(strings.table.removeFilter(label))}">×</button></span>`;
         }
         html += '<button type="button" class="tv-chip sel-opt tv-chip-more" aria-haspopup="menu" hidden></button>';
         html += this.researchHtml(state);
@@ -249,6 +282,7 @@ export class FilterBar {
         const blockParts = [...this.row.querySelectorAll<HTMLElement>('[data-rblock], .tv-rchip, [data-rmore]')];
         const rchips = [...this.row.querySelectorAll<HTMLElement>('.tv-rchip')];
         for (const c of quick) { c.hidden = false; c.style.order = ''; }
+        this.row.classList.remove('is-tight');
         more.hidden = true;
         this.hidden = [];
         this.rHidden = [];
@@ -298,6 +332,8 @@ export class FilterBar {
         }
         hideQuick(0);
         if (!this.hidden.length) more.hidden = true;
+        // Many column filters (spec 103 K1.2): their chips shorten (their words end in "…") so Clear filters stays in the row.
+        if (over()) this.row.classList.add('is-tight');
     }
 
     private onRowClick(e: MouseEvent): void {
@@ -305,12 +341,14 @@ export class FilterBar {
         if (!st) return;
         const t = e.target as Element;
         if (t.closest('.tv-chips-clear')) { this.handlers.onClear(); return; }
+        if (t.closest('.tv-grpchip-x')) { this.handlers.onUngroup?.(); return; }
+        if (t.closest('.tv-pinchip-x')) { this.handlers.onUnpinAll?.(); return; }
         const xc = t.closest<HTMLElement>('[data-xchip]');
         if (xc) { this.handlers.onChip(xc.dataset.xchip as ChipId, false); return; }
         const x = t.closest<HTMLElement>('[data-x]');
-        if (x) { this.handlers.onRemoveColumn(x.dataset.x!); return; }
+        if (x) { this.handlers.onRemoveColumn(Number(x.dataset.x)); return; }
         const edit = t.closest<HTMLElement>('.tv-chip-edit[data-col]');
-        if (edit) { this.handlers.onEditColumn(edit.dataset.col!, edit); return; }
+        if (edit) { this.handlers.onEditColumn(edit.dataset.col!, Number(edit.dataset.at ?? -1), edit); return; }
         const more = t.closest<HTMLElement>('.tv-chip-more');
         if (more) { this.openMore(more); return; }
         const rtoggle = t.closest<HTMLElement>('[data-rtoggle]');
@@ -466,6 +504,14 @@ export function columnFilterForm(model: TableModel, type: RowType, col: ColumnDe
     } else if (eq) {
         html += `<div class="tv-ff-line"><select class="tv-ff-match" aria-label="${esc(columnLabel(col))}">${eqOptions}</select>${textInput}</div>`;
     }
+    // "= A or B" (spec 103 K1.5): while "is", the column's values to tick in place of the text, the item's own ticked and first.
+    const choices = eq && kind !== 'values' ? equalChoices(model, type, col, item!) : [];
+    if (choices.length) {
+        html += `<div class="tv-ff-values tv-ff-eqvalues" role="group" aria-label="${esc(columnLabel(col))}">`
+            + choices.map((c, i) => `<label class="tv-ff-check"><input type="checkbox" class="tv-ff-eqvalue" data-i="${i}"${c.on ? ' checked' : ''}>`
+                + `<span title="${esc(c.label)}">${esc(c.label)}</span></label>`).join('')
+            + '</div>';
+    }
     if (kind === 'range') {
         const lead = col.kind === 'date' ? `<span class="tv-ff-lead">${esc(t.rangeYears)}</span>` : '';
         html += `<div class="tv-ff-line">${lead}`
@@ -479,15 +525,33 @@ export function columnFilterForm(model: TableModel, type: RowType, col: ColumnDe
                 + `${item?.values?.includes(v.value) ? ' checked' : ''}><span>${esc(v.label)}</span></label>`).join('')
             + '</div>';
     }
-    html += '<div class="tv-ff-sep" role="separator"></div>'
-        + `<label class="tv-ff-check"><input type="checkbox" class="tv-ff-empty" name="${uid}"${item?.empty ? ' checked' : ''}><span>${esc(t.onlyEmpty)}</span></label>`
-        + `<label class="tv-ff-check"><input type="checkbox" class="tv-ff-filled" name="${uid}"${item?.filled ? ' checked' : ''}><span>${esc(t.onlyFilled)}</span></label>`;
+    // A picture's column (spec 107 §8): "with photo" / "without photo" alone.
+    const presence = kind === 'presence';
+    html += (presence ? '' : '<div class="tv-ff-sep" role="separator"></div>')
+        + `<label class="tv-ff-check"><input type="checkbox" class="tv-ff-empty" name="${uid}"${item?.empty ? ' checked' : ''}><span>${esc(presence ? t.withoutPhoto : t.onlyEmpty)}</span></label>`
+        + `<label class="tv-ff-check"><input type="checkbox" class="tv-ff-filled" name="${uid}"${item?.filled ? ' checked' : ''}><span>${esc(presence ? t.withPhoto : t.onlyFilled)}</span></label>`;
     el.innerHTML = html;
     const empty = el.querySelector<HTMLInputElement>('.tv-ff-empty')!;
     const filled = el.querySelector<HTMLInputElement>('.tv-ff-filled')!;
     // Only empty and only filled exclude each other.
     empty.addEventListener('change', () => { if (empty.checked) filled.checked = false; });
     filled.addEventListener('change', () => { if (filled.checked) empty.checked = false; });
+    const list = el.querySelector<HTMLElement>('.tv-ff-eqvalues');
+    const boxes = [...el.querySelectorAll<HTMLInputElement>('.tv-ff-eqvalue')];
+    const ticked = (): EqualValue[] => choices.filter((_c, i) => boxes[i].checked).map(c => c.value);
+    if (list) {
+        const select = el.querySelector<HTMLSelectElement>('.tv-ff-match')!;
+        const textEl = el.querySelector<HTMLInputElement>('.tv-ff-text')!;
+        // "is" ticks the values; another match writes its text, the first value ticked to start with.
+        const sync = (): void => {
+            const on = select.value === 'equals';
+            if (!on && !list.hidden) textEl.value = ticked()[0]?.text ?? textEl.value;
+            list.hidden = !on;
+            textEl.hidden = on;
+        };
+        select.addEventListener('change', sync);
+        sync();
+    }
     return {
         el,
         read(): ColumnFilter {
@@ -497,11 +561,20 @@ export function columnFilterForm(model: TableModel, type: RowType, col: ColumnDe
                 const text = textEl.value.trim();
                 const m = el.querySelector<HTMLSelectElement>('.tv-ff-match')!.value;
                 const match: NonNullable<ColumnFilter['match']> = m === 'starts' || m === 'equals' || m === 'notEquals' ? m : 'contains';
-                if (text) {
+                if (list && match === 'equals') {
+                    // The values ticked (spec 103 K1.5); none, no "is" (with nothing else the chip goes).
+                    const values = ticked();
+                    Object.assign(out, equalsOf(col, values));
+                } else if (text) {
                     out.text = text;
                     out.match = match;
-                    // The person compared stays while the value is the one the cell gave.
-                    if (item?.personId && (match === 'equals' || match === 'notEquals') && text === item.text?.trim()) out.personId = item.personId;
+                    // The person compared stays while the value is one the list ticked or the cell gave; so do the further values of an "equals".
+                    const listed = ticked().find(v => v.personId && v.text.trim() === text);
+                    if (match === 'equals' || match === 'notEquals') {
+                        if (listed) out.personId = listed.personId;
+                        else if (item?.personId && text === item.text?.trim()) out.personId = item.personId;
+                    }
+                    if (item?.or?.length && match === 'equals' && item.match === 'equals' && text === item.text?.trim()) out.or = item.or;
                 }
             }
             if (kind === 'range') {
@@ -512,6 +585,7 @@ export function columnFilterForm(model: TableModel, type: RowType, col: ColumnDe
             } else if (kind === 'values') {
                 const values = [...el.querySelectorAll<HTMLInputElement>('.tv-ff-value:checked')].map(i => i.value);
                 if (values.length) out.values = values;
+                if (values.length && item?.picked) out.picked = true;
             }
             if (empty.checked) out.empty = true;
             if (filled.checked) out.filled = true;
@@ -661,7 +735,8 @@ export interface FilterSheetHandlers {
     onChoice(chip: ChipId, choice: Omit<ChipFilter, 'chip'> | null): void;
     /** "New from research" in a window, or off (16z). */
     onResearchNew(window: ResearchNewWindow | null): void;
-    onRemoveColumn(col: string): void;
+    /** A column filter's ×: that one item (`at`: its place in the filter's items). */
+    onRemoveColumn(at: number): void;
     onClear(): void;
     onClose(): void;
 }
@@ -736,7 +811,7 @@ export class FilterSheet {
             const xc = t.closest<HTMLElement>('[data-xchip]');
             if (xc) { this.handlers.onChip(xc.dataset.xchip as ChipId, false); return; }
             const x = t.closest<HTMLElement>('[data-x]');
-            if (x) this.handlers.onRemoveColumn(x.dataset.x!);
+            if (x) this.handlers.onRemoveColumn(Number(x.dataset.x));
         });
     }
 
@@ -798,9 +873,9 @@ export class FilterSheet {
         if (cols.length) {
             html += `<div class="tv-fs-section">${esc(t.inColumns)}</div>`;
             for (const c of cols) {
-                const label = columnItemLabel(st.type, c);
+                const label = columnItemLabel(st.type, c, st.model);
                 html += `<div class="tv-fs-row"><span class="tv-fs-label">${esc(label)}</span>`
-                    + `<button type="button" class="tv-fs-x" data-x="${esc(c.col)}" aria-label="${esc(t.removeFilter(label))}">×</button></div>`;
+                    + `<button type="button" class="tv-fs-x" data-x="${st.filter.items.indexOf(c)}" aria-label="${esc(t.removeFilter(label))}">×</button></div>`;
             }
         }
         html += this.researchHtml(st);

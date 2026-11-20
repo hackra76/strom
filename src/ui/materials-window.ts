@@ -17,32 +17,45 @@
  * See src/ui/module.ts for the composition pattern.
  */
 
+import { MENU_LOAD_LIMIT_MS, startMenuLoad, type MenuLoad } from './menu-load.js';
+import { allMedia, treeMedia, mediaPersonIds } from '../media.js';
+import { materialPersonLabel, mediaUsesIndex } from '../media-uses.js';
+import type { PersonId } from '../types.js';
 import { researchActionLabel } from './research-open-mark.js';
 import type { UIClass } from './index.js';
 import { DataManager } from '../data.js';
+import { SettingsManager } from '../settings.js';
 import { strings, getCurrentLanguage, joinAnd } from '../strings.js';
-import { researchPersonRef, researchSchemeUrl, researchLinkMark } from '../research-link.js';
+import { researchPersonRef, researchSchemeUrl, researchLinkMark, researchSourceRef } from '../research-link.js';
 import { announcedResearchScheme } from '../research-device.js';
 import { PersonPicker } from '../person-picker.js';
-import { MQ_MOBILE, MQ_PHONE_LANDSCAPE } from '../breakpoints.js';
+import { MQ_MOBILE, MQ_PHONE_LANDSCAPE, MQ_TABLET } from '../breakpoints.js';
 import {
-    MaterialItem, MaterialList, MaterialBatch, MaterialError, MaterialActionId,
+    MaterialItem, MaterialList, MaterialBatch, MaterialError, MaterialActionId, MaterialCaps,
     cachedMaterials, primeMaterials, fetchMaterial, saveMaterialList, materialKindLabel, materialErrorText,
-    materialType,
+    materialType, materialDateForInput, MATERIAL_SORT_FEATURE, DELETE_MAX_FILES,
 } from '../materials.js';
 import {
     OverviewFilters, OverviewGroupMode, OverviewView, OverviewGroup, OverviewFolder, OverviewLayout, OverviewRow,
-    RowMetrics, KindFilter, KIND_FILTERS, TreeAttachments,
+    RowMetrics, KindFilter, KIND_FILTERS, TreeRecord,
     emptyFilters, activeFilterCount, narrowing, overviewItems, overviewSummary, overviewGroups, overviewRows,
     rowsInView, stickyGroupAt, gridColumns, rangeKeys, personsShort, nameWithoutYears, parseViewPrefs,
-    itemWithoutPerson, OverviewSummary, inMaterialFolder, firstFolderLine,
+    itemWithoutPerson, OverviewSummary, inMaterialFolder, firstFolderLine, ViewPrefs,
+    ListSort, ListColumn, SortChoice, sortOverviewGroups, chooseSort, storedFilters, itemInTree, sourceOfPersons,
+    WindowHeadAction, windowHeadMenu, dragCarriesFiles,
 } from '../materials-overview.js';
 import { materialThumbs, ThumbSnapshot } from '../material-thumbs.js';
-import { formatBytesShort } from './originals-ui.js';
 import {
     MaterialsOpenOptions, MaterialActionCtx, fileNameBreakParts, materialShortDate, materialStaleTime, materialTileLetters, materialItemSha, treeAttachmentsKey,
 } from './materials-ui.js';
 import { uiModule } from './module.js';
+import type { SortStripView } from './material-sort-ui.js';
+import type { SortStripState } from '../material-sort.js';
+import { isPhoneBar } from '../breakpoints.js';
+import { researchBridgeActionLabel } from './research-open-mark.js';
+import { barHtml } from './prog-bar.js';
+import { deletableFiles } from '../material-delete.js';
+import { closeHeadMenu, openHeadMenu, SEP, type MenuEntry } from './table-view/table-headmenu.js';
 
 const MODAL_ID = 'materials-modal';
 const VIEW_KEY = 'strom.materials.view';
@@ -52,6 +65,21 @@ const LONG_PRESS_MS = 500;
 /** Rows drawn above and below the view (px). */
 const OVERSCAN = 480;
 
+
+/**
+ * A sort strip drawn anew (its progress, the proposal ready) keeps the focus
+ * on its action: the same one, or the strip's first when that one is gone.
+ */
+const stripHtml = new WeakMap<HTMLElement, string>();
+function setStripHtml(el: HTMLElement, html: string): void {
+    if ((stripHtml.get(el) ?? el.innerHTML) === html) return;
+    stripHtml.set(el, html);
+    const had = el.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset.sort ?? '' : null;
+    el.innerHTML = html;
+    if (had === null) return;
+    const next = (had ? el.querySelector<HTMLElement>(`[data-sort="${CSS.escape(had)}"]`) : null) ?? el.querySelector<HTMLElement>('[data-sort]');
+    next?.focus();
+}
 function esc(text: string): string {
     return text
         .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -85,7 +113,7 @@ function innerWidth(el: HTMLElement): number {
     return Math.max(0, el.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0));
 }
 
-function readPrefs(): { group: OverviewGroupMode; view: OverviewView } {
+function readPrefs(): ViewPrefs {
     try {
         return parseViewPrefs(localStorage.getItem(VIEW_KEY));
     } catch {
@@ -93,14 +121,32 @@ function readPrefs(): { group: OverviewGroupMode; view: OverviewView } {
     }
 }
 
+/** Remember the grouping (of its model: with an archive or the tree's own files) and the view. */
 function writePrefs(group: OverviewGroupMode, view: OverviewView): void {
-    try { localStorage.setItem(VIEW_KEY, JSON.stringify({ group, view })); } catch { /* blocked: this window only */ }
+    const prefs = readPrefs();
+    if (group === 'batch' || group === 'date') prefs.group = group;
+    else prefs.appGroup = group;
+    prefs.view = view;
+    try { localStorage.setItem(VIEW_KEY, JSON.stringify(prefs)); } catch { /* blocked: this window only */ }
 }
 
-type PopKind = 'person' | 'kind' | 'batch' | 'sheet' | 'batchMenu' | 'folderMenu';
+/** Remember the list's sort and the last filters (spec 102 §8). */
+function writeListPrefs(sort: ListSort | null, filters: OverviewFilters): void {
+    const prefs = readPrefs();
+    try { localStorage.setItem(VIEW_KEY, JSON.stringify({ ...prefs, sort, filters: storedFilters(filters) })); } catch { /* blocked: this window only */ }
+}
+
+/** The window's model: the research's archive with the tree's files, or the tree's own files alone. */
+type WindowModel = 'archive' | 'app';
+
+type PopKind = 'person' | 'kind' | 'batch' | 'sheet' | 'batchMenu' | 'folderMenu' | 'selMenu' | 'headMenu' | 'where';
+
+/** A batch's reading: done, stopped (its menu closed, the window gone) or refused with the research's error. */
+type BatchLoad = { ok: true } | { ok: false; stopped: true } | { ok: false; error: MaterialError; stopped?: undefined };
 
 interface Win {
     gen: number;
+    model: WindowModel;
     treeId: string;
     overlay: HTMLElement;
     scroller: HTMLElement;
@@ -109,6 +155,8 @@ interface Win {
     filters: OverviewFilters;
     group: OverviewGroupMode;
     view: OverviewView;
+    /** The list's column sort (spec 102 §8f). */
+    sort: ListSort | null;
     /** Groups and folders opened or closed by hand (others follow the defaults). */
     open: Map<string, boolean>;
     /** The batch the window was opened for (open by default). */
@@ -120,7 +168,8 @@ interface Win {
     lastPick: { group: string; folder?: string } | null;
     focusKey: string | null;
     loadedBatches: Set<string>;
-    loadingBatches: Set<string>;
+    /** Batches being read, each with its reading (a second ask waits for it). */
+    loadingBatches: Map<string, Promise<BatchLoad>>;
     loading: boolean;
     loadError: MaterialError | null;
     /** The list the items were made from (a new answer is a new object). */
@@ -143,6 +192,8 @@ interface Win {
     popAnchor: HTMLElement | null;
     popKey: ((e: KeyboardEvent) => void) | null;
     popOutside: ((e: MouseEvent) => void) | null;
+    /** The menu item reading its batch's files before its action (B88). */
+    popLoad: MenuLoad | null;
     pressTimer: ReturnType<typeof setTimeout> | null;
     suppressClick: boolean;
     width: number;
@@ -151,10 +202,25 @@ interface Win {
     drawnCaps: string;
     /** The tree's attachments its items were built from (see treeAttachmentsKey). */
     drawnAttachments: string;
+    /** The one strip of sorting over the window (spec 102 §1) as drawn last. */
+    sortView: SortStripView | null;
+    /** The strip closed with its × (A, E): away while its state stays, back with the next state or the next opening. */
+    sortClosedState: SortStripState | null;
+    /** A batch just added here (its file count): state A says "N files added" (spec 102 §1, §8). */
+    sortAdded: number;
 }
 
-function capsKey(caps: { list: boolean; assign: boolean; thumb: boolean; bridgeUp: boolean; links?: boolean }, base: string | null): string {
-    return `${caps.list}|${caps.assign}|${caps.thumb}|${caps.bridgeUp}|${caps.links !== false}|${base ?? ''}`;
+interface SelAction {
+    id: string;
+    label: string;
+    /** Offered, but not now: why. */
+    why: string | null;
+    /** The label with its mark (escaped HTML), when it carries one. */
+    html?: string;
+}
+
+function capsKey(caps: MaterialCaps, base: string | null): string {
+    return `${caps.list}|${caps.assign}|${caps.thumb}|${caps.bridgeUp}|${caps.openLinks !== false}|${caps.links}|${caps.edit}|${caps.uses}|${caps.sort}|${caps.sortRun}|${caps.sourceOf}|${caps.left}|${caps.sameAs}|${caps.delete}|${caps.mediaApp}|${base ?? ''}`;
 }
 
 let win: Win | null = null;
@@ -162,20 +228,47 @@ let generation = 0;
 
 const alive = (gen: number): Win | null => (win && win.gen === gen ? win : null);
 
-/** Every person's attachments with their REFN. */
-function treeAttachments(): TreeAttachments[] {
-    return DataManager.getAllPersons()
-        .filter(p => (p.attachments?.length ?? 0) > 0)
-        .map(p => ({ refn: researchPersonRef(p.refn), attachments: p.attachments ?? [] }));
+/**
+ * Every file of the tree once, with its people as the overview's person keys
+ * (`byRefn`: their REFN with an archive, people the research does not know
+ * yet left out; else their PersonId) and how many places it is used in.
+ */
+export function treeRecords(byRefn: boolean): TreeRecord[] {
+    const data = DataManager.getData();
+    const uses = mediaUsesIndex(data);
+    const key = (id: PersonId): string | null => (byRefn ? researchPersonRef(DataManager.getPerson(id)?.refn) : id);
+    // With an archive a file taken out of the tree stays with it (Hidden · Removed from the tree, spec 102 §9).
+    const taken = byRefn ? allMedia(data).filter(a => !a.places?.length && !!a.removed && !!a.original?.sha256) : [];
+    return [...treeMedia(data), ...taken].map(att => {
+        const used = uses.get(att.id) ?? [];
+        const src = used.find(u => u.kind === 'source' || u.kind === 'excerpt');
+        const source = src?.sourceId ? (data.sources?.[src.sourceId]?.title || strings.materials.unknownSource) : undefined;
+        // The research's ids of its sources, not counted again as the file of a source (spec 102 §7).
+        const sourceRefs = byRefn ? [...new Set(used.filter(u => u.kind === 'source' || u.kind === 'excerpt')
+            .map(u => researchSourceRef(data.sources?.[u.sourceId ?? '']?.refn)).filter((r): r is string => !!r))] : [];
+        return {
+            att,
+            persons: mediaPersonIds(att.places.length ? att : { places: att.removed?.places ?? [] }).map(key).filter((k): k is string => !!k),
+            uses: used.length,
+            ...(source ? { source } : {}),
+            ...(sourceRefs.length ? { sourceRefs } : {}),
+        };
+    });
 }
 
-/** REFN → name: the tree's person first, else what the research calls them. */
-function namesOf(list: MaterialList | null): Map<string, string> {
+/** Person key → name: REFN (the tree's person first, else what the research calls them), or PersonId without an archive. */
+function namesOf(list: MaterialList | null, model: WindowModel): Map<string, string> {
     const names = new Map<string, string>();
-    for (const [refn, name] of Object.entries(list?.people ?? {})) names.set(refn, name);
+    if (model === 'app') {
+        for (const p of DataManager.getAllPersons()) names.set(p.id, materialPersonLabel(`${p.firstName} ${p.lastName}`));
+        return names;
+    }
+    for (const [refn, name] of Object.entries(list?.people ?? {})) names.set(refn, materialPersonLabel(name));
     for (const p of DataManager.getAllPersons()) {
         const refn = researchPersonRef(p.refn);
-        if (refn) names.set(refn, `${p.firstName} ${p.lastName}`.trim() || names.get(refn) || refn);
+        if (!refn) continue;
+        const own = `${p.firstName} ${p.lastName}`.trim();
+        names.set(refn, own && own !== '?' ? own : names.get(refn) ?? materialPersonLabel(own));
     }
     return names;
 }
@@ -190,13 +283,16 @@ export const materialsWindowMethods = uiModule({
         this.teardownMaterialsWindow();
         const overlay = document.getElementById(MODAL_ID);
         const body = overlay?.querySelector<HTMLElement>('#materials-window-body');
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         if (!overlay || !body || !ctx) return;
         const prefs = readPrefs();
-        const group: OverviewGroupMode = opts.group ?? prefs.group;
+        const model: WindowModel = ctx.caps.list ? 'archive' : 'app';
+        const group: OverviewGroupMode = opts.group ?? (model === 'app' ? prefs.appGroup : prefs.group);
         overlay.dataset.group = group;
         body.innerHTML = `
             <div class="mw-status" hidden></div>
+            <div class="mw-sort mw-sort--top" role="status" hidden></div>
+            <div class="mw-lhead" hidden></div>
             <div class="mw-scroll">
                 <div class="mw-sticky"></div>
                 <div class="mw-empty" hidden></div>
@@ -205,13 +301,17 @@ export const materialsWindowMethods = uiModule({
             <div class="mw-foot">
                 <div class="mw-skipped" role="note" hidden></div>
                 <div class="mw-thumbs" role="status" hidden></div>
+                <div class="mw-bulk" role="status" hidden></div>
                 <div class="mw-selbar" role="region" hidden></div>
             </div>`;
-        const filters = emptyFilters();
+        // The last filters come back (spec 102 §8), except for a window opened for a person or a batch.
+        const filters: OverviewFilters = { ...emptyFilters(), ...(opts.person || opts.batch ? {} : prefs.filters) };
+        if (model === 'app') filters.where = null;
         filters.person = opts.person;
         filters.batch = opts.batch;
         const w: Win = {
             gen: ++generation,
+            model,
             treeId: ctx.treeId,
             overlay,
             scroller: body.querySelector<HTMLElement>('.mw-scroll')!,
@@ -220,6 +320,7 @@ export const materialsWindowMethods = uiModule({
             filters,
             group,
             view: prefs.view,
+            sort: prefs.sort,
             open: new Map(),
             focusBatch: opts.batch,
             selecting: false,
@@ -228,7 +329,7 @@ export const materialsWindowMethods = uiModule({
             lastPick: null,
             focusKey: null,
             loadedBatches: new Set(),
-            loadingBatches: new Set(),
+            loadingBatches: new Map(),
             loading: false,
             loadError: null,
             list: null,
@@ -238,7 +339,7 @@ export const materialsWindowMethods = uiModule({
             metrics: { view: 'grid', cols: 1, tileRow: 180, restoreExtra: 28, listRow: 48, group: 56, folder: 36, skeleton: 180, groupEnd: 12 },
             rendered: new Map(),
             names: new Map(),
-            summary: { files: 0, batches: 0, noPerson: 0, hidden: 0 },
+            summary: { files: 0, batches: 0, noPerson: 0, hidden: 0, noTitle: 0, noSource: 0, inTree: 0, onlyArchive: 0, left: 0 },
             io: null,
             ro: null,
             unsubThumbs: null,
@@ -250,12 +351,16 @@ export const materialsWindowMethods = uiModule({
             popAnchor: null,
             popKey: null,
             popOutside: null,
+            popLoad: null,
             pressTimer: null,
             suppressClick: false,
             width: 0,
             bridgeUp: ctx.caps.bridgeUp,
             drawnCaps: '',
             drawnAttachments: '',
+            sortView: null,
+            sortClosedState: null,
+            sortAdded: 0,
         };
         win = w;
         const thumbs = materialThumbs();
@@ -279,10 +384,16 @@ export const materialsWindowMethods = uiModule({
         }
         this.mwWireHeader();
         this.mwWireBody();
+        this.mwWireDrop();
         this.mwRebuild({ items: true });
         void primeMaterials(ctx.treeId).then(() => {
             if (!alive(w.gen)) return;
-            this.mwRebuild({ items: true });
+            // The cache read: drawn again only when it brought something the window shows. Otherwise the
+            // tiles stay (redrawn, each one was replaced just after the window opened, under a finger or a pointer).
+            const now = this.materialsWindowContext();
+            const rec = w.model === 'archive' ? cachedMaterials(w.treeId) : null;
+            if (now && (capsKey(now.caps, now.base) !== w.drawnCaps || (rec?.list ?? null) !== w.list
+                || treeAttachmentsKey() !== w.drawnAttachments)) this.mwRebuild({ items: true });
             void this.mwLoad();
         });
     },
@@ -291,6 +402,7 @@ export const materialsWindowMethods = uiModule({
         const w = win;
         if (!w) return;
         this.mwClosePop();
+        closeHeadMenu();
         w.io?.disconnect();
         w.ro?.disconnect();
         w.unsubThumbs?.();
@@ -328,12 +440,19 @@ export const materialsWindowMethods = uiModule({
 
     /** The remembered list or the bridge changed: redraw (quietly), ask again once the bridge runs. */
     refreshMaterialsWindow(): void {
+        // The agent's proposal open over it shows the files as they are now (hidden, restored).
+        this.materialSortProposalRefresh();
         const w = win;
         if (!w || !document.getElementById(MODAL_ID)) return;
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         if (!ctx || ctx.treeId !== w.treeId) return;
         const cameUp = ctx.caps.bridgeUp && !w.bridgeUp;
         w.bridgeUp = ctx.caps.bridgeUp;
+        // Add materials… comes and goes with the research's batches and the tree's lock (spec 102 §8).
+        const addBtn = w.overlay.querySelector<HTMLElement>('.mw-add');
+        if (addBtn) addBtn.hidden = !this.materialsAddOffered();
+        // The agent's sorting moves on its own (its progress, its proposal ready).
+        this.mwSortStrip();
         const changed = capsKey(ctx.caps, ctx.base) !== w.drawnCaps || (cachedMaterials(w.treeId)?.list ?? null) !== w.list
             || treeAttachmentsKey() !== w.drawnAttachments;
         if (changed && !w.raf) {
@@ -355,7 +474,7 @@ export const materialsWindowMethods = uiModule({
     /** Batches and people, the open batches' files, then the whole list in the background. */
     async mwLoad(): Promise<void> {
         const w = win;
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         if (!w || w.loading || !ctx?.caps.list || !ctx.caps.bridgeUp || !ctx.base) return;
         const gen = w.gen;
         const base = ctx.base;
@@ -387,24 +506,45 @@ export const materialsWindowMethods = uiModule({
         }
     },
 
-    /** One batch's files (`?batch=`), unless the whole list is known. */
-    async mwLoadBatch(id: string): Promise<void> {
+    /** The batch's files are known (the whole list, or the batch read). */
+    mwBatchKnown(id: string): boolean {
         const w = win;
-        const ctx = this.materialsContext();
-        if (!w || !ctx?.caps.bridgeUp || !ctx.base) return;
-        if (cachedMaterials(w.treeId)?.full || w.loadedBatches.has(id) || w.loadingBatches.has(id)) return;
+        return !w || !!cachedMaterials(w.treeId)?.full || w.loadedBatches.has(id);
+    },
+
+    /**
+     * One batch's files (`?batch=`), unless the whole list is known. A reading already under way is waited for
+     * (B88: a menu's action does not go on with half the batch); `signal` stops the waiting (its menu closed).
+     */
+    async mwLoadBatch(id: string, opts: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<BatchLoad> {
+        const w = win;
+        const ctx = this.materialsWindowContext();
+        if (!w || !ctx?.caps.bridgeUp || !ctx.base) return { ok: true };
+        if (this.mwBatchKnown(id)) return { ok: true };
         const gen = w.gen;
-        w.loadingBatches.add(id);
-        try {
-            const answer = await fetchMaterial(ctx.base, { batch: id });
-            if (!alive(gen)) return;
-            if (answer.ok) {
-                w.loadedBatches.add(id);
-                await saveMaterialList(w.treeId, answer.value, { kind: 'batch', batch: id });
-            }
-        } finally {
-            alive(gen)?.loadingBatches.delete(id);
+        const base = ctx.base;
+        let reading = w.loadingBatches.get(id);
+        if (!reading) {
+            reading = (async (): Promise<BatchLoad> => {
+                try {
+                    const answer = await fetchMaterial(base, { batch: id }, { signal: opts.signal, timeoutMs: opts.timeoutMs });
+                    if (!alive(gen)) return { ok: false, stopped: true };
+                    if (!answer.ok) return opts.signal?.aborted ? { ok: false, stopped: true } : { ok: false, error: answer.error };
+                    w.loadedBatches.add(id);
+                    await saveMaterialList(w.treeId, answer.value, { kind: 'batch', batch: id });
+                    return { ok: true };
+                } finally {
+                    alive(gen)?.loadingBatches.delete(id);
+                }
+            })();
+            w.loadingBatches.set(id, reading);
         }
+        const signal = opts.signal;
+        if (!signal) return reading;
+        if (signal.aborted) return { ok: false, stopped: true };
+        return Promise.race([reading, new Promise<BatchLoad>(resolve => {
+            signal.addEventListener('abort', () => resolve({ ok: false, stopped: true }), { once: true });
+        })]);
     },
 
     /** Open batches whose files are not known yet. */
@@ -421,7 +561,7 @@ export const materialsWindowMethods = uiModule({
         if (!w) return false;
         const set = w.open.get(key);
         if (set !== undefined) return set;
-        if (narrowing(w.filters) || w.group === 'date') return true;
+        if (narrowing(w.filters) || w.group !== 'batch') return true;
         // The batch it was opened for, else the first group; a batch's first folder with it
         // (and down its line while a folder holds only folders).
         const first = w.groups.find(g => w.focusBatch ? g.batch?.id === w.focusBatch : true) ?? w.groups[0];
@@ -439,7 +579,9 @@ export const materialsWindowMethods = uiModule({
         const width = Math.max(120, w.width);
         const compact = phone || land;
         const gap = phone ? 6 : land ? 8 : 12;
-        const cols = phone ? 3 : gridColumns(width, land ? 88 : 124, gap);
+        // A tablet (641–1024) gets larger tiles for a finger: 5 columns at 1024 (spec 102 §11).
+        const tablet = !land && media(MQ_TABLET);
+        const cols = phone ? 3 : gridColumns(width, land ? 88 : tablet ? 176 : 124, gap);
         const tile = (width - gap * (cols - 1)) / cols;
         // Under a tile: its name (2 lines) and its people; nothing on a phone (the name is in the viewer).
         const text = compact ? 0 : 57;
@@ -460,35 +602,54 @@ export const materialsWindowMethods = uiModule({
     /** Recompute what is shown from the state (items again when the list changed) and draw it. */
     mwRebuild(opts: { items?: boolean } = {}): void {
         const w = win;
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         if (!w || !ctx) return;
-        const rec = cachedMaterials(w.treeId);
+        const model: WindowModel = ctx.caps.list ? 'archive' : 'app';
+        if (model !== w.model) {
+            // A research came or went while open: the other model's grouping and filters.
+            w.model = model;
+            const prefs = readPrefs();
+            w.group = model === 'app' ? prefs.appGroup : prefs.group;
+            w.filters = { ...emptyFilters(), query: w.filters.query };
+            w.focusBatch = null;
+            opts = { ...opts, items: true };
+        }
+        const rec = model === 'archive' ? cachedMaterials(w.treeId) : null;
         const list = rec?.list ?? null;
         if (opts.items || list !== w.list) {
             w.list = list;
             w.drawnAttachments = treeAttachmentsKey();
-            w.items = overviewItems(list, treeAttachments());
-            w.names = namesOf(list);
+            w.items = overviewItems(list, treeRecords(model === 'archive'), { sourceOf: model === 'archive' && ctx.caps.sourceOf });
+            w.names = namesOf(list, model);
             const keys = new Set(w.items.map(i => i.key));
             for (const k of [...w.selected]) if (!keys.has(k)) w.selected.delete(k);
         }
         // A research without assigning never sends hidden files; "Show hidden" is not offered.
         if (!ctx.caps.assign) w.filters.showHidden = false;
-        w.summary = overviewSummary(w.items, list, !!rec?.full);
+        this.mwSortMarks();
+        w.summary = overviewSummary(w.items, list, !!rec?.full, model === 'app');
+        // "Not assigned by the agent" is offered only while there is such a file: its filter goes with the last one.
+        if (!w.summary.left) w.filters.left = false;
         w.groups = overviewGroups({
             items: w.items, list, filters: w.filters, mode: w.group,
             batchLoaded: id => !!rec?.full || w.loadedBatches.has(id),
+            personName: key => w.names.get(key) ?? null,
         });
+        // One sort for the grid and the list (the viewer and Go through follow the groups' order).
+        sortOverviewGroups(w.groups, w.sort, { personName: key => w.names.get(key) ?? null, kindLabel: materialKindLabel });
         w.drawnCaps = capsKey(ctx.caps, ctx.base);
         w.metrics = this.mwMetrics();
         w.layout = overviewRows(w.groups, key => this.mwIsOpen(key), w.metrics);
         w.overlay.dataset.group = w.group;
-        w.overlay.classList.toggle('can-select', ctx.caps.assign);
+        w.overlay.dataset.model = model;
+        w.overlay.classList.toggle('can-select', this.mwCanSelect());
         w.overlay.classList.toggle('is-selecting', w.selecting);
         w.overlay.classList.toggle('is-list', w.view === 'list');
         this.mwHeader();
         this.mwTools();
         this.mwStatus();
+        this.mwSortStrip();
+        this.mwListHead();
         const empty = this.mwEmpty();
         w.canvas.hidden = empty === 'skeleton';
         w.canvas.style.height = `${w.layout.height}px`;
@@ -501,17 +662,52 @@ export const materialsWindowMethods = uiModule({
         for (const id of this.mwOpenPendingBatches()) void this.mwLoadBatch(id);
     },
 
+    /**
+     * The files the agent left unassigned and the copies of an older file
+     * (spec 102 §4.2, §4.4), marked on the items that still lack a title or a
+     * person: their tag in the tile and the row, the filter "Not assigned by
+     * the agent". Only beside a research that sorts.
+     */
+    mwSortMarks(): void {
+        const w = win!;
+        const marks = w.model === 'archive' && this.materialSortGate() ? this.materialSortMarks(w.items) : null;
+        for (const i of w.items) {
+            delete i.agentLeft;
+            delete i.copyOf;
+            // The file of a source is assigned (spec 102 §7): no "Not assigned by the agent", no copy tag.
+            if (!marks || !i.file || i.hidden || i.sourceOf?.length || (i.titled && (i.persons.length || i.viaBatch.length))) continue;
+            const left = marks.left.get(i.file.id);
+            if (left) i.agentLeft = { ...left };
+            const copy = marks.copyOf.get(i.file.id);
+            if (copy) i.copyOf = copy;
+        }
+    },
+
+    /** The tag before the people of a tile or a row: the agent left it unassigned, or it is a copy (spec 102 §4). */
+    mwSortTagHtml(item: MaterialItem): string {
+        const s = strings.materials.agentSort;
+        const tag = item.agentLeft ? s.tagLeft : item.copyOf ? s.tagCopy : '';
+        return tag ? `<span class="mw-intree-tag mw-sort-tag" data-tag="${item.agentLeft ? 'left' : 'copy'}">${esc(tag)}</span>` : '';
+    },
+
+    /** "File of a source" / "File of 2 sources" (spec 102 §7), '' for any other file. */
+    mwSourceOfTag(item: MaterialItem): string {
+        const n = item.sourceOf?.length ?? 0;
+        return n ? strings.materials.agentSort.sourceOfN(n) : '';
+    },
+
     /** The header's counts (or "Loading…"). */
     mwHeader(): void {
         const w = win!;
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         const el = w.overlay.querySelector<HTMLElement>('.mw-summary');
         if (!el || !ctx) return;
         const m = strings.materials;
         const rec = cachedMaterials(w.treeId);
         const s = w.summary;
         let text = '';
-        if (!rec) text = ctx.caps.bridgeUp && !w.loadError ? m.loading : '';
+        if (w.model === 'app') text = w.filters.noPerson ? m.summaryNoPerson(s.noPerson, s.files) : m.summaryApp(s.files, s.noPerson);
+        else if (!rec) text = ctx.caps.bridgeUp && !w.loadError ? m.loading : '';
         else if (w.filters.noPerson) text = m.summaryNoPerson(s.noPerson, s.files);
         else text = `${m.summary(s.files, s.batches, s.noPerson)}${w.filters.showHidden ? ` ${m.summaryHidden(s.hidden)}` : ''}`;
         el.textContent = text;
@@ -521,7 +717,7 @@ export const materialsWindowMethods = uiModule({
     /** Filters, grouping, view and "Select" (the search field stays, it keeps its focus). */
     mwTools(): void {
         const w = win!;
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         const tools = w.overlay.querySelector<HTMLElement>('.mw-tools');
         if (!tools || !ctx) return;
         const m = strings.materials;
@@ -542,14 +738,22 @@ export const materialsWindowMethods = uiModule({
             <div class="mw-chips">
                 ${chip('person', m.fPerson, f.person ? m.filterChip(m.fPerson, personName) : null)}
                 ${chip('kind', m.fKind, f.kinds.length ? m.filterChip(m.fKind, f.kinds.map(kindLabel).join(', ')) : null)}
-                ${chip('batch', m.fBatch, f.batch ? m.filterChip(m.fBatch, batchName) : null)}
+                ${w.model === 'archive' ? chip('batch', m.fBatch, f.batch ? m.filterChip(m.fBatch, batchName) : null) : ''}
                 ${toggle('noperson', `${m.noPerson} · ${w.summary.noPerson.toLocaleString(getCurrentLanguage())}`, f.noPerson)}
                 ${ctx.caps.assign ? toggle('hidden', m.showHidden, f.showHidden) : ''}
                 ${count ? `<button type="button" class="link-button mw-clear" data-mw="clear">${esc(m.clearFilters)}</button>` : ''}
             </div>
+            <div class="mw-tools-row2">
+                ${this.mwReviewChips(toggle)}
+                <span class="mw-gap"></span>
+                ${this.mwSortChipHtml()}
+            </div>
             <button type="button" class="mw-chip sel-opt mw-filters-btn${count ? ' is-active' : ''}" data-mw="sheet" aria-haspopup="dialog">${esc(count ? m.filters(count) : m.filtersTitle)}</button>
             <span class="mw-gap"></span>
-            ${seg('mw-seg-group', m.groupBy, [
+            ${seg('mw-seg-group', m.groupBy, w.model === 'app' ? [
+                { act: 'group-added', label: m.groupAdded, on: w.group === 'added' },
+                { act: 'group-person', label: m.groupPerson, on: w.group === 'person' },
+            ] : [
                 { act: 'group-batch', label: m.groupBatch, on: w.group === 'batch' },
                 { act: 'group-date', label: m.groupDate, on: w.group === 'date' },
             ])}
@@ -557,13 +761,36 @@ export const materialsWindowMethods = uiModule({
                 { act: 'view-grid', label: m.grid, icon: '▦', on: w.view === 'grid' },
                 { act: 'view-list', label: m.list, icon: '☰', on: w.view === 'list' },
             ])}
-            ${ctx.caps.assign ? `<button type="button" class="mw-chip sel-opt mw-select${w.selecting ? ' is-active' : ''}" data-mw="select" aria-pressed="${w.selecting}">${esc(w.selecting ? m.done : m.select)}</button>` : ''}`);
+            ${this.mwCanSelect() ? `<button type="button" class="mw-chip sel-opt mw-select${w.selecting ? ' is-active' : ''}" data-mw="select" aria-pressed="${w.selecting}">${esc(w.selecting ? m.done : m.select)}</button>` : ''}`);
+    },
+
+    /**
+     * The review filters with their counts (spec 102 §8a): Without title,
+     * Without source | In the tree, Only in the archive (beside an archive).
+     */
+    mwReviewChips(toggle: (act: string, label: string, on: boolean) => string, cls = 'mw-chips mw-chips-review'): string {
+        const w = win!;
+        const m = strings.materials;
+        const f = w.filters;
+        const s = w.summary;
+        const where = w.model === 'archive'
+            ? `<span class="mw-chips-sep" aria-hidden="true"></span>
+                ${toggle('where-tree', m.filterCount(m.fInTree, s.inTree), f.where === 'tree')}
+                ${toggle('where-archive', m.filterCount(m.fOnlyArchive, s.onlyArchive), f.where === 'archive')}`
+            : '';
+        return `<div class="${cls}" role="group" aria-label="${esc(m.filtersTitle)}">
+                ${toggle('notitle', m.filterCount(m.fNoTitle, s.noTitle), f.noTitle)}
+                ${toggle('nosource', m.filterCount(m.fNoSource, s.noSource), f.noSource)}
+                ${where}
+                ${s.left ? `<span class="mw-chips-sep" aria-hidden="true"></span>
+                ${toggle('left', m.filterCount(m.agentSort.fLeft, s.left), f.left)}` : ''}
+            </div>`;
     },
 
     /** The strip above the content: not running (with the time), or the list's error. */
     mwStatus(): void {
         const w = win!;
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         const el = w.overlay.querySelector<HTMLElement>('.mw-status');
         if (!el || !ctx) return;
         const m = strings.materials;
@@ -571,9 +798,21 @@ export const materialsWindowMethods = uiModule({
         const start = this.researchStartUrl() ? `<button type="button" class="link-button materials-start" data-mw="start">${this.researchSyncActionLabel('startResearch', strings.sync.startResearch)}</button>` : '';
         let html = '';
         let state = 'live';
+        if (w.model === 'app') {
+            // A tree beside a research on a phone or a tablet: its own files here, the archive's on the computer (spec 102 §11f).
+            const linked = this.materialsTouchLinked() ? this.materialsContext() : null;
+            // Sorting with the agent says itself in the strip of sorting (spec 102 §11).
+            const note = linked ? (linked.agent ? m.desktopOnlyResearch : m.desktopOnly) : '';
+            w.overlay.dataset.state = 'live';
+            el.hidden = !note;
+            el.setAttribute('role', 'note');
+            el.innerHTML = note ? `<span class="mw-status-note">${esc(note)}</span>` : '';
+            return;
+        }
         if (rec && !ctx.caps.bridgeUp) {
             state = 'stale';
-            html = `<span>${esc(m.stale(materialStaleTime(rec.list.fetchedAt || Date.now())))}</span>${start}`;
+            // What can be edited now: the tree's files (written with the tree), not the material outside it (spec 102 §12a).
+            html = `<span>${esc(m.staleEdit(materialStaleTime(rec.list.fetchedAt || Date.now())))}</span>${start}`;
         } else if (w.loadError && ctx.caps.bridgeUp) {
             state = 'error';
             html = `<span>${esc(materialErrorText(w.loadError, ctx.agent))}</span><button type="button" class="link-button materials-start" data-mw="retry">${esc(m.retry)}</button>`;
@@ -584,17 +823,82 @@ export const materialsWindowMethods = uiModule({
         el.innerHTML = html;
     },
 
-    /** Nothing to show: loading (skeleton), not running without memory, or no match. */
-    mwEmpty(): 'skeleton' | 'nocache' | 'nomatch' | null {
+    /**
+     * The one strip of sorting over the list (spec 102 §1): the state of the
+     * whole archive, with a filter or a search too. On a phone (and a phone
+     * held sideways) the state only (§11); a tree beside a research on a
+     * phone or a tablet says that sorting is on the computer.
+     */
+    mwSortStrip(): void {
+        const w = win;
+        const el = w?.overlay.querySelector<HTMLElement>('.mw-sort--top');
+        if (!w || !el) return;
+        const s = strings.materials.agentSort;
+        let view: SortStripView | null = null;
+        let html = '';
+        let mod = '';
+        if (w.model === 'app') {
+            // A research whose agent sorts: that and its proposal are on the computer (spec 102 §13l, §11).
+            const linked = this.materialsTouchLinked() ? this.materialsContext() : null;
+            if (linked?.agent && linked.env.features?.includes(MATERIAL_SORT_FEATURE)) {
+                html = `<span class="mw-sort-text"><span class="mw-sort-note mw-sort-phone">${esc(s.phone)}</span><span class="mw-sort-note mw-sort-phone-short">${esc(s.phoneShort)}</span></span>`;
+                mod = 'is-off';
+            }
+        } else {
+            view = this.materialSortStripView(w.items, { phone: isPhoneBar(), added: w.sortAdded });
+            // "N files added" is A's only: once the sorting moved on, A says the whole archive again.
+            if (view.state && view.state !== 'A') w.sortAdded = 0;
+            // Closed with its ×: back once the state is another one.
+            if (w.sortClosedState && view.state !== w.sortClosedState) w.sortClosedState = null;
+            if (!(view.state && view.state === w.sortClosedState)) { html = view.html; mod = view.mod; }
+        }
+        w.sortView = view;
+        el.hidden = !html;
+        for (const c of ['is-done', 'is-off', 'is-error']) el.classList.toggle(c, c === mod);
+        el.dataset.state = html ? view?.state ?? '' : '';
+        // A batch of a run that did not run is said at once (spec 102 §3); the other states as a status.
+        const role = view?.state === 'error' && html ? 'alert' : 'status';
+        if (el.getAttribute('role') !== role) el.setAttribute('role', role);
+        setStripHtml(el, html);
+        el.onclick = (e) => {
+            const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-sort]');
+            if (!btn || !view) return;
+            if (btn.dataset.sort === 'close') { this.mwSortWholeClose(); return; }
+            if (btn.dataset.sort === 'review') { this.mwReview(view.review); return; }
+            this.materialSortStripClick(e, view);
+        };
+    },
+
+    /** The strip closed (×, states A and E): away while its state stays; the focus goes on to the files. */
+    mwSortWholeClose(): void {
+        const w = win;
+        if (!w) return;
+        const state = w.sortView?.state;
+        w.sortClosedState = state === 'A' || state === 'E' ? state : null;
+        this.mwSortStrip();
+        const next = w.canvas.querySelector<HTMLElement>('[tabindex="0"]') ?? w.overlay.querySelector<HTMLElement>('.mw-search');
+        next?.focus();
+    },
+
+        /** Nothing to show: loading (skeleton), not running without memory, no files at all (the tree's own), or no match. */
+    mwEmpty(): 'skeleton' | 'nocache' | 'none' | 'nomatch' | null {
         const w = win!;
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         const el = w.overlay.querySelector<HTMLElement>('.mw-empty');
         if (!el || !ctx) return null;
         const m = strings.materials;
-        const rec = cachedMaterials(w.treeId);
-        let kind: 'skeleton' | 'nocache' | 'nomatch' | null = null;
+        const rec = w.model === 'app' ? null : cachedMaterials(w.treeId);
+        let kind: 'skeleton' | 'nocache' | 'none' | 'nomatch' | null = null;
         let html = '';
-        if (!rec && ctx.caps.bridgeUp && !w.loadError) {
+        if (w.model === 'app') {
+            if (w.items.length === 0 && !activeFilterCount(w.filters) && !w.filters.query) {
+                kind = 'none';
+                html = `<span class="mw-empty-file" aria-hidden="true">JPG</span><h3 class="mw-empty-title">${esc(m.emptyTreeTitle)}</h3><p>${esc(m.emptyTreeText)}</p><p class="mw-empty-where">${esc(m.whereApp)}</p>`;
+            } else if (w.groups.length === 0) {
+                kind = 'nomatch';
+                html = `<p>${esc(m.noMatch)}</p>${activeFilterCount(w.filters) || w.filters.query ? `<button type="button" class="link-button" data-mw="clear">${esc(m.clearFilters)}</button>` : ''}`;
+            }
+        } else if (!rec && ctx.caps.bridgeUp && !w.loadError) {
             kind = 'skeleton';
             const square = '<span class="mw-skel-tile"></span>';
             const head = '<div class="mw-skel-head"><span></span><span></span></div>';
@@ -611,6 +915,7 @@ export const materialsWindowMethods = uiModule({
         el.className = `mw-empty${kind ? ` is-${kind}` : ''}`;
         el.setAttribute('aria-hidden', kind === 'skeleton' ? 'true' : 'false');
         el.innerHTML = html;
+        w.overlay.classList.toggle('is-bare', kind === 'none');
         return kind;
     },
 
@@ -692,8 +997,12 @@ export const materialsWindowMethods = uiModule({
         switch (group.kind) {
             case 'batch': return group.batch?.name ?? '';
             case 'loose': return m.loose;
-            case 'tree': return cachedMaterials(win?.treeId) ? m.inTreeGroup : m.inTreeAttachments;
             case 'earlier': return m.earlier;
+            case 'person': {
+                const key = group.persons?.[0] ?? '';
+                return win?.names.get(key) ?? key;
+            }
+            case 'noperson': return m.noPerson;
             case 'day': {
                 const d = new Date(`${group.day}T12:00:00`);
                 return Number.isNaN(d.getTime()) ? group.day ?? '' : d.toLocaleDateString(getCurrentLanguage(), { day: 'numeric', month: 'numeric', year: 'numeric' });
@@ -714,6 +1023,10 @@ export const materialsWindowMethods = uiModule({
         if (group.kind === 'loose') {
             const froms = (group.froms ?? []).map(k => m.from[k]).filter(Boolean);
             return froms.length ? `${m.looseSub} · ${joinAnd(lang, froms)}` : m.looseSub;
+        }
+        if ((group.kind === 'day' || group.kind === 'earlier') && w.model === 'app') {
+            const people = (group.persons ?? []).map(p => nameWithoutYears(w.names.get(p) ?? p));
+            return people.length ? m.addedWith(people) : '';
         }
         if (group.kind === 'day' || group.kind === 'earlier') {
             return [(group.batchNames ?? []).join(', '), group.looseCount ? m.looseCount(group.looseCount) : ''].filter(Boolean).join(' · ');
@@ -765,6 +1078,11 @@ export const materialsWindowMethods = uiModule({
     mwPersons(item: MaterialItem): { text: string; none: boolean } {
         const w = win!;
         if (itemWithoutPerson(item)) return { text: strings.materials.noPerson, none: true };
+        // The file of a source (spec 102 §7): its own people, then those the source cites.
+        if (item.sourceOf?.length) {
+            const cited = sourceOfPersons(item);
+            return { text: personsShort(cited.persons, refn => w.names.get(refn) ?? null, cited.more), none: false };
+        }
         return { text: personsShort(item.persons, refn => w.names.get(refn) ?? null), none: false };
     },
 
@@ -775,27 +1093,33 @@ export const materialsWindowMethods = uiModule({
         const label = hiddenLabel && !small ? `<span class="mw-hidden-label">${esc(hiddenLabel)}</span>` : '';
         const check = '<span class="mw-check" aria-hidden="true"></span>';
         const cls = `mw-thumb${item.hidden ? ' is-hidden' : ''}`;
+        // "In the tree" only beside an archive (without one everything is); a hidden file keeps its own label.
+        const inTree = win?.model === 'archive' && !hiddenLabel && itemInTree(item)
+            ? `<span class="mw-intree">${esc(m.inTreeTag)}</span>` : '';
+        const places = item.uses ? `<span class="mw-places" aria-label="${esc(m.places(item.uses))}" title="${esc(m.places(item.uses))}">${item.uses.toLocaleString(getCurrentLanguage())}</span>` : '';
+        const marks = `${label}${inTree}${places}${check}`;
         if (att && !att.originalOnly && att.mimeType.startsWith('image/') && att.dataUrl) {
-            return `<span class="${cls} has-thumb"><img src="${esc(att.dataUrl)}" alt="" loading="lazy">${label}${check}</span>`;
+            return `<span class="${cls} has-thumb"><img src="${esc(att.dataUrl)}" alt="" loading="lazy">${marks}</span>`;
         }
         const sha = materialItemSha(item);
         const letters = `<span class="mw-type">${esc(materialTileLetters(item))}</span>`;
-        const lazy = !!sha && item.origin !== 'tree' && ['image', 'pdf'].includes(materialType(item.mime, item.title));
-        if (!lazy || !sha) return `<span class="${cls}">${letters}${label}${check}</span>`;
+        const lazy = !!sha && item.origin !== 'tree' && ['image', 'pdf'].includes(materialType(item.mime, item.name));
+        if (!lazy || !sha) return `<span class="${cls}">${letters}${marks}</span>`;
         const ready = materialThumbs().urlOf(sha, THUMB_PX);
         const img = ready ? `<img src="${esc(ready)}" alt="">` : letters;
-        return `<span class="${cls}${ready ? ' has-thumb' : ''}"${ready ? '' : ` data-sha="${esc(sha)}" data-group="${esc(group.key)}" data-item="${esc(item.key)}"`}>${img}${label}${check}</span>`;
+        return `<span class="${cls}${ready ? ' has-thumb' : ''}"${ready ? '' : ` data-sha="${esc(sha)}" data-group="${esc(group.key)}" data-item="${esc(item.key)}"`}>${img}${marks}</span>`;
     },
 
     mwAriaLabel(item: MaterialItem): string {
         const m = strings.materials;
         const persons = this.mwPersons(item).text;
         const hidden = item.hidden ? m.hiddenLabel[item.hidden.reason ?? 'none'] ?? m.hiddenLabel.none : '';
-        return [item.title, persons, hidden].filter(Boolean).join(', ');
+        const tag = item.agentLeft ? m.agentSort.tagLeft : item.copyOf ? m.agentSort.tagCopy : this.mwSourceOfTag(item);
+        return [item.title, persons, tag, hidden].filter(Boolean).join(', ');
     },
 
     mwRestoreHtml(item: MaterialItem): string {
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         if (!item.hidden || !ctx?.caps.assign) return '';
         const off = ctx.caps.bridgeUp ? '' : ` aria-disabled="true" title="${esc(strings.materials.actionsWhenRunning)}"`;
         return `<button type="button" class="link-button mw-restore" data-mw="restore" data-key="${esc(item.key)}"${off}>${esc(strings.materials.restore)}</button>`;
@@ -808,26 +1132,135 @@ export const materialsWindowMethods = uiModule({
         return `<div class="mw-tile${selected ? ' is-selected' : ''}${item.hidden ? ' is-hidden' : ''}" role="gridcell" tabindex="-1" data-key="${esc(item.key)}" aria-label="${esc(this.mwAriaLabel(item))}"${w.selecting ? ` aria-selected="${selected}"` : ''}>
             ${this.mwThumbHtml(item, group, false)}
             <span class="mw-tile-title" title="${esc(item.title)}">${fileNameBreakParts(item.title).map(esc).join('<wbr>')}</span>
-            <span class="mw-tile-persons${persons.none ? ' is-none' : ''}">${esc(persons.text)}</span>
+            <span class="mw-tile-persons${persons.none ? ' is-none' : ''}">${this.mwSortTagHtml(item)}${this.mwSourceOfTagHtml(item)}${esc(persons.text)}</span>
             ${this.mwRestoreHtml(item)}
         </div>`;
     },
 
+    /**
+     * A list row with the columns of spec 102 §8f: Title (the file's name
+     * under it) · Kind · Date · People · Source · In the tree (beside an
+     * archive) · Used.
+     */
     mwListRowHtml(item: MaterialItem, group: OverviewGroup): string {
         const w = win!;
         const m = strings.materials;
         const persons = this.mwPersons(item);
         const selected = w.selected.has(item.key);
-        const kind = item.hidden ? `${materialKindLabel(item)} · ${m.hiddenLabel[item.hidden.reason ?? 'none'] ?? m.hiddenLabel.none}` : materialKindLabel(item);
+        const kind = item.hidden ? `${materialKindLabel(item)} · ${m.hiddenLabel[item.hidden.reason ?? 'none'] ?? m.hiddenLabel.none}` : (item.kind ? materialKindLabel(item) : '');
+        const date = item.date ? materialDateForInput(item.date) : '';
+        const inTree = w.model === 'archive'
+            ? `<span class="mw-li-intree">${itemInTree(item) ? `<span class="mw-intree-tag">${esc(m.inTreeTag)}</span>` : `<span class="is-none">${esc(m.onlyArchiveShort)}</span>`}</span>`
+            : '';
+        const used = item.hidden && this.mwRestoreHtml(item) ? this.mwRestoreHtml(item)
+            : item.uses ? esc(m.places(item.uses)) : `<span class="is-none">${esc(m.nowhere)}</span>`;
         return `<div class="mw-li sel-opt${selected ? ' is-selected' : ''}${item.hidden ? ' is-hidden' : ''}" role="gridcell" data-sel-form="row" tabindex="-1" data-key="${esc(item.key)}" aria-label="${esc(this.mwAriaLabel(item))}"${w.selecting ? ` aria-selected="${selected}"` : ''}>
             <span class="mw-li-check"><span class="mw-check" aria-hidden="true"></span></span>
             ${this.mwThumbHtml(item, group, true)}
-            <span class="mw-li-title" title="${esc(item.title)}">${esc(item.title)}</span>
+            <span class="mw-li-name">
+                <span class="mw-li-title" title="${esc(item.title)}">${esc(item.title)}</span>
+                ${item.titled ? `<span class="mw-li-file" title="${esc(item.name)}">${esc(item.name)}</span>` : `<span class="mw-li-file is-untitled">${esc(m.untitled)}</span>`}
+            </span>
             <span class="mw-li-kind" title="${esc(kind)}">${esc(kind)}</span>
-            <span class="mw-li-persons${persons.none ? ' is-none' : ''}">${esc(persons.text)}</span>
-            <span class="mw-li-size">${item.bytes ? esc(formatBytesShort(item.bytes)) : ''}</span>
-            <span class="mw-li-at">${item.hidden && this.mwRestoreHtml(item) ? this.mwRestoreHtml(item) : esc(materialShortDate(item.at))}</span>
+            <span class="mw-li-date">${esc(date)}</span>
+            <span class="mw-li-persons${persons.none ? ' is-none' : ''}">${this.mwSortTagHtml(item)}${this.mwSourceOfTagHtml(item, 'mw-li-srctag')}${esc(persons.text)}</span>
+            ${this.mwListSourceHtml(item)}
+            ${inTree}
+            <span class="mw-li-used">${used}</span>
         </div>`;
+    },
+
+    /** The tag "File of a source" before the people (spec 102 §7; in a list row only on a phone, where the Source column is not). */
+    mwSourceOfTagHtml(item: MaterialItem, cls = ''): string {
+        const tag = this.mwSourceOfTag(item);
+        return tag ? `<span class="mw-intree-tag mw-srcof-tag${cls ? ` ${cls}` : ''}">${esc(tag)}</span>` : '';
+    },
+
+    /** A list row's Source: the file of a source with its tag and the first source's title (", + 1"), else the tree's source. */
+    mwListSourceHtml(item: MaterialItem): string {
+        const m = strings.materials;
+        const of = item.sourceOf ?? [];
+        if (of.length) {
+            const title = `${of[0].title ?? of[0].source}${of.length > 1 ? `, + ${(of.length - 1).toLocaleString(getCurrentLanguage())}` : ''}`;
+            return `<span class="mw-li-source is-sourceof" title="${esc(title)}">${this.mwSourceOfTagHtml(item)} ${esc(title)}</span>`;
+        }
+        return `<span class="mw-li-source${item.source ? '' : ' is-none'}" title="${esc(item.source ?? '')}">${esc(item.source ?? m.noSourceShort)}</span>`;
+    },
+
+    /** The list's column header: a click or Enter sorts by it, again the other way, a third time back to the groups' order. */
+    mwListHead(): void {
+        const w = win!;
+        const el = w.overlay.querySelector<HTMLElement>('.mw-lhead');
+        if (!el) return;
+        el.hidden = w.view !== 'list';
+        if (el.hidden) { el.innerHTML = ''; return; }
+        const cols = this.mwSortColumns();
+        const cell = ([col, label]: [ListColumn, string]) => {
+            const on = w.sort?.col === col ? w.sort.dir : 0;
+            const sort = on === 1 ? 'ascending' : on === -1 ? 'descending' : 'none';
+            return `<span class="mw-lh-cell mw-lh-${col}" role="columnheader" aria-sort="${sort}"><button type="button" class="mw-lh-btn" data-mw="sort" data-col="${col}">${esc(label)}<span class="mw-lh-arrow" aria-hidden="true">${on === 1 ? '▲' : on === -1 ? '▼' : ''}</span></button></span>`;
+        };
+        el.innerHTML = `<div class="mw-lh" role="row"><span class="mw-li-check" aria-hidden="true"></span><span class="mw-lh-thumb" aria-hidden="true"></span>${cols.map(cell).join('')}</div>`;
+    },
+
+    /** The columns the window sorts by (the list's headers, the Sort menu). */
+    mwSortColumns(): [ListColumn, string][] {
+        const m = strings.materials;
+        return [
+            ['title', m.colTitle], ['kind', m.colKind], ['date', m.colDate], ['persons', m.colPersons], ['source', m.colSource],
+            ...(win?.model === 'archive' ? [['intree', m.colInTree] as [ListColumn, string]] : []), ['used', m.colUsed],
+        ];
+    },
+
+    /** The toolbar's Sort ▾ (the grid and the list; ≤ 1024 it is in the filters sheet). */
+    mwSortChipHtml(): string {
+        const w = win!;
+        const m = strings.materials;
+        const s = w.sort;
+        const col = s ? this.mwSortColumns().find(c => c[0] === s.col)?.[1] ?? s.col : '';
+        const text = s ? m.sortChip(col, s.dir === 1 ? '↑' : '↓') : m.sortBy;
+        const aria = s ? `${m.sortBy}: ${col}, ${s.dir === 1 ? m.sortAscending : m.sortDescending}` : `${m.sortBy}: ${m.sortDefault}`;
+        return `<button type="button" class="mw-chip sel-opt mw-sortby" data-mw="sort-menu" aria-haspopup="menu" aria-label="${esc(aria)}">${esc(text)} <span aria-hidden="true">▾</span></button>`;
+    },
+
+    /** Sort ▾'s menu: the default order, the columns, the direction (the table's menu: ↑ ↓ Enter Esc). */
+    mwSortMenu(anchor: HTMLElement): void {
+        const w = win;
+        if (!w) return;
+        this.mwClosePop();
+        const m = strings.materials;
+        const s = w.sort;
+        const pick = (choice: SortChoice) => () => this.mwSetSort(chooseSort(win?.sort ?? null, choice));
+        const entries: MenuEntry[] = [
+            { id: 'default', label: m.sortDefault, icon: '', checked: !s, run: pick(null) },
+            SEP,
+            ...this.mwSortColumns().map(([col, label]) => ({ id: col, label, icon: '', checked: s?.col === col, run: pick({ col }) })),
+            SEP,
+            { id: 'asc', label: m.sortAscending, icon: '↑', checked: s?.dir === 1, disabled: !s, run: pick({ dir: 1 }) },
+            { id: 'desc', label: m.sortDescending, icon: '↓', checked: s?.dir === -1, disabled: !s, run: pick({ dir: -1 }) },
+        ];
+        openHeadMenu(anchor, m.sortBy, '', entries).classList.add('mw-sort-menu');
+    },
+
+    /** The window's sort from Sort ▾ or the filters sheet: both views, remembered with the view. */
+    mwSetSort(sort: ListSort | null): void {
+        const w = win;
+        if (!w) return;
+        w.sort = sort;
+        writeListPrefs(w.sort, w.filters);
+        w.scroller.scrollTop = 0;
+        this.mwRebuild();
+    },
+
+    /** Sort the list by a column (ascending, descending, none); remembered with the view. */
+    mwSortBy(col: ListColumn): void {
+        const w = win;
+        if (!w) return;
+        const now = w.sort?.col === col ? w.sort.dir : 0;
+        w.sort = now === 0 ? { col, dir: 1 } : now === 1 ? { col, dir: -1 } : null;
+        writeListPrefs(w.sort, w.filters);
+        this.mwRebuild();
+        w.overlay.querySelector<HTMLElement>(`.mw-lhead [data-col="${col}"]`)?.focus();
     },
 
     /** The group header that stays at the top while its content scrolls. */
@@ -903,7 +1336,7 @@ export const materialsWindowMethods = uiModule({
         const pct = total ? Math.round((s.done / total) * 100) : 0;
         const text = s.phase === 'paused' ? m.thumbsPaused(s.done, total, s.where) : m.thumbsLoading(s.done, total, s.where);
         redraw(el, `
-            <span class="mw-progress" aria-hidden="true"><span style="width:${pct}%"></span></span>
+            ${barHtml(pct / 100, { cls: 'mw-progress', paused: s.phase === 'paused' })}
             <span class="mw-thumbs-text">${esc(text)}</span>
             <button type="button" class="link-button mw-thumbs-toggle" data-mw="${s.phase === 'paused' ? 'thumbs-resume' : 'thumbs-pause'}">${esc(s.phase === 'paused' ? m.resume : m.pause)}</button>`);
     },
@@ -913,7 +1346,7 @@ export const materialsWindowMethods = uiModule({
     /** Selection marks, the bar and the phone header (`marks`: also the drawn tiles). */
     mwSelectionChanged(marks = true): void {
         const w = win;
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         if (!w || !ctx) return;
         const m = strings.materials;
         w.overlay.classList.toggle('is-selecting', w.selecting);
@@ -939,27 +1372,42 @@ export const materialsWindowMethods = uiModule({
         const skipped = w.overlay.querySelector<HTMLElement>('.mw-skipped');
         if (!bar || !skipped) return;
         bar.hidden = !w.selecting;
-        const tree = items.filter(i => i.origin === 'tree').length;
-        skipped.hidden = !w.selecting || tree === 0;
-        skipped.textContent = tree ? m.skippedTree(tree) : '';
+        // Assign… and Hide… act on the research's files only: the files only in the tree stay unchanged (spec 102 §8).
+        const onlyTree = this.mwSkippedTree(items);
+        skipped.hidden = !w.selecting || !onlyTree;
+        skipped.textContent = w.selecting && onlyTree ? m.skippedTree(onlyTree) : '';
         if (!w.selecting) { bar.innerHTML = ''; return; }
-        const archive = items.filter(i => i.origin !== 'tree');
-        const onlyHidden = archive.length > 0 && archive.every(i => i.hidden);
-        const off = (why: string | null) => (why ? ` aria-disabled="true" title="${esc(why)}"` : '');
-        const why = !ctx.caps.bridgeUp ? m.actionsWhenRunning : archive.length === 0 ? (n ? m.skippedTree(tree) : m.nothingSelected) : null;
+        const off = (why: string | null | undefined) => (why ? ` aria-disabled="true" title="${esc(why)}"` : '');
         const whole = this.mwWholeTarget();
+        const acts = this.mwSelActions(items);
+        // A phone: three actions and ⋯ (spec 102 §11); wider: Go through, Link to…, Title…, Kind…, Date… and ⋯.
+        const inline: string[] = media(MQ_MOBILE) ? ['sel-attach', 'sel-title', 'sel-review'] : ['sel-review', 'sel-attach', 'sel-title', 'sel-kind', 'sel-date', 'sel-sort'];
+        const shown = inline.map(id => acts.find(a => a.id === id)).filter((a): a is SelAction => !!a);
+        const more = acts.filter(a => !inline.includes(a.id));
         bar.setAttribute('aria-label', n ? m.selected(n) : m.nothingSelected);
         redraw(bar, `
             <span class="mw-selcount">${esc(n ? m.selected(n) : m.nothingSelected)}</span>
-            <span class="mw-selacts">
-                <button type="button" class="primary mw-selbtn" data-mw="sel-assign"${off(why)}>${esc(m.assign)}</button>
-                <button type="button" class="secondary mw-selbtn" data-mw="${onlyHidden ? 'sel-restore' : 'sel-hide'}"${off(why)}>${esc(onlyHidden ? m.restore : m.hide)}</button>
+            <span class="mw-selacts" lang="${getCurrentLanguage()}">
+                ${shown.map(a => `<button type="button" class="${a.id === 'sel-attach' ? 'primary' : 'secondary'} mw-selbtn" data-mw="${a.id}"${off(a.why)}>${a.html ?? esc(a.label)}</button>`).join('')}
+                ${more.length ? `<button type="button" class="secondary mw-selbtn mw-selmore" data-mw="sel-more" aria-haspopup="menu" aria-label="${esc(m.selMore)}" title="${esc(m.selMore)}">⋯</button>` : ''}
             </span>
             <span class="mw-gap"></span>
             ${whole ? `<button type="button" class="link-button mw-selwhole" data-mw="sel-whole">${esc(whole.label)}</button>` : ''}
             <button type="button" class="link-button mw-selclear" data-mw="sel-clear">${esc(m.clearSelection)}</button>`);
         // On a phone held sideways the bar is one row: the content keeps its height free below.
         w.scroller.style.paddingBottom = '';
+    },
+
+    /**
+     * The selection's files only in the tree that the research's actions
+     * (Assign…, Hide…) leave as they are — counted when the selection also
+     * has the research's files those act on (0: no sentence).
+     */
+    mwSkippedTree(items: MaterialItem[]): number {
+        const ctx = this.materialsWindowContext();
+        if (!ctx?.caps.assign || !ctx.caps.bridgeUp) return 0;
+        const tree = items.filter(i => i.origin === 'tree').length;
+        return tree && tree < items.length ? tree : 0;
     },
 
     /** "Select whole folder" / "Select whole batch (N)" for the last picked item's place. */
@@ -997,8 +1445,176 @@ export const materialsWindowMethods = uiModule({
         this.mwSelectionChanged();
     },
 
+    /** Selecting is offered for an editable tree (its own files) and for a research that can assign. */
     mwCanSelect(): boolean {
-        return !!this.materialsContext()?.caps.assign;
+        const ctx = this.materialsWindowContext();
+        return !!ctx && (ctx.caps.assign || !DataManager.isReadOnly());
+    },
+
+    /**
+     * The selection's actions (spec 102 §8b): each with why it is off now.
+     * Archive writes (assign, hide) act on the research's files only; Title… /
+     * Kind… / Date… on the files that can change here.
+     */
+    mwSelActions(items: MaterialItem[]): SelAction[] {
+        const ctx = this.materialsWindowContext();
+        const m = strings.materials;
+        if (!ctx) return [];
+        const n = items.length;
+        const readOnly = DataManager.isReadOnly();
+        const archive = items.filter(i => i.origin !== 'tree');
+        const editable = items.filter(i => this.bulkEditable(i, ctx)).length;
+        const editWhy = !n ? m.nothingSelected : editable ? null : readOnly ? strings.materials.treeReadOnly : archive.length && !ctx.caps.bridgeUp ? m.actionsWhenRunning : m.selUnchanged(n);
+        const out: SelAction[] = [
+            // A phone's bar has room for the word only (the count is in the header).
+            { id: 'sel-review', label: media(MQ_MOBILE) ? m.reviewShort : m.review(n), why: n ? null : m.nothingSelected },
+            { id: 'sel-attach', label: m.attach, why: !n ? m.nothingSelected : readOnly ? strings.materials.treeReadOnly : null },
+            { id: 'sel-title', label: m.setTitle, why: editWhy },
+            { id: 'sel-kind', label: m.setKind, why: editWhy },
+            { id: 'sel-date', label: m.setDate, why: editWhy },
+        ];
+        if (ctx.caps.assign) {
+            const why = !ctx.caps.bridgeUp ? m.actionsWhenRunning : archive.length === 0 ? (n ? m.skippedTree(n) : m.nothingSelected) : null;
+            out.push({ id: 'sel-assign', label: m.assign, why });
+        }
+        // ⋯: Remove a person…, Hide…, Remove from the tree… (spec 102 §8), each on its own files.
+        if (ctx.caps.assign || (!readOnly && items.some(i => (i.attachment?.places?.length ?? 0) > 0))) {
+            const people = n ? this.selRemovePersonOptions(items).length : 0;
+            out.push({ id: 'sel-remove-person', label: m.selRemovePerson,
+                why: !n ? m.nothingSelected : people ? null : readOnly ? strings.materials.treeReadOnly : archive.length && !ctx.caps.bridgeUp ? m.actionsWhenRunning : m.selNoPerson });
+        }
+        if (ctx.caps.assign) {
+            const why = !ctx.caps.bridgeUp ? m.actionsWhenRunning : archive.length === 0 ? (n ? m.skippedTree(n) : m.nothingSelected) : null;
+            const onlyHidden = archive.length > 0 && archive.every(i => i.hidden);
+            out.push({ id: onlyHidden ? 'sel-restore' : 'sel-hide', label: onlyHidden ? m.restore : m.hide, why });
+        }
+        const removable = items.filter(i => i.attachment && !i.removedId && (i.attachment.places?.length ?? 0) > 0 && DataManager.canEditMedia(i.attachment.id));
+        if (removable.length) out.push({ id: 'sel-remove', label: m.removeFromTree, why: null });
+        // Sort with the agent (spec 102 §13, 13c): opens its dialog over the selected files of the research.
+        const sortGate = this.materialSortGate();
+        if (sortGate === 'on' || sortGate === 'offRun') {
+            const files = items.filter(i => !!i.file && !i.hidden).length;
+            const why = sortGate === 'offRun' ? m.agentSort.offRun : !n ? m.nothingSelected : !files ? m.skippedTree(n)
+                : this.materialSortBusy() ? m.agentSort.runNote : null;
+            out.push({ id: 'sel-sort', label: m.agentSort.sort, html: researchBridgeActionLabel(m.agentSort.sort, 'material-sort'), why });
+        }
+        // Delete permanently… (spec 102 §9): the last one, behind `material.delete`, never in a tree that is read only.
+        if (ctx.caps.delete && !readOnly) {
+            const files = deletableFiles(items).length;
+            const why = !ctx.caps.bridgeUp ? m.actionsWhenRunning : !n ? m.nothingSelected : !files ? m.skippedTree(n)
+                : files > DELETE_MAX_FILES ? m.del.tooMany(DELETE_MAX_FILES) : null;
+            out.push({ id: 'sel-delete', label: m.del.forever, why });
+        }
+        return out;
+    },
+
+    /** The selection's ⋯: the actions not in the bar. */
+    mwFillSelMenu(pop: HTMLElement): void {
+        const items = this.materialsSelection();
+        const inline = media(MQ_MOBILE) ? ['sel-attach', 'sel-title', 'sel-review'] : ['sel-review', 'sel-attach', 'sel-title', 'sel-kind', 'sel-date', 'sel-sort'];
+        const acts = this.mwSelActions(items).filter(a => !inline.includes(a.id));
+        pop.innerHTML = acts.map(a => {
+            const danger = a.id === 'sel-remove' || a.id === 'sel-delete';
+            // Remove from the tree… and Delete permanently… each after a divider of its own.
+            const divider = danger ? '<div class="materials-item-menu-divider" role="separator"></div>' : '';
+            const off = a.why ? ` aria-disabled="true" title="${esc(a.why)}"` : '';
+            return `${divider}<button type="button" role="menuitem" class="materials-item-menu-row${danger ? ' is-danger' : ''}" data-action="${a.id}"${off}>${a.html ?? esc(a.label)}</button>`;
+        }).join('');
+        pop.querySelectorAll<HTMLButtonElement>('[data-action]').forEach(btn => btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (btn.getAttribute('aria-disabled') === 'true') return;
+            const back = win?.popAnchor;
+            this.mwClosePop();
+            back?.focus();
+            this.mwSelAction(btn.dataset.action ?? '');
+        }));
+    },
+
+    /** Run a selection action (the bar's buttons, its ⋯). */
+    mwSelAction(id: string): void {
+        const w = win;
+        if (!w) return;
+        const items = this.mwOrdered(this.materialsSelection());
+        const end = () => { if (alive(w.gen)) this.clearMaterialsSelection(); };
+        switch (id) {
+            case 'sel-review': this.mwReview(items); return;
+            case 'sel-sort': this.openSortDialog({ items, batch: null, selection: true }); return;
+            case 'sel-attach': this.mwRun('attach', items, { selection: true }); return;
+            case 'sel-title': this.openBulkEditDialog('title', items, { done: end, refused: r => this.mwShowRefused(r) }); return;
+            case 'sel-kind': this.openBulkEditDialog('kind', items, { done: end, refused: r => this.mwShowRefused(r) }); return;
+            case 'sel-date': this.openBulkEditDialog('date', items, { done: end, refused: r => this.mwShowRefused(r) }); return;
+            case 'sel-remove': void this.openRemoveManyFromTreeDialog(items).then(ok => { if (ok) end(); }); return;
+            case 'sel-delete': void this.openDeleteDialog(items, { ctx: { selection: true, where: 'window' } }); return;
+            case 'sel-remove-person':
+                this.openSelRemovePersonDialog(items, {
+                    done: end,
+                    research: (files, refn) => this.mwRun('removeFromPerson', files, { selection: true, person: refn }),
+                });
+                return;
+            case 'sel-assign': case 'sel-hide': case 'sel-restore': {
+                const files = items.filter(i => i.origin !== 'tree');
+                const action: MaterialActionId = id === 'sel-assign' ? 'assign' : id === 'sel-hide' ? 'hide' : 'restore';
+                this.mwRun(action, files, { selection: true });
+                return;
+            }
+        }
+    },
+
+    /**
+     * Go through (spec 102 §8c): the viewer over the items with the fields
+     * open; the header names the review filter. At the end the window keeps
+     * its filters (files that no longer match leave it only now).
+     */
+    mwReview(items: MaterialItem[]): void {
+        const w = win;
+        if (!w || !items.length) return;
+        const m = strings.materials;
+        const f = w.filters;
+        const label = [f.noTitle ? m.fNoTitle : '', f.noSource ? m.fNoSource : '', f.noPerson ? m.noPerson : '', f.left ? m.agentSort.fLeft : ''].filter(Boolean).join(' · ');
+        this.openMaterialViewer(items, 0, {
+            where: 'review', label, noSource: f.noSource,
+            done: () => { if (alive(w.gen)) { this.clearMaterialsSelection(); this.mwRebuild({ items: true }); } },
+        });
+    },
+
+    /** Items in the window's order (the groups' order; Title… numbers them so). */
+    mwOrdered(items: MaterialItem[]): MaterialItem[] {
+        const w = win;
+        if (!w) return items;
+        const at = new Map<string, number>();
+        w.groups.forEach(g => g.items.forEach(i => { if (!at.has(i.key)) at.set(i.key, at.size); }));
+        return [...items].sort((a, b) => (at.get(a.key) ?? Infinity) - (at.get(b.key) ?? Infinity));
+    },
+
+    /** "Show" on a refusal: the refused files selected. */
+    mwShowRefused(items: MaterialItem[]): void {
+        const w = win;
+        if (!w) return;
+        w.selected.clear();
+        this.mwSelectKeys(items.map(i => i.key));
+    },
+
+    /** Ctrl/⌘+A: every file the filters show (closed groups too). */
+    mwSelectAll(): void {
+        const w = win;
+        if (!w || !this.mwCanSelect()) return;
+        const keys = w.groups.flatMap(g => g.items.map(i => i.key));
+        this.mwSelectKeys(keys);
+    },
+
+    /**
+     * The footer's progress of a large change (spec 102 §8h): `k` of `n` with
+     * Cancel; null hides it.
+     */
+    mwBulkProgress(k: number | null, n: number, cancel: (() => void) | null): void {
+        const w = win;
+        const el = w?.overlay.querySelector<HTMLElement>('.mw-bulk');
+        if (!w || !el) return;
+        if (k === null) { el.hidden = true; el.innerHTML = ''; return; }
+        el.hidden = false;
+        const pct = n ? Math.round((k / n) * 100) : 0;
+        el.innerHTML = `${barHtml(pct / 100, { cls: 'mw-progress' })}<span class="mw-thumbs-text">${esc(strings.materials.bulkProgress(k, n))}</span>${cancel ? `<button type="button" class="link-button mw-thumbs-toggle" data-mw="bulk-cancel">${esc(strings.buttons.cancel)}</button>` : ''}`;
+        el.querySelector('[data-mw="bulk-cancel"]')?.addEventListener('click', () => { cancel?.(); el.hidden = true; });
     },
 
     /** Note where an item is (its group and folder) for "Select whole …". */
@@ -1036,7 +1652,7 @@ export const materialsWindowMethods = uiModule({
 
     /** A batch's (or its folder's) actions (3b). */
     mwBatchActions(group: OverviewGroup, folder: OverviewFolder | undefined): { id: string; label: string; writes?: boolean; divider?: boolean }[] {
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         const batch = group.batch;
         if (!ctx || !batch) return [];
         const m = strings.materials;
@@ -1053,7 +1669,12 @@ export const materialsWindowMethods = uiModule({
                 rows.push({ id: 'hide', label: m.batchHide, writes: true });
             }
         }
-        if (ctx.caps.links !== false) rows.push({ id: 'research', label: strings.batch.openInResearch, divider: rows.length > 0 });
+        // Sort with the agent over the batch's files without a title or a person (spec 102 §1: the batch's strip went).
+        const gate = this.materialSortGate();
+        if (!folder && (gate === 'on' || gate === 'offRun') && (group.pending || group.items.some(i => !!i.file && !i.hidden && (!i.titled || (!i.persons.length && !i.viaBatch.length))))) {
+            rows.push({ id: 'sort', label: m.agentSort.sort, divider: rows.length > 0 });
+        }
+        if (ctx.caps.openLinks !== false) rows.push({ id: 'research', label: strings.batch.openInResearch, divider: rows.length > 0 });
         return rows;
     },
 
@@ -1073,6 +1694,11 @@ export const materialsWindowMethods = uiModule({
         if (!w || !batch) return;
         const folderCtx = folder ? { folder: { batch: batch.id, path: folder.label } } : {};
         switch (id) {
+            case 'sort': {
+                const items = await this.mwBatchItems(batch);
+                if (win) this.openSortDialog({ items, batch: batch.name });
+                break;
+            }
             case 'select': {
                 const items = await this.mwBatchItems(batch, folder?.label);
                 const now = win;
@@ -1085,7 +1711,7 @@ export const materialsWindowMethods = uiModule({
             case 'removePerson': this.mwRun('removeFromPerson', await this.mwBatchItems(batch), { batch }); break;
             case 'hide': this.mwRun('hide', await this.mwBatchItems(batch, folder?.label), { batch, ...folderCtx }); break;
             case 'research': {
-                const ctx = this.materialsContext();
+                const ctx = this.materialsWindowContext();
                 const url = ctx ? researchSchemeUrl('open', { tree: ctx.researchId }, announcedResearchScheme()) : null;
                 if (url) this.launchResearchLink(url);
                 break;
@@ -1098,6 +1724,9 @@ export const materialsWindowMethods = uiModule({
     mwClosePop(): void {
         const w = win;
         if (!w) return;
+        // A batch's files being read for its action: closing the menu cancels it (B88).
+        w.popLoad?.cancel();
+        w.popLoad = null;
         w.picker?.destroy();
         w.picker = null;
         w.pop?.remove();
@@ -1120,15 +1749,18 @@ export const materialsWindowMethods = uiModule({
         const m = strings.materials;
         const pop = document.createElement('div');
         pop.className = `mw-pop mw-pop-${kind}`;
-        const menu = kind === 'batchMenu' || kind === 'folderMenu';
+        const menu = kind === 'batchMenu' || kind === 'folderMenu' || kind === 'selMenu' || kind === 'headMenu';
         pop.setAttribute('role', menu ? 'menu' : 'dialog');
-        if (!menu) pop.setAttribute('aria-label', kind === 'sheet' ? m.filtersTitle : kind === 'person' ? m.fPerson : kind === 'kind' ? m.fKind : m.fBatch);
+        if (!menu) pop.setAttribute('aria-label', kind === 'where' ? m.whereTitle : kind === 'sheet' ? m.filtersTitle : kind === 'person' ? m.fPerson : kind === 'kind' ? m.fKind : m.fBatch);
         w.overlay.appendChild(pop);
         w.pop = pop;
         w.popKind = kind;
         w.popAnchor = anchor;
         anchor.setAttribute('aria-expanded', 'true');
-        if (menu) this.mwFillMenu(pop, data);
+        if (kind === 'selMenu') this.mwFillSelMenu(pop);
+        else if (kind === 'headMenu') this.mwFillHeadMenu(pop);
+        else if (menu) this.mwFillMenu(pop, data);
+        else if (kind === 'where') this.mwFillWhere(pop);
         else this.mwFillFilters(pop, kind);
         this.mwPlacePop();
         w.popKey = (e: KeyboardEvent) => {
@@ -1149,12 +1781,14 @@ export const materialsWindowMethods = uiModule({
         };
         w.popOutside = (e: MouseEvent) => {
             const t = e.target as Node;
-            if (pop.contains(t) || anchor.contains(t) || (t as HTMLElement).closest?.('.person-picker-dropdown')) return;
+            // The sheet drawn anew (mwRefillSheet) is another element: the current one counts.
+            if ((w.pop ?? pop).contains(t) || anchor.contains(t) || (t as HTMLElement).closest?.('.person-picker-dropdown')) return;
             this.mwClosePop();
         };
         document.addEventListener('keydown', w.popKey, true);
         document.addEventListener('mousedown', w.popOutside, true);
         if (kind === 'person') w.picker?.focusInput();
+        else if (kind === 'where') { pop.tabIndex = -1; pop.focus(); }
         else pop.querySelector<HTMLElement>('[role="menuitem"]:not([aria-disabled="true"]), input, button')?.focus();
     },
 
@@ -1174,7 +1808,7 @@ export const materialsWindowMethods = uiModule({
 
     mwFillMenu(pop: HTMLElement, data: { group?: string; folder?: string }): void {
         const w = win!;
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         const group = w.groups.find(g => g.key === data.group);
         const folder = data.folder ? group?.folders.find(f => f.key === data.folder) : undefined;
         if (!group || !ctx) return;
@@ -1182,23 +1816,164 @@ export const materialsWindowMethods = uiModule({
         const actions = this.mwBatchActions(group, folder);
         pop.innerHTML = actions.map(a => {
             const divider = a.divider ? '<div class="materials-item-menu-divider" role="separator"></div>' : '';
-            const off = a.writes && !ctx.caps.bridgeUp ? ` aria-disabled="true" title="${esc(m.actionsWhenRunning)}"` : '';
-            return `${divider}<button type="button" role="menuitem" class="materials-item-menu-row" data-action="${a.id}"${off}>${researchActionLabel(a.label, a.id === 'research' ? researchLinkMark('open') : 'none')}</button>`;
+            // A read-only tree (locked, a newer version's data, an exported page) writes nothing (spec 102 §12g).
+            const why = a.id === 'sort' ? (!ctx.caps.bridgeUp ? m.agentSort.offRun : this.materialSortBusy() ? m.agentSort.runNote : null)
+                : !a.writes ? null : DataManager.isReadOnly() ? m.treeReadOnly : !ctx.caps.bridgeUp ? m.actionsWhenRunning : null;
+            const off = why ? ` aria-disabled="true" title="${esc(why)}"` : '';
+            // Sort with the agent: through the bridge, the AI badge alone.
+            const label = a.id === 'sort' ? researchBridgeActionLabel(a.label, 'material-sort') : researchActionLabel(a.label, a.id === 'research' ? researchLinkMark('open') : 'none');
+            return `${divider}<button type="button" role="menuitem" class="materials-item-menu-row" data-action="${a.id}"${off}>${label}</button>`;
         }).join('');
         pop.querySelectorAll<HTMLButtonElement>('[data-action]').forEach(btn => btn.addEventListener('click', (e) => {
             e.stopPropagation();
-            if (btn.getAttribute('aria-disabled') === 'true') return;
+            if (btn.getAttribute('aria-disabled') === 'true' || btn.getAttribute('aria-busy') === 'true') return;
+            const action = btn.dataset.action ?? '';
+            const batch = group.batch;
+            // Its files not known yet (B88, §4 4c): the menu stays while they are read, closing it cancels.
+            if (action !== 'research' && batch && ctx.caps.bridgeUp && !this.mwBatchKnown(batch.id)) {
+                void this.mwBatchActionAfterLoad(pop, btn, action, group, folder);
+                return;
+            }
             const back = w.popAnchor;
             this.mwClosePop();
             back?.focus();
-            void this.mwBatchAction(btn.dataset.action ?? '', group, folder);
+            void this.mwBatchAction(action, group, folder);
         }));
+    },
+
+    /** A batch's action whose files are read first, the menu held meanwhile (B88). */
+    async mwBatchActionAfterLoad(pop: HTMLElement, btn: HTMLElement, action: string, group: OverviewGroup, folder: OverviewFolder | undefined): Promise<void> {
+        const w = win;
+        const batch = group.batch;
+        if (!w || !batch) return;
+        const load = startMenuLoad(pop, btn);
+        w.popLoad = load;
+        const r = await this.mwLoadBatch(batch.id, { signal: load.signal, timeoutMs: MENU_LOAD_LIMIT_MS });
+        const now = win;
+        if (!now || now.popLoad !== load) return;
+        if (load.stopped()) { now.popLoad = null; return; }
+        if (!r.ok) {
+            now.popLoad = null;
+            if ('error' in r && r.error) load.fail(materialErrorText(r.error, !!this.materialsWindowContext()?.agent));
+            else load.cancel();
+            return;
+        }
+        load.done();
+        now.popLoad = null;
+        const back = now.popAnchor;
+        this.mwClosePop();
+        back?.focus();
+        await this.mwBatchAction(action, group, folder);
+    },
+
+    /** The header's ⋯ on a phone (spec 102 §8, §11): Add materials… (no symbol) and Where the files are. */
+    mwFillHeadMenu(pop: HTMLElement): void {
+        const m = strings.materials;
+        const labels: Record<WindowHeadAction, string> = { add: m.addMaterials, where: m.whereTitle };
+        pop.innerHTML = '<div class="bottom-sheet-handle" aria-hidden="true"></div>'
+            + windowHeadMenu({ add: this.materialsAddOffered() })
+                .map(a => `<button type="button" role="menuitem" class="materials-item-menu-row" data-head="${a}">${esc(labels[a])}</button>`).join('');
+        pop.querySelectorAll<HTMLButtonElement>('[data-head]').forEach(btn => btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const anchor = win?.popAnchor ?? null;
+            this.mwClosePop();
+            if (btn.dataset.head === 'add') this.mwAddMaterials();
+            else if (anchor) this.mwOpenPop('where', anchor);
+        }));
+    },
+
+    /** Add materials… (spec 102 §8): the research's batch wizard over the window, with dropped files when there are some. */
+    mwAddMaterials(files?: { file: File; path: string }[]): void {
+        if (!win || !this.materialsAddOffered()) return;
+        this.mwClosePop();
+        this.showBatchDialog(files?.length ? { files } : {});
+    },
+
+    /**
+     * Files dragged onto the window (spec 102 §8): its own drop, `.drop-overlay`
+     * over the window, the files and folders into Add materials. The window's
+     * events stay here, so the app's drop (which waits while a dialog is open)
+     * does not refuse them; a phone has no drop.
+     */
+    mwWireDrop(): void {
+        const w = win!;
+        const box = w.overlay.querySelector<HTMLElement>('.materials-window');
+        if (!box) return;
+        let depth = 0;
+        const m = strings.materials;
+        const show = (on: boolean): void => {
+            let node = box.querySelector<HTMLElement>('.mw-drop');
+            if (!on) { node?.classList.remove('active'); return; }
+            if (!node) {
+                node = document.createElement('div');
+                node.className = 'drop-overlay mw-drop';
+                node.setAttribute('aria-hidden', 'true');
+                node.innerHTML = `<div class="drop-overlay-box"><div class="drop-overlay-title">${esc(m.dropTitleMaterials)}</div>`
+                    + `<div class="drop-overlay-sub">${esc(m.dropSubMaterials)}</div></div>`;
+                box.appendChild(node);
+            }
+            node.classList.add('active');
+        };
+        const ours = (e: DragEvent): boolean => alive(w.gen) === w && dragCarriesFiles(e.dataTransfer?.types)
+            && !media(MQ_MOBILE) && this.materialsAddOffered();
+        w.overlay.addEventListener('dragenter', (e) => {
+            if (!ours(e)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            depth++;
+            show(true);
+        });
+        w.overlay.addEventListener('dragover', (e) => {
+            if (!ours(e)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+        });
+        w.overlay.addEventListener('dragleave', (e) => {
+            if (!ours(e)) return;
+            e.stopPropagation();
+            depth = Math.max(0, depth - 1);
+            if (depth === 0) show(false);
+        });
+        w.overlay.addEventListener('drop', (e) => {
+            if (!ours(e)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            depth = 0;
+            show(false);
+            // The entries are read now (a drop's data is gone after this event), the folders walked after.
+            void this.batchFilesFromDrop(e.dataTransfer).then(files => { if (files.length && alive(w.gen)) this.mwAddMaterials(files); });
+        });
+    },
+
+    /** A batch added while the window is open (spec 102 §1 A, §8): "N files added" until the sorting moves on, the list read again. */
+    materialsBatchAdded(count: number): void {
+        const w = win;
+        if (!w || w.model !== 'archive' || count <= 0 || !document.getElementById(MODAL_ID)) return;
+        w.sortAdded = count;
+        w.sortClosedState = null;
+        this.mwSortStrip();
+        void this.mwLoad();
+    },
+
+    /** ⓘ "Where the files are": one sentence by the model, a second one for an encrypted tree (1c, 1d). */
+    mwFillWhere(pop: HTMLElement): void {
+        const w = win!;
+        const ctx = this.materialsWindowContext();
+        const m = strings.materials;
+        const agent = !!ctx?.agent;
+        const encrypted = SettingsManager.isEncryptionEnabled();
+        const lines = [
+            w.model === 'app' ? m.whereApp : agent ? m.whereArchiveResearch : m.whereArchive,
+            encrypted && w.model === 'archive' ? (agent ? m.whereEncryptedResearch : m.whereEncrypted) : '',
+        ].filter(Boolean);
+        pop.innerHTML = `<div class="mw-pop-head">${esc(m.whereTitle)}</div>${lines.map(t => `<p class="mw-where-text">${esc(t)}</p>`).join('')}`;
     },
 
     /** The filter popovers (wide) and the filters sheet (≤ 1024). */
     mwFillFilters(pop: HTMLElement, kind: PopKind): void {
         const w = win!;
-        const ctx = this.materialsContext();
+        const ctx = this.materialsWindowContext();
         if (!ctx) return;
         const m = strings.materials;
         const f = w.filters;
@@ -1218,7 +1993,7 @@ export const materialsWindowMethods = uiModule({
                 ${KIND_FILTERS.map(k => `<label class="mw-check-row"><input type="checkbox" data-pop="kind" value="${k}"${f.kinds.includes(k) ? ' checked' : ''}> ${esc(k === 'none' ? m.kindNone : m.kind[k] ?? k)}</label>`).join('')}
             </div>`);
         }
-        if (kind === 'batch' || sheet) {
+        if (kind === 'batch' || (sheet && w.model === 'archive')) {
             const batches = [...(w.list?.batches ?? [])].sort((a, b) => (Date.parse(b.at ?? '') || 0) - (Date.parse(a.at ?? '') || 0));
             parts.push(`<div class="mw-pop-section" role="radiogroup" aria-label="${esc(m.fBatch)}">
                 ${sheet ? `<div class="mw-pop-title">${esc(m.fBatch)}</div>` : ''}
@@ -1233,11 +2008,27 @@ export const materialsWindowMethods = uiModule({
                 ${toggle('noperson', `${m.noPerson} · ${w.summary.noPerson.toLocaleString(getCurrentLanguage())}`, f.noPerson)}
                 ${ctx.caps.assign ? toggle('hidden', m.showHidden, f.showHidden) : ''}
             </div>`);
+            parts.push(this.mwReviewChips(toggle, 'mw-pop-section mw-pop-toggles mw-pop-review'));
             parts.push(`<div class="mw-pop-section">
                 <div class="mw-pop-title">${esc(m.groupBy)}</div>
                 <div class="mw-seg sel-seg" role="group" aria-label="${esc(m.groupBy)}">
-                    <button type="button" class="sel-opt" data-sel-form="seg" data-pop="group-batch" aria-pressed="${w.group === 'batch'}">${esc(m.groupBatch)}</button>
-                    <button type="button" class="sel-opt" data-sel-form="seg" data-pop="group-date" aria-pressed="${w.group === 'date'}">${esc(m.groupDate)}</button>
+                    ${(w.model === 'app'
+                        ? [['added', m.groupAdded], ['person', m.groupPerson]]
+                        : [['batch', m.groupBatch], ['date', m.groupDate]]).map(([g, label]) =>
+                        `<button type="button" class="sel-opt" data-sel-form="seg" data-pop="group-${g}" aria-pressed="${w.group === g}">${esc(label)}</button>`).join('')}
+                </div>
+            </div>`);
+            // Sort (the toolbar's Sort ▾ on a computer): the default order or a column, then its direction.
+            const s = w.sort;
+            parts.push(`<div class="mw-pop-section">
+                <div class="mw-pop-title">${esc(m.sortBy)}</div>
+                <div class="mw-pop-sort" role="group" aria-label="${esc(m.sortBy)}">
+                    ${toggle('sort-col-none', m.sortDefault, !s)}
+                    ${this.mwSortColumns().map(([col, label]) => toggle(`sort-col-${col}`, label, s?.col === col)).join('')}
+                </div>
+                <div class="mw-seg sel-seg mw-pop-sortdir" role="group" aria-label="${esc(m.sortBy)}">
+                    ${([[1, '↑', m.sortAscending], [-1, '↓', m.sortDescending]] as const).map(([dir, arrow, label]) =>
+                        `<button type="button" class="sel-opt" data-sel-form="seg" data-pop="sort-dir-${dir}" aria-pressed="${s?.dir === dir}"${s ? '' : ' disabled'}><span aria-hidden="true">${arrow}</span> ${esc(label)}</button>`).join('')}
                 </div>
             </div>`);
             parts.push(`<div class="mw-pop-foot">
@@ -1249,11 +2040,11 @@ export const materialsWindowMethods = uiModule({
         if (pop.querySelector('#mw-person-picker')) {
             w.picker = new PersonPicker({
                 containerId: 'mw-person-picker',
-                filter: p => !!researchPersonRef(p.refn),
+                filter: p => w.model === 'app' || !!researchPersonRef(p.refn),
                 onSelect: (id) => {
-                    const refn = researchPersonRef(DataManager.getPerson(id)?.refn);
-                    if (!refn) return;
-                    w.filters.person = refn;
+                    const key = w.model === 'app' ? (DataManager.getPerson(id) ? id : null) : researchPersonRef(DataManager.getPerson(id)?.refn);
+                    if (!key) return;
+                    w.filters.person = key;
                     this.mwFiltersChanged();
                     if (sheet) this.mwRefillSheet(); else { const back = w.popAnchor; this.mwClosePop(); back?.focus(); }
                 },
@@ -1274,12 +2065,27 @@ export const materialsWindowMethods = uiModule({
         pop.addEventListener('click', (e) => {
             const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-pop]');
             if (!btn || btn.tagName === 'INPUT') return;
+            const sortPick = btn.dataset.pop?.match(/^sort-(col|dir)-(.+)$/);
+            if (sortPick) {
+                const [, what, value] = sortPick;
+                w.sort = chooseSort(w.sort, what === 'dir' ? { dir: value === '1' ? 1 : -1 } : value === 'none' ? null : { col: value as ListColumn });
+                this.mwFiltersChanged();
+                this.mwRefillSheet();
+                return;
+            }
             switch (btn.dataset.pop) {
                 case 'clear-person': w.filters.person = null; break;
                 case 'noperson': w.filters.noPerson = !w.filters.noPerson; break;
+                case 'notitle': w.filters.noTitle = !w.filters.noTitle; break;
+                case 'nosource': w.filters.noSource = !w.filters.noSource; break;
+                case 'left': w.filters.left = !w.filters.left; break;
+                case 'where-tree': w.filters.where = w.filters.where === 'tree' ? null : 'tree'; break;
+                case 'where-archive': w.filters.where = w.filters.where === 'archive' ? null : 'archive'; break;
                 case 'hidden': w.filters.showHidden = !w.filters.showHidden; break;
                 case 'group-batch': this.mwSetGroup('batch'); break;
                 case 'group-date': this.mwSetGroup('date'); break;
+                case 'group-added': this.mwSetGroup('added'); break;
+                case 'group-person': this.mwSetGroup('person'); break;
                 case 'clear': this.mwClearFilters(); break;
                 case 'done': { const back = w.popAnchor; this.mwClosePop(); back?.focus(); return; }
                 default: return;
@@ -1308,7 +2114,16 @@ export const materialsWindowMethods = uiModule({
         const w = win;
         if (!w) return;
         w.scroller.scrollTop = 0;
+        writeListPrefs(w.sort, w.filters);
         this.mwRebuild();
+    },
+
+    /** The files the agent left unassigned, shown with their filter (the sorting dialog's Show in Materials, spec 102 §2). */
+    mwShowLeft(): void {
+        const w = win;
+        if (!w) return;
+        w.filters.left = true;
+        this.mwFiltersChanged();
     },
 
     mwClearFilters(): void {
@@ -1396,7 +2211,7 @@ export const materialsWindowMethods = uiModule({
         });
         w.overlay.querySelector('.mw-selhead-done')?.addEventListener('click', () => this.clearMaterialsSelection());
         w.overlay.querySelector('.mw-head')?.addEventListener('click', (e) => {
-            const btn = (e.target as HTMLElement).closest<HTMLElement>('.mw-tools [data-mw]');
+            const btn = (e.target as HTMLElement).closest<HTMLElement>('.mw-tools [data-mw], .mw-where, .mw-add, .mw-head-more');
             if (!btn) return;
             this.mwToolAction(btn);
         });
@@ -1411,14 +2226,25 @@ export const materialsWindowMethods = uiModule({
             case 'kind': this.mwOpenPop('kind', btn); return;
             case 'batch': this.mwOpenPop('batch', btn); return;
             case 'sheet': this.mwOpenPop('sheet', btn); return;
+            case 'sort-menu': this.mwSortMenu(btn); return;
+            case 'where': this.mwOpenPop('where', btn); return;
+            case 'add': this.mwAddMaterials(); return;
+            case 'head-menu': this.mwOpenPop('headMenu', btn); return;
             case 'clear-person': f.person = null; break;
             case 'clear-kind': f.kinds = []; break;
             case 'clear-batch': f.batch = null; w.focusBatch = null; break;
             case 'noperson': f.noPerson = !f.noPerson; break;
+            case 'notitle': f.noTitle = !f.noTitle; break;
+            case 'nosource': f.noSource = !f.noSource; break;
+            case 'left': f.left = !f.left; break;
+            case 'where-tree': f.where = f.where === 'tree' ? null : 'tree'; break;
+            case 'where-archive': f.where = f.where === 'archive' ? null : 'archive'; break;
             case 'hidden': f.showHidden = !f.showHidden; break;
             case 'clear': this.mwClearFilters(); break;
             case 'group-batch': this.mwSetGroup('batch'); break;
             case 'group-date': this.mwSetGroup('date'); break;
+            case 'group-added': this.mwSetGroup('added'); break;
+            case 'group-person': this.mwSetGroup('person'); break;
             case 'view-grid': this.mwSetView('grid'); return;
             case 'view-list': this.mwSetView('list'); return;
             case 'select':
@@ -1441,6 +2267,15 @@ export const materialsWindowMethods = uiModule({
         }, { passive: true });
         const body = w.overlay.querySelector<HTMLElement>('#materials-window-body')!;
         body.addEventListener('click', (e) => this.mwBodyClick(e));
+        // Ctrl/⌘+A: every file the filters show (not in a text field).
+        w.overlay.addEventListener('keydown', (e) => {
+            if (!(e.ctrlKey || e.metaKey) || e.altKey || e.key.toLowerCase() !== 'a') return;
+            const t = e.target as HTMLElement;
+            if (t.closest('input, textarea, [contenteditable="true"]') || w.pop) return;
+            if (!this.mwCanSelect()) return;
+            e.preventDefault();
+            this.mwSelectAll();
+        });
         w.canvas.addEventListener('keydown', (e) => this.mwKeydown(e));
         w.canvas.addEventListener('focusin', (e) => {
             const cell = (e.target as HTMLElement).closest<HTMLElement>('[role="gridcell"][data-key]');
@@ -1448,6 +2283,8 @@ export const materialsWindowMethods = uiModule({
         });
         // Touch: a long press starts selecting with the item.
         w.canvas.addEventListener('pointerdown', (e) => {
+            // A new touch: a long press's click was not delivered (a phone sends none), the tap counts.
+            w.suppressClick = false;
             if (e.pointerType !== 'touch' || !this.mwCanSelect()) return;
             const cell = (e.target as HTMLElement).closest<HTMLElement>('[role="gridcell"][data-key]');
             if (!cell?.dataset.key) return;
@@ -1520,13 +2357,14 @@ export const materialsWindowMethods = uiModule({
                     if (whole) this.mwSelectKeys(whole.keys);
                     return;
                 }
-                case 'sel-assign': case 'sel-hide': case 'sel-restore': {
+                case 'sel-more': this.mwOpenPop('selMenu', act); return;
+                case 'sort': this.mwSortBy(act.dataset.col as ListColumn); return;
+                case 'sel-review': case 'sel-attach': case 'sel-title': case 'sel-kind': case 'sel-date':
+                case 'sel-assign': case 'sel-hide': case 'sel-restore': case 'sel-remove': case 'sel-remove-person': case 'sel-sort':
+                case 'sel-delete':
                     if (disabled) return;
-                    const items = this.materialsSelection().filter(i => i.origin !== 'tree');
-                    const id: MaterialActionId = act.dataset.mw === 'sel-assign' ? 'assign' : act.dataset.mw === 'sel-hide' ? 'hide' : 'restore';
-                    this.mwRun(id, items, { selection: true });
+                    this.mwSelAction(act.dataset.mw);
                     return;
-                }
             }
         }
         const cell = target.closest<HTMLElement>('.mw-canvas [role="gridcell"][data-key]');

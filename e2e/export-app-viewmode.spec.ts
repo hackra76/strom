@@ -146,10 +146,16 @@ test.describe('view mode: Actions and More carry what an exported page can do', 
         // The same "For the family ›" as in editing; About is reached through Settings (menu 1020 D1, D18).
         const rows = (await dropdown.locator(':scope > .tree-switcher-action:visible, :scope > .actions-submenu-wrap:visible > .actions-submenu-row')
             .allInnerTexts()).map(t => t.replace(/\s+/g, ' ').trim());
-        expect(rows.map(r => r.replace(/\s*\d+$/, ''))).toEqual(['Anniversaries', 'For the family ›', 'Tree overview', 'How Strom works', 'Settings']);
+        expect(rows.map(r => r.replace(/\s*\d+$/, ''))).toEqual(['Anniversaries', 'Lists of people…', 'For the family ›', 'Tree overview', 'How Strom works', 'Settings']);
         await expect(page.locator('#actions-view-about-row')).toHaveCount(0);
+        // Lists of people read only (spec 084 §2): the badge, no way to change a list.
+        await page.locator('#actions-lists-row').click();
+        const lists = page.locator('#person-lists-modal');
+        await expect(lists.locator('.pl-ro')).toHaveText('Read only');
+        await expect(lists.locator('.pl-new, .pl-dots, .pl-more, .pl-pencil')).toHaveCount(0);
+        await page.keyboard.press('Escape');
+        await expect(lists).toHaveCount(0);
 
-        await page.evaluate(() => window.Strom.UI.closeActionsMenu());
         const viaFamily = async (row: string) => {
             await open();
             await page.locator('#actions-family-row').click();
@@ -187,7 +193,7 @@ test.describe('view mode: Actions and More carry what an exported page can do', 
         await expect(page.locator('#sheet-undo')).toHaveCount(0);
         const rows = (await sheet.locator('.bottom-sheet-items > .bottom-sheet-item').allInnerTexts()).map(t => t.replace(/\s+/g, ' ').trim());
         // "For the family ›" as in editing (menu 1020 D18); Full screen where the browser offers it (spec 082 K1.3).
-        expect(rows.map(r => r.replace(/\s*\d+$/, ''))).toEqual(['Anniversaries', 'For the family ›', 'Tree overview', 'Full screen']);
+        expect(rows.map(r => r.replace(/\s*\d+$/, ''))).toEqual(['Anniversaries', 'Lists of people', 'For the family ›', 'Tree overview', 'Full screen']);
         await expect(sheet.locator('.bottom-sheet-pair').last().locator('.bottom-sheet-item')).toHaveText(['Settings', 'How Strom works', 'About Strom']);
         await page.locator('#sheet-family').click();
         await page.locator('#sheet-book').click();
@@ -201,4 +207,40 @@ test.describe('view mode: Actions and More carry what an exported page can do', 
         await page.evaluate(() => window.Strom.UI.toggleActionsMenu());
         await expect(page.locator('#actions-menu-dropdown')).not.toHaveClass(/active/);
     });
+});
+
+test('lists of people in the exported HTML: shown, opened in the Table and as its scope, never changed (spec 084 §16)', async ({ page }, testInfo) => {
+    await openApp(page);
+    await createFirstPerson(page, 'Jan', 'Novak');
+    await addRelation(page, 'Jan', 'partner', 'Marie', 'Novak', 'female');
+    await page.evaluate(() => {
+        const dm = window.Strom.DataManager;
+        const ids = Object.values(dm.getData().persons).map(p => p.id);
+        const work = dm.createPersonList({ name: 'Letters to write', dynamic: false, personIds: ids })!;
+        dm.setPersonListChecklist(work.id, true);
+        dm.togglePersonListDone(work.id, ids[0], true);
+    });
+
+    await openAppExportDialog(page);
+    await saveAndOpen(page, testInfo, (async () => {
+        const [d] = await Promise.all([
+            page.waitForEvent('download'),
+            page.locator('#export-password-modal').locator('#export-submit-btn').click(),
+        ]);
+        return d;
+    })());
+    await expect(page.locator('body')).toHaveClass(/view-mode/);
+
+    await page.evaluate(() => window.Strom.UI.showPersonLists());
+    const d = page.locator('#person-lists-modal');
+    await expect(d.locator('.pl-ro')).toHaveText('Read only');
+    await d.locator('.pl-row', { hasText: 'Letters to write' }).click();
+    await expect(d.locator('.pl-person .pl-pname')).toHaveCount(2);
+    await expect(d.locator('.pl-person.is-done')).toHaveCount(1);
+    // No way to change a list: no New list, ⋯, ×, boxes, handles or Add person.
+    await expect(d.locator('.pl-new, .pl-dots, .pl-more, .pl-pencil, .pl-x, .pl-check, .pl-handle, [data-act="add-person"]')).toHaveCount(0);
+    await d.locator('[data-act="open-table"]').first().click();
+    await expect(d).toHaveCount(0);
+    await expect(page.locator('#table-container .tv-scope-btn')).toHaveAttribute('aria-label', 'Scope: Letters to write');
+    await expect(page.locator('#table-container .tv-status-count')).toHaveText('2 of 2 people');
 });

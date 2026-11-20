@@ -46,11 +46,15 @@ import {
 import {
     placeAliasMap, placeSearchNames, placeVariantGroups, type PlaceMemberTag, type PlaceVariantGroup, type PlaceVariantMember,
 } from '../place-groups.js';
-import { placesView, resetPlacesView } from './places-identify-ui.js';
+import { placesView, resetPlacesView, PLACES_STEP_MS, PLACES_UNQUEUE_MS } from './places-identify-ui.js';
+import { runBusy, runHeavy, type BusyCtl } from './busy.js';
 import { uiModule } from './module.js';
 import { normalizeModal } from './modal-skeleton.js';
 import type { MapScope } from './map-ui.js';
 import { helpMark } from './help-mark.js';
+
+/** From this many persons the cleanup's working state shows at once (its save runs past 120 ms, B43). */
+const CLEAN_AT_ONCE_PERSONS = 5000;
 
 /** A row of the dialog: a place with its location, when it has one. */
 interface ManagerPlace {
@@ -781,7 +785,10 @@ export const placesManagerMethods = uiModule({
         const search = row.querySelector('.place-search') as HTMLElement;
         const query = row.querySelector('.place-query') as HTMLInputElement;
         const go = row.querySelector('.place-search-go') as HTMLButtonElement;
-        const run = (): void => { void this.searchPlaceFromManager(key, query.value, row); };
+        // B141: the button in its working state while the forms are asked (the run's own waits between them).
+        const run = (): void => {
+            void runBusy(go, () => this.searchPlaceFromManager(key, query.value, row), { label: strings.map.searching, timeoutMs: Infinity });
+        };
         go.onclick = run;
         query.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); run(); } };
 
@@ -794,9 +801,15 @@ export const placesManagerMethods = uiModule({
             query.select();
         };
         for (const b of own<HTMLButtonElement>('.place-remove')) b.onclick = () => this.removePlacePin(key);
-        for (const b of own<HTMLButtonElement>('.place-look')) b.onclick = () => void this.queuePlaces([key], false);
-        for (const b of own<HTMLButtonElement>('.place-check')) b.onclick = () => void this.queuePlaces([key], true);
-        for (const b of own<HTMLButtonElement>('.place-unqueue')) b.onclick = () => void this.unqueuePlaceForms([...(managerPlaces.get(key)?.variants.keys() ?? [])], [key]);
+        // A research step from the row (B147): its button works until the bridge answers, a refusal said under the row.
+        const step = (b: HTMLButtonElement, fn: (ctl: BusyCtl) => Promise<unknown>, timeoutMs = PLACES_STEP_MS): void => {
+            b.onclick = () => void runBusy(b, async ctl => { await fn(ctl); }, { label: strings.busy.sending, timeoutMs, rowOf: row });
+        };
+        for (const b of own<HTMLButtonElement>('.place-look')) step(b, ctl => this.queuePlaces([key], false, ctl));
+        for (const b of own<HTMLButtonElement>('.place-check')) step(b, ctl => this.queuePlaces([key], true, ctl));
+        for (const b of own<HTMLButtonElement>('.place-unqueue')) {
+            step(b, ctl => this.unqueuePlaceForms([...(managerPlaces.get(key)?.variants.keys() ?? [])], [key], { ctl }), PLACES_UNQUEUE_MS);
+        }
         for (const b of own<HTMLButtonElement>('.place-answer')) b.onclick = () => {
             const waiting = placesView.ids.get(key)?.waitingId;
             this.closePlacesManager();
@@ -1222,13 +1235,18 @@ export const placesManagerMethods = uiModule({
 
     /** Sweep coordinate entries nothing in the tree points at any more. Confirms
      *  with the count, then deletes via the normal mutation path (undo + audit
-     *  + Undo toast) and redraws the manager. */
+     *  + Undo toast) under the working state of the button that asked (B43: the
+     *  undo step copies the whole tree and saves it, long for a large one) and
+     *  redraws the manager. */
     async cleanOrphanPlaces(): Promise<void> {
         const count = orphanedPlaceKeys(DataManager.getData()).length;
         if (count === 0) return;
         if (!await this.showConfirm(strings.map.cleanOrphansConfirm(count), strings.danger.cleanPlacesTitle(count),
             { confirmLabel: strings.danger.cleanPlaces, variant: 'danger' })) return;
-        const removed = DataManager.clearOrphanPlaces();
+        const btn = document.getElementById('places-clean-orphans');
+        const atOnce = Object.keys(DataManager.getData().persons).length >= CLEAN_AT_ONCE_PERSONS;
+        const removed = await runHeavy(btn?.isConnected ? btn : null, () => DataManager.clearOrphanPlaces(),
+            { label: strings.map.cleaningOrphans, atOnce }) ?? 0;
         if (removed > 0) this.showToast(strings.map.cleanOrphansDone(removed));
         this.refreshPlacesManager();
     },

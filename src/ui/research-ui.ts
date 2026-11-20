@@ -20,8 +20,11 @@
  * The pure logic lives in src/research-link.ts.
  */
 
+import { allMedia } from '../media.js';
 import { noteOverviewSectionRows } from './overview-columns-ui.js';
+import { waitingAuditMarkEl, waitingAuditShown } from './waiting-task-ui.js';
 import { keepTableViews } from '../table-views-data.js';
+import { stampResearchTree } from '../person-lists-data.js';
 import { pressOnToast } from '../sheet-toasts.js';
 import { setResearchActionLabel, researchActionMark } from './research-open-mark.js';
 import { DataManager, migrateData } from '../data.js';
@@ -38,7 +41,8 @@ import { StromData, TreeId, PersonId, SourceExcerpt, TreeImagesVariant } from '.
 import { parseGedcom, convertToStrom, decodeGedcomFile, parseGedcomDate } from '../ged-parser.js';
 import { formatFlexDate, instantLocalDay } from '../dates.js';
 import { formatLiveTime, formatLiveClock } from '../live-time.js';
-import { isMobile } from '../breakpoints.js';
+import { isDesktop, isMobile } from '../breakpoints.js';
+import { livePanelDrawnSections, livePanelNothingAtWork, livePanelWorkingOnly } from './live-panel-working-only.js';
 import {
     readResearchHeader, parseLoopbackUrl, parseLiveBridge, contentFingerprint, fingerprintLike,
     decideResearchOpen, stabilizeIds, keepEventShares, keepTitles, keepMarriedSurname, keepSurnameVariants, keepLineageOverrides, researchHasTitles, withResearchTitles, TITLES_FEATURE, carryOverMedia, carryOverUnknownPartners, sanitizeLiveStatus, sanitizeLiveChange,
@@ -46,15 +50,15 @@ import {
     humanizeChange, isGedcomFileName, isSafariBrowser,
     parseSendBridge, pickSendDefault, sanitizeSyncReply, researchSchemeUrl, researchTaskRef,
     ResearchLinkAction, ResearchLinkParams, LiveBridgeUrls, LiveStatus, LiveChange, LiveWorker, LiveWaiting,
-    LiveQueueItem, LiveSpend, LiveIntake, LiveDirection, LiveBusy, LiveWork, ResearchCaps, BrowserInfo, LiveOffLine, ResearchHeaderInfo, ExportXrefs, ResearchAccepts, statusAgentless,
+    LiveQueueItem, LiveSpend, LiveIntake, LiveDirection, LiveBusy, LiveWork, ResearchCaps, BrowserInfo, LiveOffLine, LiveBooks, ResearchHeaderInfo, ExportXrefs, ResearchAccepts, statusAgentless,
     LiveQueueCounts, QUEUE_PAGE_FEATURE, QUEUE_SEARCH_FEATURE,
-    researchLinkMark, researchUrlMark,
+    researchLinkMark, researchUrlMark, researchMediaKeys, MEDIA_BASE_MAX, researchMediaSentAfterReturn,
 } from '../research-link.js';
 import { keepImports } from '../import-origin.js';
 import { uiModule } from './module.js';
 import { returnFocusAfterViewer } from './sources.js';
-import { withAppVersion, researchGedcomTitles, researchSendsReadings, researchSendsSourceFields, TitlesInGedcom, changeKind, changeAdds, sanitizeLiveLog, sourceIdsByRef, findSourceTitle, lineNewerThanLoaded, textKind, textPersonRefs, textWithoutRefs, LiveChangeKind, LiveLogEntry, LiveCommitAdds, LiveRecent, waitingAnswerPlace } from '../research-link.js';
-import { overviewInWindow } from '../windows/overview-window.js';
+import { withAppVersion, researchGedcomTitles, researchSendsReadings, researchSendsSourceFields, researchMediaOut, NO_MEDIA_FEATURES, type ResearchMediaOut, TitlesInGedcom, changeKind, changeAdds, sanitizeLiveLog, sourceIdsByRef, findSourceTitle, lineNewerThanLoaded, textKind, textPersonRefs, textWithoutRefs, LiveChangeKind, LiveLogEntry, LiveCommitAdds, LiveRecent, waitingAnswerPlace, booksOn } from '../research-link.js';
+import { overviewChanged, overviewInWindow } from '../windows/overview-window.js';
 import { AGENT_DONE_MS, AGENT_DONE_FADE_MS, ResearchCardInfo, setResearchCardInfoProvider } from '../card-signals.js';
 import {
     activeDirections, directionGlyph, directionsMulti, keepLineFocus, lineGlyphFor, linesMulti, queueDirectionFilter, selectedLine,
@@ -63,15 +67,19 @@ import {
 import { iconSvg } from '../icons.js';
 import {
     branchName, focusQueueMoved, personByRefn, queueBranchFilter, queueNextFor, queueNextOffered, queueRowFlash, queueWhyText, setQueueBranchFilter, taskMenuOrders, taskOrderOffered,
-    waitBranchText, workingWhyText,
+    taskProblemBox, waitBranchText, workingWhyText,
 } from './research-offline-ui.js';
-import type { TaskOrderDo } from '../research-directions-write.js';
-import { OTHER_GROUP, panelWaiting, textWithLinks, todoWaiting, waitingSection, waitingTodoCount } from '../research-waiting.js';
+import { drawRowMoreBusy } from './row-busy.js';
+import { directionPlacesKept, type TaskOrderDo, type DirectionPlaces } from '../research-directions-write.js';
+import { agentMirror } from '../windows/agent-mirror.js';
+import { FLAT_GROUP, OTHER_GROUP, listedBook, panelWaiting, panelWaitingGroups, textWithLinks, todoWaiting, waitingSection, waitingTodoCount, type WaitingGroupOpts } from '../research-waiting.js';
+import { bookHeadTitle, bookTitle, urgentBooks } from '../research-books.js';
 import { agoShort } from '../research-others.js';
 import {
     PrefKey, SECTION_PREFS_EVENT, SectionPref, autoFoldOrder, hasSectionPrefs, isImportantWaiting, resetSectionPrefs, restoreSectionPrefs, newWaiting, noteWaitingSeen, panelSectionOrder, sectionPrefs, sectionPrefsSnapshot, setSectionPref, topPrefs,
     waitingSeen, watchSectionPrefsStorage, PANEL_PREF_KEYS,
 } from './live-section-prefs.js';
+import { groupTitleMoreEl, shownWaitingGroups, storedWaitingGroupMode, storedWaitingOrder, waitingGroupName, waitingSinceText } from './waiting-order-ui.js';
 import {
     QUEUE_ROWS_CAP, QueueFilter, QueueList, loadMoreQueueList, noteQueueRev, onQueueListsChange, queueList, queueListItem, queueRemote, requestQueueList,
     resetQueueLists, retryQueueList,
@@ -79,6 +87,7 @@ import {
 import {
     QueueSearch, activeQueueSearch, clearQueueSearch, markQueueSearchPending, queueSearchFor, queueSearchOffered, sayQueueSearch,
 } from './queue-search-ui.js';
+import { parseDeepLink } from '../deep-link.js';
 import { followNotice, researchNameBeside, FOLLOW_NOTICE_MS, FOLLOW_HIGHLIGHT_MS, FollowTreeRef } from '../research-follow.js';
 import { SettingsManager } from '../settings.js';
 import { countImages, stripMedia } from '../attachments.js';
@@ -91,7 +100,14 @@ import {
     noteResearchBridge, noteResearchBridgeStatus, researchTreeOfStatus, patchResearchAutoState, researchAutoState, researchIdAtBridge, ResearchLinkBefore,
     storedResearchBridge,
 } from '../research-device.js';
-import { rememberBridgeStatus, researchSendMode, researchStatusNow } from './research-sync-ui.js';
+import { rememberBridgeStatus, researchSendMode, researchStatusNow, researchMediaFirstAgain, researchBridgeDownNow } from './research-sync-ui.js';
+import { openResearchBusy, withHandoff, type OpenBusyResult, type OpenBusyOpts } from './research-open-busy.js';
+import { endResearchAdoptWait } from './research-adopt-ui.js';
+import { countGedcomPersons, readBodyWithProgress, type TreeDownloadWatch, type TreeLoadRun } from './tree-load-progress.js';
+import type { ProgressToastHandle } from './toast.js';
+import { holdLeave } from './busy-leave.js';
+import { BUSY_SHOW_MS, BUSY_TIMEOUTS, announceBusy, busyShownOn, busySpinHtml, busyStep, runBusy } from './busy.js';
+import { TreeEditLock } from './tree-edit-lock.js';
 import { sourceReadings, researchSendVouches, conflictTakeovers, heldConflicts } from '../research-sync.js';
 import { currentAppBrowser, appBrowserName } from '../research-transfer.js';
 import { localNetworkStatus } from '../local-network.js';
@@ -99,8 +115,8 @@ import { pendingAdopt } from './pending-adopt.js';
 import { shownName, shownNameOrEmpty, fitNameHtml } from '../person-name.js';
 import { bindSectionMenu, keepSectionControlFocus, sectionClickSwallowed, sectionMovedNow } from './live-section-edit-ui.js';
 import { BRIDGE_ANSWER_MS } from '../bridge-ask.js';
-import { bridgeGivesEtag, bridgeGivesImagesByHash, bridgeGivesStale, staleTreeUrl, storedTreeEtag, treeFamilyPartners, treeFileState, treeReplyEtag, treeReplyHeads, treeReplyImages, TREE_GED_TIMEOUT_MS, type TreeReplyHeads } from '../research-tree-file.js';
-import { findImageRefs, forgetHeldImages, imagesUrlOf, refTreeUrl, resolveImageRefs, sha256Hex, type ImageResolveDeps } from '../research-image-refs.js';
+import { bridgeGivesEtag, bridgeGivesImagesByHash, bridgeGivesStale, staleTreeUrl, storedTreeEtag, treeAsksAppMedia, treeFamilyPartners, treeFileState, treeReplyEtag, treeReplyHeads, treeReplyImages, TREE_GED_TIMEOUT_MS, type TreeReplyHeads } from '../research-tree-file.js';
+import { findImageRefs, findNamedFileShas, forgetHeldImages, imagesUrlOf, refTreeUrl, resolveImageRefs, sha256Hex, type ImageResolveDeps } from '../research-image-refs.js';
 import { completeStatus, statusAskUrl } from '../status-parts.js';
 
 /** What a research open needs to know from the file (or the bridge). */
@@ -114,6 +130,104 @@ export interface ResearchSource {
     head?: string | null;
     /** `_STROM_MODE archive`: the research works without an agent. */
     mode?: 'archive' | null;
+    /** The file came with the tree's own files (`media=app`, spec 108 §5): its media are the archive's. */
+    appMedia?: true;
+}
+
+/**
+ * The media the archive gave tree `treeId` at its last return with them
+ * (spec 108 §5), as researchMediaKeys: what is in it and missing now was
+ * taken away there and is not kept. Null — every medium of the app kept —
+ * when none came yet (K2.7); undefined when this file did not come with them
+ * (carryOverMedia as ever).
+ */
+export function researchMediaBaseOf(treeId: TreeId | null | undefined, source: ResearchSource): ReadonlySet<string> | null | undefined {
+    if (!source.appMedia || !source.treeId) return undefined;
+    if (!treeId) return null;
+    const base = researchAutoState(treeId).mediaBase;
+    return base && base.research === source.treeId ? new Set(base.keys) : null;
+}
+
+/**
+ * A file with the tree's own files was loaded into `treeId` with its images
+ * (`research`, as it came): its media are the base of the next return, and
+ * when nothing of the app's own had to be kept (`carried`), the archive
+ * holds them all — no first write with them is due (K2.7, spec 108); when
+ * some were, one write with them is due (researchMediaSentAfterReturn).
+ */
+export function noteResearchMediaReturn(treeId: TreeId, researchId: string, research: StromData, carried: number): void {
+    // Files kept here that the archive lacks: the mark goes, and one write with them goes by itself (once more on this page).
+    const sent = researchMediaSentAfterReturn(researchId, carried);
+    patchResearchAutoState(treeId, {
+        mediaBase: { research: researchId, keys: researchMediaKeys(research).slice(0, MEDIA_BASE_MAX) },
+        appMediaSent: sent,
+        mediaMissed: undefined,
+    });
+    if (!sent) researchMediaFirstAgain(treeId);
+    mediaRetryDone(treeId);
+}
+
+/**
+ * A version of a research that keeps the tree's own files was loaded into
+ * `treeId` without them (its images by hash could not all be had, so the file
+ * with its images in it came, which never has them): the tree may lack files
+ * the archive holds, so its writes only add, never take one off there, until
+ * a version with them comes (noteResearchMediaReturn).
+ */
+export function noteResearchMediaMissed(treeId: TreeId, researchId: string): void {
+    patchResearchAutoState(treeId, { mediaMissed: researchId });
+}
+
+/**
+ * After a version came without the tree's own files (noteResearchMediaMissed):
+ * the waits before each new attempt to have them, then the notice with "Try
+ * again". The images themselves are each asked again a few times already
+ * (IMAGE_RETRY_MS); these try the whole file with them once the bridge may
+ * have recovered.
+ */
+export const MEDIA_RETRY_MS: readonly number[] = [5_000, 30_000];
+/** Trees whose files are being tried again (attempts planned or running): one round each. */
+const mediaRetrying = new Set<TreeId>();
+/** Trees told this session that the research's photos could not be loaded (said once, unless asked again). */
+const mediaTold = new Set<TreeId>();
+/** The notice's kind (its toast is taken away once the photos come). */
+const MEDIA_MISSED_TOAST = 'research-media-missed';
+
+/** Since when a queue filter's first page has been read (6.3: shown after 120 ms, said once). */
+const queueLoadSince = new Map<string, number>();
+
+/**
+ * Whether a filter's first page on its way shows yet (120 ms after it began; until then
+ * the overview is drawn again at that moment). Said once in the shared busy region.
+ */
+function queueLoadShown(key: string, redraw: () => void): boolean {
+    const now = Date.now();
+    const since = queueLoadSince.get(key);
+    if (since === undefined) {
+        queueLoadSince.set(key, now);
+        setTimeout(() => {
+            if (queueLoadSince.get(key) !== now) return;
+            announceBusy(strings.live.queueLoading);
+            redraw();
+        }, BUSY_SHOW_MS);
+        return false;
+    }
+    return now - since >= BUSY_SHOW_MS;
+}
+
+/** "Loading tasks…" in the queue's heading while a filter's first page is read. */
+function queueLoadingStatus(): HTMLElement {
+    const st = el('span', 'busy-st live-queue-loading');
+    st.innerHTML = busySpinHtml(12);
+    st.append(strings.live.queueLoading);
+    return st;
+}
+
+/** A version with the tree's own files came: no attempt or notice for it is due any more. */
+function mediaRetryDone(treeId: TreeId): void {
+    mediaTold.delete(treeId);
+    if (typeof document === 'undefined') return;
+    document.querySelector(`.toast[data-kind="${MEDIA_MISSED_TOAST}"]`)?.remove();
 }
 
 export interface LiveChangeItem {
@@ -148,10 +262,15 @@ export interface WaitingView {
     detail: string | null;
     /** Items to do that came while following, new to the user until the overview closes. */
     fresh: Set<string>;
+    /**
+     * Items to do the record of Awaiting action had not seen when the overview
+     * drew them: tagged "new" until the overview closes (spec 083 K5.3, H1 a).
+     */
+    tagged: Set<string>;
 }
 
 export function newWaitingView(): WaitingView {
-    return { open: new Map(), detail: null, fresh: new Set() };
+    return { open: new Map(), detail: null, fresh: new Set(), tagged: new Set() };
 }
 
 export interface LiveSession {
@@ -196,6 +315,8 @@ export interface LiveSession {
     browser?: BrowserInfo;
     /** Work outside the directions by branches (its last status's `offLine`; absent: not said). */
     offLine?: LiveOffLine;
+    /** The books of the tasks (its last status's `books`, spec 105; absent: not said). */
+    books?: LiveBooks;
     /** Sections the panel folded by itself for lack of room (not remembered). */
     autoCollapsed: Set<LiveSectionKey>;
     /** Waiting task ids already shown: a new one unfolds "Waiting for you" (unless the user keeps it collapsed or hidden). */
@@ -252,6 +373,8 @@ export interface LiveSession {
 const AUTO_CONNECT_MS = 3000;
 /** Its bridge asked once more after following could not start (as the research's own quick ask). */
 const AUTO_ASK_MS = 1500;
+/** One ask of the bridge while a link waits for its proof (asked about once a second). */
+const OPEN_ASK_TIMEOUT_MS = 1500;
 /**
  * Wait before reconnecting to the bridge's events / between status polls
  * (also the step of the backoff while the bridge is silent). A test may
@@ -662,7 +785,7 @@ export function appendChangeText(host: HTMLElement, c: LiveChangeItem, show: (id
  */
 const LIVE_RESUME_KEY = 'strom.live';
 
-function rememberLiveBridge(base: string, treeId: string): void {
+export function rememberLiveBridge(base: string, treeId: string): void {
     try {
         sessionStorage.setItem(LIVE_RESUME_KEY, JSON.stringify({ bridge: base, treeId }));
     } catch { /* no storage: a reload just ends following */ }
@@ -832,6 +955,9 @@ function researchCardInfo(): Map<string, ResearchCardInfo> {
     if (DataManager.isViewMode()) return out;
     const treeId = DataManager.getCurrentTreeId();
     if (!treeId) return out;
+    // Another window of the app (spec 097 K1.3): the main window's word, for the tree it has open.
+    const mirror = agentMirror();
+    if (mirror) return mirror.treeId() === treeId ? new Map(mirror.cards() as Map<string, ResearchCardInfo>) : out;
     const following = followedHere();
     const researchId = TreeManager.getTreeMetadata(treeId)?.research?.id;
     const waiting = following?.waiting ?? (researchId ? storedResearchWaiting(researchId)?.items : undefined) ?? [];
@@ -863,10 +989,17 @@ function researchCardInfo(): Map<string, ResearchCardInfo> {
 }
 setResearchCardInfoProvider(researchCardInfo);
 
-/** The live session of the tree on screen (null: not following it). */
+/** The research's word per person REFN for the cards, as this window has it (the agent's mirror sends it, spec 097). */
+export function researchCardInfoNow(): Map<string, ResearchCardInfo> {
+    return researchCardInfo();
+}
+
+/** The live session of the tree on screen (null: not following it); in another window, the main window's (spec 097 K1.3). */
 function followedHere(): LiveSession | null {
     const treeId = DataManager.getCurrentTreeId();
-    return live && !live.ended && live.treeId === treeId ? live : null;
+    const mirror = agentMirror();
+    const s = mirror ? mirror.session() : live;
+    return s && !s.ended && s.treeId === treeId ? s : null;
 }
 
 /** What the Table view's research cells read beyond the tree (spec 073 §16). */
@@ -887,6 +1020,8 @@ export interface ResearchTableLive {
     base: string | null;
     /** Followed here (else, when live, the bridge answers without following). */
     followed: boolean;
+    /** The followed research's lines' places, as read (null: none). */
+    places: DirectionPlaces | null;
 }
 
 const NO_DONE: ReadonlyMap<string, number> = new Map();
@@ -922,8 +1057,13 @@ function unfollowedAgentNow(researchId: string): Pick<LiveSession, 'working' | '
  * the waiting list kept from the last time.
  */
 export function researchTableLive(): ResearchTableLive {
+    const mirror = agentMirror();
+    if (mirror) return mirroredTableLive(mirror);
     const s = followedHere();
-    if (s) return { live: true, waiting: s.waiting, working: s.working, queue: s.queue, done: agentDone, base: s.bridge.base || null, followed: true };
+    if (s) {
+        const base = s.bridge.base || null;
+        return { live: true, waiting: s.waiting, working: s.working, queue: s.queue, done: agentDone, base, followed: true, places: base ? directionPlacesKept(base) : null };
+    }
     const treeId = DataManager.getCurrentTreeId();
     const researchId = treeId && !DataManager.isViewMode() ? TreeManager.getTreeMetadata(treeId)?.research?.id : undefined;
     const items = (researchId ? storedResearchWaiting(researchId)?.items : undefined) ?? NO_WAITING;
@@ -934,8 +1074,29 @@ export function researchTableLive(): ResearchTableLive {
         waiting = storedWaiting.items;
     }
     const agent = researchId ? unfollowedAgentNow(researchId) : null;
-    if (agent) return { live: true, waiting, working: agent.working, queue: agent.queue, done: NO_DONE, base: null, followed: false };
-    return { live: false, waiting, working: NO_WORKING, queue: NO_QUEUE, done: NO_DONE, base: null, followed: false };
+    if (agent) return { live: true, waiting, working: agent.working, queue: agent.queue, done: NO_DONE, base: null, followed: false, places: null };
+    return { live: false, waiting, working: NO_WORKING, queue: NO_QUEUE, done: NO_DONE, base: null, followed: false, places: null };
+}
+
+/** The Table's research input of another window (spec 097 K1.3): the main window's, the same object until it changes. */
+let mirroredLive: { work: unknown; places: unknown; value: ResearchTableLive } | null = null;
+const NOT_LIVE: ResearchTableLive = { live: false, waiting: NO_WAITING, working: NO_WORKING, queue: NO_QUEUE, done: NO_DONE, base: null, followed: false, places: null };
+
+function mirroredTableLive(mirror: NonNullable<ReturnType<typeof agentMirror>>): ResearchTableLive {
+    const work = mirror.work();
+    if (!work || DataManager.isViewMode() || mirror.treeId() !== DataManager.getCurrentTreeId()) return NOT_LIVE;
+    const places = mirror.places();
+    if (mirroredLive?.work !== work || mirroredLive.places !== places) {
+        mirroredLive = {
+            work, places,
+            value: {
+                live: work.live, followed: work.followed,
+                waiting: work.waiting as LiveSession['waiting'], working: work.working as LiveSession['working'], queue: work.queue as LiveSession['queue'],
+                done: new Map(work.done), base: null, places: work.followed ? places : null,
+            },
+        };
+    }
+    return mirroredLive.value;
 }
 
 /**
@@ -948,6 +1109,8 @@ let lastWorked: { session: LiveSession; refs: Set<string> } | null = null;
 let agentDoneTimer: ReturnType<typeof setTimeout> | null = null;
 
 function trackAgentDone(): void {
+    // Another window: the main window tracks it (its cards' word and its Table's input carry it).
+    if (agentMirror()) return;
     const s = followedHere();
     if (!s) {
         lastWorked = null;
@@ -977,8 +1140,21 @@ function trackAgentDone(): void {
 let cardInfoKey = '[]';
 let cardInfoPending = false;
 
+/** Told when the research's word about people may have changed (the agent's state for other windows, spec 097). */
+let agentStateHint: (() => void) | null = null;
+
+export function setAgentStateHint(fn: (() => void) | null): void {
+    agentStateHint = fn;
+}
+
+/** Another window's mirror of the agent's state changed: the cards follow (spec 097 K1.3). */
+export function researchMirrorChanged(): void {
+    syncResearchCardInfo();
+}
+
 /** Redraw the cards once the research's word about people changed. */
 function syncResearchCardInfo(): void {
+    agentStateHint?.();
     if (cardInfoPending) return;
     cardInfoPending = true;
     queueMicrotask(() => {
@@ -994,6 +1170,8 @@ function syncResearchCardInfo(): void {
 /** How long "Load new version" waits for the research to send it. */
 const VERSION_WAIT_MS = 20_000;
 let versionWait: ReturnType<typeof setTimeout> | null = null;
+/** The progress toast of that wait (waiting buttons §2.3). */
+let versionWaitToast: ProgressToastHandle | null = null;
 /**
  * A new version the research sent to another tab (the app open in a browser,
  * not installed: the address opens a new tab) also ends this tab's wait.
@@ -1019,6 +1197,45 @@ export interface ResearchWaitingState {
 /** One open at a time: a second file waits for the first dialog. */
 let openChain: Promise<unknown> = Promise.resolve();
 
+/** Where "Follow live" through a bridge stands: connecting (its status), then the tree loading. */
+export type FollowStartStep = 'connect' | 'tree';
+/** How a "Follow live" ended: following, not (a dialog said why, or nothing to follow), already starting, a link handed over, nothing to do. */
+export type FollowLiveOutcome = 'on' | 'off' | 'busy' | 'link' | 'none';
+/**
+ * "Follow live" starting through a bridge (by its address): its research and step. A second ask meanwhile (a
+ * second click, another place, the overview's own window) does nothing — nothing is queued after the first.
+ */
+const followStarts = new Map<string, { researchId: string; step: FollowStartStep }>();
+
+/** The step of "Follow live" starting for `researchId` now (null: none) — the overview's own window shows it. */
+export function followStartOf(researchId: string | null | undefined): FollowStartStep | null {
+    if (!researchId) return null;
+    for (const f of followStarts.values()) if (f.researchId === researchId) return f.step;
+    return null;
+}
+
+/**
+ * How following starts (startLiveFollow). `progress`: "Follow live" asked by a person — its step said
+ * (connecting, then the tree), and `settle` right before a dialog says why it cannot (the state ends there).
+ * `hint`: the words about the browser's question on the local network, said in that same state (no toast of
+ * their own over it); without it they come in a toast of their own.
+ */
+export interface LiveFollowOpts {
+    resume?: boolean;
+    follow?: boolean;
+    auto?: { researchId: string; treeId: TreeId };
+    from?: { followed: TreeId | null; open: TreeId | null };
+    progress?: { step(step: FollowStartStep): void; settle(): void; hint?(text: string): void };
+}
+
+/** The toast "Connected to the research again" (its "Follow live" says its work in it). */
+const RECONNECTED_TOAST = 'research-reconnected';
+
+/** The key of a bridge's address (null: not a bridge here). */
+function followKey(raw: string): string | null {
+    return parseLiveBridge(raw)?.base ?? null;
+}
+
 function enqueueOpen<T>(job: () => Promise<T>): Promise<T | undefined> {
     const next = openChain.then(job, job).catch((err) => {
         console.error('Opening a research failed', err);
@@ -1034,10 +1251,15 @@ function enqueueOpen<T>(job: () => Promise<T>): Promise<T | undefined> {
  * a bridge that sends its headers and then nothing more must not leave the
  * caller waiting for ever (a stuck read stopped all asking in that page).
  */
-export async function fetchWithTimeout(url: string, ms: number, headers?: Record<string, string>): Promise<Response> {
+export async function fetchWithTimeout(url: string, ms: number, headers?: Record<string, string>, signal?: AbortSignal): Promise<Response> {
     if (typeof fetch !== 'function') throw new Error('fetch unavailable');
     const ctl = typeof AbortController === 'function' ? new AbortController() : null;
     const timer = ctl ? setTimeout(() => ctl.abort(), ms) : null;
+    // Cancelled by the person (a load's Cancel, §2.4): the same as the limit for the request.
+    if (ctl && signal) {
+        if (signal.aborted) ctl.abort();
+        else signal.addEventListener('abort', () => ctl.abort(), { once: true });
+    }
     try {
         return await fetch(withAppVersion(url), {
             method: 'GET',
@@ -1084,9 +1306,15 @@ export interface FetchedTree extends TreeReplyHeads {
     variant: TreeImagesVariant;
     /** The images the file names by their hash, resolved: the parser takes them (convertToStrom `images`). */
     images?: ReadonlyMap<string, string>;
+    /** It came with the tree's own files (`media=app`, spec 108 §5): its portraits, couples' photos and attachments are the archive's. */
+    media?: true;
 }
 
-/** The excerpt images of the tree stored for a research (the open one as it is in memory). */
+/**
+ * The images and files of the tree stored for a research (the open one as it
+ * is in memory): its excerpts, and its portraits, couples' photos and
+ * attachments — what a file with the tree's own files (spec 108) names again.
+ */
 async function researchTreeImages(researchId: string): Promise<string[]> {
     const meta = TreeManager.findTreeByResearchId(researchId);
     if (!meta || TreeManager.isTreeUnreadable(meta.id)) return [];
@@ -1095,6 +1323,11 @@ async function researchTreeImages(researchId: string): Promise<string[]> {
     for (const src of Object.values(data?.sources ?? {})) {
         for (const exc of src.excerpts ?? []) if (exc.dataUrl) out.push(exc.dataUrl);
     }
+    for (const p of Object.values(data?.persons ?? {})) {
+        if (p?.photo) out.push(p.photo);
+    }
+    for (const a of data ? allMedia(data) : []) if (!a.originalOnly && a.dataUrl) out.push(a.dataUrl);
+    for (const u of Object.values(data?.partnerships ?? {})) if (u?.photo) out.push(u.photo);
     return out;
 }
 
@@ -1117,20 +1350,23 @@ const imageDeps: ImageResolveDeps = {
  * only the images not held here are downloaded (`etag` must then be a tag of
  * that variant); `images: false` leaves them out (not resolved). Anything
  * that keeps an image from being had loads the file with its images in it.
+ * `media` (with `byHash`, treeAsksAppMedia): the file with the tree's own
+ * files (`media=app`, spec 108 §5) — the answer says so (`media`); the file
+ * with the images in it it falls back to never has them.
  */
-export async function fetchResearchTree(url: string, opts: { stale?: boolean; etag?: string | null; byHash?: boolean; images?: boolean } = {}): Promise<FetchedTree> {
+export async function fetchResearchTree(url: string, opts: { stale?: boolean; etag?: string | null; byHash?: boolean; images?: boolean; media?: boolean; watch?: TreeDownloadWatch } = {}): Promise<FetchedTree> {
     if (opts.byHash) {
         const got = await fetchRefTree(url, opts);
         if (got) return got;
         // The images could not all be had: this load takes the file with them in it.
-        return fetchResearchTree(url, { stale: opts.stale });
+        return fetchResearchTree(url, { stale: opts.stale, ...(opts.watch ? { watch: opts.watch } : {}) });
     }
     const res = await fetchWithTimeout(opts.stale ? staleTreeUrl(url) : url, TREE_GED_TIMEOUT_MS,
-        opts.etag ? { 'If-None-Match': opts.etag } : undefined);
+        opts.etag ? { 'If-None-Match': opts.etag } : undefined, opts.watch?.signal);
     const get = (name: string): string | null => res.headers?.get(name) ?? null;
     if (opts.etag && res.status === 304) return { text: '', notModified: true, variant: 'data', etag: treeReplyEtag(get) ?? opts.etag, ...treeReplyHeads(get) };
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = decodeGedcomFile(await res.arrayBuffer());
+    const text = decodeGedcomFile(await readBodyWithProgress(res, opts.watch));
     noteFamilyPartners(url, researchFamilyPartners(text));
     // Its images are in it: those held for the last file would only be a second copy.
     forgetHeldImages();
@@ -1142,18 +1378,19 @@ export async function fetchResearchTree(url: string, opts: { stale?: boolean; et
  * null when they could not all be had (the caller then takes the file with
  * them in it). A bridge that cannot be reached throws, as for the whole file.
  */
-async function fetchRefTree(url: string, opts: { stale?: boolean; etag?: string | null; images?: boolean }): Promise<FetchedTree | null> {
-    const res = await fetchWithTimeout(refTreeUrl(opts.stale ? staleTreeUrl(url) : url), TREE_GED_TIMEOUT_MS,
-        opts.etag ? { 'If-None-Match': opts.etag } : undefined);
+async function fetchRefTree(url: string, opts: { stale?: boolean; etag?: string | null; images?: boolean; media?: boolean; watch?: TreeDownloadWatch }): Promise<FetchedTree | null> {
+    const res = await fetchWithTimeout(refTreeUrl(opts.stale ? staleTreeUrl(url) : url, !!opts.media), TREE_GED_TIMEOUT_MS,
+        opts.etag ? { 'If-None-Match': opts.etag } : undefined, opts.watch?.signal);
     const get = (name: string): string | null => res.headers?.get(name) ?? null;
-    if (opts.etag && res.status === 304) return { text: '', notModified: true, variant: 'ref', etag: treeReplyEtag(get) ?? opts.etag, ...treeReplyHeads(get) };
+    const media = opts.media ? { media: true as const } : {};
+    if (opts.etag && res.status === 304) return { text: '', notModified: true, variant: 'ref', etag: treeReplyEtag(get) ?? opts.etag, ...treeReplyHeads(get), ...media };
     if (!res.ok) {
         console.warn('The tree with its images by hash was refused, loading the whole file', res.status);
         return null;
     }
-    const text = decodeGedcomFile(await res.arrayBuffer());
+    const text = decodeGedcomFile(await readBodyWithProgress(res, opts.watch));
     const said = treeReplyImages(get);
-    const base = { text, etag: treeReplyEtag(get), ...treeReplyHeads(get) };
+    const base = { text, etag: treeReplyEtag(get), ...treeReplyHeads(get), ...media };
     noteFamilyPartners(url, researchFamilyPartners(text));
     // The bridge sent the file with its images in it after all: it is complete as it is.
     if (said === 'data') {
@@ -1162,8 +1399,10 @@ async function fetchRefTree(url: string, opts: { stale?: boolean; etag?: string 
     }
     if (opts.images === false) return { ...base, variant: 'ref' };
     const refs = findImageRefs(text);
+    // The tree's files the archive names by their name alone: the very files this browser holds stay (a PDF).
+    const files = opts.media ? findNamedFileShas(text) : [];
     try {
-        const got = await resolveImageRefs({ researchId: readResearchHeader(text).treeId, refs, imagesUrl: imagesUrlOf(url) }, imageDeps);
+        const got = await resolveImageRefs({ researchId: readResearchHeader(text).treeId, refs, imagesUrl: imagesUrlOf(url), files }, imageDeps);
         return { ...base, variant: 'ref', images: got.images };
     } catch (err) {
         console.warn('The images by hash could not all be had, loading the whole file', err);
@@ -1172,18 +1411,29 @@ async function fetchRefTree(url: string, opts: { stale?: boolean; etag?: string 
     }
 }
 
-export async function fetchGedcomText(url: string): Promise<string> {
-    return (await fetchResearchTree(url)).text;
+/**
+ * The research's tree with the tree's own files (`images=ref&media=app`) and
+ * every image it names; null when they could not all be had — never the file
+ * with its images in it (an attempt to have the files again, researchRetryMedia).
+ */
+export async function fetchResearchTreeWithMedia(url: string): Promise<FetchedTree | null> {
+    return fetchRefTree(url, { media: true });
+}
+
+export async function fetchGedcomText(url: string, watch?: TreeDownloadWatch): Promise<string> {
+    return (await fetchResearchTree(url, watch ? { watch } : {})).text;
 }
 
 /**
  * The research's tree for reading, its images as the file with them in it
  * would carry: by their hash when the bridge's `features` (its last status)
- * say it gives them so, else the whole file.
+ * say it gives them so, else the whole file — with the tree's own files when
+ * the research keeps them and the tree takes images (treeAsksAppMedia;
+ * `media`: they came).
  */
-export async function readResearchTreeFile(url: string, features: readonly string[] | null | undefined): Promise<{ text: string; images?: ReadonlyMap<string, string> }> {
-    const got = await fetchResearchTree(url, { byHash: bridgeGivesImagesByHash(features) });
-    return { text: got.text, ...(got.images ? { images: got.images } : {}) };
+export async function readResearchTreeFile(url: string, features: readonly string[] | null | undefined, watch?: TreeDownloadWatch): Promise<{ text: string; images?: ReadonlyMap<string, string>; media?: true }> {
+    const got = await fetchResearchTree(url, { byHash: bridgeGivesImagesByHash(features), media: treeAsksAppMedia(features, SettingsManager.isImportImages()), ...(watch ? { watch } : {}) });
+    return { text: got.text, ...(got.images ? { images: got.images } : {}), ...(got.media ? { media: true as const } : {}) };
 }
 
 /** The partners of the research's families by the tree's address (its last read), for rows of `working[]` about a couple. */
@@ -1267,16 +1517,16 @@ export function researchTitlesBase(loaded: StromData, research: StromData, knows
  * research and version. `titles`: how the names carry their titles, by what
  * the research said of itself (researchGedcomTitles).
  */
-export function researchGedcom(data: StromData, treeName: string, link: ResearchHeaderInfo, titles: TitlesInGedcom, readings = false, sourceFields = false, citations: ResearchCitationsOut = NO_CITATION_FEATURES): string {
-    return exportToGedcom(data, treeName, { research: link, titles, readings, sourceFields, ...citations }).content;
+export function researchGedcom(data: StromData, treeName: string, link: ResearchHeaderInfo, titles: TitlesInGedcom, readings = false, sourceFields = false, citations: ResearchCitationsOut = NO_CITATION_FEATURES, media: ResearchMediaOut = NO_MEDIA_FEATURES): string {
+    return exportToGedcom(data, treeName, { research: link, titles, readings, sourceFields, ...citations, ...media }).content;
 }
 
 /**
  * researchGedcom with the xrefs it gave the records (a send's `ids` answer by
  * them). `readings`: the sources' reading marks go along (researchSendsReadings).
  */
-export function researchGedcomExport(data: StromData, treeName: string, link: ResearchHeaderInfo, titles: TitlesInGedcom, readings = false, sourceFields = false, citations: ResearchCitationsOut = NO_CITATION_FEATURES): { content: string; xrefs: ExportXrefs } {
-    const r = exportToGedcom(data, treeName, { research: link, titles, readings, sourceFields, ...citations });
+export function researchGedcomExport(data: StromData, treeName: string, link: ResearchHeaderInfo, titles: TitlesInGedcom, readings = false, sourceFields = false, citations: ResearchCitationsOut = NO_CITATION_FEATURES, media: ResearchMediaOut = NO_MEDIA_FEATURES): { content: string; xrefs: ExportXrefs } {
+    const r = exportToGedcom(data, treeName, { research: link, titles, readings, sourceFields, ...citations, ...media });
     return { content: r.content, xrefs: r.xrefs };
 }
 
@@ -1404,10 +1654,12 @@ export function timeEl(value: string, kind: LiveTimeKind): HTMLElement | null {
 }
 
 /** How a time is said: ago, since, since and for how long, the last change, the bridge's last answer. */
-type LiveTimeKind = 'ago' | 'since' | 'sincefor' | 'lastchange' | 'refreshed';
+type LiveTimeKind = 'ago' | 'since' | 'sincefor' | 'lastchange' | 'refreshed' | 'waitsince';
 
 function liveTimeText(ts: number, kind: LiveTimeKind): string {
     const lang = getCurrentLanguage();
+    // An item's "waits since" in a time order of Awaiting action (spec 083 §5).
+    if (kind === 'waitsince') return waitingSinceText(ts);
     if (kind === 'refreshed') return strings.live.refreshedAgo(formatLiveTime(ts, Date.now(), lang, strings.research.justNow));
     if (kind === 'lastchange') return strings.live.lastChange(formatLiveTime(ts, Date.now(), lang, strings.research.justNow));
     if (kind === 'sincefor') return strings.live.sinceFor(formatLiveClock(ts, Date.now(), lang), liveDuration(ts));
@@ -1457,7 +1709,7 @@ export function pausedText(w: LiveWorker): string {
 function livePreparing(tag: 'p' | 'span', cls: string): HTMLElement {
     const note = el(tag, cls);
     note.setAttribute('role', 'status');
-    const spin = note.appendChild(el('span', 'live-panel-spinner'));
+    const spin = note.appendChild(el('i', 'busy-spin s12'));
     spin.setAttribute('aria-hidden', 'true');
     note.appendChild(el('span', 'live-panel-preparing-text', strings.research.newerPreparing));
     return note;
@@ -1474,7 +1726,7 @@ function tickLiveTimes(): void {
     for (const host of hosts) {
         host.querySelectorAll<HTMLElement>('.live-time[data-ts]').forEach((node) => {
             const k = node.dataset.kind;
-            const kind = k === 'since' || k === 'sincefor' || k === 'lastchange' || k === 'refreshed' ? k : 'ago';
+            const kind = k === 'since' || k === 'sincefor' || k === 'lastchange' || k === 'refreshed' || k === 'waitsince' ? k : 'ago';
             node.textContent = liveTimeText(Number(node.dataset.ts), kind);
         });
     }
@@ -1567,7 +1819,10 @@ export function setOverviewWindowDrawn(d: { live: LiveSession | null; viewing: O
 
 /** The followed research (null: none), for the overview. */
 export function liveSession(): LiveSession | null {
-    return windowDrawn ? windowDrawn.live : live;
+    if (windowDrawn) return windowDrawn.live;
+    // Another window of the app (spec 097 K1.3): the main window's session, with an empty bridge (nothing here asks it).
+    const mirror = agentMirror();
+    return mirror ? mirror.session() : live;
 }
 
 /**
@@ -1703,11 +1958,14 @@ export const researchUiMethods = uiModule({
 
     /**
      * After the first render: read (and drop) ?import-url= / ?live= / ?open=,
-     * start the file handler. Runs once; never throws.
+     * start the file handler. Runs once; never throws. Returns the opening
+     * it started, settled once its tree is in (null: none), so a link to a
+     * person on the same address waits for that tree.
      */
-    initExternalOpen(): void {
-        if (externalReady) return;
+    initExternalOpen(): Promise<void> | null {
+        if (externalReady) return null;
         externalReady = true;
+        let opening: Promise<void> | null = null;
         try {
             const startSearch = window.location.search;
             const params = new URLSearchParams(startSearch);
@@ -1742,12 +2000,12 @@ export const researchUiMethods = uiModule({
             // Something else was asked for in this tab: the old bridge is over.
             if (explicit) forgetLiveBridge();
             const resume = explicit ? null : rememberedLiveBridge();
-            if (sendUrl !== null) { reveal(); void this.sendChangesToResearch(sendUrl); }
-            else if (adoptUrl !== null) { reveal(); void this.adoptFromResearch(adoptUrl); }
-            else if (liveUrl !== null) void this.startLiveFollow(liveUrl).finally(reveal);
-            else if (importUrl !== null) void this.importResearchFromUrl(importUrl).finally(reveal);
+            if (sendUrl !== null) { reveal(); opening = this.sendChangesToResearch(sendUrl); }
+            else if (adoptUrl !== null) { reveal(); opening = this.adoptFromResearch(adoptUrl); }
+            else if (liveUrl !== null) opening = this.startLiveFollow(liveUrl).finally(reveal);
+            else if (importUrl !== null) opening = this.importResearchFromUrl(importUrl).finally(reveal);
             // A reload while following: follow the same bridge again, quietly.
-            else if (resume !== null) void this.startLiveFollow(resume, { resume: true }).finally(reveal);
+            else if (resume !== null) opening = this.startLiveFollow(resume, { resume: true }).finally(reveal);
             else reveal();
             // The link sent from a phone (?research=install): the install dialog, once.
             if (params.get('research') === 'install') {
@@ -1762,6 +2020,7 @@ export const researchUiMethods = uiModule({
             document.documentElement.classList.remove('external-opening');
             console.warn('External open unavailable', err);
         }
+        return opening ? opening.catch(() => undefined) : null;
     },
 
     /**
@@ -1786,7 +2045,13 @@ export const researchUiMethods = uiModule({
                     try { search = new URL(params.targetURL).search; } catch { /* not a URL */ }
                     const isStartup = !startupLaunchSeen && search === startSearch;
                     startupLaunchSeen = true;
-                    if (!isStartup) this.openExternalRequest(new URLSearchParams(search));
+                    if (!isStartup) {
+                        const launch = new URLSearchParams(search);
+                        const opening = this.runExternalRequest(launch);
+                        // `strom app --person P…` into the open window: the person once the research's tree is in.
+                        const link = opening ? parseDeepLink(launch) : null;
+                        if (opening && link) void opening.then(() => this.openDeepLinkFor(link, launch));
+                    }
                 }
                 const files = params?.files ? Array.from(params.files) : [];
                 for (const handle of files) {
@@ -1805,22 +2070,28 @@ export const researchUiMethods = uiModule({
     /**
      * A request from Strom Research reaching the window that is already open
      * (a later launch of the installed app): the same handling as at startup.
-     * Returns whether there was one.
+     * Returns whether the address carried such a request; its handling runs
+     * on (runExternalRequest gives it, for what waits on the tree coming in).
      */
     openExternalRequest(params: URLSearchParams): boolean {
+        return this.runExternalRequest(params) !== null;
+    },
+
+    /** openExternalRequest's handling, settled once it is done (its tree in); null when the address has none. */
+    runExternalRequest(params: URLSearchParams): Promise<void> | null {
         const sendUrl = params.get('send');
         const liveUrl = params.get('live');
         const importUrl = params.get('import-url');
         const adoptUrl = params.get('adopt');
-        if (sendUrl === null && liveUrl === null && importUrl === null && adoptUrl === null) return false;
+        if (sendUrl === null && liveUrl === null && importUrl === null && adoptUrl === null) return null;
         // Something else was asked for: the old bridge is over.
         forgetLiveBridge();
         this.settleResearchVersion();
-        if (sendUrl !== null) void this.sendChangesToResearch(sendUrl);
-        else if (adoptUrl !== null) void this.adoptFromResearch(adoptUrl);
-        else if (liveUrl !== null) void this.startLiveFollow(liveUrl);
-        else if (importUrl !== null) void this.importResearchFromUrl(importUrl);
-        return true;
+        const run = sendUrl !== null ? this.sendChangesToResearch(sendUrl)
+            : adoptUrl !== null ? this.adoptFromResearch(adoptUrl)
+                : liveUrl !== null ? this.startLiveFollow(liveUrl)
+                    : this.importResearchFromUrl(importUrl!);
+        return run.catch(() => undefined);
     },
 
     /** C. A file dropped anywhere onto the window. No-op without drag and drop. */
@@ -1920,6 +2191,8 @@ export const researchUiMethods = uiModule({
                 e.preventDefault();
                 if (modalOpen()) return;
                 if (dropCancelled) { dropCancelled = false; return; }
+                // The tree is being replaced: a file dropped now waits for the load (§2.6).
+                if (TreeEditLock.refuse()) return;
                 const files = Array.from(e.dataTransfer?.files ?? []);
                 // "Read now": the dialog with the files in it (reading starts from there).
                 if (readZones && zoneAt(e) === 'read') {
@@ -1971,7 +2244,20 @@ export const researchUiMethods = uiModule({
     },
 
     /** B. ?import-url=: a file offered by Strom Research on this computer. */
-    async importResearchFromUrl(raw: string, opts: { afterSend?: TreeId; plainAsk?: boolean; takeSame?: boolean } = {}): Promise<void> {
+    /**
+     * `load`: a load of the research's version the person asked for (startTreeLoad): its progress, Cancel while
+     * the file downloads, its failure said in its toast (never the manual way), its end at the end.
+     */
+    async importResearchFromUrl(raw: string, opts: { afterSend?: TreeId; plainAsk?: boolean; takeSame?: boolean; load?: TreeLoadRun } = {}): Promise<void> {
+        const { load, ...rest } = opts;
+        try {
+            await this.importResearchFromUrlNow(raw, rest, load);
+        } finally {
+            load?.done();
+        }
+    },
+
+    async importResearchFromUrlNow(raw: string, opts: { afterSend?: TreeId; plainAsk?: boolean; takeSame?: boolean }, load?: TreeLoadRun): Promise<void> {
         // "Load new version" asked for this: its spinner is done.
         this.settleResearchVersion();
         const url = parseLoopbackUrl(raw);
@@ -1985,13 +2271,28 @@ export const researchUiMethods = uiModule({
         }
         await enqueueOpen(async () => {
             let text: string;
+            let images: ReadonlyMap<string, string> | undefined;
+            let media: true | undefined;
+            // A bridge known here whose research keeps the tree's own files: the file with them (spec 108 §5);
+            // any other as always, the whole file.
+            const at = /\/tree\.ged$/.test(url.pathname) ? researchIdAtBridge(`${url.origin}${url.pathname.replace(/\/tree\.ged$/, '')}`) : null;
+            const features = at ? this.researchStatusOf(at)?.features : null;
             try {
-                text = await fetchGedcomText(url.href);
+                if (treeAsksAppMedia(features, SettingsManager.isImportImages())) ({ text, images, media } = await readResearchTreeFile(url.href, features, load?.watch));
+                else text = await fetchGedcomText(url.href, load?.watch);
             } catch (err) {
+                // Cancelled: nothing changed, nothing to say.
+                if (load?.cancelled) return;
                 console.warn('Fetching the research failed', err);
+                // Asked from the app (its bridge known): said in the load's toast, with Try again.
+                if (load) {
+                    load.fail(err);
+                    return;
+                }
                 await this.offerManualImport(strings.research.fetchFailed);
                 return;
             }
+            if (load?.cancelled) return;
             // Served from 127.0.0.1: the research is on this computer.
             const header = readResearchHeader(text);
             if (header.isStromResearch) noteResearchLinks(header.links, header.scheme);
@@ -2001,18 +2302,23 @@ export const researchUiMethods = uiModule({
                 const base = `${url.origin}${url.pathname.replace(/\/tree\.ged$/, '')}`;
                 void fetchStatus(`${base}/status`).then(() => this.refreshResearchSyncUi()).catch(() => undefined);
             }
-            await this.openGedcomText(text, opts);
+            if (load) await load.processing(countGedcomPersons(text));
+            await this.openGedcomText(text, { ...opts, ...(images ? { images } : {}), ...(media ? { appMedia: true } : {}) });
         });
     },
 
     /** The browser refused the local address: explain, offer the file picker. */
     /**
      * Wait for a bridge the user just came from; after a moment say what is
-     * waited for (the browser may be asking about the local network).
+     * waited for (the browser may be asking about the local network). `say`:
+     * a state that already says the connecting (an element, a progress toast)
+     * takes these words, instead of a toast of their own over it.
      */
-    async connectResearchBridge<T>(ask: () => Promise<T>): Promise<T> {
-        const hint = setTimeout(() => this.showToast(strings.research.connecting, CONNECT_TIMEOUT_MS,
-            { spinner: true, kind: 'research-connect' }), CONNECT_HINT_MS);
+    async connectResearchBridge<T>(ask: () => Promise<T>, say?: (text: string) => void): Promise<T> {
+        const hint = setTimeout(() => {
+            if (say) say(strings.research.connectingHint);
+            else this.showToast(strings.research.connecting, CONNECT_TIMEOUT_MS, { spinner: true, kind: 'research-connect' });
+        }, CONNECT_HINT_MS);
         try {
             return await ask();
         } finally {
@@ -2148,7 +2454,11 @@ export const researchUiMethods = uiModule({
      * GEDCOM text from outside. A Strom Research file opens its research
      * tree; any other GEDCOM goes to the normal import dialog.
      */
-    async openGedcomText(text: string, opts: { afterSend?: TreeId; plainAsk?: boolean; takeSame?: boolean } = {}): Promise<void> {
+    async openGedcomText(text: string, opts: { afterSend?: TreeId; plainAsk?: boolean; takeSame?: boolean;
+        /** The images the research's file names by their hash, resolved (readResearchTreeFile). */
+        images?: ReadonlyMap<string, string>;
+        /** The file came with the tree's own files (spec 108 §5). */
+        appMedia?: boolean } = {}): Promise<void> {
         if (DataManager.isViewMode()) {
             this.showToast(strings.research.notInViewMode, 5000);
             return;
@@ -2156,7 +2466,7 @@ export const researchUiMethods = uiModule({
         const header = readResearchHeader(text);
         let result;
         try {
-            result = convertToStrom(parseGedcom(text));
+            result = convertToStrom(parseGedcom(text), opts.images ? { images: opts.images } : {});
         } catch (err) {
             console.error('GEDCOM parse error:', err);
             await this.showAlert(strings.gedcom.parseError, 'error');
@@ -2172,7 +2482,7 @@ export const researchUiMethods = uiModule({
             return;
         }
         if (!await this.ensureLocalUnlocked()) return;
-        await this.applyResearch(result.data, header, { ...(opts.afterSend ? { afterSend: opts.afterSend } : {}), ...(opts.plainAsk ? { plainAsk: true } : {}),
+        await this.applyResearch(result.data, { ...header, ...(opts.appMedia ? { appMedia: true as const } : {}) }, { ...(opts.afterSend ? { afterSend: opts.afterSend } : {}), ...(opts.plainAsk ? { plainAsk: true } : {}),
             ...(opts.takeSame ? { takeSame: true } : {}) });
     },
 
@@ -2188,7 +2498,8 @@ export const researchUiMethods = uiModule({
         const link = TreeManager.getTreeMetadata(treeId)?.research;
         if (!head || !link || !source.treeId || DataManager.getCurrentTreeId() !== treeId || head === link.head) return false;
         const incoming = includeImages ? data : stripMedia(data);
-        const kept = carryOverMedia(stabilizeIds(incoming, previous), previous).data;
+        const carry = carryOverMedia(stabilizeIds(incoming, previous), previous, includeImages ? researchMediaBaseOf(treeId, source) : undefined);
+        const kept = carry.data;
         const stable = this.researchKeepsLoneFamilies(source.treeId) ? kept : carryOverUnknownPartners(kept, previous);
         if (contentFingerprint(stable) !== contentFingerprint(previous)) return false;
         const { base, titlesIn } = researchTitlesBase(stable, research, knowsTitles, link.titlesIn);
@@ -2197,6 +2508,8 @@ export const researchUiMethods = uiModule({
             head, syncedAt: new Date().toISOString(), titlesIn,
             ...(source.mode === 'archive' ? { mode: 'archive' as const } : {}),
         });
+        if (source.appMedia && includeImages) noteResearchMediaReturn(treeId, source.treeId, data, carry.carried);
+        else if (treeAsksAppMedia(this.researchStatusOf(source.treeId)?.features, includeImages)) this.researchMediaMissed(treeId, source.treeId);
         this.refreshResearchSyncUi();
         this.showToast(strings.sync.stateInSync, 4000);
         return true;
@@ -2234,6 +2547,10 @@ export const researchUiMethods = uiModule({
         const research = data;
         const features = source.treeId ? this.researchStatusOf(source.treeId)?.features : null;
         const knowsTitles = !!features?.includes(TITLES_FEATURE);
+        /** Media the archive gave at its last return with them (spec 108 §5): those it took away since are not kept. */
+        const mediaBase = researchMediaBaseOf(existing?.id, source);
+        /** Media of the app's own kept over the archive's (none for a new tree). */
+        let carried = 0;
         if (opts.noDialog && (!existing || TreeManager.isTreeUnreadable(existing.id))) return null;
         if (existing) {
             const unreadable = TreeManager.isTreeUnreadable(existing.id);
@@ -2250,7 +2567,7 @@ export const researchUiMethods = uiModule({
             // the research dropped would go — never without asking, even over a
             // tree unchanged since.
             const edited = action === 'ask';
-            const lost = previous ? carryOverMedia(stabilizeIds(data, previous), previous).lost : 0;
+            const lost = previous ? carryOverMedia(stabilizeIds(data, previous), previous, mediaBase).lost : 0;
             if (lost > 0) action = 'ask';
             // Nothing here the research lacks: the last send was written there and
             // the tree has not changed since — its newer version holds it all.
@@ -2300,7 +2617,7 @@ export const researchUiMethods = uiModule({
                 // "The research has a newer version" only when it has (not a ?live= with the same head, N61-4).
                 const incoming = opts.head || source.head || '';
                 const newer = !incoming || incoming !== (existing.research.head ?? '');
-                const choice = await this.showResearchUpdateConflict(existing.id, existing.name, data, includeImages, newer);
+                const choice = await this.showResearchUpdateConflict(existing.id, existing.name, data, includeImages, newer, mediaBase);
                 if (choice === null) return null;
                 if (choice === 'sendThenLoad') {
                     const live = opts.live;
@@ -2400,12 +2717,15 @@ export const researchUiMethods = uiModule({
             // keeps its tie as a copy — its changes can still be sent back.
             if (existing?.research) TreeManager.setResearchLink(existing.id, { ...existing.research, copy: true });
             const treeName = existing ? strings.research.copyName(name, formatFlexDate(todayIso())) : name;
-            treeId = await DataManager.importAsNewTree(data, treeName);
+            // Everyone comes into the new tree now, or on the research's own date (spec 084 §8).
+            treeId = await DataManager.importAsNewTree(stampResearchTree(data, new Date().toISOString()), treeName);
             created = true;
         } else {
             treeId = existing.id;
             if (existing.isHidden) TreeManager.setTreeVisibility(treeId, false);
-            const kept = carryOverMedia(stabilizeIds(data, previous!), previous!).data;
+            const carry = carryOverMedia(stabilizeIds(data, previous!), previous!, includeImages ? mediaBase : undefined);
+            carried = carry.carried;
+            const kept = carry.data;
             // "Married, the spouse unknown": a research that drops such a family never takes it from here (N1).
             const stable = source.treeId && this.researchKeepsLoneFamilies(source.treeId) ? kept : carryOverUnknownPartners(kept, previous!);
             if (DataManager.getCurrentTreeId() !== treeId) {
@@ -2434,6 +2754,10 @@ export const researchUiMethods = uiModule({
             if (!titlesIn) TreeManager.patchResearchLink(treeId, { titlesIn: undefined });
             // The load itself counted as an edit (it went through the edit path before the tie moved on): nothing waits now.
             patchResearchAutoState(treeId, { edits: undefined, unsentSince: undefined });
+            // With the tree's own files and its images taken: the base of the next return (spec 108 §5).
+            if (source.appMedia && includeImages) noteResearchMediaReturn(treeId, source.treeId, data, carried);
+            // Asked with them and they did not come (the file with its images in it): its writes only add.
+            else if (treeAsksAppMedia(this.researchStatusOf(source.treeId)?.features, includeImages)) this.researchMediaMissed(treeId, source.treeId);
             this.researchKeepCopy(treeId, base);
         }
         // "Restore the state before loading", offered while the tree is just what was loaded.
@@ -2461,7 +2785,9 @@ export const researchUiMethods = uiModule({
         const persons = Object.values(stored.persons).filter(p => !p.isPlaceholder).length;
         const families = countFamilies(stored);
         const restore = backupId
-            ? { action: { label: strings.sync.restoreBeforeLoad, run: () => { void this.researchRestoreBeforeLoad(treeId); } } } : {};
+            // It works in the toast (A185): "Undoing…", then the state restored with its Undo, or why not.
+            ? { action: { label: strings.sync.restoreBeforeLoad, run: () => this.researchRestoreBeforeLoad(treeId, { inToast: true }),
+                work: { label: strings.busy.reverting, timeoutMs: Infinity } } } : {};
         // Loaded over the tree: "Research version loaded · Restore the state before loading" (10 s).
         if (opts.noDialog) {
             // Said by the research panel's line (which tree is followed now), never a toast.
@@ -2489,14 +2815,15 @@ export const researchUiMethods = uiModule({
      * `newer`: the research's version is newer than the one the tree builds on.
      * Resolves 'sendThenLoad' | 'update' | 'copy', or null (cancelled).
      */
-    async showResearchUpdateConflict(treeId: TreeId, treeName: string, data: StromData, includeImages: boolean, newer = true): Promise<'sendThenLoad' | 'update' | 'copy' | null> {
+    async showResearchUpdateConflict(treeId: TreeId, treeName: string, data: StromData, includeImages: boolean, newer = true,
+        mediaBase?: ReadonlySet<string> | null): Promise<'sendThenLoad' | 'update' | 'copy' | null> {
         const u = strings.researchUpdate;
         const r = strings.research;
         const link = TreeManager.getTreeMetadata(treeId)?.research;
         const bridgeUp = !!link && await this.researchBridgeReady(link.id);
         const previous = await readTree(treeId);
         // The app's images stay; only those of people or sources the research dropped would go.
-        const lost = previous ? carryOverMedia(stabilizeIds(data, previous), previous).lost : 0;
+        const lost = previous ? carryOverMedia(stabilizeIds(data, previous), previous, mediaBase).lost : 0;
         const own = previous ? countImages(previous) : null;
         const mediaLine = lost > 0 ? r.mediaLost(lost)
             : own && own.photos + own.attachments + own.excerpts > 0 ? r.mediaKept : '';
@@ -2612,26 +2939,32 @@ export const researchUiMethods = uiModule({
         const ok = await this.showConfirm(r.sendConfirm(tree.name, researchName), r.sendConfirmTitle, { confirmLabel: r.sendButton });
         if (!ok) { cancel('cancelled'); return; }
 
-        this.showToast(r.sending, 60000);
+        // One progress toast from the send to its end (waiting buttons §2.3, A161–A162): the result in it, no alert.
+        const b = strings.busy;
+        const toast = this.showProgressToast({ title: b.sendTitle }, {});
+        const exportGedcom = { label: r.sendExportGedcom, run: () => { void this.downloadResearchGedcom(tree.id); } };
+        const releaseLeave = holdLeave('send', tree.id);
         let res: Response;
         try {
             res = await postSync(bridge.sync, researchGedcom(data, tree.name, { id: link.id, head: link.head, appTree: tree.id, transcripts: this.researchTranscriptsLink(link).transcripts }, researchGedcomTitles(status), researchSendsReadings(status), researchSendsSourceFields(status), researchCitationsOut(status)), 120000);
         } catch (err) {
+            releaseLeave();
             console.warn('Sending to the research failed', err);
-            document.querySelector('.toast')?.remove();
-            await this.offerResearchGedcom(r.sendUnreachable, tree.id);
+            const timedOut = err instanceof DOMException && err.name === 'AbortError';
+            toast.fail(timedOut ? b.errTimeout(120) : r.sendUnreachable, { label: b.retry, run: () => { void this.sendChangesToResearch(raw); } },
+                { title: b.sendFailed, more: exportGedcom });
             return;
         }
+        releaseLeave();
         let reply = sanitizeSyncReply(null);
         try {
             reply = sanitizeSyncReply(await res.json());
         } catch { /* not JSON: a refusal without a reason */ }
-        document.querySelector('.toast')?.remove();
         if (res.ok && reply.ok) {
             // What the research now has of the user's transcripts (Research for this tree).
             TreeManager.patchResearchLink(tree.id, { sentSources: sourceReadings(data) });
-            await this.showAlert(r.sent, 'info');
-        } else await this.showAlert(r.sendRefused(reply.error), 'error');
+            toast.done(r.sent);
+        } else toast.fail(r.sendRefused(reply.error), undefined, { more: exportGedcom });
     },
 
     /** Explain the way back to the research; offer the faithful GEDCOM of the tree. */
@@ -2660,9 +2993,9 @@ export const researchUiMethods = uiModule({
     },
 
     /** Hand a strom-research:// link to the system (the browser asks first). */
-    handOverResearchLink(url: string): void {
+    handOverResearchLink(url: string, handoff?: string | null): void {
         const a = document.createElement('a');
-        a.href = url;
+        a.href = handoff ? withHandoff(url, handoff) : url;
         a.rel = 'noopener';
         a.style.display = 'none';
         document.body.appendChild(a);
@@ -2670,15 +3003,24 @@ export const researchUiMethods = uiModule({
         a.remove();
     },
 
-    /** Open a strom-research:// link and say what to expect (the page cannot tell whether it opened). */
-    launchResearchLink(url: string, kind: ResearchLinkKind = 'terminal'): void {
-        this.handOverResearchLink(url);
-        const r = strings.research;
-        if (kind === 'version') this.awaitResearchVersion();
-        else if (kind === 'agent') this.showToast(r.openingAgentHint, 8000, { title: r.openingAgent });
-        // A link the research takes without its terminal (no mark): no word of a terminal window.
-        else if (researchUrlMark(url) === 'none') this.showToast(r.openingQuietHint, 8000, { title: r.opening });
-        else this.showToast(r.openingHint, 8000, { title: r.opening });
+    /**
+     * Open a strom-research:// link: the element that started it (`el`, else the one of the click) says
+     * "Opening the research…" until the research proves it took the link, or a sentence after the limit
+     * (waiting buttons §3.1, src/ui/research-open-busy.ts). A new version from the research waits as before.
+     */
+    launchResearchLink(url: string, kind: ResearchLinkKind = 'terminal', el?: HTMLElement | null,
+        opts: Omit<OpenBusyOpts, 'agent' | 'relayed'> = {}): Promise<OpenBusyResult> {
+        if (kind === 'version') {
+            this.handOverResearchLink(url);
+            this.awaitResearchVersion();
+            return Promise.resolve('opened');
+        }
+        return openResearchBusy(el ?? null, url, { agent: kind === 'agent', ...opts }, {
+            handOver: (link, handoff) => this.handOverResearchLink(link, handoff),
+            ask: (id) => this.askResearchBridge(id, OPEN_ASK_TIMEOUT_MS),
+            statusNow: (id) => researchStatusNow(id),
+            bridgeDown: (id) => researchBridgeDownNow(id),
+        });
     },
 
     /** Listen for a version that reached another tab; announce one that reached this tab. */
@@ -2689,7 +3031,7 @@ export const researchUiMethods = uiModule({
             versionChannel.onmessage = () => {
                 this.settleResearchVersion();
                 // The research came back for the tree in another tab: stop waiting here.
-                document.querySelector('.toast[data-kind="adopt"]')?.remove();
+                endResearchAdoptWait();
             };
             if (arrivedHere) versionChannel.postMessage('arrived');
         } catch { /* no channel: the wait just ends on its own */ }
@@ -2699,19 +3041,27 @@ export const researchUiMethods = uiModule({
     awaitResearchVersion(): void {
         const r = strings.research;
         if (versionWait) clearTimeout(versionWait);
-        this.showToast(r.awaitingVersion, VERSION_WAIT_MS + 500, { spinner: true });
+        // A new wait: the toast of the one before goes, also its "did not answer".
+        versionWaitToast?.close();
+        const toast = this.showProgressToast({ title: r.awaitingVersion }, {});
+        versionWaitToast = toast;
         versionWait = setTimeout(() => {
             versionWait = null;
-            this.showToast(r.noAnswer, 6000);
+            toast.fail(r.noAnswer, { label: strings.busy.retry, run: () => {
+                const url = this.activeResearchLink('app');
+                if (url) this.launchResearchLink(url, 'version');
+            } });
         }, VERSION_WAIT_MS);
     },
 
     /** The version came (or something else was asked for): stop waiting quietly. */
     settleResearchVersion(): void {
+        // Its toast goes, also a "did not answer" of a wait over (the version came late).
+        versionWaitToast?.close();
+        versionWaitToast = null;
         if (!versionWait) return;
         clearTimeout(versionWait);
         versionWait = null;
-        document.querySelector('.toast')?.remove();
     },
 
     /** The active tree's research id, when it is a research tree (the app's own trees: null). */
@@ -2871,8 +3221,8 @@ export const researchUiMethods = uiModule({
     },
 
     /** "Follow live" in the idle panel: the open tree's research, through its bridge here (else its link). */
-    followResearchHere(researchId: string): void {
-        this.startFollowLive('panel', researchId);
+    followResearchHere(researchId: string, el?: HTMLElement | null): void {
+        void this.startFollowLive('panel', researchId, el);
     },
 
     /**
@@ -2881,19 +3231,91 @@ export const researchUiMethods = uiModule({
      * here when this browser knows it (the tree switches to the research's
      * version), else its link (the research starts its bridge and opens
      * ?live= here). One way for all of them.
+     *
+     * Through the bridge, `el` (the button) shows the state at once (network
+     * work, waiting buttons §1) until following is on or a dialog says why
+     * not: connecting, then the tree loading; without it (the menu closed) a
+     * progress toast does (§2.1). `window`: asked by the overview's own
+     * window, which shows the state itself (§11.2) and hears the outcome.
      */
-    startFollowLive(origin: 'menu' | 'panel' | 'overview', forResearch?: string): void {
+    startFollowLive(origin: 'menu' | 'panel' | 'overview' | 'window', forResearch?: string, el?: HTMLElement | null): Promise<FollowLiveOutcome> {
         const researchId = forResearch ?? this.activeResearchId();
-        if (!researchId) return;
+        if (!researchId) return Promise.resolve('none');
         const base = storedResearchBridge(researchId)?.base;
-        if (base && parseLiveBridge(base)) {
+        const key = base ? followKey(base) : null;
+        if (base && key) {
+            // Starting already (a second click, another place): nothing more is queued.
+            if (followStarts.has(key)) return Promise.resolve('busy');
             // From the overview: it stays open, now the followed research's.
-            if (origin === 'overview' && viewing) viewing.follow = true;
-            void this.startLiveFollow(base, { follow: true, from: { followed: null, open: null } });
-            return;
+            if ((origin === 'overview' || origin === 'window') && viewing) viewing.follow = true;
+            const startOpts = { follow: true, from: { followed: null, open: null } };
+            if (origin === 'window') return this.followLiveGuarded(base, researchId, startOpts);
+            return this.followLiveWithState(base, researchId, startOpts, el ?? null);
         }
         const url = this.activeResearchLink('live');
-        if (url) this.launchResearchLink(url);
+        if (!url) return Promise.resolve('none');
+        void this.launchResearchLink(url);
+        return Promise.resolve('link');
+    },
+
+    /**
+     * Following through a bridge with the state on `el` from the click on (shown at once: the work is the
+     * network's): "Connecting to the research…", then "Loading the tree from the research…", until following is
+     * on, or gone before a dialog that says why not. Without `el` (or once it is gone) a progress toast says it.
+     */
+    async followLiveWithState(base: string, researchId: string, startOpts: LiveFollowOpts, el: HTMLElement | null): Promise<FollowLiveOutcome> {
+        const started: { outcome?: Promise<FollowLiveOutcome> } = {};
+        const target = el ?? document.createElement('span');
+        // The browser's question on the local network: a quiet line under the element still seen, else the
+        // progress toast's line (its title keeps "Connecting…"); the tree's step takes its place.
+        let hintLine: { clear(): void } | null = null;
+        const clearHint = (): void => { hintLine?.clear(); hintLine = null; };
+        await runBusy(target, (ctl) => new Promise<void>((resolve) => {
+            started.outcome = this.followLiveGuarded(base, researchId, startOpts, {
+                step: (step) => {
+                    if (step !== 'tree') return;
+                    clearHint();
+                    ctl.step(strings.busy.loadingTree);
+                },
+                settle: () => { clearHint(); resolve(); },
+                hint: (text) => {
+                    clearHint();
+                    // Drawn anew meanwhile (the overview redraws): the element in its place.
+                    const shown = busyShownOn(target);
+                    if (shown) hintLine = busyStep(shown, text);
+                    else ctl.step(text);
+                },
+            });
+            started.outcome.then(() => resolve(), () => resolve());
+        }), { label: strings.busy.connectingResearch, atOnce: true, kind: 'tree', toastWhenGone: true });
+        clearHint();
+        return started.outcome ?? 'busy';
+    },
+
+    /**
+     * Start following through `raw`'s bridge unless a start for it runs already ('busy'); its step said to `ui`
+     * and to the overview's own window (its snapshot), `ui.settle` right before a dialog says why it cannot.
+     * Resolves once the start ended: following ('on') or not ('off').
+     */
+    async followLiveGuarded(raw: string, researchId: string, startOpts: LiveFollowOpts,
+        ui?: { step(step: FollowStartStep): void; settle(): void; hint?(text: string): void }): Promise<FollowLiveOutcome> {
+        const key = followKey(raw);
+        if (!key) return 'none';
+        if (followStarts.has(key)) return 'busy';
+        const step = (s: FollowStartStep): void => {
+            followStarts.set(key, { researchId, step: s });
+            overviewChanged();
+            ui?.step(s);
+        };
+        step('connect');
+        try {
+            const hint = ui?.hint ? (text: string): void => ui.hint?.(text) : undefined;
+            await this.startLiveFollow(raw, { ...startOpts, progress: { step, settle: () => ui?.settle(), ...(hint ? { hint } : {}) } });
+        } finally {
+            followStarts.delete(key);
+            overviewChanged();
+        }
+        return live && !live.ended && live.bridge.base === key ? 'on' : 'off';
     },
 
     // ==================== THE OVERVIEW WITHOUT FOLLOWING (spec 057 §7) ====================
@@ -2987,6 +3409,7 @@ export const researchUiMethods = uiModule({
         s.researches = status.researches;
         s.caps = status.caps;
         s.offLine = status.offLine;
+        s.books = status.books;
         s.update = status.update;
         s.busy = status.busy;
         s.work = status.work;
@@ -3124,7 +3547,7 @@ export const researchUiMethods = uiModule({
             return;
         }
         const research = { id: meta.research.id, head: meta.research.head, appTree: treeId, transcripts: this.researchTranscriptsLink(meta.research).transcripts };
-        const blob = new Blob([researchGedcom(data, meta.name, research, researchGedcomTitles(this.researchStatusOf(meta.research.id)), researchSendsReadings(this.researchStatusOf(meta.research.id)), researchSendsSourceFields(this.researchStatusOf(meta.research.id)), researchCitationsOut(this.researchStatusOf(meta.research.id)))], { type: 'text/plain;charset=utf-8' });
+        const blob = new Blob([researchGedcom(data, meta.name, research, researchGedcomTitles(this.researchStatusOf(meta.research.id)), researchSendsReadings(this.researchStatusOf(meta.research.id)), researchSendsSourceFields(this.researchStatusOf(meta.research.id)), researchCitationsOut(this.researchStatusOf(meta.research.id)), researchMediaOut(this.researchStatusOf(meta.research.id)))], { type: 'text/plain;charset=utf-8' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -3142,24 +3565,26 @@ export const researchUiMethods = uiModule({
      * load gave, the tree unchanged since, its images taken as the setting
      * says now, the tag of the file's `variant` about to be asked (the one
      * with its images by hash and the one with them in it have their own
-     * tags). Null otherwise (the file is then asked without a tag).
+     * tags; `media`: the one with the tree's own files, spec 108, has its
+     * own too). Null otherwise (the file is then asked without a tag).
      */
-    async researchHeldFile(researchId: string, variant: TreeImagesVariant = 'data'): Promise<HeldResearchFile | null> {
+    async researchHeldFile(researchId: string, variant: TreeImagesVariant = 'data', media = false): Promise<HeldResearchFile | null> {
         const meta = TreeManager.findTreeByResearchId(researchId);
         const link = meta?.research;
         if (!meta || !link?.treeEtag || TreeManager.isTreeUnreadable(meta.id)) return null;
         const data = await readTree(meta.id);
         if (!data) return null;
-        const etag = storedTreeEtag(link, fingerprintLike(data, link.fingerprint), SettingsManager.isImportImages(), variant);
+        const etag = storedTreeEtag(link, fingerprintLike(data, link.fingerprint), SettingsManager.isImportImages(), variant, media);
         if (!etag) return null;
         return { treeId: meta.id, etag, data, head: link.head ?? '', mode: link.mode ?? null };
     },
 
-    /** Keep the tag of the file just loaded into `treeId` with its tie (only that research's, not a copy's), with the file's variant. */
-    researchKeepTreeEtag(treeId: TreeId, researchId: string, tag: string, images: boolean, variant: TreeImagesVariant = 'data'): void {
+    /** Keep the tag of the file just loaded into `treeId` with its tie (only that research's, not a copy's), with the file's variant (and whether it had the tree's own files). */
+    researchKeepTreeEtag(treeId: TreeId, researchId: string, tag: string, images: boolean, variant: TreeImagesVariant = 'data', media = false): void {
         const link = TreeManager.getTreeMetadata(treeId)?.research;
         if (!link || link.copy || link.id !== researchId.toLowerCase() || !link.fingerprint) return;
-        TreeManager.patchResearchLink(treeId, { treeEtag: { tag, head: link.head ?? '', fingerprint: link.fingerprint, images, ...(variant === 'ref' ? { variant } : {}) } });
+        TreeManager.patchResearchLink(treeId, { treeEtag: { tag, head: link.head ?? '', fingerprint: link.fingerprint, images,
+            ...(variant === 'ref' ? { variant } : {}), ...(media ? { media: true as const } : {}) } });
     },
 
     /**
@@ -3236,9 +3661,41 @@ export const researchUiMethods = uiModule({
             if (DataManager.getCurrentTreeId() !== existing.id) return false;
         }
         rememberBridgeStatus(status.treeId!, status);
+        const researchId = status.treeId!;
         this.showToast(strings.research.reconnected, 10000, {
             closable: true,
-            action: { label: strings.research.followLive, run: () => { void this.startLiveFollow(raw, { follow: true }); } },
+            kind: RECONNECTED_TOAST,
+            // The toast stays and says the work (§4) until following is on, or goes before a dialog that says why not.
+            action: {
+                label: strings.research.followLive,
+                run: () => new Promise<void>((resolve) => {
+                    const title = (): Element | null => document.querySelector(`.toast[data-kind="${RECONNECTED_TOAST}"] .toast-title`);
+                    // The browser's question on the local network: the toast's quiet line, under its title.
+                    const sub = (text: string | null): void => {
+                        const body = title()?.parentElement;
+                        if (!body) return;
+                        let line = body.querySelector<HTMLElement>('.t-sub');
+                        if (text === null) { line?.remove(); return; }
+                        if (!line) {
+                            line = document.createElement('span');
+                            line.className = 't-sub';
+                            body.appendChild(line);
+                        }
+                        line.textContent = text;
+                    };
+                    void this.followLiveGuarded(raw, researchId, { follow: true }, {
+                        step: (step) => {
+                            const t = title();
+                            if (!t || step !== 'tree') return;
+                            t.textContent = strings.busy.loadingTree;
+                            sub(null);
+                        },
+                        settle: resolve,
+                        hint: (text) => sub(text),
+                    }).then(() => resolve(), () => resolve());
+                }),
+                work: { label: strings.busy.connectingResearch, timeoutMs: BUSY_TIMEOUTS.tree },
+            },
         });
         this.refreshResearchSyncUi();
         void this.pollResearchBridge();
@@ -3253,7 +3710,7 @@ export const researchUiMethods = uiModule({
      * `from`: the tree followed and the tree open before (the panel's line
      * says which tree is followed now); by default as they are now.
      */
-    async startLiveFollow(raw: string, opts: { resume?: boolean; follow?: boolean; auto?: { researchId: string; treeId: TreeId }; from?: { followed: TreeId | null; open: TreeId | null } } = {}): Promise<void> {
+    async startLiveFollow(raw: string, opts: LiveFollowOpts = {}): Promise<void> {
         const bridge = parseLiveBridge(raw);
         if (!bridge) {
             if (opts.resume) forgetLiveBridge();
@@ -3295,16 +3752,19 @@ export const researchUiMethods = uiModule({
             // A bridge with `ged.imagesByHash`: the file with its images by their hash, and those images.
             let images: ReadonlyMap<string, string> | undefined;
             let variant: TreeImagesVariant = 'data';
+            /** The file came with the tree's own files (spec 108 §5). */
+            let appMedia = false;
             try {
                 status = opts.resume || auto
                     ? await fetchStatus(bridge.status, auto ? AUTO_CONNECT_MS : undefined)
-                    : await this.connectResearchBridge(() => fetchStatus(bridge.status, CONNECT_TIMEOUT_MS));
+                    : await this.connectResearchBridge(() => fetchStatus(bridge.status, CONNECT_TIMEOUT_MS), opts.progress?.hint);
                 if (!status) throw new Error('bad status');
                 if (auto && status.treeId !== auto.researchId) {
                     passive();
                     return;
                 }
                 if (!status.treeId) {
+                    opts.progress?.settle();
                     await this.showAlert(strings.research.liveNoTree, 'error');
                     return;
                 }
@@ -3312,20 +3772,24 @@ export const researchUiMethods = uiModule({
                 const tagged = bridgeGivesEtag(status.features);
                 const byHash = bridgeGivesImagesByHash(status.features);
                 const asked: TreeImagesVariant = byHash ? 'ref' : 'data';
-                const ask = tagged ? await this.researchHeldFile(status.treeId, asked) : null;
-                let got = await fetchResearchTree(bridge.ged, { stale, etag: ask?.etag, byHash });
+                // With the tree's own files when the research keeps them and the tree takes images (spec 108 §5).
+                const media = treeAsksAppMedia(status.features, SettingsManager.isImportImages());
+                opts.progress?.step('tree');
+                const ask = tagged ? await this.researchHeldFile(status.treeId, asked, media) : null;
+                let got = await fetchResearchTree(bridge.ged, { stale, etag: ask?.etag, byHash, media });
                 if (got.notModified) {
                     // Still exactly that tree (nothing changed it meanwhile): kept. Else the file itself.
-                    const now = await this.researchHeldFile(status.treeId, asked);
+                    const now = await this.researchHeldFile(status.treeId, asked, media);
                     if (now && now.etag === ask?.etag && now.treeId === ask.treeId) {
                         held = now;
                     } else {
-                        got = await fetchResearchTree(bridge.ged, { stale, byHash });
+                        got = await fetchResearchTree(bridge.ged, { stale, byHash, media });
                     }
                 }
                 text = got.text;
                 images = got.images;
                 variant = got.variant;
+                appMedia = !!got.media && !got.notModified;
                 if (stale) reply = got;
                 if (tagged) etag = got.etag;
             } catch (err) {
@@ -3341,6 +3805,7 @@ export const researchUiMethods = uiModule({
                     this.showToast(strings.research.ended, 4000);
                     return;
                 }
+                opts.progress?.settle();
                 // The tree of that research, when this browser knows its address: the question is about it,
                 // never about whichever tree the page started with (rc.27 round).
                 const knownId = researchIdAtBridge(bridge.base);
@@ -3354,6 +3819,7 @@ export const researchUiMethods = uiModule({
                 ? { ...readResearchHeader(''), treeId: status.treeId, head: held.head || null, mode: held.mode }
                 : readResearchHeader(text);
             if (header.treeId && header.treeId !== status.treeId) {
+                opts.progress?.settle();
                 if (auto) passive();
                 else await this.showAlert(strings.research.liveOtherTree, 'error');
                 return;
@@ -3362,6 +3828,7 @@ export const researchUiMethods = uiModule({
             try {
                 data = held ? held.data : convertToStrom(parseGedcom(text), { images }).data;
             } catch {
+                opts.progress?.settle();
                 if (auto) passive();
                 else await this.showAlert(strings.gedcom.parseError, 'error');
                 return;
@@ -3378,6 +3845,7 @@ export const researchUiMethods = uiModule({
             // not a second, empty tree (J7 of the language round).
             if (!opts.resume && !auto && Object.keys(data.persons ?? {}).length === 0 && !TreeManager.findTreeByResearchId(status.treeId)
                 && await this.researchAwaitsHandOver(bridge.base)) {
+                opts.progress?.settle();
                 void this.adoptFromResearch(bridge.base);
                 return;
             }
@@ -3386,12 +3854,13 @@ export const researchUiMethods = uiModule({
                 ? await this.researchKeepHeldFile(held, status.treeId, { head: file.head, quiet: opts.resume, noDialog: !!auto })
                 : await this.applyResearch(
                     data,
-                    { treeId: status.treeId, name, date: header.date, ...(header.asOf ? { asOf: header.asOf } : {}), mode: header.mode },
+                    { treeId: status.treeId, name, date: header.date, ...(header.asOf ? { asOf: header.asOf } : {}), mode: header.mode,
+                        ...(appMedia ? { appMedia: true as const } : {}) },
                     { head: file.head, quiet: opts.resume, noAsk: true, live: raw, ...(auto ? { noDialog: true } : {}), taken }
                 );
             // The file's tag kept with the tree it was loaded into (only a file sent with one: one built without
             // all its images has none and is never kept as a finished state).
-            if (treeId && etag && !held) this.researchKeepTreeEtag(treeId, status.treeId, etag, taken.images, variant);
+            if (treeId && etag && !held) this.researchKeepTreeEtag(treeId, status.treeId, etag, taken.images, variant, appMedia);
             if (!treeId) {
                 if (opts.resume) forgetLiveBridge();
                 passive();
@@ -3431,6 +3900,7 @@ export const researchUiMethods = uiModule({
                 researches: status.researches,
                 ...(status.caps ? { caps: status.caps } : {}),
                 ...(status.offLine ? { offLine: status.offLine } : {}),
+                ...(status.books ? { books: status.books } : {}),
                 autoCollapsed: new Set(window.innerHeight < 700 ? ['queue'] : []),
                 seenWaiting: new Set(status.waiting.map(w => w.id)),
                 waitingPendingOpen: new Set(),
@@ -3709,6 +4179,7 @@ export const researchUiMethods = uiModule({
         s.researches = status.researches;
         s.caps = status.caps;
         s.offLine = status.offLine;
+        s.books = status.books;
         s.update = status.update;
         s.busy = status.busy;
         s.work = status.work;
@@ -3829,7 +4300,7 @@ export const researchUiMethods = uiModule({
      * `head`: the change's; a bridge with `ged.stale` says the file's own head,
      * which is the state the tree then holds.
      */
-    async refreshLiveTree(s: LiveSession, head: string): Promise<StromData | null> {
+    async refreshLiveTree(s: LiveSession, head: string, prefetched?: FetchedTree): Promise<StromData | null> {
         let text: string;
         let fileHead: string | null = null;
         let etag: string | null = null;
@@ -3838,11 +4309,16 @@ export const researchUiMethods = uiModule({
         const takeImages = SettingsManager.isImportImages();
         let images: ReadonlyMap<string, string> | undefined;
         let variant: TreeImagesVariant = 'data';
+        /** The file came with the tree's own files (spec 108 §5). */
+        let appMedia = false;
         try {
-            const got = await fetchResearchTree(s.bridge.ged, { byHash: bridgeGivesImagesByHash(s.features), images: takeImages });
+            // `prefetched`: the file with the tree's own files an attempt to have them again got (researchRetryMedia).
+            const got = prefetched ?? await fetchResearchTree(s.bridge.ged, { byHash: bridgeGivesImagesByHash(s.features), images: takeImages,
+                media: treeAsksAppMedia(s.features, takeImages) });
             text = got.text;
             images = got.images;
             variant = got.variant;
+            appMedia = !!got.media;
             if (!takeImages) forgetHeldImages();
             if (bridgeGivesEtag(s.features)) etag = got.etag;
             if (ownHead) fileHead = got.head ?? readResearchHeader(text).head;
@@ -3876,7 +4352,9 @@ export const researchUiMethods = uiModule({
         const knowsTitles = !!features?.includes(TITLES_FEATURE);
         const link = TreeManager.getTreeMetadata(s.treeId)?.research;
         const known = previous ? keepEventShares(keepTableViews(keepImports(keepLineageOverrides(keepSurnameVariants(keepMarriedSurname(keepTitles(data, previous, features, researchHasTitles(link, features)), previous, features), previous), previous), previous, features), previous), previous, features) : data;
-        const kept = previous ? carryOverMedia(stabilizeIds(known, previous), previous).data : data;
+        const mediaBase = researchMediaBaseOf(s.treeId, { treeId: s.researchId, name: null, date: null, ...(appMedia ? { appMedia: true as const } : {}) });
+        const carry = previous ? carryOverMedia(stabilizeIds(known, previous), previous, mediaBase) : null;
+        const kept = carry ? carry.data : data;
         const stable = migrateData(previous && !this.researchKeepsLoneFamilies(s.researchId) ? carryOverUnknownPartners(kept, previous) : kept);
         if (active) {
             // Following replaces the tree again and again: one backup, before the first time.
@@ -3902,9 +4380,116 @@ export const researchUiMethods = uiModule({
         }, { agentless: this.researchAgentlessFor(s.researchId, header.mode === 'archive' ? { mode: 'archive' } : undefined) });
         if (!titlesIn) TreeManager.patchResearchLink(s.treeId, { titlesIn: undefined });
         this.researchKeepCopy(s.treeId, base);
+        // With the tree's own files (asked only while images are taken): the base of the next return (spec 108 §5).
+        if (appMedia) noteResearchMediaReturn(s.treeId, s.researchId, data, carry?.carried ?? 0);
+        // Asked with them and they did not come (the file with its images in it): its writes only add.
+        else if (treeAsksAppMedia(s.features, takeImages)) this.researchMediaMissed(s.treeId, s.researchId);
         // The file's tag (one sent with it): a reload while the research stays here keeps this tree (a 304).
-        if (etag) this.researchKeepTreeEtag(s.treeId, s.researchId, etag, takeImages, variant);
+        if (etag) this.researchKeepTreeEtag(s.treeId, s.researchId, etag, takeImages, variant, appMedia);
         return loaded;
+    },
+
+    /**
+     * A version of a research that keeps the tree's own files came into
+     * `treeId` without them (noteResearchMediaMissed: its writes only add
+     * meanwhile): tried again by itself after a while (MEDIA_RETRY_MS), and
+     * when the files still cannot be had, said once with "Try again".
+     */
+    researchMediaMissed(treeId: TreeId, researchId: string): void {
+        noteResearchMediaMissed(treeId, researchId);
+        if (mediaRetrying.has(treeId)) return;
+        mediaRetrying.add(treeId);
+        const attempt = (i: number): void => {
+            if (i >= MEDIA_RETRY_MS.length) {
+                mediaRetrying.delete(treeId);
+                this.tellResearchMediaMissed(treeId);
+                return;
+            }
+            setTimeout(() => {
+                void this.researchRetryMedia(treeId, true).then(got => {
+                    if (got === 'failed') return attempt(i + 1);
+                    mediaRetrying.delete(treeId);
+                    // Loading them would ask (changes here, or a newer version): said, "Try again" asks.
+                    if (got === 'asks') this.tellResearchMediaMissed(treeId);
+                });
+            }, MEDIA_RETRY_MS[i]);
+        };
+        attempt(0);
+    },
+
+    /** "The research's photos could not be loaded" with "Try again": once per tree, unless asked again by hand (`again`). */
+    tellResearchMediaMissed(treeId: TreeId, again = false): void {
+        if ((!again && mediaTold.has(treeId)) || DataManager.getCurrentTreeId() !== treeId) return;
+        mediaTold.add(treeId);
+        this.showToast(strings.sync.mediaMissed, Infinity, {
+            closable: true, notice: true, kind: MEDIA_MISSED_TOAST,
+            // The toast stays and says the work (§4) until the files are in, or says again that they are not.
+            action: {
+                label: strings.sync.retry,
+                run: async () => (await this.researchRetryMediaNow(treeId, true) === 'failed'
+                    ? { ok: false, text: strings.sync.mediaMissed, whole: true } : undefined),
+                work: { label: strings.busy.loadingTree, timeoutMs: BUSY_TIMEOUTS.tree },
+            },
+        });
+    },
+
+    /**
+     * "Try again" of that notice: the file with the tree's own files asked once more, loading it may ask as any
+     * load. `inToast`: the notice's toast says a failure itself (its Try again again), none new.
+     */
+    async researchRetryMediaNow(treeId: TreeId, inToast = false): Promise<'loaded' | 'failed' | 'asks' | 'gone' | 'busy'> {
+        if (mediaRetrying.has(treeId)) return 'busy';
+        mediaRetrying.add(treeId);
+        try {
+            const got = await this.researchRetryMedia(treeId, false);
+            if (got === 'failed' && !inToast) this.tellResearchMediaMissed(treeId, true);
+            return got;
+        } finally {
+            mediaRetrying.delete(treeId);
+        }
+    },
+
+    /**
+     * One attempt to have the tree's own files of its research again (the
+     * file with them, never the one with its images in it): loaded as that
+     * version is (following live: as the next change). `auto`: only over a
+     * tree that is that very version, nothing asked ('asks' otherwise).
+     * 'gone': nothing to try any more (another tree open, the files came
+     * meanwhile, the question cancelled).
+     */
+    async researchRetryMedia(treeId: TreeId, auto: boolean): Promise<'loaded' | 'failed' | 'asks' | 'gone'> {
+        const link = TreeManager.getTreeMetadata(treeId)?.research;
+        const missed = researchAutoState(treeId).mediaMissed;
+        if (!link || !missed || missed.toLowerCase() !== link.id.toLowerCase() || DataManager.getCurrentTreeId() !== treeId) return 'gone';
+        const s = live && !live.ended && live.treeId === treeId ? live : null;
+        const ged = s ? s.bridge.ged : parseLiveBridge(storedResearchBridge(link.id)?.base)?.ged;
+        if (!ged) return 'failed';
+        let got: FetchedTree | null;
+        try {
+            got = await fetchResearchTreeWithMedia(ged);
+        } catch (err) {
+            console.warn('The research\'s files could not be had again', err);
+            got = null;
+        }
+        if (!got) return 'failed';
+        if (s) {
+            if (s.ended || live !== s) return 'gone';
+            return await this.refreshLiveTree(s, s.head, got) ? 'loaded' : 'failed';
+        }
+        const header = readResearchHeader(got.text);
+        const now = TreeManager.getTreeMetadata(treeId)?.research;
+        if (!now || header.treeId !== now.id || DataManager.getCurrentTreeId() !== treeId) return 'gone';
+        let research: StromData;
+        try {
+            research = convertToStrom(parseGedcom(got.text), { images: got.images }).data;
+        } catch {
+            return 'failed';
+        }
+        // The very version the tree is, unchanged here: its files go in quietly. Else the load asks as any.
+        const quiet = !!header.head && header.head === (now.head ?? '') && this.researchSyncFingerprints(treeId, now).matchesBase;
+        if (!quiet && auto) return 'asks';
+        const done = await this.applyResearch(research, { ...header, appMedia: true }, quiet ? { quiet: true } : {});
+        return done === treeId && !researchAutoState(treeId).mediaMissed ? 'loaded' : 'gone';
     },
 
     /** The user stops following (or a new ?live= replaces the session). */
@@ -4019,10 +4604,10 @@ export const researchUiMethods = uiModule({
             row.appendChild(helpMark('waiting'));
             host = body;
         }
-        const list = el('ul', 'live-panel-list live-waiting');
-        host.appendChild(list);
-        const { shown, more } = panelWaiting(items, undefined, waitingFocusIds());
-        for (const w of shown) {
+        // The research's books (spec 105 §5, 5g): the order and the groups chosen, the books' heads compact.
+        const ls = liveSession();
+        const books = !!ls && ls.waiting === items && booksOn(ls) && items.some(w => w.section);
+        const rowOf = (w: LiveWaiting): HTMLLIElement => {
             const li = el('li', 'live-waiting-row');
             markWaitingFocus(li, w);
             const text = el('div', 'live-waiting-text');
@@ -4034,10 +4619,11 @@ export const researchUiMethods = uiModule({
                 const whyStory = waitingWhyEl(w);
                 if (whyStory) text.appendChild(whyStory);
                 li.append(text, compare);
-                list.appendChild(li);
-                continue;
+                return li;
             }
             const what = text.appendChild(el('span', 'live-waiting-what'));
+            // A finding of how the task is recorded (spec 109 §5.3): only its mark here; the overview shows the finding.
+            if (waitingAuditShown(liveSession(), w)) what.appendChild(waitingAuditMarkEl(strings.live.waitingAudit.auditMarkPanel));
             // A newer research names the kind: a short label before the text.
             if (w.kind === 'branch') what.appendChild(el('span', 'live-kind live-kind--decide', strings.live.waitBranchKind));
             else if (w.section) what.appendChild(waitingKindLabel(w));
@@ -4045,7 +4631,11 @@ export const researchUiMethods = uiModule({
             if (w.kind === 'hypothesis') what.append(el('strong', 'hwr-id', w.id), ' · ');
             what.append(w.kind === 'branch' ? waitBranchText(w, liveSession()) : w.what);
             // "on" is the agent's free text; "user" only repeats the heading.
-            if (!waitsOnUser(w.on)) text.appendChild(el('small', 'live-time', r.waitingOn(w.on!)));
+            // A compact row: a long instruction is clamped to two lines here, whole in the overview.
+            if (!waitsOnUser(w.on)) {
+                const on = text.appendChild(el('small', 'live-time live-waiting-on', r.waitingOn(w.on!)));
+                on.title = on.textContent ?? '';
+            }
             const at = timeEl(w.at, 'ago');
             if (at) text.appendChild(at);
             const why = waitingWhyEl(w);
@@ -4071,7 +4661,17 @@ export const researchUiMethods = uiModule({
                 answer.onclick = () => this.answerResearchTask(w);
                 li.appendChild(answer);
             }
-            list.appendChild(li);
+            return li;
+        };
+        let more: number;
+        if (books && ls) {
+            more = this.appendPanelWaitingBooks(host, ls, items, rowOf);
+        } else {
+            const list = el('ul', 'live-panel-list live-waiting');
+            host.appendChild(list);
+            const panel = panelWaiting(items, undefined, waitingFocusIds());
+            for (const w of panel.shown) list.appendChild(rowOf(w));
+            more = panel.more;
         }
         if (more > 0) {
             // The rest in the overview (where it can open), else just how many.
@@ -4084,7 +4684,61 @@ export const researchUiMethods = uiModule({
                 host.appendChild(el('p', 'live-waiting-more', L.waitingMore(more).replace(/\s*⤢$/, '')));
             }
         }
+        // The books offered to download (spec 105 §5, Q2): one line, never counted; the overview opens with them.
+        const urgent = ls && ls.waiting === items && booksOn(ls) ? urgentBooks(ls.books).length : 0;
+        if (urgent > 0) {
+            const text = L.books.panelUrgent(urgent);
+            if (this.canExpandLivePanel()) {
+                const btn = el('button', 'link-button live-waiting-urgent', text);
+                btn.type = 'button';
+                btn.onclick = () => this.showOverviewBooksOffer();
+                host.appendChild(btn);
+            } else {
+                host.appendChild(el('p', 'live-waiting-urgent', text.replace(/\s*⤢$/, '')));
+            }
+        }
         return host;
+    },
+
+    /**
+     * Awaiting action of the small panel with the research's books (spec 105
+     * §5, 5g): "⇅ Order ▾" and "Groups: … ▾" (a menu; a sheet on a phone),
+     * the first rows to do in that order and grouping — a book's head its
+     * title, how many wait for it and how many, a place's its name and how
+     * many, "No book" before the places after the books; the books' actions
+     * stay in the overview. Returns how many more there are to do.
+     */
+    appendPanelWaitingBooks(host: HTMLElement, s: LiveSession, items: readonly LiveWaiting[], rowOf: (w: LiveWaiting) => HTMLLIElement): number {
+        const B = strings.live.books;
+        const order = storedWaitingOrder(true);
+        const groupsShown = shownWaitingGroups(storedWaitingGroupMode(), order, true);
+        const opts: WaitingGroupOpts = groupsShown === 'book' ? { by: 'book', books: s.books } : {};
+        if (todoWaiting(items).length >= 2) {
+            host.appendChild(this.overviewWaitingOrderEl(order, true, 'docked', true, { compact: true, redraw: () => this.renderLivePanel() }));
+        }
+        const { groups, more } = panelWaitingGroups(items, order, groupsShown !== 'none', opts, undefined, waitingFocusIds());
+        for (const { rows, total } of groups) {
+            if (rows.key !== FLAT_GROUP) {
+                if (rows.afterBooks) host.appendChild(el('div', 'live-waiting-nobook', B.noBook));
+                const head = el('div', `live-waiting-grouphead${rows.book ? ' is-book' : ''}`);
+                head.dataset.group = rows.key;
+                const book = listedBook(rows.book);
+                const name = rows.book ? (book ? bookTitle(book) : rows.book.title) : waitingGroupName(rows.items[0]);
+                // Its title wrapped up to four lines, "more" under a cut one (spec 105 U4 §1, 1e, 1h).
+                const title = el('span', 'live-waiting-grouptitle', name);
+                title.title = book ? bookHeadTitle(book) : name;
+                const side = el('span', 'live-waiting-groupside');
+                if (book) side.appendChild(el('span', 'live-waiting-groupwait', B.waiting(book.waiting)));
+                side.appendChild(el('span', 'live-waiting-groupcount', String(total)));
+                head.append(title, side, groupTitleMoreEl(title, rows.key, s.waitingView.open));
+                host.appendChild(head);
+            }
+            // A group's rows hang on its line under its band (spec 105 U4 §2, D1: no indent in the panel).
+            const list = el('ul', `live-panel-list live-waiting${rows.key !== FLAT_GROUP ? ' is-grouped' : ''}`);
+            for (const w of rows.items) list.appendChild(rowOf(w));
+            host.appendChild(list);
+        }
+        return more;
     },
 
     /** Fold or unfold a section of the small panel: a lasting choice (this device, panel and overview alike). */
@@ -4292,7 +4946,8 @@ export const researchUiMethods = uiModule({
         const url = s.bridge.ged;
         familiesReading.add(url);
         // Only its families are read: the file with its images by hash is enough, its images are not asked.
-        void fetchResearchTree(url, { byHash: bridgeGivesImagesByHash(s.features), images: false }).then(() => {
+        void fetchResearchTree(url, { byHash: bridgeGivesImagesByHash(s.features), images: false,
+            media: treeAsksAppMedia(s.features, SettingsManager.isImportImages()) }).then(() => {
             if (live === s) this.renderLivePanel();
         }, () => { /* the next status tries again */ }).finally(() => familiesReading.delete(url));
     },
@@ -4333,12 +4988,15 @@ export const researchUiMethods = uiModule({
         // Phones: the panel is a strip (head and a summary); a tap opens the overview sheet.
         const phone = window.matchMedia?.('(max-width: 640px)').matches === true;
         const collapsed = s.collapsed || phone;
+        // The overview in its own window, on a computer (spec 079 U9): the head and "Working" only, the rest is there.
+        const workingOnly = livePanelWorkingOnly({ overviewInWindow: overviewInWindow(), desktop: isDesktop(), ended: s.ended });
         panel.setAttribute('aria-label', r.panelLabel);
         panel.classList.remove('idle');
         panel.classList.toggle('ended', s.ended);
         panel.classList.toggle('lost', !s.ended && s.lostSince !== null);
         panel.classList.toggle('collapsed', collapsed);
         panel.classList.toggle('phone-strip', phone && !s.ended);
+        panel.classList.toggle('working-only', workingOnly);
         // The overview shows the same (a drawn overview hides the panel).
         panel.hidden = livePanelHidden(s);
         // A redraw replaces the ⋯ buttons: an open task menu moves to the new one.
@@ -4372,7 +5030,7 @@ export const researchUiMethods = uiModule({
         // "Awaiting action" hidden: its count stays in the head, first (a click shows it in the overview).
         // Folded, the summary has it; a phone's strip has its own.
         const waitHidden = panelSectionHidden('waiting');
-        const headWaitChip = waitHidden && !collapsed && !phone ? waitingChip(s, () => this.openResearchOverview({ showWaiting: true })) : null;
+        const headWaitChip = waitHidden && !collapsed && !phone && !workingOnly ? waitingChip(s, () => this.openResearchOverview({ showWaiting: true })) : null;
         if (headWaitChip) actions.appendChild(headWaitChip);
         // Folded: the other trees as one chip (unfolds the panel with them shown; spec 011).
         const otherChip = collapsed && !phone && !s.ended ? this.researchElsewhereChip('collapsed') : null;
@@ -4425,12 +5083,12 @@ export const researchUiMethods = uiModule({
                 if (chip) summary.appendChild(chip);
             }
             // "Awaiting action" collapsed or hidden: its count first (a click opens the overview; hidden, shown there).
-            if (!phone && (waitHidden || panelSectionCollapsed(s, 'waiting'))) {
+            if (!phone && !workingOnly && (waitHidden || panelSectionCollapsed(s, 'waiting'))) {
                 const chip = waitingChip(s, () => this.openResearchOverview({ showWaiting: waitHidden }));
                 if (chip) summary.appendChild(chip);
             }
             const fresh = s.changes.length - s.seenChanges;
-            if (fresh > 0) summary.appendChild(el('span', 'live-panel-chip live-panel-new', r.newChanges(fresh)));
+            if (fresh > 0 && !workingOnly) summary.appendChild(el('span', 'live-panel-chip live-panel-new', r.newChanges(fresh)));
             // An older tree shown at once: the newer one comes by itself.
             if (s.preparing && !s.ended) summary.appendChild(livePreparing('span', 'live-panel-chip live-panel-preparing'));
             if (!s.ended && !phone) summary.appendChild(el('span', 'live-panel-chip', r.readOnly));
@@ -4462,7 +5120,7 @@ export const researchUiMethods = uiModule({
             menu: (h, at) => this.openLiveSectionMenu(h, key, 'panel', at),
         });
         // Every section hidden: a word and the way back instead (the head keeps the count of what waits).
-        if (PANEL_PREF_KEYS.every(k => panelSectionHidden(k))) {
+        if (!workingOnly && PANEL_PREF_KEYS.every(k => panelSectionHidden(k))) {
             appendAllHidden(body, (anchor) => this.openLiveSectionEditor(anchor, 'panel'));
         }
 
@@ -4470,9 +5128,15 @@ export const researchUiMethods = uiModule({
         // show it only while live.
         const multi = linesMulti(s);
         const sel = selectedLine(s);
+        // Beside the overview's window "Working" stays expanded (folded it would leave the panel a head).
+        const workingFoldNow = (): LiveFold & { locked?: boolean } => (workingOnly
+            ? { ...fold('working'), collapsed: false, locked: true } : fold('working'));
         const drawWorking = (): void => {
-            if (panelSectionHidden('working')) {
-                // Hidden by the user: not drawn.
+            if (workingOnly && livePanelNothingAtWork(s.working)) {
+                // Beside the overview's window, nobody at work: a line in place of the section.
+                body.appendChild(el('p', 'live-panel-nowork', L.nothingAtWork));
+            } else if (panelSectionHidden('working') && !workingOnly) {
+                // Hidden by the user: not drawn (beside the overview's window it is all the panel has).
             } else if (!s.ended && multi) {
                 // Two or more lines at work: a row each, one can be selected (spec 011).
                 const o = strings.otherResearch;
@@ -4483,7 +5147,7 @@ export const researchUiMethods = uiModule({
                     : [glyphs, o.linesWorking(n)].filter(Boolean).join(' · ');
                 // Folded, the summary says the lines or the selection; unfolded, the title says the count
                 // and "All directions" drops a selection.
-                const workingFold = fold('working');
+                const workingFold = workingFoldNow();
                 const title = n >= 2 && !workingFold.collapsed ? o.linesTitle(n) : r.atWork;
                 let aside: HTMLButtonElement | undefined;
                 if (sel && !workingFold.collapsed) {
@@ -4499,7 +5163,7 @@ export const researchUiMethods = uiModule({
                 const w = s.working[0];
                 const since = w ? Date.parse(w.since) : NaN;
                 const summary = w ? [w.who, w.paused ? L.statePaused : Number.isFinite(since) ? liveDuration(since) : ''].filter(Boolean).join(' · ') : L.nobody;
-                const host = liveSection(body, { ...fold('working'), title: r.atWork, summary, help: nowHelpTopic(s) });
+                const host = liveSection(body, { ...workingFoldNow(), title: r.atWork, summary, help: nowHelpTopic(s) });
                 this.appendWorkingList(host, s);
             }
         };
@@ -4551,7 +5215,7 @@ export const researchUiMethods = uiModule({
         };
         // In the sections' order (one for the panel and the overview; the panel has four of them).
         const draw: Record<LiveSectionKey, () => void> = { working: drawWorking, waiting: drawWaiting, changes: drawChanges, queue: drawQueue };
-        for (const key of panelSectionOrder()) draw[key]();
+        for (const key of livePanelDrawnSections(panelSectionOrder(), workingOnly)) draw[key]();
         panel.appendChild(body);
         if (!s.ended && s.spend && !phone) this.appendSpendFoot(panel, s.spend);
         placeLivePanel(panel);
@@ -4559,7 +5223,8 @@ export const researchUiMethods = uiModule({
         if (again && menuTask) this.openLiveTaskMenu(again, menuTask, true);
         // Too tall for the window: fold from the bottom up (by default Up next, then Changes, then Working;
         // never Waiting, never a section with a choice: one kept expanded makes the panel scroll). Not remembered.
-        if (!collapsed && !panel.hidden && body.scrollHeight > body.clientHeight + 1) {
+        // Beside the overview's window "Working" alone stays expanded and scrolls.
+        if (!collapsed && !workingOnly && !panel.hidden && body.scrollHeight > body.clientHeight + 1) {
             const prefs = sectionPrefs();
             const next = autoFoldOrder().find(k => prefs[k] === undefined && !s.autoCollapsed.has(k)
                 && body.querySelector(`#live-sec-${k}`));
@@ -4628,8 +5293,14 @@ export const researchUiMethods = uiModule({
             : branch ? { branch } : dirFilter !== 'all' ? { research: dirFilter } : null;
         const whole: QueueFilter = { state: 'next' };
         // A filter's list is read when shown; the whole queue's only once "Load more" was asked.
-        const list = filter ? requestQueueList(base, filter, 'queue')
+        const read = filter ? requestQueueList(base, filter, 'queue')
             : paged && queueList(base, whole) ? requestQueueList(base, whole, 'queue') : null;
+        // A filter's first page on its way (6.3, read once): its tasks of the status's window stay, the list dimmed and
+        // aria-busy, "Loading tasks…" in the heading (both after 120 ms); a failed read keeps its row with Try again.
+        const loadingFirst = !!read && read.total === null && !read.error;
+        const list = loadingFirst ? null : read;
+        const loadShown = loadingFirst && queueLoadShown(read.key, () => this.renderResearchOverview());
+        if (read && !loadingFirst) queueLoadSince.delete(read.key);
         const next = list ? list.items.filter(q => q.state === 'next') : allNext.filter(inFilter);
         const windowParked = s.queue.filter(q => q.state === 'parked' && inFilter(q));
         const parked = list ? [...list.items.filter(q => q.state === 'parked'),
@@ -4650,6 +5321,7 @@ export const researchUiMethods = uiModule({
         const host = liveSection(body, {
             ...fold, title: counted ? L.queueTitleCount(title, nextCount) : title, headCls: 'live-queue-toggle', help: 'queue',
             ...(action ? { aside: action } : {}),
+            ...(loadShown ? { extra: [queueLoadingStatus()] } : {}),
             ...(counted ? {} : {
                 summary: sel ? strings.otherResearch.lineQueueOf(counts ? lineCount(sel.id) : next.length, nextCount, directionGlyph(sel))
                     : L.queueCount(nextCount),
@@ -4701,6 +5373,10 @@ export const researchUiMethods = uiModule({
         if (search && this.appendQueueSearchResult(host, s, search, { base, branch, dirFilter, multi })) return;
         const ul = el('ul', 'live-panel-list live-queue');
         host.appendChild(ul);
+        if (loadingFirst) {
+            ul.setAttribute('aria-busy', 'true');
+            if (loadShown) ul.classList.add('busy-list-dim');
+        }
         if (search) this.queueRowsKeys(ul, search);
         if (list && list.total === null) {
             // The filter's first page not read yet: being read, or failed (try again).
@@ -4742,11 +5418,7 @@ export const researchUiMethods = uiModule({
             if (dir) text.appendChild(el('span', 'research-overview__dir', ` · ${dir}`));
             appendQueueNote(text, q, s);
             const problem = this.taskOrderProblem(q.id);
-            if (problem) {
-                const box = el('span', 'live-queue-problem', problem);
-                box.setAttribute('role', 'alert');
-                text.appendChild(box);
-            }
+            if (problem) text.appendChild(taskProblemBox(problem, this.taskOrderRetry(q.id)));
             if (this.taskOrderBusy(q.id)) li.setAttribute('aria-busy', 'true');
             li.appendChild(text);
             if (queueRowMenu(s, q, canTask, canOrder)) {
@@ -4755,10 +5427,13 @@ export const researchUiMethods = uiModule({
                 more.setAttribute('aria-label', r.taskMenu);
                 more.setAttribute('aria-haspopup', 'menu');
                 more.dataset.task = q.id;
-                more.onclick = (e) => {
-                    e.stopPropagation();
-                    this.openLiveTaskMenu(more, q.id);
-                };
+                // Its place on its way (§4, 4a): the spinner in the ⋯'s place, no menu meanwhile.
+                if (!drawRowMoreBusy(more, this.taskOrderView(q.id))) {
+                    more.onclick = (e) => {
+                        e.stopPropagation();
+                        this.openLiveTaskMenu(more, q.id);
+                    };
+                }
                 li.appendChild(more);
             }
             ul.appendChild(li);
@@ -4781,7 +5456,7 @@ export const researchUiMethods = uiModule({
             ul.appendChild(li);
         }
         const open = this.activeResearchLink('open');
-        if (paged && counts) {
+        if (paged && counts && !loadingFirst) {
             // How far the list goes: "Load more" (a page) while there is more, the cap said at its end.
             // Only the tasks up next count, as the chips do: a filter's list holds the set-aside ones
             // after them (the research's order), never part of "N of M shown".
@@ -4802,6 +5477,8 @@ export const researchUiMethods = uiModule({
                 btn.type = 'button';
                 btn.dataset.do = 'queue-more';
                 if (busy) {
+                    // The next page on its way (A212): the spinner before its words, the button locked with its focus.
+                    btn.insertAdjacentHTML('afterbegin', busySpinHtml(14));
                     btn.setAttribute('aria-disabled', 'true');
                     li.setAttribute('aria-busy', 'true');
                 } else {
@@ -4949,6 +5626,8 @@ export const researchUiMethods = uiModule({
             btn.type = 'button';
             btn.dataset.do = 'queue-more';
             if (busy) {
+                // The next page on its way (A212): the spinner before its words, the button locked with its focus.
+                btn.insertAdjacentHTML('afterbegin', busySpinHtml(14));
                 btn.setAttribute('aria-disabled', 'true');
                 li.setAttribute('aria-busy', 'true');
             } else if (drawn === list) {
@@ -5005,11 +5684,7 @@ export const researchUiMethods = uiModule({
             if (parked) meta.appendChild(el('span', 'research-queue__deferred', L.queueTagDeferred));
             text.appendChild(meta);
             const problem = this.taskOrderProblem(q.id);
-            if (problem) {
-                const box = el('span', 'live-queue-problem', problem);
-                box.setAttribute('role', 'alert');
-                text.appendChild(box);
-            }
+            if (problem) text.appendChild(taskProblemBox(problem, this.taskOrderRetry(q.id)));
             if (this.taskOrderBusy(q.id)) li.setAttribute('aria-busy', 'true');
             li.appendChild(text);
             if (!parked && queueRowMenu(s, q, canTask, canOrder)) {
@@ -5018,10 +5693,13 @@ export const researchUiMethods = uiModule({
                 more.setAttribute('aria-label', r.taskMenu);
                 more.setAttribute('aria-haspopup', 'menu');
                 more.dataset.task = q.id;
-                more.onclick = (e) => {
-                    e.stopPropagation();
-                    this.openLiveTaskMenu(more, q.id);
-                };
+                // Its place on its way (§4, 4a): the spinner in the ⋯'s place, no menu meanwhile.
+                if (!drawRowMoreBusy(more, this.taskOrderView(q.id))) {
+                    more.onclick = (e) => {
+                        e.stopPropagation();
+                        this.openLiveTaskMenu(more, q.id);
+                    };
+                }
                 li.appendChild(more);
             } else if (parked && canTask) {
                 const wake = setResearchActionLabel(el('button', 'link-button live-queue-wake'), r.wake, researchLinkMark('task', { taskDo: 'wake' }));
@@ -5271,7 +5949,7 @@ export const researchUiMethods = uiModule({
         const researchId = idlePanel;
         const state = researchId ? storedResearchWaiting(researchId) : null;
         panel.setAttribute('aria-label', r.panelIdle);
-        panel.classList.remove('ended', 'collapsed');
+        panel.classList.remove('ended', 'collapsed', 'working-only');
         panel.classList.add('idle');
         // The overview open without following shows the same (and the panel lay over its ⤡).
         panel.hidden = this.activeResearchId() !== researchId || viewingShown();
@@ -5325,7 +6003,8 @@ export const researchUiMethods = uiModule({
                 row.appendChild(el('span', 'live-agent-started-text', o.agentStarted));
                 const go = row.appendChild(el('button', 'link-button live-agent-started-follow', r.followLive));
                 go.type = 'button';
-                go.onclick = () => this.followResearchHere(researchId);
+                go.dataset.action = 'follow-live-agent';
+                go.onclick = () => this.followResearchHere(researchId, go);
             }
             if (connected) {
                 // Back from "only load" with changes meanwhile, the first send goes by hand.
@@ -5349,17 +6028,20 @@ export const researchUiMethods = uiModule({
         const upHere = !off && !!researchId && answer?.result === 'up' && !!answer.status && !this.activeResearchAgentless()
             && !panel.querySelector('.live-agent-started');
         if (open || upHere) {
-            const foot = el('div', 'live-panel-foot');
+            const foot = el('div', 'live-panel-foot busy-host');
             if (upHere && researchId) {
                 const follow = el('button', 'live-panel-follow', r.followLive);
                 follow.type = 'button';
-                follow.onclick = () => this.followResearchHere(researchId);
+                follow.dataset.action = 'follow-live';
+                follow.onclick = () => this.followResearchHere(researchId, follow);
                 foot.appendChild(follow);
             }
             if (open) {
                 const btn = setResearchActionLabel(el('button', 'primary live-panel-open'), r.openResearch, researchLinkMark('open'));
                 btn.type = 'button';
-                btn.onclick = () => this.launchResearchLink(open);
+                // Found again when the panel is drawn anew while it waits: the state and its sentence follow (§3.1).
+                btn.dataset.action = 'open-research';
+                btn.onclick = () => { void this.launchResearchLink(open, 'terminal', btn); };
                 foot.appendChild(btn);
             }
             panel.appendChild(foot);
@@ -5381,6 +6063,12 @@ export const researchUiMethods = uiModule({
         }
         const panel = document.getElementById('live-panel');
         if (panel && live && panel.classList.contains('phone-strip') !== (phone && !live.ended)) {
+            this.renderLivePanel();
+            return;
+        }
+        // Across 1024 px beside the overview's window: the head and "Working" only on a computer, all below.
+        if (panel && live && panel.classList.contains('working-only')
+            !== livePanelWorkingOnly({ overviewInWindow: overviewInWindow(), desktop: isDesktop(), ended: live.ended })) {
             this.renderLivePanel();
             return;
         }

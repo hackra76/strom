@@ -43,6 +43,7 @@ import { fillResearchConfirmedValues, hasUnvaluedResearchConfirmations } from '.
 import { requestPersistentStorage } from './persistence.js';
 import { newTieSendMode } from './research-sync.js';
 import { asciiSlug } from './filenames.js';
+import { browserMediaFingerprint } from './browser-media.js';
 import { looksLikeSampleTree } from './demo-sample.js';
 import { announceTreeSaved, clearTreeStale, isTreeStale } from './tab-sync.js';
 import { cloneTreeDataAsJson, estimateJsonBytes } from './clone.js';
@@ -209,6 +210,13 @@ class TreeManagerClass {
         activeTreeId: null,
         trees: []
     };
+
+    /**
+     * A satellite window (spec 079, 097 K1.3) has no index of its own: the
+     * main window's metadata of the tree it shows, as the agent's mirror
+     * carries it (src/windows/agent-mirror.ts). Read only, never stored.
+     */
+    private windowMeta: TreeMetadata | null = null;
 
     private initialized = false;
 
@@ -498,6 +506,7 @@ class TreeManagerClass {
         // the delete below (review S20). Then drain the tree's queue.
         this.index.trees.splice(idx, 1);
         this.unreadableTrees.delete(id);
+        this.preMigrationStates.delete(id);
         await this.flush(id);
         forgetRescues(id);
 
@@ -633,15 +642,53 @@ class TreeManagerClass {
             if (!this.isTreeNewer(id) && hasUnvaluedResearchConfirmations(result.data)) await this.valueResearchConfirmations(id, result.data);
             if (!this.isTreeNewer(id) && version < STROM_DATA_VERSION && needsDataUpdate(result.data, version)) {
                 result.data = await this.updateStoredData(id, tree, result.data, version);
+            } else {
+                this.notePreMigrationState(id, result.data, version);
             }
             const count = realPersonCount(result.data);
             if (tree && tree.personCount !== count) {
                 tree.personCount = count;
                 changed = true;
             }
+            // Its pictures and files only the browser keeps (a tree saved before this was counted is learnt here).
+            const mediaFp = browserMediaFingerprint(result.data);
+            if (tree && tree.mediaFp !== mediaFp) {
+                tree.mediaFp = mediaFp;
+                changed = true;
+            }
             if (changed) this.saveIndex();
         }
         return result;
+    }
+
+    /**
+     * A tree linked to a research that an index saved before spec 108 knows
+     * no fingerprint of its pictures and files for (mediaFp) learns it from
+     * its stored record, so the "only in browser" indicator judges a tree not
+     * open yet by what it has. Only reads: no migration, no save of the tree.
+     * The open tree is left out (its fingerprint comes from memory), and so is
+     * one that cannot be read now (locked): it stays unknown until it opens.
+     * Returns how many trees learnt one while it read them (by this read or
+     * another one of the same tree).
+     */
+    async learnMediaFingerprints(): Promise<number> {
+        const unknown = this.index.trees.filter(t => t.research && t.mediaFp === undefined && t.id !== this.index.activeTreeId);
+        let learnt = 0;
+        for (const tree of unknown) {
+            // A read that fails here marks nothing: the tree is judged unreadable only when it is opened.
+            const wasUnreadable = this.unreadableTrees.has(tree.id);
+            const result = await this.readTreeRecord(tree.id).catch(() => null);
+            if (result?.status !== 'ok') {
+                if (!wasUnreadable) this.unreadableTrees.delete(tree.id);
+                continue;
+            }
+            // Another read of the tree meanwhile (the cards' badges, the tree list) may have learnt it first:
+            // it is known now either way, and the caller paints again.
+            if (tree.mediaFp === undefined) tree.mediaFp = browserMediaFingerprint(result.data);
+            learnt++;
+        }
+        if (learnt > 0) this.saveIndex();
+        return learnt;
     }
 
     /**
@@ -675,6 +722,42 @@ class TreeManagerClass {
         // Before the tree is shown: its changes per person are read against the copy.
         await unknownSexInResearchCopies(id, sexU);
         return next ?? data;
+    }
+
+    /**
+     * A tree an older app stored that is read here as it was (no update on
+     * reading, see needsDataUpdate) still changes when this window first
+     * writes it: the data are moved over in memory (data v24: attachments
+     * become records of the tree's files) and the first save stamps this
+     * version. The state as stored is kept until then, and that first write
+     * takes the backup "Before the data update of a new version" from it
+     * (takePreMigrationBackup) — once per tree and data version, as the
+     * stored version is this one afterwards; a tree only opened is not
+     * backed up. An empty tree needs nothing. Any later version step works
+     * the same, the encrypted profile too (the backup is encrypted).
+     */
+    private notePreMigrationState(id: TreeId, data: StromData, version: number): void {
+        if (this.isTreeNewer(id) || version >= STROM_DATA_VERSION || Object.keys(data.persons ?? {}).length === 0) {
+            this.preMigrationStates.delete(id);
+            return;
+        }
+        // The copy shares its strings (photos, scans) with the read data: cheap even for a large tree.
+        this.preMigrationStates.set(id, {
+            data: cloneTreeDataAsJson(data), version,
+            base: this.backupResearchBase(id, this.researchBaseOf(id)),
+        });
+    }
+
+    /** The first write of a newer data version over a tree kept by notePreMigrationState: its backup first. */
+    private async takePreMigrationBackup(id: TreeId, writing: StromData): Promise<void> {
+        const kept = this.preMigrationStates.get(id);
+        if (!kept || (writing.version ?? 1) <= kept.version) return;
+        this.preMigrationStates.delete(id);
+        try {
+            await createSnapshot(id, kept.data, 'pre-migration', Date.now(), kept.base);
+        } catch (err) {
+            console.warn('The backup before the data update could not be written', err);
+        }
     }
 
     /**
@@ -958,6 +1041,9 @@ class TreeManagerClass {
     /** The research base this window last read or wrote with each tree (researchBaseKnownMatches). */
     private storedBases = new Map<TreeId, ResearchBase & { researchId: string }>();
 
+    /** A tree's state as an older app stored it, until its first write here (notePreMigrationState). */
+    private preMigrationStates = new Map<TreeId, { data: StromData; version: number; base: SnapshotResearchBase | null }>();
+
     /** How many states were handed to the queue per tree (a read can tell a write made meanwhile). */
     private queuedWrites = new Map<TreeId, number>();
 
@@ -1140,6 +1226,7 @@ class TreeManagerClass {
                 this.settle(id, pending);
                 return;
             }
+            await this.takePreMigrationBackup(id, latest);
             const images = collectPoolable(latest);
             if (images.size > 0) {
                 await this.writePooledTree(id, latest, images, pending.base);
@@ -1340,6 +1427,7 @@ class TreeManagerClass {
             tree.personCount = realPersonCount(data);
             tree.partnershipCount = Object.keys(data.partnerships).length;
             tree.sizeBytes = sizeBytes;
+            tree.mediaFp = browserMediaFingerprint(data);
             this.saveIndex();
         }
     }
@@ -1378,8 +1466,9 @@ class TreeManagerClass {
             personCount: realPersonCount(data),
             partnershipCount: Object.keys(data.partnerships).length,
             sizeBytes,
+            mediaFp: browserMediaFingerprint(data),
             // The file it came from is a copy (a split-off part is not).
-            ...(fromFile ? { fileCopyAt: now } : {})
+            ...(fromFile ? { fileCopyAt: now, fileCopyMediaFp: browserMediaFingerprint(data) } : {})
         };
 
         // Add to index
@@ -1415,7 +1504,12 @@ class TreeManagerClass {
     }
 
     getTreeMetadata(id: TreeId): TreeMetadata | null {
-        return this.index.trees.find(t => t.id === id) || null;
+        return this.index.trees.find(t => t.id === id) || (this.windowMeta?.id === id ? this.windowMeta : null);
+    }
+
+    /** The main window's metadata of the tree a satellite shows (null: none); never stored, never in the list of trees. */
+    setWindowTreeMetadata(meta: TreeMetadata | null): void {
+        this.windowMeta = meta;
     }
 
     getFirstTree(): TreeMetadata | null {
@@ -1616,14 +1710,22 @@ class TreeManagerClass {
         if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('strom:user-change', { detail: { treeId } }));
     }
 
-    /** These trees were just written, whole, to a file (export, working file). */
-    noteFileCopy(treeIds: readonly TreeId[]): void {
+    /**
+     * These trees were just written, whole, to a file (export, working file).
+     * `written`: the data each file carried, so its pictures and files count
+     * as copied only when it had them (an export without photos does not
+     * copy them); without it they count as not known to be in the file.
+     */
+    noteFileCopy(treeIds: readonly TreeId[], written?: Readonly<Record<string, StromData | null | undefined>>): void {
         const now = new Date().toISOString();
         let any = false;
         for (const id of treeIds) {
             const tree = this.index.trees.find(t => t.id === id);
             if (!tree) continue;
             tree.fileCopyAt = now;
+            const data = written?.[id];
+            if (data) tree.fileCopyMediaFp = browserMediaFingerprint(data);
+            else delete tree.fileCopyMediaFp;
             any = true;
         }
         if (!any) return;

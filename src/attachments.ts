@@ -6,7 +6,8 @@
  */
 
 import { Person, StromData, personSourceIds, partnershipSourceIds } from './types.js';
-import { dataUrlByteSize, stripPhotos } from './photo.js';
+import { dataUrlByteSize, dataUrlImageSize, stripPhotos } from './photo.js';
+import { allMedia, personMedia as personMediaOf } from './media.js';
 
 /** Longest edge (px) an attached image is downscaled to. */
 export const ATTACHMENT_MAX_SIDE = 1600;
@@ -18,6 +19,23 @@ export const MAX_PDF_BYTES = 2 * 1024 * 1024;
 export const ATTACHMENT_WARN_BYTES = 10 * 1024 * 1024;
 
 export const ATTACHMENT_IMAGE_TYPES = ['image/jpeg', 'image/png'];
+
+/**
+ * Whether a file of the tree was downscaled when it was added, told by the
+ * size of the image as stored (read from its header, cheap):
+ * - 'resized': its longest side is ATTACHMENT_MAX_SIDE, the size
+ *   compressImageAttachment brings a larger picture to;
+ * - 'unknown': an image whose size cannot be read (said as "at most");
+ * - null: not resized — a smaller or a larger image (one from a GEDCOM file
+ *   or the research is kept as it came), not an image, or only the original
+ *   the research keeps.
+ */
+export function attachmentResizeState(att: { mimeType: string; dataUrl: string; originalOnly?: true; original?: unknown }): 'resized' | 'unknown' | null {
+    if (!att.mimeType.startsWith('image/') || att.originalOnly || att.original || !att.dataUrl) return null;
+    const size = dataUrlImageSize(att.dataUrl);
+    if (!size) return 'unknown';
+    return Math.max(size.w, size.h) === ATTACHMENT_MAX_SIDE ? 'resized' : null;
+}
 
 /**
  * Compress a user-selected image into an aspect-preserving JPEG data URL whose
@@ -91,9 +109,7 @@ export function totalExcerptBytes(data: StromData): number {
  */
 export function totalAttachmentBytes(data: StromData): number {
     let total = totalExcerptBytes(data);
-    for (const person of Object.values(data.persons)) {
-        for (const att of person.attachments ?? []) total += att.sizeBytes || dataUrlByteSize(att.dataUrl);
-    }
+    for (const att of allMedia(data)) total += att.sizeBytes || dataUrlByteSize(att.dataUrl);
     return total;
 }
 
@@ -111,7 +127,7 @@ export function personMedia(person: Person, data: StromData): PersonMedia {
         photoBytes: person.photo ? dataUrlByteSize(person.photo) : 0,
         attachments: 0, attachmentBytes: 0, excerpts: 0, excerptBytes: 0,
     };
-    for (const att of person.attachments ?? []) {
+    for (const att of personMediaOf(data, person.id)) {
         out.attachments++;
         out.attachmentBytes += att.sizeBytes || dataUrlByteSize(att.dataUrl);
     }
@@ -150,9 +166,7 @@ export function stripExcerpts(data: StromData): StromData {
  */
 export function stripAttachments(data: StromData): StromData {
     const copy = structuredClone(data);
-    for (const person of Object.values(copy.persons)) {
-        delete person.attachments;
-    }
+    delete copy.media;
     dropExcerptsInPlace(copy);
     return copy;
 }
@@ -160,9 +174,7 @@ export function stripAttachments(data: StromData): StromData {
 /** Deep copy with all images (photos, attachments, excerpts) removed, for lean files. */
 export function stripMedia(data: StromData): StromData {
     const copy = stripPhotos(data);
-    for (const person of Object.values(copy.persons)) {
-        delete person.attachments;
-    }
+    delete copy.media;
     dropExcerptsInPlace(copy);
     return copy;
 }
@@ -183,9 +195,17 @@ export function countImages(data: StromData): ImageCount {
             out.photos++;
             out.bytes += dataUrlByteSize(person.photo);
         }
-        for (const att of person.attachments ?? []) {
-            out.attachments++;
-            out.bytes += att.sizeBytes || dataUrlByteSize(att.dataUrl);
+    }
+    for (const att of allMedia(data)) {
+        out.attachments++;
+        out.bytes += att.sizeBytes || dataUrlByteSize(att.dataUrl);
+    }
+    // The couples' photos count with the photos (spec 107); a portrait's
+    // original is an attachment already.
+    for (const union of Object.values(data.partnerships ?? {})) {
+        if (union.photo) {
+            out.photos++;
+            out.bytes += dataUrlByteSize(union.photo);
         }
     }
     for (const src of Object.values(data.sources ?? {})) {

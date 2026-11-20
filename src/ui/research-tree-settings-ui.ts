@@ -17,11 +17,13 @@ import { strings } from '../strings.js';
 import { TreeId, ResearchTranscripts, ResearchSendMode, StromData } from '../types.js';
 import {
     researchSchemeUrl, TERMINAL_CHOICE_FEATURE, STORIES_HISTORY_FEATURE, HYPOTHESES_DECIDE_FEATURE, researchLinkMark, researchUrlMark,
-    type ResearchHypothesesDecide,
+    booksOn, BOOKS_MIN_TASKS_DEFAULT, BOOKS_SAME_BOOK_DEFAULT, type ResearchHypothesesDecide, type LiveBooksSettings,
 } from '../research-link.js';
-import { postBridgeStories, postBridgeHypotheses, postBridgeReadTask } from '../history-bridge.js';
+import { postBridgeStories, postBridgeHypotheses, postBridgeReadTask, postBridgeBooks, type BooksSettingBody } from '../history-bridge.js';
+import { booksSettingHtml, booksMinTasksInput, type BooksSettingNote } from './books-setting-view.js';
 import { READ_SOURCE_TASK_FEATURE, type ReadTaskSetting } from '../research-read-task.js';
 import { readTaskSettingHtml, type ReadTaskSettingNote } from './read-task-setting-view.js';
+import { startPend, endPend, dropPend, pendAttrs, pendStatusHtml } from './switch-pend.js';
 import { researchAutoState, patchResearchAutoState, researchSendPreviewSkipped, noteResearchSendPreviewSkipped, announcedResearchScheme } from '../research-device.js';
 import { sourceReadingHash, unverifiedOlderSources, newTieSendMode } from '../research-sync.js';
 import { uiModule } from './module.js';
@@ -43,7 +45,7 @@ const askLater = new Set<TreeId>();
  * (`link`: its way on), the value asked until the research's status says it
  * (`want`), a write on its way (`busy`). Per research; forgotten with the dialog.
  */
-const stories: { rid: string; note?: { text: string; link?: ResearchNoteLink }; want?: boolean; busy?: boolean } = { rid: '' };
+const stories: { rid: string; note?: { text: string; link?: ResearchNoteLink }; want?: boolean; busy?: boolean; sending?: boolean } = { rid: '' };
 let storiesListening = false;
 
 /**
@@ -51,15 +53,52 @@ let storiesListening = false;
  * research's answer under the row (`link`: its terminal confirms the agent),
  * the value asked until the status says it (`want`), a write on its way (`busy`).
  */
-const hypos: { rid: string; note?: { text: string; link?: ResearchNoteLink }; want?: ResearchHypothesesDecide; busy?: boolean } = { rid: '' };
+const hypos: {
+    rid: string; note?: { text: string; link?: ResearchNoteLink; retry?: () => void; said?: boolean }; want?: ResearchHypothesesDecide; busy?: boolean;
+    /** The choice on its way (6.1: shown at once, dashed). */
+    sending?: ResearchHypothesesDecide;
+} = { rid: '' };
 
 /**
  * "Task from a new reading" (spec 059 §4): the same parts as `hypos` — the note under the choices (the write on
  * its way, the research's confirmation, a refusal), the value asked until the status says it (`want`), the group open.
  */
-const readTask: { rid: string; note?: ReadTaskSettingNote; want?: ReadTaskSetting; busy?: boolean; open?: boolean } = { rid: '' };
+const readTask: { rid: string; note?: ReadTaskSettingNote; want?: ReadTaskSetting; busy?: boolean; open?: boolean; retry?: ReadTaskSetting; said?: boolean } = { rid: '' };
+/** The write states of the two choices (6.1, switch-pend). */
+const HYPOS_PEND = 'tree:hypos';
+const READ_TASK_PEND = 'tree:readtask';
+const STORIES_PEND = 'tree:stories';
 /** How long the group stays highlighted when a link opens the dialog at it. */
 const READ_TASK_FLASH_MS = 1500;
+
+/**
+ * "Books" (spec 105 §4): the same parts as `readTask` — the settings the research confirmed until its status says
+ * them (`want`), the last write (`last`, for Try again), the number typed when it is not one (`invalid`), the group
+ * gone after the research said the tree is an archive (`gone`), a redraw held while the number field has the focus
+ * (`stale`) and the control a write came from (`focusId`).
+ */
+const books: {
+    rid: string; note?: BooksSettingNote; want?: LiveBooksSettings; last?: BooksSettingBody; busy?: boolean; open?: boolean;
+    invalid?: string; gone?: boolean; stale?: boolean; focusId?: string;
+} = { rid: '' };
+const BOOKS_FOCUSABLE = ['research-books-min', 'research-books-same', 'research-books-min-reset', 'research-books-same-reset', 'research-books-retry'];
+
+/** The same four values (what the research keeps; its defaults aside). */
+function sameBooksSettings(a: LiveBooksSettings, b: LiveBooksSettings): boolean {
+    return a.minTasks === b.minTasks && a.minTasksOwn === b.minTasksOwn && a.sameBook === b.sameBook && a.sameBookOwn === b.sameBookOwn;
+}
+
+/** The settings as a write asks them (shown while it is on its way). */
+function booksSettingsAsked(s: LiveBooksSettings, body: BooksSettingBody): LiveBooksSettings {
+    if ('minTasks' in body) {
+        return body.minTasks === 'default'
+            ? { ...s, minTasks: s.minTasksDefault ?? BOOKS_MIN_TASKS_DEFAULT, minTasksOwn: false }
+            : { ...s, minTasks: body.minTasks, minTasksOwn: true };
+    }
+    return body.sameBook === 'default'
+        ? { ...s, sameBook: s.sameBookDefault ?? BOOKS_SAME_BOOK_DEFAULT, sameBookOwn: false }
+        : { ...s, sameBook: body.sameBook, sameBookOwn: true };
+}
 
 /** A phone-sized or touch screen: short card texts, and a note instead of the effect box and the status line. */
 function compactScreen(): boolean {
@@ -205,8 +244,11 @@ export const researchTreeSettingsMethods = uiModule({
         return this.researchModeOf(link.id, link) !== 'archive' && !this.researchAgentAway(link.id, link);
     },
 
-    /** The dialog for a tree tied to a research that knows how a transcript weighs. */
-    async showResearchTreeSettings(treeId: TreeId): Promise<void> {
+    /**
+     * The dialog for a tree tied to a research that knows how a transcript weighs.
+     * `group: 'books'` opens it at "Books", open and highlighted for a moment (Faster by downloading › Settings…).
+     */
+    async showResearchTreeSettings(treeId: TreeId, opts: { group?: 'books' } = {}): Promise<void> {
         const meta = TreeManager.getTreeMetadata(treeId);
         const link = meta?.research;
         if (!meta || !link) return;
@@ -309,6 +351,7 @@ export const researchTreeSettingsMethods = uiModule({
                 <div class="research-stories-host" id="research-stories-host"></div>
                 ${archive || agentAway ? '' : `<div class="research-hypos-host" id="research-hypos-host"></div>`}
                 ${archive || agentAway ? '' : `<div class="research-readtask-host" id="research-readtask-host"></div>`}
+                ${archive || agentAway ? '' : `<div class="research-books-host" id="research-books-host"></div>`}
                 ${this.offLineSettingsOffered(treeId) ? `<div class="research-offline-host" id="research-offline-host" data-research="${esc(link.id)}"></div>` : ''}
                 <button type="button" class="link-button research-read-history" id="research-read-history" hidden></button>
                 ${modeWhereHtml}
@@ -446,6 +489,10 @@ export const researchTreeSettingsMethods = uiModule({
         readTask.rid = link.id;
         delete readTask.note; delete readTask.want; delete readTask.busy; delete readTask.open;
         this.renderResearchReadTaskRow();
+        books.rid = link.id;
+        delete books.note; delete books.want; delete books.last; delete books.busy; delete books.open;
+        delete books.invalid; delete books.gone; delete books.stale; delete books.focusId;
+        this.renderResearchBooksRow();
         // Work outside the directions (§9.5): the same condition as the transcripts, with the research's branches.
         this.startOffLineSettings(link.id);
         if (!storiesListening) {
@@ -455,6 +502,7 @@ export const researchTreeSettingsMethods = uiModule({
                 this.renderResearchStoriesRow();
                 this.renderResearchHypothesesRow();
                 this.renderResearchReadTaskRow();
+                this.renderResearchBooksRow();
                 this.renderOffLineSettings();
             });
         }
@@ -462,6 +510,9 @@ export const researchTreeSettingsMethods = uiModule({
         if (historyBtn) void this.fillReadHistoryRow(historyBtn, treeId);
         await renderOlder();
         overlay.querySelector<HTMLInputElement>('input[name="research-transcripts"]:checked')?.focus();
+        if (opts.group === 'books') {
+            this.flashResearchSettingsGroup('research-books-group', '#research-books-min', () => { books.open = true; });
+        }
     },
 
     /**
@@ -485,24 +536,30 @@ export const researchTreeSettingsMethods = uiModule({
         const up = this.researchBridgeUp(rid);
         const said = last?.storiesHistory === true;
         if (stories.want !== undefined && last?.storiesHistory === stories.want) delete stories.want;
-        const on = stories.want ?? said;
+        const on = stories.sending ?? stories.want ?? said;
         const note = !up ? { text: h.storiesBridgeDown } : stories.note;
         const focused = document.activeElement?.id === 'research-stories-history';
+        // On its way (6.1): the new state at once, dashed and locked (keeping its focus), its words after 120 ms.
+        const pend = !!stories.busy;
         host.innerHTML = `
             <fieldset class="research-transcripts research-stories">
                 <legend>${esc(h.storiesSection)}</legend>
-                <label class="settings-checkbox research-stories-row">
-                    <input type="checkbox" id="research-stories-history"${on ? ' checked' : ''}${up && !stories.busy ? '' : ' disabled'}>
+                <label class="settings-checkbox research-stories-row"${pend ? pendAttrs(STORIES_PEND).replace(' aria-disabled="true"', '') : ''}>
+                    <input type="checkbox" id="research-stories-history"${on ? ' checked' : ''}${!up ? ' disabled' : pend ? ' aria-disabled="true"' : ''}>
                     <span class="settings-text">
                         <span class="settings-name">${esc(h.storiesTitle)}</span>
-                        <span class="settings-desc">${esc(h.storiesDesc)}</span>
+                        <span class="settings-desc">${esc(h.storiesDesc)}</span>${pend ? pendStatusHtml(STORIES_PEND) : ''}
                     </span>
                 </label>
                 ${note ? `<p class="research-stories-note" id="research-stories-note"><span>${esc(note.text)}</span>${'link' in note && note.link
                     ? ` <button type="button" class="link-button" id="research-stories-note-link">${researchActionLabel(note.link.label, note.link.mark ?? 'none', { size: 12 })}</button>` : ''}</p>` : ''}
             </fieldset>`;
         const input = host.querySelector<HTMLInputElement>('#research-stories-history');
-        input?.addEventListener('change', () => { void this.setResearchStoriesHistory(input.checked); });
+        // Locked while on its way: a click changes nothing (the row drawn again as it stands).
+        input?.addEventListener('change', () => {
+            if (stories.busy) { this.renderResearchStoriesRow(); return; }
+            void this.setResearchStoriesHistory(input.checked);
+        });
         host.querySelector<HTMLButtonElement>('#research-stories-note-link')?.addEventListener('click', () => stories.note?.link?.run());
         if (focused) input?.focus({ preventScroll: true });
     },
@@ -515,12 +572,16 @@ export const researchTreeSettingsMethods = uiModule({
         if (!base || stories.busy) { this.renderResearchStoriesRow(); return; }
         const h = strings.history;
         stories.busy = true;
+        stories.sending = on;
         delete stories.note;
+        startPend(STORIES_PEND, { redraw: () => this.renderResearchStoriesRow() });
         this.renderResearchStoriesRow();
         const scheme = announcedResearchScheme();
         const r = await postBridgeStories(base, on, ctx!.features, { tree: rid, ...(scheme ? { scheme } : {}) });
-        if (stories.rid !== rid) return;
+        if (stories.rid !== rid) { dropPend(STORIES_PEND); return; }
+        await endPend(STORIES_PEND);
         delete stories.busy;
+        delete stories.sending;
         if (r.ok) {
             stories.want = on;
         } else if (r.link && (r.code === 'link' || r.code === 'off')) {
@@ -559,17 +620,24 @@ export const researchTreeSettingsMethods = uiModule({
         }
         const r = strings.research;
         if (hypos.want !== undefined && said === hypos.want) delete hypos.want;
-        const value = hypos.want ?? said;
+        const value = hypos.sending ?? hypos.want ?? said;
         const note = !up ? { text: strings.history.storiesBridgeDown } : hypos.note;
+        // A refusal is said as an alert once (a redraw does not say it again).
+        const alert = !!note && note === hypos.note && !!hypos.note.retry && !hypos.note.said;
+        if (alert) hypos.note!.said = true;
         const focused = (document.activeElement as HTMLInputElement | null)?.name === 'research-hypos-decide'
             ? (document.activeElement as HTMLInputElement).value : '';
-        const off = up && !hypos.busy ? '' : ' disabled';
-        const option = (v: ResearchHypothesesDecide, label: string, ai: boolean): string => `
-                <label class="settings-checkbox research-hypos-row">
+        // On its way (6.1): the chosen one dashed with its words after 120 ms, the others locked keeping their focus.
+        const off = !up ? ' disabled' : hypos.busy ? ' aria-disabled="true"' : '';
+        const option = (v: ResearchHypothesesDecide, label: string, ai: boolean): string => {
+            const pend = hypos.busy && v === value;
+            return `
+                <label class="settings-checkbox research-hypos-row"${pend ? pendAttrs(HYPOS_PEND).replace(' aria-disabled="true"', '') : ''}>
                     <input type="radio" name="research-hypos-decide" value="${v}"${v === value ? ' checked' : ''}${off}>
                     <span class="settings-text"><span class="settings-name">${esc(label)}${ai
-                        ? ` <span class="research-ai-badge" title="${esc(r.aiCostHint)}" aria-hidden="true">${esc(r.aiBadge)}</span>` : ''}</span></span>
+                        ? ` <span class="research-ai-badge" title="${esc(r.aiCostHint)}" aria-hidden="true">${esc(r.aiBadge)}</span>` : ''}</span>${pend ? pendStatusHtml(HYPOS_PEND) : ''}</span>
                 </label>`;
+        };
         host.innerHTML = `
             <fieldset class="research-transcripts research-hypos" id="research-hypos">
                 <legend>${esc(r.hypoDecideTitle)}</legend>
@@ -577,7 +645,8 @@ export const researchTreeSettingsMethods = uiModule({
                 ${option('agent', r.hypoDecideAgent, true)}
                 <p class="research-hypos-desc">${esc(r.hypoDecideDesc)}</p>
                 <p class="research-not-retroactive"><span class="research-not-retroactive-icon" aria-hidden="true">i</span><span>${esc(r.hypoDecideNotRetro)}</span></p>
-                ${note ? `<p class="research-stories-note research-hypos-note" id="research-hypos-note"><span>${esc(note.text)}</span>${'link' in note && note.link
+                ${note ? `<p class="research-stories-note research-hypos-note${'retry' in note && note.retry ? ' is-err' : ''}" id="research-hypos-note"${alert ? ' role="alert"' : ''}><span>${esc(note.text)}</span>${'retry' in note && note.retry
+                    ? ` <button type="button" class="link-button research-hypos-retry" id="research-hypos-retry">${esc(strings.busy.retry)}</button>` : ''}${'link' in note && note.link
                     ? ` <button type="button" class="link-button" id="research-hypos-note-link">${researchActionLabel(note.link.label, note.link.mark ?? 'none', { size: 12 })}</button>` : ''}</p>` : ''}
             </fieldset>`;
         host.querySelectorAll<HTMLInputElement>('input[name="research-hypos-decide"]').forEach(input => {
@@ -591,6 +660,7 @@ export const researchTreeSettingsMethods = uiModule({
             if (focused && input.value === focused) input.focus({ preventScroll: true });
         });
         host.querySelector<HTMLButtonElement>('#research-hypos-note-link')?.addEventListener('click', () => hypos.note?.link?.run());
+        host.querySelector<HTMLButtonElement>('#research-hypos-retry')?.addEventListener('click', () => hypos.note?.retry?.());
     },
 
     /**
@@ -604,12 +674,17 @@ export const researchTreeSettingsMethods = uiModule({
         if (!base || hypos.busy) { this.renderResearchHypothesesRow(); return; }
         const r = strings.research;
         hypos.busy = true;
+        hypos.sending = decide;
         delete hypos.note;
+        startPend(HYPOS_PEND, { redraw: () => this.renderResearchHypothesesRow() });
         this.renderResearchHypothesesRow();
         const scheme = announcedResearchScheme();
         const res = await postBridgeHypotheses(base, decide, ctx!.features, { tree: rid, ...(scheme ? { scheme } : {}) });
-        if (hypos.rid !== rid) return;
+        if (hypos.rid !== rid) { dropPend(HYPOS_PEND); return; }
+        await endPend(HYPOS_PEND);
         delete hypos.busy;
+        delete hypos.sending;
+        const retry = (): void => void this.setResearchHypothesesDecide(decide);
         if (res.ok) {
             hypos.want = res.decide ?? decide;
         } else if (res.code === 'link') {
@@ -619,9 +694,9 @@ export const researchTreeSettingsMethods = uiModule({
                 ...(url ? { link: { label: r.hypoDecideConfirmLink, run: () => this.launchResearchLink(url, 'terminal'), mark: researchUrlMark(url) ?? 'terminal' } } : {}),
             };
         } else if (res.code === 'busy') {
-            hypos.note = { text: strings.history.errBusy };
+            hypos.note = { text: strings.history.errBusy, retry };
         } else {
-            hypos.note = { text: res.reason || (res.held ? this.researchWriteHeldText(res.held, false).toast : strings.live.waitingWrite.writeFailed) };
+            hypos.note = { text: res.reason || (res.held ? this.researchWriteHeldText(res.held, false).toast : strings.live.waitingWrite.writeFailed), retry };
         }
         this.renderResearchHypothesesRow();
     },
@@ -648,8 +723,13 @@ export const researchTreeSettingsMethods = uiModule({
         const said: ReadTaskSetting = last?.accepts?.read?.sourceTask ?? 'ask';
         if (readTask.want !== undefined && said === readTask.want) delete readTask.want;
         const value = readTask.want ?? said;
-        const note: ReadTaskSettingNote | undefined = readTask.busy ? { kind: 'busy' }
+        let note: ReadTaskSettingNote | undefined = readTask.busy ? { kind: 'busy', words: pendStatusHtml(READ_TASK_PEND) }
             : !up ? { kind: 'text', text: strings.history.storiesBridgeDown } : readTask.note;
+        // A refusal is said as an alert once (a redraw does not say it again).
+        if (note && note === readTask.note && note.kind === 'text' && note.retry && !readTask.said) {
+            readTask.said = true;
+            note = { ...note, alert: true };
+        }
         const focused = (document.activeElement as HTMLInputElement | null)?.name === 'research-read-task'
             ? (document.activeElement as HTMLInputElement).value : '';
         host.innerHTML = readTaskSettingHtml({ value, open: !!readTask.open, up, note });
@@ -659,6 +739,9 @@ export const researchTreeSettingsMethods = uiModule({
         host.querySelectorAll<HTMLInputElement>('input[name="research-read-task"]').forEach(input => {
             input.addEventListener('change', () => { if (input.checked) void this.setResearchReadTask(input.value as ReadTaskSetting); });
             if (focused && input.value === focused) input.focus({ preventScroll: true });
+        });
+        host.querySelector<HTMLButtonElement>('#research-readtask-retry')?.addEventListener('click', () => {
+            if (readTask.retry) void this.setResearchReadTask(readTask.retry);
         });
     },
 
@@ -671,19 +754,25 @@ export const researchTreeSettingsMethods = uiModule({
         readTask.busy = true;
         readTask.want = value;
         delete readTask.note;
+        delete readTask.retry;
+        startPend(READ_TASK_PEND, { redraw: () => this.renderResearchReadTaskRow() });
         this.renderResearchReadTaskRow();
         const res = await postBridgeReadTask(base, value, ctx!.features, { tree: rid });
-        if (readTask.rid !== rid) return;
+        if (readTask.rid !== rid) { dropPend(READ_TASK_PEND); return; }
+        await endPend(READ_TASK_PEND);
         delete readTask.busy;
         if (res.ok) {
             readTask.want = res.value ?? value;
             readTask.note = { kind: 'ok' };
         } else {
             delete readTask.want;
+            readTask.retry = value;
+            readTask.said = false;
             readTask.note = {
                 kind: 'text',
                 text: res.code === 'busy' ? strings.history.errBusy
                     : res.reason || (res.held ? this.researchWriteHeldText(res.held, false).toast : strings.live.waitingWrite.writeFailed),
+                retry: true,
             };
         }
         this.renderResearchReadTaskRow();
@@ -699,17 +788,141 @@ export const researchTreeSettingsMethods = uiModule({
         const id = TreeManager.getActiveTreeId();
         if (!id) return;
         void this.showResearchTreeSettings(id).then(() => {
-            const group = document.querySelector<HTMLDetailsElement>(`#${SETTINGS_ID} #research-readtask-group`);
-            if (!group) return;
-            group.open = true;
-            readTask.open = true;
-            let box: HTMLElement | null = group.parentElement;
-            while (box && box.scrollHeight <= box.clientHeight + 1) box = box.parentElement;
-            if (box) box.scrollTop += group.getBoundingClientRect().top - box.getBoundingClientRect().top - 12;
-            group.classList.add('is-flash');
-            window.setTimeout(() => group.classList.remove('is-flash'), READ_TASK_FLASH_MS);
-            group.querySelector<HTMLInputElement>('input[name="research-read-task"]:checked')?.focus({ preventScroll: true });
+            this.flashResearchSettingsGroup('research-readtask-group', 'input[name="research-read-task"]:checked', () => { readTask.open = true; });
         });
+    },
+
+    /** A group of the dialog opened, scrolled into view in the dialog (its own scroll, not the page's), highlighted for a moment and focused. */
+    flashResearchSettingsGroup(groupId: string, focusSelector: string, opened: () => void): void {
+        const group = document.querySelector<HTMLDetailsElement>(`#${SETTINGS_ID} #${groupId}`);
+        if (!group) return;
+        group.open = true;
+        opened();
+        let box: HTMLElement | null = group.parentElement;
+        while (box && box.scrollHeight <= box.clientHeight + 1) box = box.parentElement;
+        if (box) box.scrollTop += group.getBoundingClientRect().top - box.getBoundingClientRect().top - 12;
+        group.classList.add('is-flash');
+        window.setTimeout(() => group.classList.remove('is-flash'), READ_TASK_FLASH_MS);
+        group.querySelector<HTMLElement>(focusSelector)?.focus({ preventScroll: true });
+    },
+
+    /**
+     * Spec 105 §4: "Books" — only with `books` and its part said (not in an archive nor a research waiting for its
+     * agent: no host there); the values follow the research's status, also when they change in its terminal, but
+     * never under a number being typed (`force`: a redraw of this group's own write). Without the bridge the controls
+     * rest, dimmed, with its sentence.
+     */
+    renderResearchBooksRow(force = false): void {
+        const host = document.querySelector<HTMLElement>(`#${SETTINGS_ID} #research-books-host`);
+        if (!host) return;
+        const rid = books.rid;
+        const ctx = this.historyManageContext();
+        const last = (ctx?.researchId === rid ? ctx.lastStatus : this.researchStatusOf(rid)) ?? lastBridgeStatus(rid);
+        const features = ctx?.researchId === rid ? ctx.features : last?.features ?? [];
+        if (books.gone || !booksOn({ features, books: last?.books })) {
+            host.innerHTML = '';
+            return;
+        }
+        const active = document.activeElement as HTMLElement | null;
+        if (!force && active?.id === 'research-books-min' && host.contains(active)) {
+            books.stale = true;
+            return;
+        }
+        delete books.stale;
+        const was = host.querySelector<HTMLDetailsElement>('#research-books-group');
+        if (was) books.open = was.open;
+        const up = this.researchBridgeUp(rid);
+        const said = last!.books!.settings;
+        if (books.want && sameBooksSettings(said, books.want)) delete books.want;
+        const settings = books.want ?? said;
+        const note: BooksSettingNote | undefined = books.busy ? { kind: 'busy' }
+            : !up ? { kind: 'text', text: strings.history.storiesBridgeDown } : books.note;
+        const focusId = books.focusId ?? (active && host.contains(active) && BOOKS_FOCUSABLE.includes(active.id) ? active.id : '');
+        host.innerHTML = booksSettingHtml({ settings, open: !!books.open, up, note, invalid: books.invalid ?? null });
+        host.querySelector<HTMLDetailsElement>('#research-books-group')?.addEventListener('toggle', (e) => {
+            books.open = (e.currentTarget as HTMLDetailsElement).open;
+        });
+        const min = host.querySelector<HTMLInputElement>('#research-books-min');
+        if (min) {
+            const take = (): void => {
+                const text = min.value.trim();
+                if (!text && !min.validity.badInput) {
+                    // An empty field takes the research's value back.
+                    delete books.invalid;
+                    this.renderResearchBooksRow(true);
+                    return;
+                }
+                const n = booksMinTasksInput(text);
+                if (n === null) {
+                    books.invalid = text;
+                    books.focusId = 'research-books-min';
+                    this.renderResearchBooksRow(true);
+                    delete books.focusId;
+                    return;
+                }
+                delete books.invalid;
+                if (n === settings.minTasks) { this.renderResearchBooksRow(true); return; }
+                void this.setResearchBooks({ minTasks: n }, 'research-books-min');
+            };
+            min.addEventListener('change', take);
+            min.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); take(); } });
+            // A redraw held while typing comes when the field is left.
+            min.addEventListener('blur', () => {
+                window.setTimeout(() => { if (books.stale && document.activeElement?.id !== 'research-books-min') this.renderResearchBooksRow(); }, 0);
+            });
+        }
+        const same = host.querySelector<HTMLInputElement>('#research-books-same');
+        same?.addEventListener('change', () => { void this.setResearchBooks({ sameBook: same.checked ? 'yes' : 'no' }, 'research-books-same'); });
+        host.querySelector<HTMLButtonElement>('#research-books-min-reset')?.addEventListener('click', () => {
+            delete books.invalid;
+            void this.setResearchBooks({ minTasks: 'default' }, 'research-books-min');
+        });
+        host.querySelector<HTMLButtonElement>('#research-books-same-reset')?.addEventListener('click', () => {
+            void this.setResearchBooks({ sameBook: 'default' }, 'research-books-same');
+        });
+        host.querySelector<HTMLButtonElement>('#research-books-retry')?.addEventListener('click', () => {
+            if (books.last) void this.setResearchBooks(books.last, books.focusId ?? 'research-books-min');
+        });
+        if (focusId) {
+            const el = host.querySelector<HTMLElement>(`#${focusId}`) ?? (focusId.endsWith('-reset') ? host.querySelector<HTMLElement>(`#${focusId.replace('-reset', '')}`) : null);
+            if (el && !(el as HTMLInputElement).disabled) el.focus({ preventScroll: true });
+        }
+    },
+
+    /** Spec 105 §4: `POST /books` — written at once; the values stay as the research says. */
+    async setResearchBooks(body: BooksSettingBody, from: string): Promise<void> {
+        const rid = books.rid;
+        const ctx = this.historyManageContext();
+        const base = ctx?.researchId === rid ? ctx.base : null;
+        if (!base || books.busy) { this.renderResearchBooksRow(true); return; }
+        const status = ctx!.lastStatus?.books?.settings;
+        books.busy = true;
+        books.last = body;
+        if (status) books.want = booksSettingsAsked(books.want ?? status, body);
+        delete books.note;
+        this.renderResearchBooksRow(true);
+        const res = await postBridgeBooks(base, body, ctx!.features);
+        if (books.rid !== rid) return;
+        delete books.busy;
+        if (res.ok) {
+            if (res.settings) books.want = res.settings;
+            books.note = { kind: 'ok' };
+        } else {
+            delete books.want;
+            const W = strings.live.waitingWrite;
+            switch (res.code) {
+                case 'archive': books.gone = true; break;
+                case 'busy': books.note = { kind: 'text', text: strings.treeSettings.booksBusyErr, retry: true }; break;
+                case 'invalid': books.note = { kind: 'text', text: strings.treeSettings.minTasksInvalid }; break;
+                case 'locked': books.note = { kind: 'text', text: W.locked }; break;
+                case 'held': books.note = { kind: 'text', text: res.reason || this.researchWriteHeldText(res.held!, false).toast }; break;
+                case 'full': books.note = { kind: 'text', text: res.reason || W.fileFull }; break;
+                default: books.note = { kind: 'text', text: res.reason || W.writeFailed };
+            }
+        }
+        books.focusId = from;
+        this.renderResearchBooksRow(true);
+        delete books.focusId;
     },
 
     /** Save the choice at once (it goes with the next send). */

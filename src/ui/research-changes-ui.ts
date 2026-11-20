@@ -7,10 +7,10 @@
  * matches the tree's tie (another path moved the base) is not used.
  */
 
+import { canvasBusy } from './canvas-busy.js';
 import { DataManager } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { TreeRenderer } from '../renderer.js';
-import { ZoomPan } from '../zoom.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { Person, PersonId, StromData, TreeId } from '../types.js';
 import { formatLiveClock } from '../live-time.js';
@@ -18,14 +18,16 @@ import {
     ChangeKind, PersonChange, diffByPerson, baseCopy, diffOther, otherRowCount, previewInexact, OtherChanges, SourceChange, CoupleChange,
     SourceChangeKind, CoupleChangeKind, PlaceChange, VariantChange, SentOtherRow, sentOtherRows, sanitizeSentOtherRow,
     sourceAppOnly, coupleAppOnly, placesAppOnly, variantsAppOnly, lineageAppOnly, pairNotWritten, RESEARCH_UNREAD_KINDS,
-    NotWrittenItem, PairedNotWritten,
+    NotWrittenItem, PairedNotWritten, withWrittenMedia, MEDIA_APP_READ_KINDS, gateMediaChanges, docSentRows, type MediaWrites,
 } from '../research-changes.js';
+import { lifeEventLabel } from '../person-sources.js';
+import { researchKeepsAppMedia, MATERIAL_LINKS_FEATURE, type SyncMediaWritten } from '../research-link.js';
 import { gedcomTagEventType } from '../ged-parser.js';
 import { foreignSendCheck, researchRefsOf } from '../research-foreign-send.js';
 import { yearOf } from '../dates.js';
 import { saveResearchCopy, loadResearchCopy, saveResearchPrevCopy, loadResearchPrevCopy } from '../research-copy.js';
 import { RESEARCH_COPY_FP_KEY, RESEARCH_PREV_COPY_FP_KEY } from '../storage-keys.js';
-import { researchAutoState, patchResearchAutoState, noteResearchSendPreviewSkipped } from '../research-device.js';
+import { researchAutoState, patchResearchAutoState, noteResearchSendPreviewSkipped, isBridgelessWindow } from '../research-device.js';
 import { researchSendMode, personsByResearchRefs } from './research-sync-ui.js';
 import { researchFactLabel } from './person-research-ui.js';
 import { uiModule } from './module.js';
@@ -72,7 +74,11 @@ const NO_OTHER: OtherChanges = { sources: [], couples: [] };
  * written; `stands`: the fingerprints the kept copy could stand for when it
  * went (the tie's base, the last written send's).
  */
-const pendingSent = new Map<string, { fingerprint: string; data: StromData; list: PersonChange[] | null; other: SentOtherRow[]; stands: string[] }>();
+const pendingSent = new Map<string, { fingerprint: string; data: StromData; list: PersonChange[] | null; other: SentOtherRow[]; stands: string[];
+    /** It went to a research that keeps the tree's own files (`media.app`): what it wrote of them is its answer's word. */
+    keepsMedia?: true;
+    /** Something of the tree's files was not told as it is (the research does not write it, spec 102 §10). */
+    older?: true }>();
 
 function esc(text: string): string {
     return text
@@ -92,28 +98,46 @@ function sanitizeChange(v: unknown): PersonChange | null {
         kinds: r.kinds.filter((k): k is ChangeKind => typeof k === 'string').slice(0, 20),
         ...(r.deleted === true ? { deleted: true } : {}),
         ...(r.deleted === true && typeof r.refn === 'string' && /^P\d{1,9}$/.test(r.refn) ? { refn: r.refn } : {}),
+        ...(sanitizeMediaAt(r.mediaAt) ? { mediaAt: sanitizeMediaAt(r.mediaAt)! } : {}),
+        ...(typeof r.mediaFrom === 'string' && r.mediaFrom ? { mediaFrom: r.mediaFrom.slice(0, 200) } : {}),
     };
 }
 
-/** "What was written": the last written send's people and its rows beyond them (null: none kept). */
-export function researchWrittenList(treeId: string): { at: string; list: PersonChange[]; other: SentOtherRow[] } | null {
+function sanitizeMediaAt(v: unknown): PersonChange['mediaAt'] | null {
+    const r = v as Record<string, unknown> | null;
+    if (!r || typeof r !== 'object') return null;
+    if (r.fact === 'birth' || r.fact === 'death') return { fact: r.fact };
+    return typeof r.eventId === 'string' && r.eventId.length <= 80 ? { eventId: r.eventId } : null;
+}
+
+/**
+ * "What was written": the last written send's people and its rows beyond them (null: none kept); `more`:
+ * changes of the tree's own files it wrote beyond those rows (more than its answer listed, or none named here).
+ */
+export function researchWrittenList(treeId: string): { at: string; list: PersonChange[]; other: SentOtherRow[]; more: number; older?: true } | null {
     try {
         const raw = localStorage.getItem(WRITTEN_KEY + treeId);
         if (!raw) return null;
-        const p = JSON.parse(raw) as { at?: unknown; list?: unknown; other?: unknown };
+        const p = JSON.parse(raw) as { at?: unknown; list?: unknown; other?: unknown; more?: unknown; older?: unknown };
         if (typeof p.at !== 'string' || !Array.isArray(p.list)) return null;
         return {
             at: p.at, list: p.list.map(sanitizeChange).filter((c): c is PersonChange => !!c),
             other: Array.isArray(p.other) ? p.other.slice(0, WRITTEN_MAX).map(sanitizeSentOtherRow).filter((r): r is SentOtherRow => !!r) : [],
+            more: typeof p.more === 'number' && p.more > 0 ? Math.min(Math.floor(p.more), 1_000_000) : 0,
+            ...(p.older === true ? { older: true as const } : {}),
         };
     } catch {
         return null;
     }
 }
 
-function storeWritten(treeId: string, at: string, list: PersonChange[], other: SentOtherRow[] = []): void {
+function storeWritten(treeId: string, at: string, list: PersonChange[], other: SentOtherRow[] = [], more = 0, older = false): void {
     try {
-        localStorage.setItem(WRITTEN_KEY + treeId, JSON.stringify({ at, list: list.slice(0, WRITTEN_MAX), ...(other.length ? { other: other.slice(0, WRITTEN_MAX) } : {}) }));
+        localStorage.setItem(WRITTEN_KEY + treeId, JSON.stringify({ at, list: list.slice(0, WRITTEN_MAX), ...(older ? { older: true } : {}),
+            ...(other.length ? { other: other.slice(0, WRITTEN_MAX) } : {}),
+            // Rows not kept count with the rest.
+            ...(more + Math.max(0, list.length - WRITTEN_MAX) + Math.max(0, other.length - WRITTEN_MAX) > 0
+                ? { more: more + Math.max(0, list.length - WRITTEN_MAX) + Math.max(0, other.length - WRITTEN_MAX) } : {}) }));
     } catch { /* not kept */ }
 }
 
@@ -130,16 +154,27 @@ export function forgetResearchChanges(treeId: string): void {
     pendingSent.delete(treeId);
 }
 
-/** The labels of a row's kinds: at most three, then "+ N more". */
-export function changeKindsText(kinds: readonly ChangeKind[]): string {
+/** The labels of a row's kinds: at most three, then "+ N more". `ch`: the person's row (where a file went, which source it left). */
+export function changeKindsText(kinds: readonly ChangeKind[], ch?: Pick<PersonChange, 'personId' | 'mediaAt' | 'mediaFrom'>): string {
     const c = strings.changes;
     const label: Record<ChangeKind, string> = {
         added: c.kindAdded, deleted: c.kindDeleted, name: c.kindName, gender: c.kindGender, birth: c.kindBirth, death: c.kindDeath,
         marriage: c.kindMarriage, event: c.kindEvent, godparent: c.kindGodparent, witness: c.kindWitness,
-        citation: c.kindCitation, source: c.kindSource, attachment: c.kindAttachment,
-        attachmentRemoved: c.kindAttachmentRemoved, note: c.kindNote, parents: c.kindParents, other: c.kindOther,
+        citation: c.kindCitation, source: c.kindSource, photo: c.kindPhoto, photoRemoved: c.kindPhotoRemoved, attachment: c.kindAttachment,
+        attachmentRemoved: c.kindAttachmentRemoved, attachmentEdited: c.kindSourceAttachment, note: c.kindNote, parents: c.kindParents, other: c.kindOther,
+        attachmentTitle: c.kindAttachmentTitle,
+        attachmentAt: c.kindAttachmentAt(mediaAtLabel(ch)),
+        attachmentFrom: ch?.mediaFrom ? c.kindAttachmentFrom(ch.mediaFrom) : c.kindAttachmentRemoved,
     };
     return kindsLine(kinds.map(k => label[k]));
+}
+
+/** The fact or event a person's file was put at, as its label (the row's `mediaAt`; unknown: the events' word). */
+function mediaAtLabel(ch: Pick<PersonChange, 'personId' | 'mediaAt'> | undefined): string {
+    const at = ch?.mediaAt;
+    if (at?.fact) return strings.events.types[at.fact];
+    const ev = at?.eventId ? DataManager.getPerson(ch!.personId)?.events?.find(e => e.id === at.eventId) : undefined;
+    return ev ? lifeEventLabel(ev) : strings.changes.kindEvent;
 }
 
 /** At most three labels, then "+ N more". */
@@ -154,7 +189,7 @@ export function sourceKindsText(kinds: readonly SourceChangeKind[]): string {
     const c = strings.changes;
     const label: Record<SourceChangeKind, string> = {
         added: c.kindSourceAdded, deleted: c.kindSourceDeleted, title: c.kindTitle, transcript: c.kindTranscript, page: c.kindPage,
-        excerptAdded: c.kindExcerptAdded, excerptRemoved: c.kindExcerptRemoved, attachment: c.kindSourceAttachment, other: c.kindOther,
+        excerptAdded: c.kindExcerptAdded, excerptRemoved: c.kindExcerptRemoved, attachment: c.kindSourceAttachment, doc: c.kindSourceDoc, other: c.kindOther,
     };
     return kindsLine(kinds.map(k => label[k]));
 }
@@ -164,6 +199,8 @@ export function coupleKindsText(kinds: readonly CoupleChangeKind[]): string {
     const c = strings.changes;
     const label: Record<CoupleChangeKind, string> = {
         childOrder: c.kindChildOrder, mainMarriage: c.kindMainMarriage, marriageEvidence: c.kindMarriageEvidence, singleParent: c.kindSingleParent,
+        photo: c.kindCouplePhoto, photoRemoved: c.kindPhotoRemoved, attachment: c.kindAttachment, attachmentRemoved: c.kindAttachmentRemoved,
+        attachmentEdited: c.kindSourceAttachment,
     };
     return kindsLine(kinds.map(k => label[k]));
 }
@@ -195,11 +232,13 @@ function coordText(p: PlaceChange): string {
  * The kinds of change the research does not read: the spelling groups are
  * read by a research that says `surnames.read` (spec 021 §4.4).
  */
-function researchUnread(readsSurnames: boolean, readsLineage = false): ReadonlySet<string> {
-    if (!readsSurnames && !readsLineage) return RESEARCH_UNREAD_KINDS;
+function researchUnread(readsSurnames: boolean, readsLineage = false, keepsMedia = false): ReadonlySet<string> {
+    if (!readsSurnames && !readsLineage && !keepsMedia) return RESEARCH_UNREAD_KINDS;
     const out = new Set(RESEARCH_UNREAD_KINDS);
     if (readsSurnames) out.delete('variants');
     if (readsLineage) out.delete('lineage');
+    // A research that keeps the tree's own files (`media.app`, spec 108 K2.6): a source's attachments and a couple's photo are written there.
+    if (keepsMedia) for (const k of MEDIA_APP_READ_KINDS) out.delete(k);
     return out;
 }
 
@@ -238,7 +277,9 @@ export function nwReason(item: NotWrittenItem, removedHere = false): string {
     if (why === 'pick') return s.notWrittenPick;
     if (why === 'removed') return s.notWrittenRemoved;
     if (!code) return strings.changes.noReason;
-    const own = Object.prototype.hasOwnProperty.call(s.nw, code) ? s.nw[code] : '';
+    // A file that could not be read (spec 108): its name or note (written as it came), or its data (not written).
+    const key = code === 'media.unreadable' ? `${code}.${item.params?.part === 'text' ? 'text' : 'data'}` : code;
+    const own = Object.prototype.hasOwnProperty.call(s.nw, key) ? s.nw[key] : '';
     if (own) return own;
     // What the research wanted to write and could not (`record.none` …): its write failed.
     return item.skipped ? s.nw['write.failed'] : s.nwUnknown;
@@ -318,6 +359,9 @@ function nwCodedRow(row: Extract<PairedNotWritten, { type: 'coded' }>, data: Str
         parts.push(`<span class="research-changes-name">${esc(strings.changes.unnamedOne)}</span>`);
     }
     if (fact) parts.push(`<span class="research-changes-fact">${esc(fact)}</span>`);
+    // A file's word (`media.*`): the file by its name or title, as the research names it.
+    const file = (row.item.code ?? '').startsWith('media.') ? row.item.params?.name?.trim() ?? '' : '';
+    if (file) parts.push(`<span class="research-changes-fact">${esc(file)}</span>`);
     for (const src of source ? [source, ...(more ?? [])] : []) {
         parts.push(`<button type="button" class="research-changes-name" data-source="${esc(src.id)}">${esc(src.title)}</button>`);
     }
@@ -342,8 +386,15 @@ function personRowOf(ch: PersonChange, mode: 'send' | 'written'): string {
         : `<button type="button" class="research-changes-name" data-person="${esc(ch.personId)}">${esc(ch.name)}</button>`;
     return `<li class="research-changes-row" data-kind="person">`
         + `<span class="research-changes-icon ${mode === 'written' ? 'is-check' : 'is-ring'}" aria-hidden="true">${mode === 'written' ? '✓' : ''}</span>`
-        + `<span class="research-changes-text">${name}<span class="research-changes-kinds">${esc(changeKindsText(ch.kinds))}</span></span>`
-        + '</li>';
+        + `<span class="research-changes-text">${name}<span class="research-changes-kinds">${esc(changeKindsText(ch.kinds, ch))}</span></span>`
+        + photoPic(ch) + '</li>';
+}
+
+/** A changed portrait's 30 px preview at the row's end (spec 102 §10; a removed one has none). */
+function photoPic(ch: PersonChange): string {
+    if (!ch.kinds.includes('photo') || ch.deleted) return '';
+    const photo = DataManager.getPerson(ch.personId)?.photo;
+    return photo && /^data:image\//.test(photo) ? `<img class="research-changes-pic" src="${esc(photo)}" alt="" aria-hidden="true">` : '';
 }
 
 /**
@@ -442,7 +493,21 @@ export const researchChangesMethods = uiModule({
     researchChangesCount(): { persons: number; other: number } | null {
         const list = this.researchChangesNow();
         if (!list) return null;
-        return { persons: list.length, other: otherRowCount(this.researchOtherNow()) };
+        const other = this.researchOtherNow();
+        const treeId = DataManager.getCurrentTreeId();
+        const w = treeId ? this.researchMediaWritesOf(treeId) : null;
+        // Counted as the list shows them (spec 102 §10): what the research does not write is not promised.
+        const g = w ? gateMediaChanges(list, other, w, { doc: true }) : { list, other };
+        return { persons: g.list.length, other: otherRowCount(g.other) };
+    },
+
+    /** The people "What will be sent" lists: the changes per person as the research writes them (spec 102 §10); null: not known. */
+    researchChangesShown(): PersonChange[] | null {
+        const list = this.researchChangesNow();
+        if (!list) return null;
+        const treeId = DataManager.getCurrentTreeId();
+        const w = treeId ? this.researchMediaWritesOf(treeId) : null;
+        return w ? gateMediaChanges(list, null, w).list : list;
     },
 
     /**
@@ -453,6 +518,8 @@ export const researchChangesMethods = uiModule({
      * is refreshed once it is —, or the copy no longer stands for the tie's base).
      */
     researchChangesBase(): 'same' | { treeId: TreeId; base: StromData; key: string } | null {
+        // Another window of the app keeps no copy of the research's tree (it reads no storage): not known there.
+        if (isBridgelessWindow()) return null;
         const ctx = this.researchSyncLink();
         if (!ctx) return null;
         const { treeId, link } = ctx;
@@ -512,13 +579,33 @@ export const researchChangesMethods = uiModule({
         void saveResearchCopy(treeId, copy.base!, to);
     },
 
+    /** The tree's research keeps the tree's own files (`media.app`, spec 108): its portraits, couples' photos and attachments. */
+    researchKeepsMediaOf(treeId: TreeId): boolean {
+        const link = TreeManager.getTreeMetadata(treeId)?.research;
+        return !!link && researchKeepsAppMedia(this.researchStatusOf(link.id));
+    },
+
+    /** What the tree's research writes of its files (spec 102 §10); null: not known yet (its status not read), nothing held back. */
+    researchMediaWritesOf(treeId: TreeId): MediaWrites | null {
+        const link = TreeManager.getTreeMetadata(treeId)?.research;
+        const features = link ? this.researchStatusOf(link.id)?.features : null;
+        if (!features) return null;
+        return { photos: researchKeepsAppMedia({ features }), links: features.includes(MATERIAL_LINKS_FEATURE) };
+    },
+
     /** A send is about to go: what it carries (for "What was written" once written). */
     researchNoteSending(treeId: TreeId, data: StromData, fingerprint: string): void {
-        const list = DataManager.getCurrentTreeId() === treeId ? this.researchChangesNow() : null;
-        const other = list ? sentOtherRows(this.researchOtherNow(), researchUnread(surnamesReadByResearch(treeId), lineageReadByResearch(treeId))) : [];
+        const now = DataManager.getCurrentTreeId() === treeId ? this.researchChangesNow() : null;
+        const keepsMedia = this.researchKeepsMediaOf(treeId);
+        // What the research does not write of the tree's files is not promised as written (spec 102 §10, R10 b).
+        const w = this.researchMediaWritesOf(treeId);
+        const gated = now && w ? gateMediaChanges(now, this.researchOtherNow(), w) : null;
+        const list = gated ? gated.list : now;
+        const other = list ? sentOtherRows(gated ? gated.other : this.researchOtherNow(), researchUnread(surnamesReadByResearch(treeId), lineageReadByResearch(treeId), keepsMedia)) : [];
         const link = TreeManager.getTreeMetadata(treeId)?.research;
         const stands = [link?.fingerprint ?? '', link?.sent?.state === 'written' ? link.sent.fingerprint : ''].filter(Boolean);
-        pendingSent.set(treeId, { fingerprint, data: baseCopy(data), list, other, stands });
+        pendingSent.set(treeId, { fingerprint, data: baseCopy(data), list, other, stands, ...(keepsMedia ? { keepsMedia: true as const } : {}),
+            ...(gated?.older ? { older: true as const } : {}) });
     },
 
     /**
@@ -558,9 +645,13 @@ export const researchChangesMethods = uiModule({
      * The research wrote the send with this fingerprint: its data is the
      * research's version, its list what was written. `retagged`: the sent
      * state took the research's numbers since, so the copy is that state
-     * under its fingerprint (the send's fingerprint now).
+     * under its fingerprint (the send's fingerprint now). `media`: what its
+     * answer (or its record in `/status.sends`) says it wrote of the tree's
+     * own files — for a send to a research that keeps them (`media.app`),
+     * those rows are told by it alone (withWrittenMedia).
      */
-    researchNoteWritten(treeId: TreeId, fingerprint: string, at: string, retagged?: { fingerprint: string; data: StromData }): void {
+    researchNoteWritten(treeId: TreeId, fingerprint: string, at: string, retagged?: { fingerprint: string; data: StromData },
+        media?: { items: readonly SyncMediaWritten[]; count: number }): void {
         const p = pendingSent.get(treeId);
         if (!p || p.fingerprint !== fingerprint) return;
         pendingSent.delete(treeId);
@@ -576,7 +667,16 @@ export const researchChangesMethods = uiModule({
         memo = null;
         try { localStorage.setItem(FP_KEY + treeId, fp); } catch { /* not trusted next time */ }
         void saveResearchCopy(treeId, base, fp);
-        if (p.list) storeWritten(treeId, at, p.list, p.other);
+        if (p.keepsMedia && (p.list || media?.items.length || media?.count)) {
+            // The research's numbers of the people, couples and sources it names: the tree now (the ids of this
+            // send taken), else the state sent.
+            const named = DataManager.getCurrentTreeId() === treeId ? DataManager.getData() : retagged?.data ?? p.data;
+            const w = withWrittenMedia(p.list ?? [], p.other, media?.items ?? [], media?.count ?? 0, named,
+                researchUnread(surnamesReadByResearch(treeId), lineageReadByResearch(treeId), true));
+            storeWritten(treeId, at, w.list, w.other, w.more, !!p.older);
+        } else if (p.list) {
+            storeWritten(treeId, at, p.list, p.other, 0, !!p.older);
+        }
     },
 
     /**
@@ -666,6 +766,7 @@ export const researchChangesMethods = uiModule({
         let appOnlyRows: string[] = [];
         let other: OtherChanges | null = null;
         let inexact = false;
+        let olderMedia = false;
         if (mode === 'written') {
             this.researchNoteWrittenSeen(ctx.treeId);
             const w = researchWrittenList(ctx.treeId);
@@ -673,13 +774,16 @@ export const researchChangesMethods = uiModule({
             const lw = st.lastWritten;
             list = w?.list ?? [];
             const sentOther = w?.other ?? [];
+            // Changes of the tree's own files beyond the rows (more than the answer listed, or none named here).
+            const mediaMore = w?.more ?? 0;
+            olderMedia = !!w?.older;
             title = c.writtenTitle(clock(w?.at ?? lw?.at));
             const k = lw?.changes ?? list.length;
             const conflicts = lw?.conflicts ?? 0;
             sub = conflicts ? `${s.changesN(k)} · ${s.conflictsN(conflicts)}` : s.changesN(k);
             // What the research does not read stays in the app: a quiet section of its own, never "written".
             const appOnly = sentOther.filter(r => r.appOnly);
-            let written = sentOther.filter(r => !r.appOnly);
+            let written = docSentRows(sentOther.filter(r => !r.appOnly), !!this.researchMediaWritesOf(ctx.treeId)?.links);
             // What the research did not write (its `applied`, not what went, V-J): first, amber, with its reason;
             // the people, sources and couples it named are not listed as written.
             const nw = st.notWritten && (st.notWritten.fingerprint === ctx.link.sent?.fingerprint || st.notWritten.fingerprint === lw?.fingerprint) ? st.notWritten : null;
@@ -697,8 +801,10 @@ export const researchChangesMethods = uiModule({
                     if (n.why === 'kept' || n.why === 'removed') keptHere = true;
                     if (row.type === 'coded') {
                         // Named by its code (`sync.notWritten.codes`): "person · fact · source", the reason by the code.
-                        if (row.personId) named.add(row.personId);
-                        if (row.sourceId) named.add(`source:${row.sourceId}`);
+                        // A file's word (`media.*`: kept at the person, its name unreadable) leaves the rest written.
+                        const ofFile = (n.code ?? '').startsWith('media.');
+                        if (row.personId && !ofFile) named.add(row.personId);
+                        if (row.sourceId && !ofFile) named.add(`source:${row.sourceId}`);
                         return nwCodedRow(row, data);
                     }
                     const why = nwReason(n, row.type === 'person' && !!row.deleted);
@@ -756,6 +862,11 @@ export const researchChangesMethods = uiModule({
                 moreWrittenPeople = written.length === 0;
                 writtenRows = writtenRows.slice(0, 3);
             }
+            // Files written beyond the rows: "+ N more" under them.
+            if (mediaMore > 0) {
+                moreWritten += mediaMore;
+                moreWrittenPeople = false;
+            }
             appOnlyRows = appOnly.map(r => otherRowOf(r, 'appOnly', data));
             // Conflicts the same in an archive as in a research: a fact changed in both copies is one (F40).
             if (conflicts && this.researchDecideUrl(ctx.treeId)) {
@@ -766,6 +877,14 @@ export const researchChangesMethods = uiModule({
             const now = this.researchChangesNow();
             other = now === null ? null : this.researchOtherNow();
             list = now ?? [];
+            // What the research does not write of the tree's files is not promised (spec 102 §10): one sentence says so.
+            const w = this.researchMediaWritesOf(ctx.treeId);
+            if (w) {
+                const g = gateMediaChanges(list, other, w, { doc: true });
+                list = g.list;
+                other = g.other;
+                olderMedia = g.older;
+            }
             title = c.willSendTitle;
             // Changed since the research last had the tree: its version loaded, or the last send it wrote
             // (also when a later send is still on its way or was taken back).
@@ -802,6 +921,8 @@ export const researchChangesMethods = uiModule({
         if (mode === 'send') {
             const base = this.researchChangesBase();
             const baseData = base && base !== 'same' ? base.base : null;
+            // What the research reads: a source's attachments and a couple's photo too, once it keeps the tree's own files.
+            const unreadNow = researchUnread(surnamesReadByResearch(), lineageReadByResearch(), this.researchKeepsMediaOf(ctx.treeId));
             const sourceRows = (other?.sources ?? []).map(ch => (): string => {
                 const linked = !ch.deleted && !ch.attachmentOnly && !!data.sources?.[ch.sourceId];
                 const name = linked
@@ -809,7 +930,7 @@ export const researchChangesMethods = uiModule({
                     : `<span class="research-changes-name${ch.deleted ? ' is-deleted' : ''}">${esc(ch.title)}</span>`;
                 const context = sourceContext(ch, data);
                 return `<li class="research-changes-row" data-kind="source"><span class="research-changes-icon is-ring" aria-hidden="true"></span>`
-                    + `<span class="research-changes-text">${rowLine(name, '', sourceAppOnly(ch.kinds))}<span class="research-changes-kinds">${esc(sourceKindsText(ch.kinds))}</span>`
+                    + `<span class="research-changes-text">${rowLine(name, '', sourceAppOnly(ch.kinds, unreadNow))}<span class="research-changes-kinds">${esc(sourceKindsText(ch.kinds))}</span>`
                     + (context ? `<span class="research-changes-ctx">${esc(context)}</span>` : '') + '</span></li>';
             });
             const coupleRows = (other?.couples ?? []).map(ch => (): string => {
@@ -819,7 +940,7 @@ export const researchChangesMethods = uiModule({
                     ? `<button type="button" class="research-changes-name" data-couple="${esc(focus)}">${esc(label)}</button>`
                     : `<span class="research-changes-name${ch.deleted ? ' is-deleted' : ''}">${esc(label)}</span>`;
                 return `<li class="research-changes-row" data-kind="couple"><span class="research-changes-icon is-ring" aria-hidden="true"></span>`
-                    + `<span class="research-changes-text">${rowLine(name, '', coupleAppOnly(ch.kinds))}<span class="research-changes-kinds">${esc(coupleKindsText(ch.kinds))}</span></span></li>`;
+                    + `<span class="research-changes-text">${rowLine(name, '', coupleAppOnly(ch.kinds, unreadNow))}<span class="research-changes-kinds">${esc(coupleKindsText(ch.kinds))}</span></span></li>`;
             });
             const places = other?.places?.count ? other.places : null;
             const variants = other?.surnameVariants?.count ? other.surnameVariants : null;
@@ -849,7 +970,8 @@ export const researchChangesMethods = uiModule({
                 + section('couples', c.sectionCouples(coupleRows.length), coupleRows)
                 + section('places', places ? c.sectionPlaces(places.count) : '', placesRow)
                 + section('variants', variants ? c.sectionVariants(variants.count) : '', variantsRow)
-                + section('lineage', lineageRows.length ? c.sectionLineage(lineageRows.length) : '', lineageRows);
+                + section('lineage', lineageRows.length ? c.sectionLineage(lineageRows.length) : '', lineageRows)
+                + (olderMedia ? `<p class="research-changes-note">${esc(c.olderMedia)}</p>` : '');
         } else {
             const rows = writtenRows.join('');
             bodyHtml = notWrittenHtml
@@ -858,7 +980,8 @@ export const researchChangesMethods = uiModule({
                 + (moreWritten ? `<div class="research-changes-more">${esc(moreWrittenPeople ? c.andMore(moreWritten) : c.more(moreWritten))}</div>` : '')
                 // What the research does not read: quiet, under what was written.
                 + (appOnlyRows.length ? `<div class="research-changes-section" data-section="appOnly">${esc(c.appOnlySection(appOnlyRows.length))}</div>`
-                    + `<ul class="research-changes-list is-quiet" data-group="appOnly">${appOnlyRows.join('')}</ul>` : '');
+                    + `<ul class="research-changes-list is-quiet" data-group="appOnly">${appOnlyRows.join('')}</ul>` : '')
+                + (olderMedia ? `<p class="research-changes-note">${esc(c.olderMedia)}</p>` : '');
         }
         const panel = document.createElement('div');
         panel.id = PANEL_ID;
@@ -896,9 +1019,9 @@ export const researchChangesMethods = uiModule({
             if (d.person || d.couple) {
                 // A person or a couple: the tree centred on it (a couple on its first partner), the panel closed.
                 const id = (d.person ?? d.couple) as PersonId;
+                // A63, 8a: the panel closes, the tree is laid out anew under the canvas overlay (painted first).
                 this.closeResearchChanges();
-                TreeRenderer.setFocus(id);
-                ZoomPan.centerOnPerson(id);
+                void canvasBusy(() => TreeRenderer.setFocus(id));
             } else if (d.source) {
                 // A source: its viewer over the panel, which stays; focus back on the row once the viewer closes.
                 this.showSourceViewer(d.source, null);
@@ -938,18 +1061,10 @@ export const researchChangesMethods = uiModule({
         panel.querySelector<HTMLButtonElement>('[data-act="send"]')?.addEventListener('click', (e) => {
             const btn = e.currentTarget as HTMLButtonElement;
             if (panel.querySelector<HTMLInputElement>('#research-changes-skip')?.checked) noteResearchSendPreviewSkipped(ctx.treeId, true);
-            // Seen what goes: Send here sends ("Sending…" until the research answers, then the toast tells).
-            if (btn.classList.contains('primary')) {
-                btn.disabled = true;
-                btn.textContent = s.sending;
-                panel.querySelectorAll<HTMLInputElement>('input, [data-act="close"]').forEach(el => { el.disabled = true; });
-                void this.researchSendNow({ previewed: true }).finally(() => {
-                    if (document.getElementById(PANEL_ID) === panel) this.closeResearchChanges();
-                });
-                return;
-            }
+            // Seen what goes: Send here sends; the panel goes and the bar's Send (or a toast) carries the
+            // working state until the research answers (waiting buttons §1.5, A60).
             this.closeResearchChanges();
-            void this.researchSendNow({ previewed: true });
+            void this.researchSendNow({ previewed: true }, btn);
         });
         panel.querySelector('[data-act="loadNewer"]')?.addEventListener('click', () => {
             this.closeResearchChanges();

@@ -60,10 +60,11 @@ import { renderDebugOverlay, clearDebugOverlay } from './debug-overlay.js';
 import { debugPanel } from './debug-panel.js';
 import { yearOf, displayYear, formatFlexDate, shortYearRanges } from './dates.js';
 import { computeTimelineModel } from './timeline.js';
-import { buildTimelineSvg } from './timeline-chart.js';
+import { buildTimelineSvg, TimelineBranchSigns } from './timeline-chart.js';
 import { HISTORY_CHANGED_EVENT } from './ui/history-ui.js';
 import { sortLifeEvents } from './events.js';
-import { classifyBranches, Branch } from './branch-colors.js';
+import { classifyBranches, BranchSet } from './branch-colors.js';
+import { applyBranchMarkerAttrs, branchAriaId } from './branch-marker-attrs.js';
 import { presumedDeceasedSet } from './privacy.js';
 import { placeList } from './places.js';
 import { SettingsManager } from './settings.js';
@@ -102,8 +103,10 @@ import { MOBILE_MAX, MQ_PHONE_LANDSCAPE } from './breakpoints.js';
 import { updateBulkFamilySwitches } from './ui/bulk-family-ui.js';
 import { pillUnderFinger } from './card-tap.js';
 import { showFocusToast, hideFocusToast } from './focus-toast.js';
+import { VIEW_STEP_EVENT } from './windows/window-focus.js';
 import { openCardMenuFromKeyboard } from './ui/keyboard-access.js';
 import { syncDepthStepper } from './ui/depth-stepper.js';
+import { rememberOpenedFocus, updateDefaultFocusButtons } from './ui/default-focus.js';
 import {
     ViewLink, ViewLinkCandidate, loadViewLinks, isViewLinksMaster, viewLinksToDraw, viewLinksAvailable, viewLinkContext, viewLinkCandidates, familyGroups,
 } from './view-links.js';
@@ -169,6 +172,11 @@ interface CustomCardsMeasure {
  * A layout configuration with another spacing's gaps (layoutConfigFor), its
  * card sizes, partner line and card heights kept.
  */
+/** A step of the view's own (a step of its history, Back / Forward, another view): the run of another window's centres ends. */
+function viewStep(): void {
+    if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(VIEW_STEP_EVENT));
+}
+
 function withSpacing(config: LayoutConfig, spacing: TreeSpacing): LayoutConfig {
     const { dense: _dense, ...rest } = config;
     const gaps = layoutConfigFor(spacing);
@@ -381,11 +389,12 @@ class TreeRendererClass {
      */
     private normalHeights: Map<PersonId, number> | null = null;
     /**
-     * Whether someone drawn in the view (not a placeholder) has a photo: the
-     * medium and large photo sizes apply only then (spec 096 D3). The next
-     * render starts from it (usually the same).
+     * Whether someone drawn in the view has an avatar (not a placeholder):
+     * the medium and large photo sizes apply only then (spec 096 D3; since
+     * spec 103 K2.1 the initials of a card without a photo take the photo's
+     * size too). The next render starts from it (usually the same).
      */
-    private viewHasPhoto = false;
+    private viewHasAvatar = false;
     /** The custom card's lines per drawn person, computed once per render. */
     private customLines = new Map<PersonId, CardLine[]>();
     /** The custom card lines' rows (src/card-width.ts customCardRows): what wraps, what is cut. */
@@ -830,7 +839,7 @@ class TreeRendererClass {
         // The layout engine spaces cards from the config size — keep it in sync
         // with the density (and the CSS box) or cards overlap / drift apart.
         const density = SettingsManager.getCardDensity();
-        const size = SettingsManager.getCardSize(this.viewHasPhoto);
+        const size = SettingsManager.getCardSize(this.viewHasAvatar);
         // Detailed, Register and Custom draw lines of details (their fields: effectiveCardFields).
         const fieldCards = SettingsManager.getEffectiveCardFields(density);
         const custom = !!fieldCards && !STANDALONE_VIEWS.includes(this.viewMode);
@@ -853,6 +862,8 @@ class TreeRendererClass {
             ...(density === 'normal' && this.normalHeights ? { personHeights: this.normalHeights } : {}),
         };
         document.body.dataset.cardDensity = density;
+        // Lineage markers (spec 112): the shape, the tint and the tag's letters on <body>.
+        applyBranchMarkerAttrs(SettingsManager.getBranchMarker(), SettingsManager.isBranchTintOn());
         // The cards of details share one look (index.html body[data-card-fields]).
         if (fieldCards) document.body.dataset.cardFields = '';
         else delete document.body.dataset.cardFields;
@@ -870,15 +881,15 @@ class TreeRendererClass {
         const islandRoom = this.viewLinkIslandRoom(viewLinks);
         if (islandRoom) this.config = { ...this.config, roomBelow: islandRoom };
         let result = this.computeTreeLayout(descendantsOnly, viewLinks);
-        // The photo on the card (spec 096): a medium or large photo only in a
-        // view where someone drawn has one (D3); the Normal card is wider
-        // then: laid out again when that changed (the person set does not
-        // depend on the card size).
-        const hasPhoto = this.photoInView(result.positions);
-        const photoChanged = hasPhoto !== this.viewHasPhoto;
+        // The photo on the card (spec 096): a medium or large avatar (a photo
+        // or the initials, spec 103 K2.1) only in a view where someone drawn
+        // has one (D3); the Normal card is wider then: laid out again when
+        // that changed (the person set does not depend on the card size).
+        const hasAvatar = this.avatarInView(result.positions);
+        const photoChanged = hasAvatar !== this.viewHasAvatar;
         if (photoChanged) {
-            this.viewHasPhoto = hasPhoto;
-            const next = SettingsManager.getCardSize(hasPhoto);
+            this.viewHasAvatar = hasAvatar;
+            const next = SettingsManager.getCardSize(hasAvatar);
             if (density === 'normal' && next.cardWidth !== this.config.cardWidth) {
                 this.config = { ...this.config, cardWidth: next.cardWidth };
                 result = this.computeTreeLayout(descendantsOnly, viewLinks);
@@ -1346,6 +1357,12 @@ class TreeRendererClass {
      * bridge's answer) counts the same.
      */
     async refreshViewLinks(change: () => void): Promise<void> {
+        this.applyViewLinks(change);
+        await this.renderInternal();
+    }
+
+    /** The view links changed now (the depths kept as they were); the redraw is the caller's (§8: under the overlay). */
+    applyViewLinks(change: () => void): void {
         const focus = this.focusPersonId;
         const before = focus ? maxGenerationsWithSiblings(this.viewData(this.viewLayer?.links ?? []), focus) : null;
         change();
@@ -1354,7 +1371,6 @@ class TreeRendererClass {
             this.focusDepthUp = this.focusDepthUp >= before.up ? after.up : Math.min(this.focusDepthUp, after.up);
             this.focusDepthDown = this.focusDepthDown >= before.down ? after.down : Math.min(this.focusDepthDown, after.down);
         }
-        await this.renderInternal();
     }
 
     /** The live bridge the tree follows (its /status features), for whether the view links show at all. */
@@ -1411,9 +1427,9 @@ class TreeRendererClass {
         const { roomBelow: _room, ...screen } = this.config;
         let config: LayoutConfig = own ? screen : withSpacing(screen, spacing);
         let result = this.computeTreeLayout(descendantsOnly, [], false, config);
-        // Without the view links nobody laid out may have a photo (D3): the small card then.
+        // Without the view links nobody laid out may have an avatar (D3): the small card then.
         let photo = screenPhoto;
-        if (photo !== 'small' && this.viewLayer && !this.photoInView(result.positions)) {
+        if (photo !== 'small' && this.viewLayer && !this.avatarInView(result.positions)) {
             photo = 'small';
             if (SettingsManager.getCardDensity() === 'normal') {
                 const small = this.smallPhotoConfig(screen);
@@ -1559,8 +1575,9 @@ class TreeRendererClass {
     /**
      * The custom card measured for the people of a layout (the screen's or an
      * output's), nothing kept. `view`: the photo size of the view's cards
-     * (spec 096 §3; an output nobody of which has a photo: small): a card with a photo
-     * gets the avatar of a medium or large one.
+     * (spec 096 §3; an output nobody of which has an avatar: small): a card with
+     * an avatar, a photo or the initials (spec 103 K2.1), gets the avatar of a
+     * medium or large one.
      */
     private customCardsOf(positions: Map<PersonId, Position>, view: CardPhotoSize = this.viewPhotoSize()): CustomCardsMeasure {
         const data = DataManager.getData();
@@ -1582,7 +1599,7 @@ class TreeRendererClass {
         const signalCtx = this.signalContext();
         const visible = (pid: PersonId) => positions.has(pid);
         let anyBirth = false;
-        // The view's largest avatar (a card with a medium or large photo): every card of one height is as tall.
+        // The view's largest avatar (a card with a medium or large one): every card of one height is as tall.
         let viewAvatar = CARD_AVATAR_SIZE;
         this.prepareCrossTreePills(positions.keys(), this.lastCrossTrees);
         for (const id of positions.keys()) {
@@ -1602,7 +1619,8 @@ class TreeRendererClass {
             // The birth surname under the name (src/person-name.ts): its row never widens the card.
             const birth = birthNoteText(shownNameParts(person, '?').birthNote);
             if (birth) anyBirth = true;
-            const photo = view !== 'small' && !!person.photo && !person.isPlaceholder;
+            // The avatar of the view's photo size, a photo or the initials (spec 103 K2.1).
+            const photo = view !== 'small' && !person.isPlaceholder;
             if (photo) viewAvatar = Math.max(viewAvatar, cardAvatarSize(view));
             entries.push({
                 name: shownName(person, '?'), avatar: !person.isPlaceholder, lines: personLines,
@@ -1665,32 +1683,32 @@ class TreeRendererClass {
      * A Normal card's avatar, text column and photo in a view of a photo
      * size (spec 096 §2): in the small view the card as it always was (126 /
      * 168px by the avatar); in a medium or large one the column of that box
-     * (src/card-width.ts normalCardTextWidth) and the photo's size.
+     * (src/card-width.ts normalCardTextWidth) and the avatar's size, a photo
+     * or the initials alike (spec 103 K2.1).
      */
     private normalNameColumn(person: Person, view: CardPhotoSize): Pick<NormalCardName, 'avatar' | 'textWidth' | 'photo'> {
         const avatar = !person.isPlaceholder;
         if (view === 'small') return { avatar };
-        const photo = avatar && !!person.photo;
-        return { avatar, textWidth: normalCardTextWidth(view, avatar, photo), ...(photo ? { photo: view } : {}) };
+        return { avatar, textWidth: normalCardTextWidth(view, avatar), ...(avatar ? { photo: view } : {}) };
     }
 
-    /** Whether someone laid out (not a placeholder) has a photo (spec 096 D3). */
-    private photoInView(positions: ReadonlyMap<PersonId, Position>): boolean {
+    /** Whether someone laid out has an avatar, a photo or the initials (not a placeholder; spec 096 D3, 103 K2.1). */
+    private avatarInView(positions: ReadonlyMap<PersonId, Position>): boolean {
         if (SettingsManager.getCardDensity() === 'compact') return false;
         for (const id of positions.keys()) {
             const person = DataManager.getPerson(id);
-            if (person?.photo && !person.isPlaceholder) return true;
+            if (person && !person.isPlaceholder) return true;
         }
         return false;
     }
 
     /**
      * The photo size the drawn view's cards have (index.html
-     * body[data-card-photo]): the chosen one where someone drawn has a photo,
-     * else small (D3); the Compact card never shows one.
+     * body[data-card-photo]): the chosen one where someone drawn has an
+     * avatar, else small (D3); the Compact card never shows one.
      */
     private viewPhotoSize(): CardPhotoSize {
-        if (!this.viewHasPhoto || SettingsManager.getCardDensity() === 'compact') return 'small';
+        if (!this.viewHasAvatar || SettingsManager.getCardDensity() === 'compact') return 'small';
         return SettingsManager.getCardPhoto().size;
     }
 
@@ -1725,8 +1743,9 @@ class TreeRendererClass {
 
     /**
      * The photo on the card the image export draws (spec 096 P2): the size
-     * its cards were laid out with (small when nobody it draws has a photo),
-     * the chosen shape, and who was laid out with a photo.
+     * its cards were laid out with (small when nobody it draws has an
+     * avatar), the chosen shape, and who was laid out with the avatar of
+     * that size: everyone with an avatar, a photo or the initials (spec 103 K2.1).
      */
     getPosterCardPhoto(spacing?: TreeSpacing): { size: CardPhotoSize; shape: CardPhotoShape; photoIds: Set<PersonId> } {
         const output = this.outputLayout(spacing);
@@ -1734,7 +1753,7 @@ class TreeRendererClass {
         if (output.photo !== 'small') {
             for (const id of output.positions.keys()) {
                 const person = DataManager.getPerson(id);
-                if (person?.photo && !person.isPlaceholder) photoIds.add(id);
+                if (person && !person.isPlaceholder) photoIds.add(id);
             }
         }
         return { size: output.photo, shape: SettingsManager.getCardPhoto().shape, photoIds };
@@ -1879,11 +1898,14 @@ class TreeRendererClass {
 
         if (persons.length === 0) {
             this.focusPersonId = null;
+            rememberOpenedFocus(null);
             return;
         }
 
         if (this.applyReloadPoint(reload)) {
             this.recordReload();
+            // "Last focused" leads ⌂ to the person the tree opened on (spec 111 §5).
+            rememberOpenedFocus(this.focusPersonId);
             return;
         }
 
@@ -1916,14 +1938,20 @@ class TreeRendererClass {
         }
         // What a load opens is what a reload keeps until the work moves on.
         this.recordReload();
+        rememberOpenedFocus(this.focusPersonId);
     }
 
     // Public Focus Mode API
     /**
      * `reveal`: instead of centring the focused card after the render, call
      * this (it moves the view itself). Resolves once drawn and placed.
+     * `agent`: a jump that follows the research agent (spec 097 §4) — not a
+     * choice of a person, so the other windows do not take it as a selection.
+     * `history: 'replace'`: the step takes the place of the last one (a run
+     * of centres chosen in another window, spec 110 §2): the view it leaves
+     * is not kept, Back goes to the view before the run.
      */
-    setFocus(personId: PersonId | null, saveToData = true, reveal?: (id: PersonId) => void): Promise<void> {
+    setFocus(personId: PersonId | null, saveToData = true, reveal?: (id: PersonId) => void, opts: { agent?: boolean; history?: 'push' | 'replace' } = {}): Promise<void> {
         // Always have a focus person
         // If null is passed, find a default person
         if (!personId) {
@@ -1939,7 +1967,7 @@ class TreeRendererClass {
         // programmatic focus a load performs, while still counting the user's
         // very first click. goBack/goForward set suppressHistoryPush so they
         // can manage the stacks themselves.
-        if (!this.suppressHistoryPush && this.focusPersonId && personId
+        if (!this.suppressHistoryPush && opts.history !== 'replace' && this.focusPersonId && personId
             && this.focusPersonId !== personId) {
             const before = this.currentHistoryEntry();
             this.pushHistoryStep(before && { ...before, leftView: this.historyTransform() });
@@ -1953,9 +1981,9 @@ class TreeRendererClass {
         this.pendingShown = null;
         if (pendingShown && this.viewMode === 'family') this.applyShownSnapshot(pendingShown);
         this.focusPersonId = personId;
-        // Other windows follow the person chosen here (spec 079 §2).
+        // Other windows follow the person chosen here (spec 079 §2); a jump after the agent says so (spec 097 §4).
         if (focusChanged && personId && typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent('strom:focus-changed', { detail: { personId } }));
+            window.dispatchEvent(new CustomEvent('strom:focus-changed', { detail: opts.agent ? { personId, agent: true } : { personId } }));
         }
 
         // Set default depth to max available when focusing on a new person
@@ -4065,8 +4093,13 @@ class TreeRendererClass {
     }
 
     /** Switch the display view mode and re-render. Persisted per tree. */
-    setViewMode(mode: ViewMode): void {
+    /**
+     * Resolves when the view is drawn (the canvas overlay waits for it, §8 C5). The mode is the new one at once;
+     * `beforeLayout` (the overlay painted) is awaited before the layout.
+     */
+    async setViewMode(mode: ViewMode, beforeLayout?: () => Promise<void>): Promise<void> {
         if (this.viewMode === mode) return;
+        viewStep();
         // The Table view and the others share the person in focus (spec 073 U9):
         // the table's active row's person goes along, and the table opens at the focus.
         const fromTable = this.viewMode === 'table' ? UI.tableFocusPerson?.(this.focusPersonId) ?? null : null;
@@ -4081,19 +4114,22 @@ class TreeRendererClass {
         const centre = mode === 'fan' ? UI.liveFollowFanCenter?.() ?? null : null;
         if (centre && centre !== this.focusPersonId && DataManager.getPerson(centre)) {
             this.fanView?.deactivate();
-            void this.setFocus(centre, false);
-            return;
+            await beforeLayout?.();
+            // Following's own centre, not a choice of a person (spec 097 §4).
+            return this.setFocus(centre, false, undefined, { agent: true });
         }
         if (fromTable && fromTable !== this.focusPersonId && DataManager.getPerson(fromTable)) {
-            void this.setFocus(fromTable, true, () => this.centerForViewMode());
-            return;
+            await beforeLayout?.();
+            return this.setFocus(fromTable, true, () => this.centerForViewMode());
         }
         // The modes lay the tree out in different coordinate frames — the
         // pan/zoom state from the previous mode can leave every card outside
         // the viewport (reported on a live tree: switching to descendants
         // showed an empty canvas). Center AFTER the async render finishes so
         // the new cards are measurable. Timeline has its own scroll container.
-        void this.renderInternal().then(() => this.centerForViewMode());
+        await beforeLayout?.();
+        await this.renderInternal();
+        this.centerForViewMode();
     }
 
     /** Re-center the viewport for the current view mode (after a render). */
@@ -4235,6 +4271,7 @@ class TreeRendererClass {
         this.viewStandIn = null;
         this.historySeq++;
         this.updateNavButtons();
+        viewStep();
     }
 
     /** The pan and zoom the history takes the view for (historyView: the stand-in after a step over a new focus). */
@@ -4283,6 +4320,7 @@ class TreeRendererClass {
      * persons deleted meanwhile.
      */
     private async navigateHistory(dir: 'back' | 'forward'): Promise<void> {
+        viewStep();
         const current = this.currentHistoryEntry();
         if (!current) {
             this.updateNavButtons();
@@ -4566,15 +4604,25 @@ class TreeRendererClass {
         if (this.viewMode === 'fan') {
             this.fanView?.revealPerson(id);
         } else if (this.viewMode === 'timeline') {
-            const row = this.markTimelineWindowSelected();
-            const box = document.getElementById('timeline-container');
-            if (!row || !box) return;
-            const r = row.getBoundingClientRect(), c = box.getBoundingClientRect();
-            if (r.top < c.top) box.scrollBy({ top: r.top - c.top - 8, behavior: 'smooth' });
-            else if (r.bottom > c.bottom) box.scrollBy({ top: r.bottom - c.bottom + 8, behavior: 'smooth' });
+            this.scrollTimelineRow(this.markTimelineWindowSelected());
         } else if (this.viewMode === 'map') {
             UI.revealMapPerson(id);
         }
+    }
+
+    /** The Timeline scrolled to the person's row when it is out of view (a centre chosen in another window, spec 110 §3). */
+    revealTimelinePerson(id: PersonId): void {
+        if (this.viewMode !== 'timeline') return;
+        const sel = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(id) : id;
+        this.scrollTimelineRow(document.querySelector<SVGGElement>(`#timeline-container .timeline-bar[data-person-id="${sel}"]`));
+    }
+
+    private scrollTimelineRow(row: SVGGElement | null): void {
+        const box = document.getElementById('timeline-container');
+        if (!row || !box) return;
+        const r = row.getBoundingClientRect(), c = box.getBoundingClientRect();
+        if (r.top < c.top) box.scrollBy({ top: r.top - c.top - 8, behavior: 'smooth' });
+        else if (r.bottom > c.bottom) box.scrollBy({ top: r.bottom - c.bottom + 8, behavior: 'smooth' });
     }
 
     getWindowSelected(): PersonId | null {
@@ -4617,6 +4665,8 @@ class TreeRendererClass {
         this.evidenceIds = ids;
         this.evidenceFaintIds = ids ? faint : null;
         this.applyEvidenceHighlight();
+        // The fan's legend chip names a highlighted family line (spec 114 §6).
+        this.fanView?.refreshLegend();
     }
 
     /** The Evidence mode: each card framed by its level (full / partial / none); null ends it. */
@@ -4628,6 +4678,19 @@ class TreeRendererClass {
     getEvidenceHighlight(): ReadonlySet<PersonId> | null {
         return this.evidenceIds;
     }
+
+    /**
+     * The fan's preview of a family line under the mouse (spec 114 §5): its
+     * sectors marked as when highlighted, the others less dimmed; it covers
+     * the highlighted group while it lasts. Null ends it.
+     */
+    setFanRodPreview(group: { hit: ReadonlySet<PersonId>; faint: ReadonlySet<PersonId> } | null): void {
+        if (!group && !this.fanRodPreview) return;
+        this.fanRodPreview = group;
+        this.applyEvidenceHighlight();
+    }
+
+    private fanRodPreview: { hit: ReadonlySet<PersonId>; faint: ReadonlySet<PersonId> } | null = null;
 
     /** A card's class while a group is highlighted: in it, shown faintly beside it, or dimmed. */
     private evidenceClass(id: PersonId): string {
@@ -4647,13 +4710,52 @@ class TreeRendererClass {
             const level = card.dataset.id ? this.evidenceLevelMap?.get(card.dataset.id as PersonId) : undefined;
             if (level) card.classList.add(`evl-${level}`);
         });
-        document.querySelectorAll<HTMLElement>('[data-fan-person]').forEach(seg => mark(seg, seg.dataset.fanPerson));
+        const preview = this.fanRodPreview;
+        document.querySelectorAll<HTMLElement>('[data-fan-person]').forEach(seg => {
+            const id = seg.dataset.fanPerson as PersonId | undefined;
+            if (!preview || !seg.closest('#fan-chart')) { mark(seg, id); return; }
+            seg.classList.remove('evidence-hit', 'evidence-faint', 'evidence-dim');
+            if (id) seg.classList.add(preview.hit.has(id) ? 'evidence-hit' : preview.faint.has(id) ? 'evidence-faint' : 'evidence-dim');
+        });
+        document.getElementById('fan-chart')?.classList.toggle('fan-rod-preview', !!preview);
+        this.applyFanHighlightEdges();
         document.body.classList.toggle('evidence-mode', !!this.evidenceIds || !!this.evidenceLevelMap);
+    }
+
+    /**
+     * The highlighted sectors of the fan outlined in a layer over all of them
+     * (spec 114 §5): a dashed copy of each one's outline, whole (a stroke on
+     * the sector itself hides under its neighbours' gaps).
+     */
+    private applyFanHighlightEdges(): void {
+        const svg = document.querySelector<SVGSVGElement>('#fan-chart svg.fan-svg');
+        if (!svg) return;
+        svg.querySelectorAll('.fan-hl-layer').forEach(e => e.remove());
+        const hits = svg.querySelectorAll<SVGGElement>('[data-fan-person].evidence-hit');
+        if (!hits.length) return;
+        const NS = 'http://www.w3.org/2000/svg';
+        const layer = document.createElementNS(NS, 'g');
+        layer.setAttribute('class', 'fan-hl-layer');
+        layer.setAttribute('pointer-events', 'none');
+        layer.setAttribute('aria-hidden', 'true');
+        for (const g of hits) {
+            const shape = g.querySelector<SVGElement>('.fan-fill, .fan-focus-disc');
+            if (!shape) continue;
+            const edge = document.createElementNS(NS, shape.tagName === 'circle' ? 'circle' : 'path');
+            for (const a of shape.tagName === 'circle' ? ['cx', 'cy', 'r'] : ['d']) {
+                const v = shape.getAttribute(a);
+                if (v !== null) edge.setAttribute(a, v);
+            }
+            edge.setAttribute('class', 'fan-hl-edge');
+            layer.appendChild(edge);
+        }
+        svg.appendChild(layer);
     }
 
     private updateFocusUI(): void {
         this.updateNavButtons();
         this.updateChildrenShownUI();
+        updateDefaultFocusButtons();
         const focusControls = document.getElementById('focus-controls');
         const focusName = document.getElementById('focus-name');
         const focusCount = document.getElementById('focus-person-count');
@@ -4873,13 +4975,15 @@ class TreeRendererClass {
     private renderCards(canvas: HTMLElement, allTrees: Map<TreeId, { name: string; data: StromData }> | null, live: LiveRender | null): void {
         const currentTreeId = DataManager.getCurrentTreeId();
 
-        // Optional branch colouring: classify once per render (never in timeline).
+        // Optional lineage markers: classify once per render (the Timeline draws no cards; its signs: timelineBranchSigns).
         // A link "linked in the view only" stands as if real: the family it shows takes its branch.
         const layoutData = this.viewLayer?.data ?? DataManager.getData();
-        const branchMap: Map<PersonId, Branch> | null =
-            (SettingsManager.isBranchColorsEnabled() && this.viewMode !== 'timeline' && this.focusPersonId)
-                ? classifyBranches(layoutData, this.focusPersonId)
-                : null;
+        const branches = (SettingsManager.isBranchMarkingOn() && this.viewMode !== 'timeline' && this.focusPersonId)
+            ? classifyBranches(layoutData, this.focusPersonId)
+            : null;
+        const branchMap: Map<PersonId, BranchSet> | null = branches?.map ?? null;
+        // R5: two same-gender parents → the lines are numbered (tag letters 1 / 2).
+        canvas.classList.toggle('branch-numbered', !!branches?.numbered);
 
         // Descendants / family views de-emphasize context-only people (step-
         // relatives, or in-laws shown only for context). The membership rule is
@@ -4950,9 +5054,12 @@ class TreeRendererClass {
             }
             // The avatar circle is always present in normal/detailed density
             // (initials by default); a photo just fills it instead. `has-photo`
-            // marks the photo case for styling/tests.
-            if (person.photo && !person.isPlaceholder && SettingsManager.getCardDensity() !== 'compact') {
-                classes += ' has-photo';
+            // marks the photo case for styling/tests; `has-avatar` every card
+            // with the avatar, which takes the view's photo size (index.html
+            // body[data-card-photo], spec 103 K2.1).
+            if (!person.isPlaceholder && SettingsManager.getCardDensity() !== 'compact') {
+                classes += ' has-avatar';
+                if (person.photo) classes += ' has-photo';
             }
             // Add focused class if this is the focus person
             if (this.focusPersonId && id === this.focusPersonId) {
@@ -4974,11 +5081,11 @@ class TreeRendererClass {
             if (this.evidenceIds) classes += ` ${this.evidenceClass(id)}`;
             const evl = this.evidenceLevelMap?.get(id);
             if (evl) classes += ` evl-${evl}`;
-            // Optional branch colour stripe (focus and placeholders never tagged).
-            if (branchMap && !person.isPlaceholder) {
-                const b = branchMap.get(id);
-                if (b) classes += ` branch-${b}`;
-            }
+            // Optional lineage marker (focus and placeholders never tagged); R4: both lines at once.
+            const branchSet = branchMap && !person.isPlaceholder ? branchMap.get(id) : undefined;
+            if (branchSet?.paternal) classes += ' branch-paternal';
+            if (branchSet?.maternal) classes += ' branch-maternal';
+            if (branchSet?.descendant) classes += ' branch-descendant';
             // Descendants/family view: de-emphasize context-only relatives.
             if (indirectIds?.has(id)) {
                 classes += ' indirect';
@@ -5004,6 +5111,10 @@ class TreeRendererClass {
                 if (this.config.personHeights.has(id)) card.style.height = `${this.cardHeightOf(id)}px`;
             } else if (this.config.personHeights) card.style.setProperty('--card-custom-h', `${this.cardHeightOf(id)}px`);
             card.dataset.id = id;
+            // The lineage in words for screen readers (the marker itself is a pseudo-element, never read).
+            const branchAria = branchAriaId(branchSet, !!branches?.numbered);
+            if (branchAria) card.setAttribute('aria-describedby', branchAria);
+            else card.removeAttribute('aria-describedby');
             if (ghostOf) {
                 card.dataset.viewGhost = '';
                 card.dataset.viewHypo = ghostOf.hypo;
@@ -5238,20 +5349,26 @@ class TreeRendererClass {
             // The fold takes the very corner; without it the status mark moves into it (index.html).
             if (stateHtml) card.classList.add('has-story');
             // The action badge on the avatar's corner (a dot on the card's
-            // corner where there is no avatar, or when zoomed far out). Without
-            // a badge: the agent's arc circling the avatar (a small ring at the
-            // card's corner), or the check once it is done with the person.
+            // corner where there is no avatar, or when zoomed far out). The
+            // agent at work: its arc circling the avatar (a small ring at the
+            // card's corner; around the badge's dot when there is one), beside
+            // the badge too. Without either: the check once it is done with the person.
             // Two or three signals: a stack of badges, its bubble a row per signal (src/card-signal-marks.ts).
             let badgeHtml = '';
             let dotHtml = '';
             const actionMarks = cardActionMarksHtml(id, signals,
                 signals.actions.length >= 2 && signals.waiting ? UI.waitingCountOf(id) : 1);
+            const agentHtml = signals.showAgent
+                ? `<span class="card-agent-mark" data-mark="agent"><span class="card-agent" style="animation-delay:${spinDelay}" aria-hidden="true"></span></span>`
+                    + markTip('agent', c.tipAgentHead, [clipText(signals.agent ?? '')], c.tipClickAgent) : '';
+            const agentDotHtml = signals.showAgent
+                ? `<span class="card-agent-dot${actionMarks ? ' card-agent-dot--badge' : ''}" style="animation-delay:${spinDelay}" aria-hidden="true"></span>` : '';
             if (actionMarks) {
-                ({ badgeHtml, dotHtml } = actionMarks);
+                badgeHtml = agentHtml + actionMarks.badgeHtml;
+                dotHtml = agentDotHtml + actionMarks.dotHtml;
             } else if (signals.showAgent) {
-                badgeHtml = `<span class="card-agent-mark" data-mark="agent"><span class="card-agent" style="animation-delay:${spinDelay}" aria-hidden="true"></span></span>`
-                    + markTip('agent', c.tipAgentHead, [clipText(signals.agent ?? '')], c.tipClickAgent);
-                dotHtml = `<span class="card-agent-dot" style="animation-delay:${spinDelay}" aria-hidden="true"></span>`;
+                badgeHtml = agentHtml;
+                dotHtml = agentDotHtml;
             } else if (signals.doneSince !== null) {
                 const since = Math.min(renderedAt - signals.doneSince, AGENT_DONE_MS + AGENT_DONE_FADE_MS);
                 const fade = `animation-delay:-${Math.max(0, since)}ms`;
@@ -5885,7 +6002,7 @@ class TreeRendererClass {
             const card = it.nameEl.closest('.person-card');
             const avatar = !!card?.querySelector('.card-avatar');
             return { given: it.given, surname: it.surname, avatar,
-                ...(view === 'small' ? {} : { textWidth: normalCardTextWidth(view, avatar, !!card?.classList.contains('has-photo')) }) };
+                ...(view === 'small' ? {} : { textWidth: normalCardTextWidth(view, avatar) }) };
         }), measureCardTexts);
         const lineOf = (cls: string, text: string, rows: readonly string[]): HTMLElement => {
             const line = document.createElement('span');
@@ -6460,7 +6577,7 @@ class TreeRendererClass {
         if (s.action === 'waiting') tail.push(c.ariaWaiting);
         else if (s.action === 'conflict') tail.push(c.ariaConflict);
         else if (s.action === 'question') tail.push(c.ariaQuestion);
-        else if (s.showAgent) tail.push(c.ariaAgent);
+        if (s.showAgent) tail.push(c.ariaAgent);
         if (extra.crossTrees) tail.push(c.ariaCross(extra.crossTrees));
         if (extra.locked) tail.push(strings.lock.lockedTooltip.toLocaleLowerCase());
         return [head.join(', '), ...tail].join('; ');
@@ -7055,14 +7172,18 @@ class TreeRendererClass {
                 relTypeLabel: (t) => strings.parentRelType[t],
                 addParentLabel: () => strings.contextMenu.addParent,
                 afterDraw: () => {
-                    if (this.evidenceIds || this.evidenceLevelMap) this.applyEvidenceHighlight();
+                    if (this.evidenceIds || this.evidenceLevelMap || this.fanRodPreview) this.applyEvidenceHighlight();
                     UI.applyFanFollowMarks?.();
                 },
                 pinnedCenter: () => UI.liveFollowPinned?.() ?? null,
                 menuExtra: (id, isCentre) => UI.fanFollowMenuItems?.(id, isCentre) ?? [],
                 unpinCenter: () => UI.unpinFanCenter?.(),
+                homeChanged: () => updateDefaultFocusButtons(),
                 menuClosed: () => UI.fanFollowMenuClosed?.(),
                 selectedRod: () => UI.selectedRod(),
+                highlightedRod: () => (UI.evidenceHighlightKind() === 'rod' ? UI.selectedRod() : null),
+                selectRod: id => UI.selectRodFromFan(id),
+                previewRod: group => this.setFanRodPreview(group),
                 personDetail: id => UI.runPersonMenuAction(id, 'edit'),
                 personPage: id => UI.runPersonMenuAction(id, 'page'),
                 menuSheet: (menu, onClose) => UI.presentMenuSheet(menu.title, [
@@ -7072,6 +7193,10 @@ class TreeRendererClass {
                 hideMenuSheet: () => UI.hideBottomSheet(),
                 remembersPrefs: () => !DataManager.isWindowCopy(),
                 windowSelected: () => this.windowSelectedId,
+                // The main window tells its satellites the family lines' colours it remembers (spec 114 §3).
+                rodColorsChanged: memory => {
+                    if (!DataManager.isWindowCopy()) window.dispatchEvent(new CustomEvent('strom:fan-rod-colors', { detail: memory }));
+                },
             });
         }
         this.fanView.render(container);
@@ -7089,6 +7214,20 @@ class TreeRendererClass {
         ctx.font = `600 11.5px ${getComputedStyle(container).fontFamily || 'sans-serif'}`;
         // A pixel more than measured: the label's halo and a rounding of the drawn text.
         return (text) => Math.ceil(ctx.measureText(text).width) + 1;
+    }
+
+    /**
+     * The Timeline's lineage signs (spec 112 §3): the marker chosen in the
+     * settings and each person's lines relative to the focused person, as the
+     * cards would carry them; null while the markers are off.
+     */
+    private timelineBranchSigns(): TimelineBranchSigns | null {
+        const marker = SettingsManager.getBranchMarker();
+        if (marker === 'none' || !this.focusPersonId) return null;
+        const data = this.viewLayer?.data ?? DataManager.getData();
+        if (!data.persons[this.focusPersonId]) return null;
+        const { map, numbered } = classifyBranches(data, this.focusPersonId);
+        return { marker, numbered, lines: map as ReadonlyMap<string, BranchSet> };
     }
 
     private renderTimeline(container: HTMLElement): void {
@@ -7156,6 +7295,7 @@ class TreeRendererClass {
             unknownColor: 'var(--unknown)',
             narrow: isMobile,
             measureLabel: this.timelineLabelMeasure(container),
+            branches: this.timelineBranchSigns(),
         });
 
         // Nothing changed (a status that brought nothing new for the row): the DOM stays.

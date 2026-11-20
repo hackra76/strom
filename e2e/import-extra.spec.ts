@@ -384,6 +384,35 @@ test('GEDCOM result: another program\'s own tags are kept for the way back, deep
     await expect(lines.nth(2)).toHaveText(/^Uchováno pro export „Zpět do MyHeritage Family Tree Builder“: 4 značky \(/);
 });
 
+test('GEDCOM result: a family\'s picture outside the file is counted among the couples, connected it says so', async ({ page }, testInfo) => {
+    await openApp(page);
+    const ged = [
+        '0 HEAD', '1 SOUR MYHERITAGE', '2 NAME MyHeritage Family Tree Builder', '1 GEDC', '2 VERS 5.5.1', '1 CHAR UTF-8',
+        '0 @I1@ INDI', '1 NAME Hromoslav /Ozubec/', '1 SEX M', '1 OBJE', '2 FORM jpg', '2 FILE photos/hromoslav.jpg', '1 FAMS @F1@',
+        '0 @I2@ INDI', '1 NAME Libuna /Mechová/', '1 SEX F', '1 FAMS @F1@',
+        '0 @F1@ FAM', '1 HUSB @I1@', '1 WIFE @I2@', '1 OBJE', '2 FORM jpg', '2 FILE photos/svatba.jpg', '2 TITL Svatba',
+        '0 TRLR', '',
+    ].join('\n');
+    const p = testInfo.outputPath('family-photo.ged');
+    writeFileSync(p, ged);
+    await page.locator('#gedcom-input').setInputFiles(p);
+    const result = page.locator('#gedcom-result-modal');
+    await expect(result).toBeVisible();
+    await expect(result.locator('#gedcom-media-text')).toHaveText(/^The file references 2 external media files: 1 on people, 1 on couples \(/);
+    // The couple's photo comes from the picked file (a small JPEG drawn in the page).
+    await page.evaluate(async () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 40; canvas.height = 30;
+        canvas.getContext('2d')!.fillRect(0, 0, 40, 30);
+        const blob = await new Promise<Blob>(r => canvas.toBlob(b => r(b!), 'image/jpeg'));
+        const dt = new DataTransfer();
+        dt.items.add(new File([blob], 'svatba.jpg', { type: 'image/jpeg' }));
+        await window.Strom.UI.attachGedcomMedia(dt.files);
+    });
+    await expect(page.locator('.toast').last()).toContainText('Attached 1 of 2 referenced files: 0 portraits, 0 attachments, 1 couple photo.');
+    await expect(result.locator('#gedcom-media-text')).toHaveText(/^The file references 1 external media file \(/);
+});
+
 test('GEDCOM result: a file with nothing unsupported has no sentence about it', async ({ page }, testInfo) => {
     await openApp(page);
     const p = testInfo.outputPath('clean.ged');
@@ -425,3 +454,31 @@ for (const viewport of [{ width: 390, height: 844 }, { width: 1280, height: 800 
         }
     });
 }
+
+test('GEDCOM › Merge with existing: a large file says "Analyzing people…" at the choice before the matching (C57, waiting buttons §8)', async ({ page }, testInfo) => {
+    test.setTimeout(90_000);
+    await openApp(page);
+    await createFirstPerson(page, 'Jan', 'Novak', { birthDate: '1950' });
+    await waitForPersist(page, 'Jan');
+    const lines = ['0 HEAD', '1 GEDC', '2 VERS 5.5.1', '1 CHAR UTF-8'];
+    for (let i = 1; i <= 1100; i++) lines.push(`0 @I${i}@ INDI`, `1 NAME Osk${i} /Brenvald/`, `1 SEX ${i % 2 ? 'M' : 'F'}`, '1 BIRT', `2 DATE ${1800 + (i % 200)}`);
+    lines.push('0 TRLR', '');
+    const file = testInfo.outputPath('large.ged');
+    writeFileSync(file, lines.join('\n'));
+    await page.locator('#gedcom-input').setInputFiles(file);
+    const result = page.locator('#gedcom-result-modal');
+    await expect(result).toBeVisible();
+    const btn = result.locator('#gedcom-merge-btn');
+    await btn.evaluate((b) => {
+        const w = window as unknown as { __said: string[] };
+        w.__said = [];
+        new MutationObserver(() => {
+            if (b.getAttribute('aria-busy') === 'true') w.__said.push(b.textContent ?? '');
+        }).observe(b, { attributes: true, childList: true, subtree: true, characterData: true });
+    });
+    await btn.click();
+    await expect(page.locator('#merge-modal')).toBeVisible({ timeout: 60_000 });
+    await expect(result).toBeHidden();
+    const said = await page.evaluate(() => (window as unknown as { __said: string[] }).__said);
+    expect(said.some(t => t.includes('Analyzing people…'))).toBe(true);
+});

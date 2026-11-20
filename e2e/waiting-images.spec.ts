@@ -32,6 +32,8 @@ interface Bridge {
     replies: Reply[];
     puts: Put[];
     answers: { task: string; body: Record<string, unknown> }[];
+    /** While set, an upload waits for it before its answer (the sending state stays on screen). */
+    hold?: Promise<void>;
 }
 
 const ARCHIVE = { key: 'repo:R0077', kind: 'archive', name: 'Zemský archiv ve Smyšlenově' };
@@ -106,6 +108,7 @@ async function follow(page: Page, size: { width: number; height: number }, setup
             const h = req.headers();
             const put: Put = { task: h['x-strom-task'], image: h['x-strom-image'] ?? null, replace: h['x-strom-replace'] ?? null, name: h['x-strom-name'] ?? null };
             bridge.puts.push(put);
+            if (bridge.hold) await bridge.hold;
             const next = bridge.replies.shift();
             if (next) return route.fulfill(json(next.status, next.body));
             const n = Number(put.image);
@@ -167,12 +170,14 @@ test.describe('Add images in the overview (accepts.media.taskImages)', () => {
         const bridge = await follow(page, { width: 1440, height: 900 });
         await openOverview(page);
         const item = await openItem(page, 'T0002');
-        await item.locator('.waiting-actions [data-action="images"]').click();
+        await item.locator('.research-overview__deliver-steps [data-action="images"]').click();
         const area = item.locator('.waiting-upload');
         await expect(area.locator('.waiting-upload__drop-text')).toHaveText('Drop images here or choose files');
         await expect(area.locator('.waiting-upload__formats')).toHaveText('JPG, PNG, TIFF, HEIC, PDF · up to 500 MB per file');
-        // The actions hide while the area is open.
+        // The actions and the Deliver block's steps hide while the area is open (spec 105 U4 §5).
         await expect(item.locator('.waiting-actions')).toHaveCount(0);
+        await expect(item.locator('.research-overview__deliver-steps')).toHaveCount(0);
+        await expect(item.locator('.research-overview__waiting-deliver')).toBeVisible();
 
         await area.locator('.waiting-upload__input').setInputFiles([jpeg('SOA_N12_0113.jpg'), jpeg('SOA_N12_0112.jpg')]);
         const files = area.locator('.waiting-upload__file');
@@ -183,7 +188,19 @@ test.describe('Add images in the overview (accepts.media.taskImages)', () => {
         const send = area.locator('.waiting-upload__send');
         await expect(send).toHaveText('Send 2 images');
         await expect(send).toHaveAttribute('aria-disabled', 'false');
+        let release!: () => void;
+        bridge.hold = new Promise<void>(r => { release = r; });
         await send.click();
+        // While it sends (2h): what goes with the files done of all at the right; each file its MB above a 4 px bar.
+        const line = area.locator('.waiting-upload__line');
+        await expect(line.locator('.waiting-upload__going')).toHaveText('Sending 2 files…');
+        await expect(line.locator('.prog-k')).toHaveText('0 of 2');
+        const bar = area.locator('.waiting-upload__progress .bar[role="progressbar"]').first();
+        await expect(bar).toBeVisible();
+        expect(await bar.evaluate(el => getComputedStyle(el).height)).toBe('4px');
+        await expect(area.locator('.waiting-upload__progress .prog-k').first()).toHaveText(/^sending · \d+ of [\d.]+ MB$/);
+        release();
+        bridge.hold = undefined;
 
         await expect(item).toHaveCount(0);
         await expect(page.locator('.toast', { hasText: 'All images saved, the task is back in the queue.' })).toBeVisible();
@@ -197,7 +214,7 @@ test.describe('Add images in the overview (accepts.media.taskImages)', () => {
         });
         await openOverview(page);
         const item = await openItem(page, 'T0001');
-        await item.locator('.waiting-actions [data-action="images"]').click();
+        await item.locator('.research-overview__deliver-steps [data-action="images"]').click();
         const area = item.locator('.waiting-upload');
         await area.locator('.waiting-upload__input').setInputFiles([jpeg('DS_0058.jpg')]);
         await expect(area.locator('.waiting-upload__num')).toHaveValue('58');
@@ -216,7 +233,7 @@ test.describe('Add images in the overview (accepts.media.taskImages)', () => {
         });
         await openOverview(page);
         const item = await openItem(page, 'T0002');
-        await item.locator('.waiting-actions [data-action="images"]').click();
+        await item.locator('.research-overview__deliver-steps [data-action="images"]').click();
         const area = item.locator('.waiting-upload');
         await area.locator('.waiting-upload__input').setInputFiles([jpeg('SOA_N12_0113.jpg')]);
         await area.locator('.waiting-upload__send').click();
@@ -230,7 +247,7 @@ test.describe('Add images in the overview (accepts.media.taskImages)', () => {
         // Saved; the task keeps waiting: the area closes, the line says how it stands.
         await expect(area).toHaveCount(0);
         await expect(item.locator('.waiting-images-result')).toHaveText('✓ 1 of 2 images saved – image 113 missing. The task keeps waiting.');
-        await expect(item.locator('.waiting-actions [data-action="images"]')).toBeVisible();
+        await expect(item.locator('.research-overview__deliver-steps [data-action="images"]')).toBeVisible();
         expect(bridge.puts.map(p => p.image)).toEqual(['113', '112']);
         // Folding the detail lets the line go.
         await item.locator('.research-overview__waiting-row').click();
@@ -272,7 +289,7 @@ test.describe('Add images in the overview (accepts.media.taskImages)', () => {
         // Cancel: nothing goes, the actions are back.
         await area.locator('.waiting-upload__cancel').click();
         await expect(area).toHaveCount(0);
-        await expect(item.locator('.waiting-actions [data-action="images"]')).toBeFocused();
+        await expect(item.locator('.research-overview__deliver-steps [data-action="images"]')).toBeFocused();
         // A row of another kind takes no files.
         expect(await dragFiles(ov.locator('.research-overview__waiting-item[data-id="T0003"]'), ['DS_0058.jpg'], false)).toBe(false);
     });
@@ -283,7 +300,7 @@ test.describe('Add images in the overview (accepts.media.taskImages)', () => {
         });
         await openOverview(page);
         const item = await openItem(page, 'T0002');
-        await item.locator('.waiting-actions [data-action="images"]').click();
+        await item.locator('.research-overview__deliver-steps [data-action="images"]').click();
         const area = item.locator('.waiting-upload');
         await area.locator('.waiting-upload__input').setInputFiles([jpeg('SOA_N12_0113.jpg'), jpeg('SOA_N12_0112.jpg')]);
         await area.locator('.waiting-upload__send').click();
@@ -302,7 +319,7 @@ test.describe('Add images in the overview (accepts.media.taskImages)', () => {
         });
         await openOverview(page);
         const item = await openItem(page, 'T0002');
-        await item.locator('.waiting-actions [data-action="images"]').click();
+        await item.locator('.research-overview__deliver-steps [data-action="images"]').click();
         const area = item.locator('.waiting-upload');
         await area.locator('.waiting-upload__input').setInputFiles([jpeg('SOA_N12_0112.jpg'), jpeg('SOA_N12_0113.jpg')]);
         await area.locator('.waiting-upload__send').click();
@@ -317,6 +334,143 @@ test.describe('Add images in the overview (accepts.media.taskImages)', () => {
         await expect(area).toHaveCount(0);
         await expect(item.locator('.waiting-images-result')).toHaveText(
             '✓ 1 of 2 images saved – image 113 missing. The task keeps waiting. SOA_N12_0112.jpg: Already saved as image 112.');
+    });
+});
+
+/** A task that does not know how many images it wants (K044): the research says the book's next free number. */
+function unknownCount(b: Bridge, next: number | undefined): void {
+    const at = new Date(Date.now() - 86_400_000).toISOString();
+    b.waiting.push({
+        id: 'T0004', what: 'Prohlédnout sčítací operát obce Smyšlenov 1921', kind: 'images', section: 'images', group: ARCHIVE, at, order: 3,
+        inbox: { dir: 'inbox/T0004', have: 3, missing: [], book: 'Sčítací operát Smyšlenov 1921', ...(next !== undefined ? { next } : {}) },
+        actions: ['images', 'answer', 'chat', 'folder'],
+    });
+}
+const savedUnknown = (n: number, next: number) => ({ status: 200, body: {
+    task: 'T0004', image: n, images: [n], by: 'image', woken: false, added: ['M0201'], head: '',
+    inbox: { dir: 'inbox/T0004', have: n, missing: [], next },
+} });
+
+test.describe('a task that does not know how many images it wants (K044)', () => {
+    test('every file the next free number, sent with it even when its name has one; the next file the number the research said last', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, (b) => {
+            unknownCount(b, 12);
+            // Meanwhile something else came in: the research says 20 is the next free after the first.
+            b.replies.push(savedUnknown(12, 20), savedUnknown(20, 21), savedUnknown(21, 22));
+        });
+        await openOverview(page);
+        const item = await openItem(page, 'T0004');
+        await item.locator('.research-overview__deliver-steps [data-action="images"]').click();
+        const area = item.locator('.waiting-upload');
+        await area.locator('.waiting-upload__input').setInputFiles([jpeg('Akta 1831 102.jpg'), jpeg('IMG_20241117_101500.jpg'), jpeg('IMG_4821.JPG')]);
+        const files = area.locator('.waiting-upload__file');
+        await expect(files).toHaveCount(3);
+        await expect(files.locator('.waiting-upload__num')).toHaveCount(3);
+        for (const [i, v] of ['12', '13', '14'].entries()) await expect(files.nth(i).locator('.waiting-upload__num')).toHaveValue(v);
+        await expect(files.locator('.waiting-upload__how')).toHaveText(['next free number', 'next free number', 'next free number']);
+        await expect(files.nth(0).locator('.waiting-upload__num')).toHaveAttribute('aria-label', 'Akta 1831 102.jpg: Image number');
+        await expect(area.locator('.waiting-upload__send')).toHaveAttribute('aria-disabled', 'false');
+        await area.locator('.waiting-upload__send').click();
+
+        await expect(area).toHaveCount(0);
+        expect(bridge.puts.map(p => [p.task, p.image, decodeURIComponent(p.name ?? '')])).toEqual([
+            ['T0004', '12', 'Akta 1831 102.jpg'], ['T0004', '20', 'IMG_20241117_101500.jpg'], ['T0004', '21', 'IMG_4821.JPG'],
+        ]);
+    });
+
+    test('a number typed by hand goes as typed; the same one twice waits, said', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, (b) => {
+            unknownCount(b, 12);
+            b.replies.push(savedUnknown(12, 13), savedUnknown(30, 31), savedUnknown(31, 32));
+        });
+        const row = page.locator('#live-panel .live-waiting-row').filter({ has: page.locator('[data-action]') }).filter({ hasText: 'sčítací' });
+        await dragFiles(row, ['skan.jpg', 'skan-2.jpg', 'skan-3.jpg']);
+        const dialog = page.locator('.waiting-dialog');
+        const files = dialog.locator('.waiting-upload__file');
+        await expect(files).toHaveCount(3);
+        await files.nth(1).locator('.waiting-upload__num').fill('30');
+        await files.nth(1).locator('.waiting-upload__num').press('Tab');
+        await expect(files.nth(2).locator('.waiting-upload__num')).toHaveValue('31');
+        await files.nth(2).locator('.waiting-upload__num').fill('30');
+        await files.nth(2).locator('.waiting-upload__num').press('Tab');
+        await expect(files.nth(2).locator('.waiting-upload__msg.is-warn')).toHaveText('Image 30 is on another file too.');
+        await expect(dialog.locator('.waiting-upload__send')).toHaveAttribute('aria-disabled', 'true');
+        // The summary says why it waits: the number is another file's, not missing.
+        await expect(dialog.locator('.waiting-upload__warn')).toHaveText('1 file has the number of another file.');
+        // Emptied: the next free again.
+        await files.nth(2).locator('.waiting-upload__num').fill('');
+        await files.nth(2).locator('.waiting-upload__num').press('Tab');
+        await expect(files.nth(2).locator('.waiting-upload__num')).toHaveValue('31');
+        await dialog.locator('.waiting-upload__send').click();
+        await expect(dialog).toHaveCount(0);
+        expect(bridge.puts.map(p => p.image)).toEqual(['12', '30', '31']);
+    });
+
+    test('an older research refusing a file without a number: never an empty list; the name gives none, a number is typed', async ({ page }) => {
+        const bridge = await follow(page, { width: 1440, height: 900 }, (b) => {
+            unknownCount(b, undefined);
+            b.replies.push({ status: 409, body: { error: 'unknown', code: 'waiting.image-unknown', missing: [] } }, savedUnknown(7, 8));
+        });
+        await openOverview(page);
+        const item = await openItem(page, 'T0004');
+        await item.locator('.research-overview__deliver-steps [data-action="images"]').click();
+        const area = item.locator('.waiting-upload');
+        await area.locator('.waiting-upload__input').setInputFiles([jpeg('Akta 1831 102.jpg')]);
+        await expect(area.locator('.waiting-upload__num')).toHaveValue('');
+        await area.locator('.waiting-upload__send').click();
+
+        const file = area.locator('.waiting-upload__file');
+        await expect(file.locator('.waiting-upload__msg.is-warn')).toHaveText('The file name does not give the image number.');
+        await expect(file).not.toContainText('Missing');
+        const again = file.locator('.waiting-upload__again');
+        await expect(again.locator('.waiting-upload__retry')).toHaveAttribute('aria-disabled', 'true');
+        await again.locator('.waiting-upload__num').fill('7');
+        await expect(again.locator('.waiting-upload__retry')).toHaveAttribute('aria-disabled', 'false');
+        await again.locator('.waiting-upload__retry').click();
+        await expect(area).toHaveCount(0);
+        expect(bridge.puts.map(p => p.image)).toEqual([null, '7']);
+    });
+
+    test('a number refused as not wanted without the numbers wanted: a sentence says so above the field', async ({ page }) => {
+        await follow(page, { width: 1440, height: 900 }, (b) => {
+            unknownCount(b, 12);
+            b.replies.push({ status: 409, body: { error: 'unwanted', code: 'waiting.image-unwanted', want: [] } });
+        });
+        await openOverview(page);
+        const item = await openItem(page, 'T0004');
+        await item.locator('.research-overview__deliver-steps [data-action="images"]').click();
+        const area = item.locator('.waiting-upload');
+        await area.locator('.waiting-upload__input').setInputFiles([jpeg('skan.jpg')]);
+        await area.locator('.waiting-upload__send').click();
+        const file = area.locator('.waiting-upload__file');
+        await expect(file.locator('.waiting-upload__msg.is-warn')).toHaveText('The research does not take this image number.');
+        await expect(file.locator('.waiting-upload__again .waiting-upload__num')).toBeVisible();
+    });
+});
+
+test.describe('Polish at a tablet\'s width (K044)', () => {
+    test.use({ locale: 'pl-PL' });
+    test('the typed number\'s field is as wide as its placeholder: "— wybierz numer —" is not cut', async ({ page }) => {
+        await follow(page, { width: 1024, height: 800 }, (b) => {
+            unknownCount(b, undefined);
+            b.replies.push({ status: 409, body: { error: 'unknown', code: 'waiting.image-unknown', missing: [] } });
+        });
+        await openOverview(page);
+        const item = await openItem(page, 'T0004');
+        await item.locator('.research-overview__deliver-steps [data-action="images"]').click();
+        const area = item.locator('.waiting-upload');
+        await area.locator('.waiting-upload__input').setInputFiles([jpeg('skan.jpg')]);
+        await area.locator('.waiting-upload__send').click();
+        const field = area.locator('.waiting-upload__again .waiting-upload__num');
+        await expect(field).toHaveAttribute('placeholder', '— wybierz numer —');
+        const fit = await field.evaluate((el: HTMLInputElement) => {
+            const cs = getComputedStyle(el);
+            const ctx = document.createElement('canvas').getContext('2d')!;
+            ctx.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+            const inner = el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+            return { inner, text: ctx.measureText(el.placeholder).width };
+        });
+        expect(fit.inner).toBeGreaterThanOrEqual(fit.text);
     });
 });
 
@@ -362,6 +516,12 @@ test.describe('the small panel', () => {
         await expect(dialog.locator('.waiting-dialog__title')).toHaveText('Add images');
         await expect(dialog.locator('.waiting-dialog__task')).toHaveText('Uložit snímky 112–113 křestní matriky Smyšlenov');
         await expect(dialog.locator('.waiting-upload__num')).toHaveCount(2);
+        // The Deliver block above the area (spec 105 U4 §5): the sentence, the steps stacked, the area itself the last step.
+        const deliver = dialog.locator('.research-overview__waiting-deliver');
+        await expect(deliver.locator('.research-overview__deliver-text')).toContainText('112–113 as files (JPG or PNG)');
+        await expect(deliver.locator('.research-overview__deliver-steps')).toHaveClass(/is-column/);
+        await expect(deliver.locator('[data-action="images"]')).toHaveCount(0);
+        await expect(deliver.locator('.research-overview__deliver-arrow').first()).toBeHidden();
         // Escape closes it; the files stay for the next time.
         await page.keyboard.press('Escape');
         await expect(dialog).toHaveCount(0);
@@ -404,7 +564,7 @@ test.describe('an older bridge without task images', () => {
 
 test.describe('a phone in German', () => {
     test.use({ locale: 'de-DE' });
-    test('no Add images; the images are added on a computer; Answer in a full-screen sheet; nothing spills', async ({ page }) => {
+    test('no Add images; the Deliver block says the images are saved on the computer; "can\'t be obtained" in a full-screen sheet; nothing spills', async ({ page }) => {
         const bridge = await follow(page, { width: 390, height: 844 });
         await page.locator('#live-panel .live-panel-toggle').click();
         const ov = page.locator('#research-overview');
@@ -416,7 +576,17 @@ test.describe('a phone in German', () => {
         await expect(item.locator('.wait-book')).toBeVisible();
         await expect(item.locator('[data-action="images"]')).toHaveCount(0);
         await expect(item.locator('.waiting-more')).toHaveCount(0);
-        await expect(item.locator('.waiting-phone-note')).toHaveText(['Bilder werden in der App am Computer hinzugefügt.']);
+        // Only the Deliver block (spec 105 U4 §5, 5f): what and where, saved on the computer; no steps, no website.
+        const deliver = item.locator('.research-overview__waiting-deliver');
+        await expect(deliver.locator('.research-overview__deliver-text')).toHaveText('Bild 58 als Datei (JPG oder PNG) im Ordner der Aufgabe');
+        await expect(deliver.locator('.research-overview__deliver-phone')).toHaveText('Bilder werden am Computer gespeichert.');
+        await expect(item.locator('.research-overview__deliver-steps')).toHaveCount(0);
+        await expect(item.locator('[data-action="web"]')).toHaveCount(0);
+        await expect(item.locator('.waiting-phone-note')).toHaveCount(0);
+        await expect(item.locator('.waiting-actions [data-action="answer"]')).toHaveText('Bilder nicht erhältlich…');
+        await expect(item.locator('.waiting-actions [data-action="answer"]')).toHaveClass(/link-button/);
+        const tap = await item.locator('.waiting-actions [data-action="answer"]').boundingBox();
+        expect(tap!.height).toBeGreaterThanOrEqual(44);
         expect(await dragFiles(item, ['DS_0058.jpg'], false)).toBe(false);
         const spill = await item.evaluate((o) => [o, ...o.querySelectorAll<HTMLElement>('*')]
             .filter(n => n.scrollWidth > n.clientWidth + 1 && getComputedStyle(n).overflowX !== 'hidden' && getComputedStyle(n).overflowX !== 'clip' && n.clientWidth > 0)
@@ -436,6 +606,9 @@ test.describe('a phone in German', () => {
         await expect(send).toHaveAttribute('aria-disabled', 'true');
         const field = sheet.locator('.waiting-answer__text');
         await expect(field).toBeFocused();
+        // Its own heading and hint: why the images cannot be had (5b).
+        await expect(sheet.locator('.waiting-answer__label')).toHaveText('Warum die Bilder nicht erhältlich sind');
+        await expect(sheet.locator('.waiting-answer__hint')).toHaveText(/^Hierher gehört, warum die Bilder nicht geliefert werden können/);
         expect(await field.evaluate(n => getComputedStyle(n).fontSize)).toBe('16px');
         const headSpill = await sheet.locator('.waiting-answer-sheet__head').evaluate(n => n.scrollWidth - n.clientWidth);
         expect(headSpill).toBeLessThanOrEqual(0);
@@ -452,7 +625,7 @@ test.describe('a phone in German', () => {
         expect(bridge.answers.map(a => [a.task, a.body.text])).toEqual([['T0001', 'Snímek 58 v archivu chybí.']]);
     });
 
-    test('without waiting.answer: the website and where answers are given', async ({ page }) => {
+    test('without waiting.answer: only the Deliver block and where answers are given', async ({ page }) => {
         await follow(page, { width: 390, height: 844 }, (b) => { b.features = ['waiting.groups']; });
         await page.locator('#live-panel .live-panel-toggle').click();
         const ov = page.locator('#research-overview');
@@ -460,8 +633,9 @@ test.describe('a phone in German', () => {
         if (await head.getAttribute('aria-expanded') === 'false') await head.click();
         const item = ov.locator('.research-overview__waiting-item[data-id="T0001"]');
         await item.locator('.research-overview__waiting-row').click();
-        await expect(item.locator('.waiting-actions > .waiting-action')).toHaveText(['Website öffnen ↗']);
-        await expect(item.locator('.waiting-phone-note')).toHaveCount(2);
+        await expect(item.locator('.research-overview__deliver-phone')).toHaveText('Bilder werden am Computer gespeichert.');
+        await expect(item.locator('.waiting-actions')).toHaveCount(0);
+        await expect(item.locator('.waiting-phone-note')).toHaveText(['Geantwortet wird in der Forschung am Computer.']);
     });
 });
 
@@ -487,7 +661,7 @@ test.describe('German at a tablet\'s width', () => {
 
         await openOverview(page);
         const item = await openItem(page, 'T0001');
-        await item.locator('.waiting-actions [data-action="images"]').click();
+        await item.locator('.research-overview__deliver-steps [data-action="images"]').click();
         await item.locator('.waiting-upload__input').setInputFiles([jpeg('Zemsky_archiv_Smyslenov_oddaci_matrika_N_1858-1871_snimek_0057.jpg'), jpeg('DS_0058.jpg')]);
         await expect(item.locator('.waiting-upload__file')).toHaveCount(2);
         expect(await spills(item)).toEqual([]);

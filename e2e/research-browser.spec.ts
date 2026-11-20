@@ -80,8 +80,17 @@ test.describe('Research for this tree: the agent box', () => {
         await expect(more).toHaveText('and 2 more');
         await expect(more).toHaveAttribute('title', 'Archiv D ve Smyšlenově, Archiv E ve Smyšlenově');
         expect(await more.evaluate(n => n.tagName)).toBe('SPAN');
+        // §5: a link in text has its 12 px slot from the start (between its words and its mark); opening, only the
+        // spinner in it – its words and its mark stay, no "Opening the research…".
+        await expect(permits.nth(1).locator('.busy-slot')).toHaveCount(1);
+        const width = (await permits.nth(1).boundingBox())!.width;
         await permits.nth(1).click();
         expect(await links(page)).toEqual([expect.stringMatching(new RegExp(`^strom-research://archive\\?tree=${RESEARCH_UUID}&host=b\\.archiv\\.example$`))]);
+        await expect(permits.nth(1).locator('.busy-slot .busy-spin.s12')).toBeVisible();
+        await expect(permits.nth(1)).toContainText('Permission…');
+        await expect(permits.nth(1)).not.toContainText('Opening');
+        await expect(permits.nth(1).locator('.research-open-mark')).toBeVisible();
+        expect(Math.round((await permits.nth(1).boundingBox())!.width)).toBe(Math.round(width));
         // Never the link without a host.
         expect((await links(page)).every(l => /[?&]host=/.test(l))).toBe(true);
     });
@@ -316,7 +325,7 @@ test.describe('Waiting for images from a browser-only archive', () => {
             return [!!(book.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_FOLLOWING), !!(n.compareDocumentPosition(actions) & Node.DOCUMENT_POSITION_FOLLOWING)];
         });
         expect(order).toEqual([true, true]);
-        await item.locator('.waiting-actions [data-action="images"]').click();
+        await item.locator('.research-overview__deliver-steps [data-action="images"]').click();
         await expect(item.locator('.waiting-upload')).toBeVisible();
         await expect(note).toHaveCount(0);
 

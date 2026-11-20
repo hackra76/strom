@@ -260,13 +260,29 @@ Agent, který není přihlášený ke svému předplatnému, sezení neudělá. 
 spustit … a přihlásit se**.
 
 - **Hranice:**
-  - před prvním sezením to strom ověří jen u Claude Code se zvláštní složkou (`agent.claudeConfigDir` nebo
-    `CLAUDE_CONFIG_DIR`, jiná než `~/.claude`). Běh pak skončí bez sezení a bez dotazu na podmínku;
+  - před prvním sezením to strom ověří u Claude Code: do výzkumu 1.33.0 jen se zvláštní složkou
+    (`agent.claudeConfigDir` nebo `CLAUDE_CONFIG_DIR`, jiná než `~/.claude`), od 1.34.0 i s výchozí. Běh pak skončí
+    bez sezení a bez dotazu na podmínku;
   - jinak to pozná podmínka `claude-usage` (zastaví; u ručního běhu padne **Spustit přesto?**,
     [R7.4.1](#R7.4.1)), nebo sezení, které skončí chybou přihlášení.
 - **Platí od:** výzkum 1.25.2; zastavení po sezení s chybou přihlášení od 1.0.0
+- **Od výzkumu 1.34.0:** Claude Code v terminálu, který strom spouští sám (samostatná práce, čtenáři skenů
+  a dokumentů, [R8.3](R8-reading-scans.md#R8.3)), má vlastní přihlášení, ne přihlášení aplikace Claude. Když
+  `claude auth status` řekne, že přihlášený není:
+  - `strom read` a další čtení čtenáři (výřezy, přepisy, dokument z aplikace) nespustí žádného čtenáře a hned
+    skončí: **Claude Code v terminálu není přihlášený – … ho spouští sám (ne aplikace Claude, ta má vlastní
+    přihlášení)**, s radou **jednou se přihlásit v terminálu: …, pak /login**;
+  - čtenář, který skončí chybou přihlášení, to řekne i s návodem k přihlášení, v průběhu i ve shrnutí, nikdy jen
+    „auth“;
+  - `strom doctor` má vlastní řádek **přihlášení Claude Code**: **Claude Code v terminálu přihlášen**, nebo varování
+    **Claude Code v terminálu není přihlášený – …** s opravou **… v terminálu, pak /login**. V archivu Stromu se
+    přihlášení neověřuje ani neříká.
 
-<!-- zdroj: research:src/commands/session.ts:916 loggedOut, :1260-1264 auth · src/core/claudedir.ts claudeConfigSet :33, forClaude, claudeLoggedIn :91 · gate.ts:253-258 loggedIn · CHANGELOG.cs.md 1.25.2 -->
+  Odpověď, ze které přihlášení nejde poznat, nic nerozhoduje. Terminál: `claude`, pak `/login`; `strom doctor`.
+- **Od výzkumu 1.35.0:** kontrola přihlášení, která do 5 s neodpoví, nic nerozhoduje a ukončí všechno, co spustila,
+  i na Windows, kde dřív program agenta mohl běžet dál.
+
+<!-- zdroj: research:src/commands/session.ts:916 loggedOut, :1260-1264 auth · src/core/claudedir.ts claudeConfigSet :33, forClaude, claudeLoggedIn :91 · gate.ts:253-258 loggedIn · CHANGELOG.cs.md 1.25.2 · 1.34.0 (K040): src/core/agentcli.ts requireClaudeLogin, agentLoggedOut (agent.logged-out) · src/commands/readers.ts refuseReadersLoggedOut, readerAuthSaid · src/commands/read.ts · src/commands/session.ts loggedOut bez claudeConfigSet · src/commands/setup.ts doctor login (ne v archivu) · assets/lang/*.json ui.read.auth, ui.doc.login*, ui.error.agent.logged-out* · CHANGELOG 1.34.0 · 1.35.0: research:bb79ee54 src/core/claudedir.ts AUTH_STATUS_MS 5000, claudeLoggedIn přes src/core/runsync.ts runSync (win32 taskkill /T /F, jinde skupina procesů) · CHANGELOG.cs.md 1.35.0 „Windows: po kontrole přihlášení nic neběží dál“ -->
 
 <a id="R7.8"></a>
 ## R7.8 Archiv Stromu: výzkum, na kterém agent nepracuje
@@ -303,15 +319,18 @@ Výzkum, jehož agent na tomto počítači není (nenainstalovaný, nebo výzkum
 Do té doby se chová jako Archiv Stromu.
 
 - **Hlídá kód:**
-  - co pošle aplikace, se zapíše jako v archivu; pro agenta nic nevzniká a práce agenta je odmítnutá s větou, že
+  - co pošle aplikace, se zapíše jako v archivu; agent nic nedostane a práce agenta je odmítnutá s větou, že
     výzkum čeká na agenta, a kde ho nainstalovat nebo vybrat jiného;
-  - uložený režim se nemění a úkoly se neodkládají. Po instalaci agenta výzkum pokračuje sám s úkoly, které měl;
+  - uložený režim se nemění a úkoly, které výzkum měl, se neodkládají. Po instalaci agenta výzkum pokračuje sám s úkoly, které měl;
   - agent, který ve výzkumu právě pracuje (i jiný než nastavený), ho dělá výzkumem.
 - **Proč:** archiv je volba člověka a strom ji za něj nezapíše. Výzkum bez agenta se jen chová jako archiv, takže po
-  instalaci agenta sám pokračuje s úkoly, které měl; žádný není odložený.
+  instalaci agenta sám pokračuje s úkoly, které měl.
 - **Ovládání:** terminál: menu, první položka (**Nechat jen jako Archiv Stromu: ukládat data z aplikace Strom**,
   nebo instalace agenta); `strom mode` ukáže stav. Aplikace ukazuje takový výzkum jako **Archiv**
   ([S1.3](S1-connecting-app-and-research.md#S1.3)).
-- **Platí od:** výzkum 1.15.0
+- **Platí od:** výzkum 1.15.0; 1.35.0: nové úkoly odložené
+- **Od výzkumu 1.35.0:** úkol, který mezitím přijde (k poslanému materiálu, sken ke čtení), vznikne odložený jako
+  v archivu. Do fronty se vrátí, jakmile na výzkumu začne pracovat agent (začátek sezení, `strom run`, chat; i jiný
+  než nastavený), nebo když je nastavený agent zase na počítači.
 
-<!-- zdroj: research:src/core/state.ts (hlavička, stateOf, actsAsArchive, kindOf, refuseInArchive agent.missing) · cs.json ui.mode.is.waiting, ui.waiting.refuse, ui.menu.keeparchive · CHANGELOG 1.15.0 -->
+<!-- zdroj: research:src/core/state.ts (hlavička, stateOf, actsAsArchive, kindOf, refuseInArchive agent.missing) · cs.json ui.mode.is.waiting, ui.waiting.refuse, ui.menu.keeparchive · CHANGELOG 1.15.0 · 1.35.0: research:31def74a src/core/state.ts heldWhereNobody (parked, heldBy archive, waiting.held), settleWaiting (atWork: session start, run, chat; jinak stateOf research) · src/core/records.ts create · CHANGELOG.cs.md 1.35.0 „Rodinný materiál … odložený, dokud tu agent není“ -->

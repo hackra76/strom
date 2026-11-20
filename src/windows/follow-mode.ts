@@ -55,3 +55,58 @@ export function effectiveFollowMode(choice: FollowMode | null, kind: SatelliteKi
 export function followChoiceToStore(mode: FollowMode, kind: SatelliteKind): string {
     return mode === defaultFollowMode(kind) ? '' : mode;
 }
+
+/**
+ * What a choice made in this window does in the main window (spec 110 §1,
+ * §6): `mark` marks the person there, its centre stays; `focus` makes the
+ * person the main window's centre, as its card's Focus does. Until one is
+ * chosen, the view decides: a Table focuses, the Timeline and the Map mark. Offered where the window's choice is a person picked in a list (the
+ * Table, the Timeline, the Map); a chart (Family, Descendants, Fan) moves its
+ * own centre with a choice, so it only marks. Kept for the window
+ * (sessionStorage), also while another view shows (it comes back with the
+ * Table).
+ */
+export type SendMode = 'mark' | 'focus';
+
+const SENDING: readonly SatelliteKind[] = ['table', 'timeline', 'map'];
+
+/** Whether the view offers what its choice does in the main window. */
+export function sendModeAvailable(kind: SatelliteKind | string): boolean {
+    return (SENDING as readonly string[]).includes(kind);
+}
+
+/** sessionStorage key of the window's send mode (survives its reload, not other windows). */
+export function sendModeKey(windowId: string): string {
+    return `strom.win.send.${windowId}`;
+}
+
+/** What a choice does in the main window until one is chosen: the Table focuses, the other views mark. */
+export function defaultSendMode(kind: SatelliteKind | string): SendMode {
+    return kind === 'table' ? 'focus' : 'mark';
+}
+
+/** The stored send mode (nothing or anything else: the view's default). */
+export function parseSendMode(raw: string | null | undefined, kind: SatelliteKind | string = ''): SendMode {
+    return raw === 'focus' || raw === 'mark' ? raw : defaultSendMode(kind);
+}
+
+type SendStorage = Pick<Storage, 'getItem' | 'setItem'> | null | undefined;
+
+function defaultSendStorage(): SendStorage {
+    try { return typeof sessionStorage !== 'undefined' ? sessionStorage : null; } catch { return null; }
+}
+
+/** The send mode chosen in the window, whatever view shows now (none chosen: the default of the view `kind`). */
+export function getSendModeChoice(windowId: string, kind: SatelliteKind | string, storage: SendStorage = defaultSendStorage()): SendMode {
+    try { return parseSendMode(storage?.getItem(sendModeKey(windowId)), kind); } catch { return defaultSendMode(kind); }
+}
+
+/** What a choice in the view does in the main window now: the choice where the view offers it, else `mark`. */
+export function getSendMode(windowId: string, kind: SatelliteKind | string, storage: SendStorage = defaultSendStorage()): SendMode {
+    return sendModeAvailable(kind) ? getSendModeChoice(windowId, kind, storage) : 'mark';
+}
+
+/** Keep the window's send mode (both kept as chosen: `mark` in a Table is not its default). */
+export function setSendMode(windowId: string, mode: SendMode, storage: SendStorage = defaultSendStorage()): void {
+    try { storage?.setItem(sendModeKey(windowId), mode === 'focus' ? 'focus' : 'mark'); } catch { /* no storage */ }
+}

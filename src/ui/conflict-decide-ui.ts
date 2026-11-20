@@ -9,6 +9,8 @@
  * hypotheses: a conflict is amber and two sides, a hypothesis a ghost.
  */
 
+import { activatedElement } from './busy.js';
+import { startTreeLoad, currentTreeLoad, countGedcomPersons, type TreeLoadRun } from './tree-load-progress.js';
 import { keepTableViews } from '../table-views-data.js';
 import { researchActionLabel } from './research-open-mark.js';
 import { DataManager } from '../data.js';
@@ -43,7 +45,8 @@ const cardStates = new Map<string, ConflictCardState>();
 const drawn = new WeakMap<Element, string>();
 
 /** The research's version as read from its bridge (for "The research has N more changes"), by research and head. */
-interface ResearchVersion { key: string; data: StromData; header: ResearchHeader }
+/** `header.appMedia`: the file came with the tree's own files (spec 108 §5). */
+interface ResearchVersion { key: string; data: StromData; header: ResearchHeader & { appMedia?: true } }
 let versionRead: ResearchVersion | null = null;
 /** A read on its way (one at a time, by the same key). */
 let versionAsk: { key: string; job: Promise<ResearchVersion | null> } | null = null;
@@ -183,7 +186,7 @@ export const conflictDecideMethods = uiModule({
         const kindLine = kind && view.body === 'sides' ? `<p class="prc-kind">${esc(kind === 'import' ? o.proposeImport : o.proposeUser)}.</p>` : '';
 
         const tag = view.tag === 'busy'
-            ? `<span class="person-research-open-tag prc-tag prc-tag--busy"><span class="prc-spinner prc-spinner--tag" aria-hidden="true"></span>${esc(k.busyTag)}</span>`
+            ? `<span class="person-research-open-tag prc-tag prc-tag--busy"><i class="busy-spin s12" aria-hidden="true"></i>${esc(k.busyTag)}</span>`
             : view.tag === 'done'
                 ? `<span class="person-research-open-tag prc-tag prc-tag--done">${esc(k.decidedTag)}</span>`
                 : `<span class="person-research-open-tag">${esc(r.conflictOpen)}</span>`;
@@ -238,7 +241,7 @@ export const conflictDecideMethods = uiModule({
                     // A conflict of a kind: the choices stand in one row under both sides (kindRow).
                 } else if (view.choices === 'buttons') {
                     choice = `<button type="button" class="prc-choice" data-decide="${which}" data-focus="choice-${which}"${busy ? ' aria-busy="true" aria-disabled="true"' : ''}${off ? ' disabled' : ''}${view.notes ? ` aria-describedby="${noteId}"` : ''}>${busy
-                        ? `<span class="prc-spinner" aria-hidden="true"></span>${esc(k.busy)}`
+                        ? `<i class="busy-spin" aria-hidden="true"></i>${esc(k.busy)}`
                         : esc(which === 'user' ? k.keep : k.take)}</button>`;
                 } else if (view.choices === 'links') {
                     choice = `<button type="button" class="prc-choice" data-conflict="${esc(id)}" data-do="decide" data-take="${which}" data-focus="choice-${which}"${off ? ' disabled' : ''}${view.notes ? ` aria-describedby="${noteId}"` : ''}>${researchActionLabel(which === 'user' ? k.keepLink : k.takeLink, researchLinkMark('conflict', { conflictDo: 'decide' }))}</button>`;
@@ -414,7 +417,22 @@ export const conflictDecideMethods = uiModule({
             }
             return 'later';
         };
-        const version = await this.researchVersionRead(true);
+        // The research's version is loaded here: its progress toast, the edits waiting (waiting buttons §2.3).
+        if (currentTreeLoad()) return later();
+        const load = startTreeLoad({ treeId });
+        try {
+            return await this.researchConflictTakenLoad(personId, c, values, id, from, later, load);
+        } finally {
+            load.done();
+        }
+    },
+
+    async researchConflictTakenLoad(personId: PersonId, c: ResearchConflict, values: ConflictDecidedValues, id: string,
+        from: ReturnType<typeof this.researchConflictValueNow>, later: () => 'later', load: TreeLoadRun): Promise<'quiet' | 'asked' | 'later'> {
+        const ctx = this.researchSyncLink();
+        if (!ctx) return 'later';
+        const { treeId, link } = ctx;
+        const version = await this.researchVersionRead(true, load);
         if (!version || DataManager.getCurrentTreeId() !== treeId) return later();
         const here = DataManager.getData();
         const there = this.researchVersionAsLoaded(version.data);
@@ -622,7 +640,7 @@ export const conflictDecideMethods = uiModule({
      * asked now (after a decision), else the one read for this head. Null:
      * no bridge, no answer, or not this tree's research.
      */
-    async researchVersionRead(fresh: boolean): Promise<ResearchVersion | null> {
+    async researchVersionRead(fresh: boolean, load?: TreeLoadRun): Promise<ResearchVersion | null> {
         const ctx = this.researchSyncLink();
         const bridge = ctx ? parseLiveBridge(storedResearchBridge(ctx.link.id)?.base) : null;
         if (!ctx || !bridge) return null;
@@ -632,10 +650,12 @@ export const conflictDecideMethods = uiModule({
         const researchId = ctx.link.id;
         const job = (async (): Promise<ResearchVersion | null> => {
             try {
-                const { text, images } = await readResearchTreeFile(bridge.ged, this.researchStatusOf(researchId)?.features);
+                const { text, images, media } = await readResearchTreeFile(bridge.ged, this.researchStatusOf(researchId)?.features, load?.watch);
                 const header = readResearchHeader(text);
                 if (!header.isStromResearch || header.treeId !== researchId) return null;
-                return { key: header.head ? `${researchId}|${header.head}` : key, data: convertToStrom(parseGedcom(text), { images }).data, header };
+                if (load) await load.processing(countGedcomPersons(text));
+                return { key: header.head ? `${researchId}|${header.head}` : key, data: convertToStrom(parseGedcom(text), { images }).data,
+                    header: { ...header, ...(media ? { appMedia: true as const } : {}) } };
             } catch {
                 return null;
             }
@@ -671,7 +691,7 @@ export const conflictDecideMethods = uiModule({
         } else if (action === 'load') {
             const c = this.researchConflictsShown(personId).find(x => researchConflictRef(x.id) === conflictId);
             if (state?.kind !== 'takenPending' || !c) {
-                void this.researchLoadNewer();
+                void this.researchLoadNewer({}, activatedElement());
                 return;
             }
             // Left for later: the same load as right after the decision (quietly, or the Load dialog).

@@ -183,7 +183,23 @@ test.describe('source images from the research', () => {
         await modal.getByRole('button', { name: 'Load all from the research…' }).click();
         await expect(modal.locator('.sources-bulk-panel')).toContainText('2 sources, 3 images, about 900 kB.');
         await expect(modal.locator('.sources-bulk-panel')).toContainText('Free space in the browser');
+        let release!: () => void;
+        ex.hold = new Promise<void>(r => { release = r; });
         await modal.locator('#sources-bulk-go').click();
+        // While it loads (2h): what runs with "k of n" at the right, a 4 px bar, Pause and Stop at the right.
+        const prog = modal.locator('.sources-bulk-prog');
+        await expect(prog.locator('.prog-t')).toHaveText('Loading source images from the research');
+        await expect(prog.locator('.prog-k')).toHaveText('0 of 2');
+        expect(await prog.locator('.bar').evaluate(el => getComputedStyle(el).height)).toBe('4px');
+        await expect(prog.locator('.prog-acts #sources-bulk-pause')).toBeVisible();
+        await expect(prog.locator('.prog-acts #sources-bulk-stop')).toBeVisible();
+        // An action keeps its word whole on a narrow screen (the line's overflow-wrap broke "Pausieren" in two).
+        expect(await prog.locator('#sources-bulk-pause').evaluate(el => {
+            const cs = getComputedStyle(el);
+            return `${cs.whiteSpace} ${cs.overflowWrap}`;
+        })).toBe('nowrap normal');
+        release();
+        ex.hold = undefined;
         await expect(modal.locator('.sources-bulk-panel')).toContainText('Loaded 2 sources');
         expect(ex.asks.sort()).toEqual(['S0001/C0001', 'S0001/C0002', 'S0002/C0003']);
         // No badge in the toolbar: the Research menu's row says it ended (until Sources opens again).
@@ -303,6 +319,41 @@ test.describe('the Research menu: Images only in the research', () => {
         await openMenu(page);
         await expect(row(page)).toHaveCount(0);
         await expect(page.locator('#research-images-badge, .research-images-badge')).toHaveCount(0);
+    });
+
+    test('A202: "Load all from the research…" waits with its spinner while the research lists what is missing', async ({ page }) => {
+        await setup(page, { auto: false });
+        await openMenu(page);
+        await row(page).click();
+        const modal = page.locator('#sources-modal');
+        await expect(modal.locator('.source-row')).toHaveCount(2);
+        let answer: () => void = () => {};
+        const gate = new Promise<void>(r => { answer = r; });
+        await page.route(/\/excerpts\?missing=1/, async (route) => { await gate; await route.fallback(); });
+        const open = modal.locator('#sources-bulk-open');
+        await open.click();
+        await expect(open).toHaveAttribute('data-busy', 'busy');
+        await expect(open).toHaveAttribute('aria-busy', 'true');
+        await expect(open.locator('.b-busy .busy-spin')).toBeVisible();
+        await expect(modal.locator('#sources-bulk-go')).toHaveCount(0);
+        answer();
+        await expect(modal.locator('#sources-bulk-go')).toBeVisible();
+    });
+
+    test('A153: Settings › "Load all…" opens Sources with the link waiting while the research lists what is missing', async ({ page }) => {
+        await setup(page, { auto: false });
+        let answer: () => void = () => {};
+        const gate = new Promise<void>(r => { answer = r; });
+        await page.route(/\/excerpts\?missing=1/, async (route) => { await gate; await route.fallback(); });
+        await page.evaluate(() => window.Strom.UI.showResearchTreeSettings(window.Strom.TreeManager.getActiveTreeId()!));
+        await page.locator('.research-images #research-images-load-all').click();
+        const modal = page.locator('#sources-modal');
+        const open = modal.locator('#sources-bulk-open');
+        await expect(open).toHaveAttribute('data-busy', 'busy');
+        await expect(open).toHaveAttribute('aria-busy', 'true');
+        await expect(modal.locator('#sources-bulk-go')).toHaveCount(0);
+        answer();
+        await expect(modal.locator('#sources-bulk-go')).toBeVisible();
     });
 
     test('no row while the research is not running; back once it runs', async ({ page }) => {

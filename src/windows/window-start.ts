@@ -16,7 +16,7 @@ import { WindowBus } from './window-bus.js';
 import { WindowRegistry, dataManagerHost } from './window-registry.js';
 import { SatelliteClient } from './satellite.js';
 import { MAIN_WINDOW_NAME, newWindowId, satelliteViewMode, satelliteWindowName, tryBecomeMain, type SatelliteParams } from './window-role.js';
-import { becomeMain, writeBecomeMainMark } from './become-main.js';
+import { becomeMain, writeBecomeMainMark, type BecomeMainMark } from './become-main.js';
 import { recordReloadPoint } from '../resume-view.js';
 import { openForwardedLink, type ForwardedLink, type LinkOpenerDeps } from './window-link.js';
 import { SecondTab, renderSecondTab, removeSecondTabScreen } from './second-tab.js';
@@ -26,8 +26,16 @@ import { TreeRenderer } from '../renderer.js';
 import { ZoomPan } from '../zoom.js';
 import { PERSON_MENU_ACTION, runSatelliteResearchRow, SatelliteResearchMenu, setSatelliteResearchMenu } from './window-research-menu.js';
 import { startOverviewMain } from './overview-main.js';
+import { onOverviewChanged } from './overview-window.js';
+import { startAgentMain, type AgentMain } from './agent-main.js';
+import { setAgentStateHint } from '../ui/research-ui.js';
+import { onBridgeStatus } from '../ui/research-sync-ui.js';
+import { onDirectionPlaces } from '../research-directions-write.js';
 import type { PersonId } from '../types.js';
-import { wireMainSelection, wireSatelliteSelection, type SelectionDeps } from './window-selection.js';
+import { cardInView, wireMainSelection, wireSatelliteSelection, type MainFocusDeps, type SelectionDeps } from './window-selection.js';
+import { hideWindowNotice, showWindowNotice } from '../ui/window-notice.js';
+import { windowAgentFollow } from './agent-follow-state.js';
+import { setTableResearchForward, TABLE_BUBBLE_ACTION } from './window-table-research.js';
 import { SettingsManager } from '../settings.js';
 import type { MapKind } from '../places.js';
 import type { SatelliteKind } from './window-role.js';
@@ -60,8 +68,8 @@ const appLinkOpener: LinkOpenerDeps = {
         const tree = TreeManager.getTreeFromUrl(params);
         return tree ? { id: tree.id, researchId: tree.research?.id ?? null } : null;
     },
-    switchTree: (treeId) => UI.switchToTree(treeId),
-    externalRequest: (params) => UI.openExternalRequest(params),
+    switchTree: async (treeId) => { await UI.switchToTree(treeId); },
+    externalRequest: (params) => UI.runExternalRequest(params),
     search: (query) => UI.handleSearchResults(DataManager.searchPersons(query), query),
     deepLink: (link, matches) => UI.openDeepLink(link, matches),
     openFile: (handle) => {
@@ -98,10 +106,12 @@ export function startMainWindow(): WindowRegistry {
             redo: () => UI.performRedo(),
             // Where a satellite without a state of its own starts (its reload, another tree).
             focus: () => mainFocusNow(),
+            // Following the agent, a centre chosen in another window is only marked (spec 110 §4): the satellites say so.
+            followingAgent: () => mainFollowsAgent(),
         }),
     });
     registry.start();
-    wireMainSelection(registry, selectionDeps());
+    wireMainSelection(registry, { ...selectionDeps(), mainFocus: mainFocusDeps() });
     // The person menu's research rows of a satellite (§2, 2g): listed and run here, as this window's own menu.
     const researchItems = (personId: string) => (DataManager.getPerson(personId as PersonId) ? UI.personResearchMenuItems(personId as PersonId) : null);
     registry.setResearchMenuProvider((personId) => researchItems(personId) ?? []);
@@ -111,9 +121,15 @@ export function startMainWindow(): WindowRegistry {
         run: (a) => UI.runOverviewWindowAction(a),
         openChanged: (open) => UI.overviewWindowOpenChanged(open),
     });
+    wireAgentMain(registry);
     registry.setResearchActionHandler((action, args) => {
         if (action === PERSON_MENU_ACTION) {
             runSatelliteResearchRow(args, { items: researchItems, run: (personId, a) => UI.runPersonMenuAction(personId as PersonId, a) });
+            return;
+        }
+        // A research bubble's action of a satellite's Table (spec 097 §5): only one this window's bubble offers.
+        if (action === TABLE_BUBBLE_ACTION) {
+            UI.runForwardedTableResearchAction(args);
             return;
         }
         return overview.handle(action, args).result;
@@ -121,16 +137,83 @@ export function startMainWindow(): WindowRegistry {
     return registry;
 }
 
+/** The agent's state for the other windows (spec 097 K1.3; null: not the main window). */
+let agentMain: AgentMain | null = null;
+
+export function mainAgentState(): AgentMain | null {
+    return agentMain;
+}
+
+/**
+ * The agent's state sent to the other windows (spec 097 K1.3): after every
+ * hint of a change (the research panel drawn, the cards' research word, a
+ * bridge's status, the lines' places read, another tree), at most one post
+ * per tick; the whole state to a window that says hello or asks.
+ */
+function wireAgentMain(reg: WindowRegistry): void {
+    agentMain = startAgentMain(reg, { sections: () => UI.agentWindowState() });
+    const hint = () => agentMain?.changed();
+    setAgentStateHint(hint);
+    onOverviewChanged(hint);
+    onBridgeStatus(hint);
+    onDirectionPlaces(hint);
+    window.addEventListener('strom:tree-switched', hint);
+}
+
 /** The app's side of the shared selection (spec 079 §2). */
 function selectionDeps(): SelectionDeps {
     return {
         viewMode: () => TreeRenderer.getViewMode(),
         setTableSelectionShare: (share) => UI.setTableSelectionShare(share),
-        tableSharedSelect: (id) => UI.tableSharedSelect(id),
+        tableSharedSelect: (id, scroll) => UI.tableSharedSelect(id, scroll),
         setWindowSelected: (id) => TreeRenderer.setWindowSelected(id),
         glideTo: (id) => { ZoomPan.glideToPerson(id); },
         reveal: (id) => TreeRenderer.revealWindowSelected(id),
         recenter: (id) => recenterOn(id),
+    };
+}
+
+/** The main window follows the research agent now (spec 097 §4): following on and not paused here. */
+function mainFollowsAgent(): boolean {
+    return UI.liveFollowView() !== null && !UI.liveFollowPausedHere();
+}
+
+/**
+ * A centre chosen in another window (spec 110 §3): as the card's Focus, in
+ * the view shown (Descendants stays Descendants, its new root); stored as
+ * the tree's last focus as the card's Focus stores it. The Timeline and the
+ * Map bring the person into view, the Table selects their row.
+ */
+function focusFromWindow(id: PersonId, history: 'push' | 'replace'): void {
+    const mode = TreeRenderer.getViewMode();
+    const reveal = mode === 'timeline' ? (pid: PersonId) => TreeRenderer.revealTimelinePerson(pid)
+        : mode === 'map' ? (pid: PersonId) => UI.revealMapPerson(pid)
+        : undefined;
+    void TreeRenderer.setFocus(id, true, reveal, { history }).then(() => {
+        if (TreeRenderer.getViewMode() === 'table') UI.tableSharedSelect(id, true);
+    });
+}
+
+/** The app's side of a centre chosen in another window (spec 110 §2–§7). */
+function mainFocusDeps(): MainFocusDeps {
+    return {
+        focusId: () => TreeRenderer.getFocusPersonId(),
+        exists: (id) => !!DataManager.getPerson(id),
+        // Hidden here (§7): the main window's Table leaves the person out (its filter, search or list).
+        // The charts hide no one (privacy hides only in an export).
+        hidden: (id) => UI.tableHidesPerson(id),
+        followingAgent: () => mainFollowsAgent(),
+        focus: (id, history) => focusFromWindow(id, history),
+        showNotice: (n, announce, actions) => showWindowNotice(n, announce, actions),
+        hideNotice: () => hideWindowNotice(),
+        drawn: (id) => {
+            const mode = TreeRenderer.getViewMode();
+            if (mode === 'family' || mode === 'descendants') return cardInView(document, id) !== null;
+            if (mode === 'fan') return TreeRenderer.getFanView()?.hasPerson(id) ?? null;
+            return null;
+        },
+        back: () => { void TreeRenderer.goBack(); },
+        goTo: (id) => { void TreeRenderer.setFocus(id); },
     };
 }
 
@@ -151,11 +234,19 @@ function recenterOn(id: PersonId): boolean {
     return true;
 }
 
-/** A satellite's side of the shared selection (spec 079 §2). */
+/** A satellite's side of the shared selection (spec 079 §2); following the agent, another window's choice is only marked (spec 097 §4). */
 export function startSatelliteSelection(client: SatelliteClient): void {
-    wireSatelliteSelection(client, selectionDeps());
+    wireSatelliteSelection(client, { ...selectionDeps(), agentAttached: () => windowAgentFollow() === 'attached' });
     // The person menu's research rows come from the main window and run there (§2, 2g).
     setSatelliteResearchMenu(new SatelliteResearchMenu(client));
+    // So do the research actions of the Table's bubbles (spec 097 §5).
+    setTableResearchForward({
+        mainOpen: () => client.connection === 'connected',
+        run: (args, focusMain) => {
+            client.researchAction(TABLE_BUBBLE_ACTION, args);
+            if (focusMain) void client.requestMainFocus();
+        },
+    });
 }
 
 /** A launch as launchQueue hands it over. */
@@ -247,8 +338,8 @@ export function showSecondTab(startSatellite: (params: SatelliteParams) => void)
  * the mark (the new page tries again for the lock a moment), the reload point
  * and the Table's state of a satellite, its address without `okno=`.
  */
-function prepareMainStart(opts: { tree: string | null; search?: string | null; table?: unknown }): void {
-    writeBecomeMainMark({ tree: opts.tree, ...(opts.table !== undefined ? { table: opts.table } : {}), at: Date.now() });
+function prepareMainStart(opts: { tree: string | null; search?: string | null; table?: unknown; live?: BecomeMainMark['live'] }): void {
+    writeBecomeMainMark({ tree: opts.tree, ...(opts.table !== undefined ? { table: opts.table } : {}), ...(opts.live ? { live: opts.live } : {}), at: Date.now() });
     try {
         const url = new URL(window.location.href);
         if (opts.search) url.search = opts.search;
@@ -256,6 +347,16 @@ function prepareMainStart(opts: { tree: string | null; search?: string | null; t
         url.hash = '';
         history.replaceState(null, '', url.toString());
     } catch { /* the address stays */ }
+}
+
+/** What a satellite writes before it starts again as the main window: its view (the reload point), its Table, the mark. */
+function prepareSatelliteMain(client: SatelliteClient, kind: SatelliteParams['kind'], live?: BecomeMainMark['live']): void {
+    const tree = client.treeId;
+    const view = satelliteViewMode(kind);
+    // The reload point needs a person: the focus, else the first one of the tree (the Table keeps its own row).
+    const person = TreeRenderer.getFocusPersonId() ?? DataManager.getAllPersons().find(p => !p.isPlaceholder)?.id ?? null;
+    if (tree && person) recordReloadPoint({ tree, person, view });
+    prepareMainStart({ tree, table: view === 'table' ? UI.tableWindowState() : undefined, live });
 }
 
 /**
@@ -269,13 +370,27 @@ export function makeSatelliteMain(client: SatelliteClient, kind: SatelliteParams
     return becomeMain({
         tryLock: () => tryBecomeMain(),
         prepare: () => {
-            const tree = client.treeId;
-            const view = satelliteViewMode(kind);
-            // The reload point needs a person: the focus, else the first one of the tree (the Table keeps its own row).
-            const person = TreeRenderer.getFocusPersonId() ?? DataManager.getAllPersons().find(p => !p.isPlaceholder)?.id ?? null;
-            if (tree && person) recordReloadPoint({ tree, person, view });
             try { sessionStorage.removeItem('strom.live'); } catch { /* no storage */ }
-            prepareMainStart({ tree, table: view === 'table' ? UI.tableWindowState() : undefined });
+            prepareSatelliteMain(client, kind);
+        },
+        restart: () => window.location.reload(),
+    });
+}
+
+/**
+ * Taking over after the main window closed while it followed a research
+ * (spec 097 §7): as "Make this the main window", with the research followed
+ * in the mark (the new main window follows it again, ◎ as it was); the
+ * session's copy (`strom.live`) is not removed here, the new main window
+ * writes it anew from the bridge address stored in this browser.
+ * `locked`: the lock is held, before the reload.
+ */
+export function takeOverAsMain(client: SatelliteClient, kind: SatelliteParams['kind'], live: NonNullable<BecomeMainMark['live']>, locked: () => void): Promise<boolean> {
+    return becomeMain({
+        tryLock: () => tryBecomeMain(),
+        prepare: () => {
+            locked();
+            prepareSatelliteMain(client, kind, live);
         },
         restart: () => window.location.reload(),
     });

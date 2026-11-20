@@ -3,6 +3,14 @@
  * see src/ui/module.ts for the composition pattern.
  */
 
+import { runTreeSwitch } from './tree-switch-busy.js';
+import { activatedElement, busyLocal, busyStep, busyToast, clearBusyMessage, isBusy, runBusy, runHeavy, showBusyMessage } from './busy.js';
+import { runInParts } from './in-parts.js';
+import { canvasBusy } from './canvas-busy.js';
+import { holdLeave } from './busy-leave.js';
+import { openFilePicker, takePickOrigin, readPickedFile, FileUnreadableError, looksLikeGedcom, paintBeforeParse, fileReadStep } from './file-pick.js';
+import type { FollowSwitchFrom } from './research-follow-ui.js';
+import { allMedia } from '../media.js';
 import type { PrivacyMode, ContentOptions } from '../privacy.js';
 import { noteExportAll } from '../research-device.js';
 import { DataManager, auditPersonName, storedTreeForExport } from '../data.js';
@@ -29,15 +37,16 @@ import { strings } from '../strings.js';
 import { extractSubtree } from '../subtree.js';
 import { findComponents } from '../components.js';
 import { compressPhoto, dataUrlByteSize } from '../photo.js';
-import { compressImageAttachment, readFileAsDataUrl, MAX_PDF_BYTES, countImages, stripMedia } from '../attachments.js';
+import { compressImageAttachment, readFileAsDataUrl, countImages, stripMedia } from '../attachments.js';
 import { getDemoTree, DEMO_FOCUS } from '../demo-tree.js';
 import { demoImageMaker } from '../demo-images.js';
 import {
-    parseGedcom, convertToStrom, decodeGedcomBytes, GedcomConversionResult, GedcomEncoding, GEDCOM_ENCODING_CHOICES,
+    parseGedcomSteps, convertToStromSteps, decodeGedcomBytes, GedcomConversionResult, GedcomEncoding, GEDCOM_ENCODING_CHOICES,
     gedcomSampleNames, GedcomImportOrigin,
 } from '../ged-parser.js';
 import { createSha256 } from '../sha256.js';
-import { dropMediaLink, localIsoDay } from '../import-origin.js';
+import { localIsoDay } from '../import-origin.js';
+import { attachGedcomMediaFile, gedcomMediaAttachedText, GedcomMediaAttached, GedcomMediaTarget } from '../ged-media-attach.js';
 import { importProgramName } from '../import-next.js';
 
 /**
@@ -56,7 +65,7 @@ export interface AfterImportOptions {
 import {
     validateJsonImport,
     ValidationResult,
-    MergerUI,
+    MergerUI, mergeAnalysisLong,
     getCurrentMergeInfo,
     listMergeSessionsInfo,
     deleteMergeSession,
@@ -65,7 +74,7 @@ import {
 import { PersonPicker } from '../person-picker.js';
 import { AppExporter } from '../export.js';
 import { SettingsManager } from '../settings.js';
-import { ThemeMode, LanguageSetting, AppMode, AuditLog, uniqueIdSuffix } from '../types.js';
+import { ThemeMode, LanguageSetting, AppMode, AuditLog } from '../types.js';
 import { CryptoSession, isEncrypted, encrypt, decrypt, EncryptedData, classifyCryptoError, CryptoFailure } from '../crypto.js';
 import { cryptoErrorText, cryptoFailureText, resetPasswordError } from '../crypto-errors.js';
 import { validateTreeData, ValidationResult as TreeValidationResult, ValidationIssue } from '../validation.js';
@@ -75,6 +84,30 @@ import { uiModule } from './module.js';
 import { safeFileName } from '../filenames.js';
 import { isMultiTreeBackup, readEmbeddedHtml, readWindowAssignment, BackupTrees, BackupTreeEntry } from '../backup-formats.js';
 import { viewLinksPayload } from '../view-links.js';
+import type { PersonList } from '../types.js';
+import { listDisplayName, listKind } from '../person-lists.js';
+import { listKindIcon } from './list-kind-icon.js';
+
+/** A list the export dialog's list scope offers (spec 084 §12): one with people. */
+interface ExportableList { list: PersonList; count: number }
+
+/** The active tree's lists with people, by name. */
+function exportableLists(): ExportableList[] {
+    return DataManager.getPersonLists()
+        .map(list => ({ list, count: DataManager.getPersonListIds(list.id).length }))
+        .filter(l => l.count > 0)
+        .sort((a, b) => listDisplayName(a.list).localeCompare(listDisplayName(b.list)));
+}
+
+/**
+ * §8 C52/C53: a GEDCOM text read and converted in parts, the page let go every 40 ms; `people` hears the people
+ * found so far ("Loading family.ged… 2,400 people").
+ */
+async function readGedcomInParts(text: string, importOrigin: GedcomImportOrigin, people: (n: number) => void): Promise<GedcomConversionResult> {
+    const parsed = await runInParts(parseGedcomSteps(text), { onStep: s => people(s.people) });
+    people(parsed.individuals.size);
+    return runInParts(convertToStromSteps(parsed, { importOrigin }), { onStep: s => people(s.people) });
+}
 
 export const importExportMethods = uiModule({
     // ---- EXPORT/IMPORT DIALOGS ----
@@ -124,30 +157,44 @@ export const importExportMethods = uiModule({
     },
 
     /**
-     * The export dialog's "Whole tree · Current view only (N people)" switch
-     * (remembered). The view exists for the active tree only, and only when
-     * it shows anyone (the fan / timeline views lay out no people); in the
-     * view scope the formats that cannot export a view are disabled.
+     * The export dialog's "Whole tree · Current view only (N people) · List
+     * of people" switch (remembered). The view exists for the active tree
+     * only, and only when it shows anyone (the fan / timeline views lay out
+     * no people); the list scope (spec 084 §12) only when the active tree has
+     * a list with people, its list chosen below the switch. In the view and
+     * list scopes the formats that cannot export them are disabled.
      */
     renderExportScope(): void {
         const modal = document.getElementById('export-modal');
         if (!modal) return;
         const isActive = this.exportTargetTreeId === TreeManager.getActiveTreeId();
         const count = isActive ? TreeRenderer.getVisiblePersonIds().size : 0;
-        const scope = count > 0 ? SettingsManager.getExportScope() : 'tree';
+        const lists = isActive ? exportableLists() : [];
+        let scope = SettingsManager.getExportScope();
+        if (scope === 'view' && count === 0) scope = 'tree';
+        const listId = SettingsManager.getExportListId();
+        const list = lists.find(l => l.list.id === listId) ?? null;
+        // A remembered list that is gone (another tree, deleted, empty): the whole tree.
+        if (scope === 'list' && !list) scope = 'tree';
         modal.classList.toggle('scope-view', scope === 'view');
+        modal.classList.toggle('scope-list', scope === 'list');
         const viewBtn = document.getElementById('export-scope-view') as HTMLButtonElement | null;
         if (viewBtn) {
             viewBtn.textContent = strings.exportMenu.scopeView(count);
             viewBtn.disabled = count === 0;
         }
+        const listBtn = document.getElementById('export-scope-list') as HTMLButtonElement | null;
+        if (listBtn) listBtn.hidden = lists.length === 0;
         modal.querySelectorAll<HTMLButtonElement>('.export-scope .segment-btn').forEach(btn => {
             const on = btn.dataset.scope === scope;
             btn.classList.toggle('active', on);
             btn.setAttribute('aria-checked', String(on));
         });
+        this.renderExportListPick(scope === 'list' ? lists : [], list?.list.id ?? null);
         modal.querySelectorAll<HTMLButtonElement>('.menu-options .menu-option').forEach(option => {
-            if (option.hasAttribute('data-view-ok')) return;
+            const viewOk = option.hasAttribute('data-view-ok');
+            const listOk = option.hasAttribute('data-list-ok');
+            if (viewOk && listOk) return;
             const text = option.querySelector('.option-text');
             let note = text?.querySelector('.option-scope-note');
             if (text && !note) {
@@ -156,24 +203,97 @@ export const importExportMethods = uiModule({
                 text.appendChild(note);
             }
             if (note) note.textContent = strings.exportMenu.scopeWholeOnly;
-            option.disabled = scope === 'view';
+            option.disabled = (scope === 'view' && !viewOk) || (scope === 'list' && !listOk);
         });
         // The view's people without anyone seen only through a link shown in the view.
         this.renderViewLinksNote(document.getElementById('export-scope'), isActive && scope === 'view');
     },
 
-    setExportScope(scope: 'tree' | 'view'): void {
+    /** The list choice under the switch (spec 084 §12): the kind's icon, "name · N people"; hidden outside the list scope. */
+    renderExportListPick(lists: ExportableList[], chosen: string | null): void {
+        const box = document.getElementById('export-list-pick');
+        const select = document.getElementById('export-list-select') as HTMLSelectElement | null;
+        if (!box || !select) return;
+        box.hidden = !lists.length;
+        if (!lists.length) return;
+        select.replaceChildren(...lists.map(l => {
+            const o = document.createElement('option');
+            o.value = l.list.id;
+            o.textContent = `${listDisplayName(l.list)} · ${strings.lists.persons(l.count)}`;
+            return o;
+        }));
+        const on = lists.find(l => l.list.id === chosen) ?? lists[0];
+        select.value = on.list.id;
+        const icon = document.getElementById('export-list-kind');
+        if (icon) icon.innerHTML = listKindIcon(listKind(on.list), 16);
+    },
+
+    setExportScope(scope: 'tree' | 'view' | 'list'): void {
+        // The list scope starts on the remembered list, else the first one.
+        if (scope === 'list') {
+            const lists = exportableLists();
+            if (!lists.length) return;
+            const id = SettingsManager.getExportListId();
+            if (!lists.some(l => l.list.id === id)) SettingsManager.setExportListId(lists[0].list.id);
+        }
         SettingsManager.setExportScope(scope);
         this.renderExportScope();
     },
 
-    /** The export dialog's JSON backup: the whole tree, or only the people the view shows. */
+    /** The list of the list scope (spec 084 §12), remembered. */
+    setExportList(id: string): void {
+        if (!exportableLists().some(l => l.list.id === id)) return;
+        SettingsManager.setExportListId(id);
+        SettingsManager.setExportScope('list');
+        this.renderExportScope();
+    },
+
+    /**
+     * The export dialog opened on a list (⋯ of a list › Export › GEDCOM…,
+     * spec 084 §12): the list scope with the list chosen.
+     */
+    showExportDialogForList(listId: string): void {
+        if (!exportableLists().some(l => l.list.id === listId)) return;
+        SettingsManager.setExportListId(listId);
+        SettingsManager.setExportScope('list');
+        this.showExportDialog();
+    },
+
+    /**
+     * The list the export dialog exports now (its list scope), with its
+     * people in the list's order; null: the whole tree or the view.
+     */
+    exportScopeList(): { list: PersonList; ids: PersonId[] } | null {
+        const modal = document.getElementById('export-modal');
+        if (!modal?.classList.contains('active') || !modal.classList.contains('scope-list')) return null;
+        const id = SettingsManager.getExportListId();
+        const list = id ? DataManager.getPersonList(id) : undefined;
+        if (!list) return null;
+        const ids = DataManager.getPersonListIds(list.id).filter(pid => !!DataManager.getData().persons[pid]);
+        return ids.length ? { list, ids } : null;
+    },
+
+    /** The export dialog's JSON backup: the whole tree, only the people the view shows, or the list's (spec 084 §12). */
     exportBackupFromDialog(): void {
-        if (document.getElementById('export-modal')?.classList.contains('scope-view')) {
+        const scoped = this.exportScopeList();
+        if (scoped) {
+            void this.exportPersonListJSON(scoped.list, scoped.ids);
+        } else if (document.getElementById('export-modal')?.classList.contains('scope-view')) {
             void this.exportFocusedJSON();
         } else {
             void this.exportTargetTreeJSON();
         }
+    },
+
+    /** The JSON backup of a list's people (the tree's data narrowed to them, spec 084 §12). */
+    async exportPersonListJSON(list: PersonList, ids: PersonId[]): Promise<void> {
+        this.closeExportDialog();
+        const treeName = TreeManager.getTreeMetadata(TreeManager.getActiveTreeId() as TreeId)?.name;
+        const file = `${safeFileName(treeName, 'family-tree')}-${safeFileName(listDisplayName(list), 'list')}.json`;
+        this.showExportPasswordDialog(async (password: string | null) => {
+            await DataManager.exportFocusedJSON(new Set(ids), password, this.readExportPrivacyMode(), this.readExportContentOptions(), file);
+            return file;
+        }, false, { format: 'json' });
     },
 
     /**
@@ -211,7 +331,7 @@ export const importExportMethods = uiModule({
 
         const name = TreeManager.getTreeMetadata(treeId)?.name ?? '';
         this.showExportPasswordDialog(async (password: string | null) => {
-            await DataManager.exportTreeJSON(treeId, password, this.readExportPrivacyMode(), this.readExportContentOptions());
+            return await DataManager.exportTreeJSON(treeId, password, this.readExportPrivacyMode(), this.readExportContentOptions());
         }, false, quick ? { quick: { hint: strings.fileCopy.quickHint(name) } } : { format: 'json', treeId });
     },
 
@@ -246,6 +366,8 @@ export const importExportMethods = uiModule({
             this.closeExportDialog();
             return;
         }
+        // The dialog's list scope (spec 084 §12): the list's people and the families between them.
+        const scoped = this.exportScopeList();
         this.closeExportDialog();
 
         // GEDCOM cannot be encrypted, so show the export dialog in passwordless
@@ -254,9 +376,10 @@ export const importExportMethods = uiModule({
         this.showExportPasswordDialog(async () => {
             const { exportToGedcom } = await import('../ged-exporter.js');
             const { applyLivingPrivacy } = await import('../privacy.js');
-            const data = await storedTreeForExport(treeId);
+            const stored = await storedTreeForExport(treeId);
             const metadata = TreeManager.getTreeMetadata(treeId);
-            if (!data) return;
+            if (!stored) return;
+            const data: StromData = scoped ? { version: stored.version, ...extractSubtree(stored, new Set(scoped.ids)) } : stored;
 
             const { isFaithfulExport } = await import('../research-link.js');
             const { resolveContentOptions } = await import('../privacy.js');
@@ -281,10 +404,14 @@ export const importExportMethods = uiModule({
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `${safeFileName(metadata?.name, 'family-tree')}.ged`;
+            a.download = scoped
+                ? `${safeFileName(metadata?.name, 'family-tree')}-${safeFileName(listDisplayName(scoped.list), 'list')}.ged`
+                : `${safeFileName(metadata?.name, 'family-tree')}.ged`;
             a.click();
             URL.revokeObjectURL(url);
-            if (privacy === 'full') TreeManager.noteFileCopy([treeId]);
+            // The file carries the photos and attachments only when the content kept them (embedded).
+            if (privacy === 'full' && !scoped) TreeManager.noteFileCopy([treeId], content.photos && content.attachments ? { [treeId]: filtered } : undefined);
+            return a.download;
         }, false, { defaultPrivacy: 'initials', passwordless: true, content: true, format: 'gedcom', treeId, gedcomPurpose: opts.preset === 'back' ? 'back' : 'share' });
     },
 
@@ -316,6 +443,7 @@ export const importExportMethods = uiModule({
             a.download = `${safeFileName(metadata?.name, 'family-tree')}.csv`;
             a.click();
             URL.revokeObjectURL(url);
+            return a.download;
         }, false, { defaultPrivacy: 'full', passwordless: true, format: 'csv' });
     },
 
@@ -357,6 +485,7 @@ export const importExportMethods = uiModule({
         this.showExportPasswordDialog(async (password: string | null) => {
             const visibleIds = TreeRenderer.getVisiblePersonIds();
             await DataManager.exportFocusedJSON(visibleIds, password, this.readExportPrivacyMode(), this.readExportContentOptions());
+            return 'family-tree-focus.json';
         }, false, { format: 'json' });
     },
 
@@ -405,6 +534,8 @@ export const importExportMethods = uiModule({
     handleGedcomFile(event: Event): void {
         const input = event.target as HTMLInputElement;
         const file = input.files?.[0];
+        // The element that opened the system dialog carries the reading (9a); a file handed in otherwise has none.
+        const origin = takePickOrigin(input);
         if (!file) return;
 
         // Snapshot the import intent NOW: manager / empty-state paths set their
@@ -414,34 +545,59 @@ export const importExportMethods = uiModule({
         // resolves (input.value reset below would otherwise not matter).
         const fromManager = this.importFromTreeManager;
         const toCurrent = this.importToCurrentTree;
-
-        const reader = new FileReader();
-        reader.onload = (e) => {
-            try {
-                // Raw bytes, not readAsText: the file's own HEAD > CHAR (or, for
-                // ANSI, its bytes) decides the encoding; the summary offers another.
-                const buffer = e.target?.result as ArrayBuffer;
-                const decoding = decodeGedcomBytes(buffer);
-                const sha = createSha256();
-                sha.update(new Uint8Array(buffer));
-                this.gedcomFileInfo = { name: file.name, sha: sha.digestHex(), at: localIsoDay() };
-                this.gedcomResult = convertToStrom(parseGedcom(decoding.text),
-                    { importOrigin: this.gedcomImportOrigin(decoding.encoding) });
-                this.gedcomRawBuffer = buffer;
-                this.gedcomDecoding = decoding;
-                this.gedcomImportImages = null;
-                this.importFromTreeManager = fromManager;
-                this.importToCurrentTree = toCurrent;
-                this.showGedcomResultDialog();
-            } catch (error) {
-                this.showAlert(strings.gedcom.parseError, 'error');
-                console.error('GEDCOM parse error:', error);
-            }
-        };
-        reader.readAsArrayBuffer(file);
-
         // Reset input so same file can be re-imported
         input.value = '';
+
+        void (async () => {
+            const got = await readPickedFile(origin, file, async ctl => {
+                // Raw bytes, not readAsText: the file's own HEAD > CHAR (or, for
+                // ANSI, its bytes) decides the encoding; the summary offers another.
+                const buffer = await file.arrayBuffer();
+                const decoding = decodeGedcomBytes(buffer);
+                // Not a GEDCOM at all: said at the element, never an empty tree made of it (9a).
+                if (!looksLikeGedcom(decoding.text)) throw new FileUnreadableError();
+                const sha = createSha256();
+                sha.update(new Uint8Array(buffer));
+                // The import's record (file, hash, day) is read by gedcomImportOrigin during the conversion.
+                this.gedcomFileInfo = { name: file.name, sha: sha.digestHex(), at: localIsoDay() };
+                // §8 C52: read in parts, the page let go between them, the people found so far in the state.
+                const result = await readGedcomInParts(decoding.text, this.gedcomImportOrigin(decoding.encoding), ctl.people);
+                ctl.people(result.stats.totalPersons);
+                return { buffer, decoding, info: this.gedcomFileInfo, result };
+            }, () => { this.importFromTreeManager = fromManager; this.importToCurrentTree = toCurrent; openFilePicker(input, origin); });
+            if (!got) return;
+            this.gedcomFileInfo = got.info;
+            this.gedcomResult = got.result;
+            this.gedcomRawBuffer = got.buffer;
+            this.gedcomDecoding = got.decoding;
+            this.gedcomImportImages = null;
+            this.importFromTreeManager = fromManager;
+            this.importToCurrentTree = toCurrent;
+            this.leavePickDialog();
+            this.showGedcomResultDialog();
+        })();
+    },
+
+    /**
+     * The menu dialog a file was picked from (Import, New tree, Import from a
+     * file) stays open while the system dialog is open and the file is read
+     * (9a: a choice called off leaves it as it was, an unreadable file is said
+     * there); it goes once the file is read, as its opening did before.
+     */
+    leavePickDialog(): void {
+        const active = (id: string): boolean => !!document.getElementById(id)?.classList.contains('active');
+        if (active('import-modal')) this.closeImportDialog();
+        if (active('import-file-modal')) this.closeImportFileDialog();
+        if (active('new-tree-menu-modal')) {
+            // Into the import, the tree manager stays the dialog to come back to.
+            document.getElementById('new-tree-menu-modal')?.classList.remove('active');
+            if (this.dialogStack[this.dialogStack.length - 1] === 'new-tree-menu-modal') this.dialogStack.pop();
+        }
+    },
+
+    /** One of the import inputs opened for the element of this click (the dialog it is in stays, 9a). */
+    pickImportFile(inputId: 'file-input' | 'gedcom-input' | 'html-input'): void {
+        openFilePicker(document.getElementById(inputId) as HTMLInputElement | null);
     },
 
     showGedcomResultDialog(): void {
@@ -550,7 +706,13 @@ export const importExportMethods = uiModule({
         const mediaText = document.getElementById('gedcom-media-text');
         const pending = this.gedcomResult.externalMedia.length;
         if (mediaRow) mediaRow.style.display = pending > 0 && this.gedcomImportImages !== false ? '' : 'none';
-        if (mediaText && pending > 0) mediaText.textContent = strings.gedcom.externalMedia(pending);
+        // Couples' photos among them (spec 107): the sentence says how many are whose.
+        const onCouples = this.gedcomResult.externalMedia.filter(r => r.partnershipId).length;
+        if (mediaText && pending > 0) {
+            mediaText.textContent = onCouples > 0
+                ? strings.gedcom.externalMediaSplit(pending, pending - onCouples, onCouples)
+                : strings.gedcom.externalMedia(pending);
+        }
         // Platform exports (MyHeritage) reference photos by URL — offer a
         // direct download (their CDN allows cross-origin GET).
         const downloadBtn = document.getElementById('gedcom-media-download');
@@ -594,79 +756,60 @@ export const importExportMethods = uiModule({
      * Mutates the in-memory conversion result — every import path (new tree /
      * merge / insert) then carries the media along.
      */
+    /** "Attach media files…": the system's dialog with nothing shown, the button only guarded (§9). */
+    pickGedcomMedia(): void {
+        openFilePicker(document.getElementById('gedcom-media-input') as HTMLInputElement | null);
+    },
+
     async attachGedcomMedia(files: FileList | null): Promise<void> {
+        // The button that opened the dialog carries the attaching (each image compressed): "Loading <name>… k of n".
+        const origin = takePickOrigin(document.getElementById('gedcom-media-input') as HTMLInputElement | null);
         if (!this.gedcomResult || !files || files.length === 0) return;
         const byName = new Map<string, File>();
         for (const f of Array.from(files)) byName.set(f.name.toLowerCase(), f);
 
         const refs = this.gedcomResult.externalMedia;
         const total = refs.length;
-        let matched = 0;
+        const became = new Map<GedcomMediaAttached, number>();
         const remaining: typeof refs = [];
 
-        for (const ref of refs) {
-            const file = byName.get(ref.fileName.toLowerCase());
-            if (!file || !(await this.attachFileToGedcomRef(ref, file))) {
-                remaining.push(ref);
-                continue;
+        const attachAll = async (step: (text: string) => void): Promise<void> => {
+            const todo = refs.filter(r => byName.has(r.fileName.toLowerCase())).length;
+            let k = 0;
+            for (const ref of refs) {
+                const file = byName.get(ref.fileName.toLowerCase());
+                if (file) step(`${strings.busy.loadingFile(file.name)} ${strings.busy.kOfN(++k, todo)}`);
+                const kind = file ? await this.attachFileToGedcomRef(ref, file) : null;
+                if (!kind) {
+                    remaining.push(ref);
+                    continue;
+                }
+                became.set(kind, (became.get(kind) ?? 0) + 1);
             }
-            matched++;
-        }
+        };
+        if (origin) await runBusy(origin, ctl => attachAll(t => ctl.step(t)), { label: strings.busy.generic, kind: 'local' });
+        else await attachAll(() => undefined);
+        const matched = [...became.values()].reduce((a, b) => a + b, 0);
         // Fix attachment sizes from data URLs (compression changed them).
-        for (const person of Object.values(this.gedcomResult.data.persons)) {
-            for (const att of person.attachments ?? []) {
-                if (!att.sizeBytes && !att.originalOnly) att.sizeBytes = dataUrlByteSize(att.dataUrl);
-            }
+        for (const att of allMedia(this.gedcomResult.data)) {
+            if (!att.sizeBytes && !att.originalOnly) att.sizeBytes = dataUrlByteSize(att.dataUrl);
         }
 
         this.gedcomResult.externalMedia = remaining;
         // Files brought in by hand are images wanted in this import.
         if (matched > 0) this.gedcomImportImages = true;
         this.showToast(matched > 0
-            ? strings.gedcom.mediaAttached(matched, total)
+            ? gedcomMediaAttachedText(became, total)
             : strings.gedcom.mediaNoMatch);
         this.showGedcomResultDialog();   // refresh tiles + media row
     },
 
-    /** Attach one picked/downloaded file to the person of a media ref. */
-    async attachFileToGedcomRef(ref: { personId: PersonId; title?: string; date?: string; filePath?: string }, file: File): Promise<boolean> {
-        const person = this.gedcomResult?.data.persons[ref.personId];
-        if (!person) return false;
-        // The picture's date from the file goes with it (spec 066 G8).
-        const date = ref.date ? { date: ref.date } : {};
-        try {
-            if (file.type.startsWith('image/')) {
-                if (!person.photo) {
-                    person.photo = await compressPhoto(file);
-                    person.photoOriginalName = file.name;
-                    if (ref.date) person.photoDate = ref.date;
-                } else {
-                    (person.attachments ??= []).push({
-                        id: `att_${Date.now()}_${uniqueIdSuffix()}`,
-                        name: ref.title || file.name,
-                        mimeType: 'image/jpeg',
-                        dataUrl: await compressImageAttachment(file),
-                        sizeBytes: 0,
-                        ...date,
-                    });
-                }
-            } else if (file.type === 'application/pdf' && file.size <= MAX_PDF_BYTES) {
-                (person.attachments ??= []).push({
-                    id: `att_${Date.now()}_${uniqueIdSuffix()}`,
-                    name: ref.title || file.name,
-                    mimeType: 'application/pdf',
-                    dataUrl: await readFileAsDataUrl(file),
-                    sizeBytes: file.size,
-                    ...date,
-                });
-            } else {
-                return false;
-            }
-            if (ref.filePath) dropMediaLink(person, ref.filePath);
-            return true;
-        } catch {
-            return false;
-        }
+    /** Attach one picked/downloaded file to the person or couple of a media ref (what it became, or null). */
+    async attachFileToGedcomRef(ref: GedcomMediaTarget, file: File): Promise<GedcomMediaAttached | null> {
+        if (!this.gedcomResult) return null;
+        return attachGedcomMediaFile(this.gedcomResult.data, ref, file, {
+            portrait: compressPhoto, image: compressImageAttachment, raw: readFileAsDataUrl,
+        });
     },
 
     /**
@@ -680,33 +823,43 @@ export const importExportMethods = uiModule({
         if (urlRefs.length === 0) return;
 
         const btn = document.getElementById('gedcom-media-download') as HTMLButtonElement | null;
-        if (btn) btn.disabled = true;
-        let done = 0, ok = 0;
+        if (btn && isBusy(btn)) return;
+        let ok = 0;
+        const became = new Map<GedcomMediaAttached, number>();
         const succeeded = new Set<(typeof refs)[number]>();
-        for (const ref of urlRefs) {
-            done++;
-            if (btn) btn.textContent = strings.gedcom.downloading(done, urlRefs.length);
-            try {
-                const resp = await fetch(ref.filePath);
-                if (!resp.ok) continue;
-                const blob = await resp.blob();
-                const type = blob.type || 'image/jpeg';
-                const file = new File([blob], ref.fileName, { type });
-                if (await this.attachFileToGedcomRef(ref, file)) {
-                    succeeded.add(ref);
-                    ok++;
-                }
-            } catch { /* expired link, offline, CORS — ref stays offered */ }
+        // The button's working state (§2): "Downloading photos… k/n" as its words; its own label again at the end.
+        const downloadAll = async (step: (text: string) => void): Promise<void> => {
+            let done = 0;
+            for (const ref of urlRefs) {
+                step(strings.gedcom.downloading(++done, urlRefs.length));
+                try {
+                    const resp = await fetch(ref.filePath);
+                    if (!resp.ok) continue;
+                    const blob = await resp.blob();
+                    const type = blob.type || 'image/jpeg';
+                    const file = new File([blob], ref.fileName, { type });
+                    const kind = await this.attachFileToGedcomRef(ref, file);
+                    if (kind) {
+                        succeeded.add(ref);
+                        became.set(kind, (became.get(kind) ?? 0) + 1);
+                        ok++;
+                    }
+                } catch { /* expired link, offline, CORS — ref stays offered */ }
+            }
+        };
+        if (btn && btn.isConnected) {
+            await runBusy(btn, ctl => downloadAll(t => ctl.step(t)),
+                { label: strings.gedcom.downloading(1, urlRefs.length), kind: 'local' });
+        } else {
+            await downloadAll(() => undefined);
         }
-        // Its own label again ("Downloading photos… 1/1" stood after a failed download); the links not downloaded stay offered.
-        if (btn) { btn.disabled = false; btn.textContent = strings.gedcom.downloadMedia; }
 
         this.gedcomResult.externalMedia = refs.filter(r => !succeeded.has(r));
         // The photos go into the import, not yet into the tree: no "Undo" of an earlier change rides in this message.
         this.dismissUndoToast();
         if (ok > 0) this.gedcomImportImages = true;
         this.showToast(ok > 0
-            ? strings.gedcom.mediaAttached(ok, urlRefs.length)
+            ? gedcomMediaAttachedText(became, urlRefs.length)
             : strings.gedcom.mediaDownloadFailed(urlRefs.length));
         this.showGedcomResultDialog();
     },
@@ -749,21 +902,46 @@ export const importExportMethods = uiModule({
     },
 
     /** Re-read the GEDCOM file of the summary in another encoding and show the summary again. */
-    setGedcomEncoding(encoding: string): void {
-        if (!this.gedcomRawBuffer || !(GEDCOM_ENCODING_CHOICES as readonly string[]).includes(encoding)) return;
-        try {
-            const decoding = decodeGedcomBytes(this.gedcomRawBuffer, encoding as GedcomEncoding);
-            // The import record says which encoding the file was read in: this one now.
-            const result = convertToStrom(parseGedcom(decoding.text),
-                { importOrigin: this.gedcomImportOrigin(decoding.encoding) });
-            this.gedcomDecoding = decoding;
-            this.gedcomResult = result;
-        } catch (error) {
-            this.showAlert(strings.gedcom.parseError, 'error');
-            console.error('GEDCOM parse error:', error);
+    async setGedcomEncoding(encoding: string): Promise<void> {
+        const buffer = this.gedcomRawBuffer;
+        if (!buffer || !(GEDCOM_ENCODING_CHOICES as readonly string[]).includes(encoding)) return;
+        const select = document.getElementById('gedcom-encoding-select') as HTMLSelectElement | null;
+        // One reading at a time: a choice made meanwhile goes back to the one being read.
+        if (select?.getAttribute('aria-busy') === 'true') {
+            select.value = this.gedcomEncodingReading ?? select.value;
             return;
         }
-        this.showGedcomResultDialog();
+        // C53, §8: the file read again in parts; the select locked (its focus kept) with the step under it
+        // ("Loading family.ged… 2,400 people", seen after 120 ms).
+        const name = this.gedcomFileInfo?.name ?? '';
+        if (select) clearBusyMessage(select);
+        const step = select ? busyStep(select, fileReadStep(name)) : null;
+        select?.setAttribute('aria-busy', 'true');
+        select?.setAttribute('aria-disabled', 'true');
+        this.gedcomEncodingReading = encoding;
+        let ok = false;
+        try {
+            const decoding = decodeGedcomBytes(buffer, encoding as GedcomEncoding);
+            // The import record says which encoding the file was read in: this one now.
+            const result = await readGedcomInParts(decoding.text, this.gedcomImportOrigin(decoding.encoding),
+                n => step?.set(fileReadStep(name, n)));
+            if (this.gedcomRawBuffer === buffer) {
+                this.gedcomDecoding = decoding;
+                this.gedcomResult = result;
+                ok = true;
+            }
+        } catch (error) {
+            console.error('GEDCOM parse error:', error);
+            step?.clear();
+            if (select) showBusyMessage(select, { ok: false, kind: 'error', text: strings.busy.fileUnreadable });
+            else this.showAlert(strings.gedcom.parseError, 'error');
+        } finally {
+            step?.clear();
+            select?.removeAttribute('aria-busy');
+            select?.removeAttribute('aria-disabled');
+            this.gedcomEncodingReading = null;
+        }
+        if (ok) this.showGedcomResultDialog();
     },
 
     /** The origin of the GEDCOM file in the result dialog, read in `encoding` (its import record). */
@@ -846,7 +1024,8 @@ export const importExportMethods = uiModule({
             void DataManager.snapshotNow('pre-import');
             // Load data directly into current tree
             DataManager.loadStromData(this.gedcomDataForImport());
-            TreeRenderer.render();
+            // §8: the imported tree laid out under the canvas overlay (a large file: "Calculating the layout…").
+            void canvasBusy(() => TreeRenderer.renderAsync());
             this.gedcomResult = null;
             const treeId = DataManager.getCurrentTreeId();
             // A file from another program gets the "What next" card in place of the toast.
@@ -871,14 +1050,18 @@ export const importExportMethods = uiModule({
     /**
      * Merge GEDCOM data with existing tree
      */
-    mergeGedcomWithExisting(): void {
-        if (!this.gedcomResult) return;
-
-        // Start merge process
-        MergerUI.startMerge(this.gedcomDataForImport(), undefined, false,
-            { gedcom: true, ...(this.gedcomResult.importId ? { importId: this.gedcomResult.importId } : {}) });
-        this.gedcomResult = null;
-        this.closeGedcomResultDialog();
+    async mergeGedcomWithExisting(): Promise<void> {
+        const result = this.gedcomResult;
+        if (!result) return;
+        const incoming = this.gedcomDataForImport();
+        // §8: the matching runs under the working state of the choice, its words at once for large trees.
+        await runHeavy(activatedElement(), () => {
+            if (this.gedcomResult !== result) return;
+            MergerUI.startMerge(incoming, undefined, false,
+                { gedcom: true, ...(result.importId ? { importId: result.importId } : {}) });
+            this.gedcomResult = null;
+            this.closeGedcomResultDialog();
+        }, { label: strings.merge.analyzing, atOnce: mergeAnalysisLong(DataManager.getData(), incoming) });
     },
 
     // ---- JSON IMPORT WITH VALIDATION ----
@@ -888,20 +1071,47 @@ export const importExportMethods = uiModule({
     handleJsonFile(event: Event): void {
         const input = event.target as HTMLInputElement;
         const file = input.files?.[0];
+        const origin = takePickOrigin(input);
         if (!file) return;
-
-        const reader = new FileReader();
-        reader.onload = (e) => {
-            // A stale handle from an earlier (failed/cancelled) "open from
-            // file" must never get attached to THIS unrelated import — Ctrl+S
-            // would then silently overwrite the wrong file on disk.
-            this.pendingOpenFileHandle = null;
-            void this.importJsonString(e.target?.result as string);
-        };
-        reader.readAsText(file);
-
         // Reset input
         input.value = '';
+        void this.readJsonImportFile(file, origin, () => { openFilePicker(input, origin); });
+    },
+
+    /**
+     * A chosen JSON file read as its element's working state (9a): a file that
+     * is not JSON is said there with "Choose another file", the rest goes on
+     * as an import of its text.
+     */
+    async readJsonImportFile(file: File, origin: HTMLElement | null, again: () => void): Promise<void> {
+        // A stale handle from an earlier (failed/cancelled) "open from
+        // file" must never get attached to THIS unrelated import — Ctrl+S
+        // would then silently overwrite the wrong file on disk.
+        await this.readJsonImportText(file.name, () => file.text(), file.size, origin, again,
+            () => { this.pendingOpenFileHandle = null; });
+    },
+
+    /** See readJsonImportFile; `before` runs once the text is read, before the import. */
+    async readJsonImportText(name: string, read: () => Promise<string>, size: number, origin: HTMLElement | null,
+        again: () => void, before?: () => void): Promise<void> {
+        const got = await readPickedFile(origin, { name }, async ctl => {
+            const text = await read();
+            await paintBeforeParse(size);
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(text);
+            } catch {
+                throw new FileUnreadableError();
+            }
+            if (!parsed || typeof parsed !== 'object') throw new FileUnreadableError();
+            const persons = (parsed as { persons?: unknown }).persons;
+            if (persons && typeof persons === 'object') ctl.people(Object.keys(persons).length);
+            return { text, parsed };
+        }, again);
+        if (!got) return;
+        before?.();
+        this.leavePickDialog();
+        await this.importJsonString(got.text, got.parsed);
     },
 
     /**
@@ -909,13 +1119,15 @@ export const importExportMethods = uiModule({
      * (encrypted → password prompt, invalid → dialog, warnings → confirm). Shared
      * by the file-input upload and the File System Access "open from file" flow.
      */
-    async importJsonString(content: string): Promise<void> {
-        let parsed: unknown;
-        try {
-            parsed = JSON.parse(content);
-        } catch {
-            this.showValidationDialog({ valid: false, errors: ['validation.invalidJson'], warnings: [] });
-            return;
+    async importJsonString(content: string, parsedAlready?: unknown): Promise<void> {
+        let parsed: unknown = parsedAlready;
+        if (parsedAlready === undefined) {
+            try {
+                parsed = JSON.parse(content);
+            } catch {
+                this.showValidationDialog({ valid: false, errors: ['validation.invalidJson'], warnings: [] });
+                return;
+            }
         }
 
         // A change packet (collaboration diff) is reconstructed against a local
@@ -1104,8 +1316,8 @@ export const importExportMethods = uiModule({
      */
     importJsonToCurrentTree(): void {
         this.importToCurrentTree = true;
-        this.closeImportFileDialog();
-        document.getElementById('file-input')?.click();
+        // The dialog stays while the file is chosen and read (9a); it goes once the file is read.
+        this.pickImportFile('file-input');
     },
 
     /**
@@ -1113,8 +1325,7 @@ export const importExportMethods = uiModule({
      */
     importGedcomToCurrentTree(): void {
         this.importToCurrentTree = true;
-        this.closeImportFileDialog();
-        document.getElementById('gedcom-input')?.click();
+        this.pickImportFile('gedcom-input');
     },
 
     /**
@@ -1123,11 +1334,9 @@ export const importExportMethods = uiModule({
      */
     startJsonImportFromManager(): void {
         this.importFromTreeManager = true;
-        // Close new-tree-menu but keep tree-manager in stack
-        document.getElementById('new-tree-menu-modal')?.classList.remove('active');
-        this.dialogStack.pop(); // Remove new-tree-menu, keep tree-manager
-        // Trigger file input
-        document.getElementById('file-input')?.click();
+        // The New tree menu stays while the file is chosen and read (9a); leavePickDialog
+        // then closes it and keeps the tree manager in the stack.
+        this.pickImportFile('file-input');
     },
 
     /**
@@ -1139,16 +1348,12 @@ export const importExportMethods = uiModule({
     startGedcomImportPlain(): void {
         this.importFromTreeManager = false;
         this.importToCurrentTree = false;
-        document.getElementById('gedcom-input')?.click();
+        this.pickImportFile('gedcom-input');
     },
 
     startGedcomImportFromManager(): void {
         this.importFromTreeManager = true;
-        // Close new-tree-menu but keep tree-manager in stack
-        document.getElementById('new-tree-menu-modal')?.classList.remove('active');
-        this.dialogStack.pop(); // Remove new-tree-menu, keep tree-manager
-        // Trigger file input
-        document.getElementById('gedcom-input')?.click();
+        this.pickImportFile('gedcom-input');
     },
 
     /**
@@ -1160,6 +1365,8 @@ export const importExportMethods = uiModule({
      */
     handleImportFileCancel(): void {
         if (!this.importFromTreeManager) return;
+        // The menu stays open while the file is chosen (9a): nothing to come back to.
+        if (document.getElementById('new-tree-menu-modal')?.classList.contains('active')) return;
         this.importFromTreeManager = false;
         this.showNewTreeMenu();
     },
@@ -1169,9 +1376,7 @@ export const importExportMethods = uiModule({
      */
     startHtmlImportFromManager(): void {
         this.importFromTreeManager = true;
-        document.getElementById('new-tree-menu-modal')?.classList.remove('active');
-        this.dialogStack.pop();
-        document.getElementById('html-input')?.click();
+        this.pickImportFile('html-input');
     },
 
     /**
@@ -1179,8 +1384,7 @@ export const importExportMethods = uiModule({
      */
     importHtmlToCurrentTree(): void {
         this.importToCurrentTree = true;
-        this.closeImportFileDialog();
-        document.getElementById('html-input')?.click();
+        this.pickImportFile('html-input');
     },
 
     /**
@@ -1189,24 +1393,26 @@ export const importExportMethods = uiModule({
     handleHtmlFile(event: Event): void {
         const input = event.target as HTMLInputElement;
         const file = input.files?.[0];
+        const origin = takePickOrigin(input);
         if (!file) return;
+        input.value = '';
 
-        const reader = new FileReader();
-        reader.onload = (e) => {
-            const htmlContent = e.target?.result as string;
-
+        void (async () => {
+            const got = await readPickedFile(origin, file, async () => {
+                const htmlContent = await file.text();
+                const envelope = this.extractEnvelopeFromHtml(htmlContent);
+                const content = readEmbeddedHtml(htmlContent);
+                // Not a Strom file with data in it: said at the element (9a).
+                if (!envelope && !content.envelope?.data && !content.allTrees) throw new FileUnreadableError();
+                return { htmlContent, envelope };
+            }, () => { openFilePicker(input, origin); });
+            if (!got) return;
+            this.leavePickDialog();
             // Collaboration: a file replying to one of my shared trees gets the
             // merge offer instead of the plain import flow.
-            const envelope = this.extractEnvelopeFromHtml(htmlContent);
-            if (envelope && this.handleImportedShareEnvelope(envelope)) {
-                input.value = '';
-                return;
-            }
-
-            void this.importHtmlContent(htmlContent);
-        };
-        reader.readAsText(file);
-        input.value = '';
+            if (got.envelope && this.handleImportedShareEnvelope(got.envelope)) return;
+            await this.importHtmlContent(got.htmlContent);
+        })();
     },
 
     /**
@@ -1337,7 +1543,14 @@ export const importExportMethods = uiModule({
         this.importToCurrentTree = false;
         this.importFromTreeManager = false;
         this.closeImportDialog();
-        const ids = await DataManager.importTreesAsNew(valid);
+        // The question's dialog is gone: the writing of every tree as a progress toast past 120 ms (§1).
+        const release = holdLeave('import');
+        let ids: Awaited<ReturnType<typeof DataManager.importTreesAsNew>>;
+        try {
+            ids = await busyToast(strings.busy.importing, () => DataManager.importTreesAsNew(valid));
+        } finally {
+            release();
+        }
 
         this.updateTreeSwitcher();
         this.updateTreeManagerList();
@@ -1431,7 +1644,12 @@ export const importExportMethods = uiModule({
         const name = nameInput?.value.trim() || strings.treeManager.importTreeName;
 
         const gedcomImport = this.pendingGedcomImport;
-        const newTreeId = await DataManager.importAsNewTree(this.importTreeData, name);
+        // The dialog's Import carries the writing (§1); Enter in the name has it too.
+        const btn = activatedElement() ?? document.querySelector<HTMLElement>('#import-tree-modal .buttons .primary');
+        const data = this.importTreeData;
+        const newTreeId = await busyLocal(btn, strings.busy.importing, () => DataManager.importAsNewTree(data, name),
+            () => ({ ok: false, kind: 'error', text: strings.busy.failed, retry: () => { void this.confirmImportTree(); } }));
+        if (!newTreeId) return;
         this.restoreImportResearch(newTreeId);
 
         this.closeImportTreeDialog();
@@ -1513,17 +1731,27 @@ export const importExportMethods = uiModule({
     async loadDemoTree(): Promise<void> {
         // Read-only viewers (and locked data) must not create trees
         if (DataManager.isReadOnly()) return;
+        const el = activatedElement();
         this.closeMobileMenu();
         this.closeNewTreeMenu();
+        // Leaving the open tree as a switch does (waiting buttons 2f): its changes sent (when they go by
+        // themselves) first, Cancel meanwhile, no sample after 15 s; the following of its research ended
+        // once the sample is open. A second click meanwhile makes no second sample.
+        await runTreeSwitch(el, 'demo', {
+            before: (o) => this.researchFollowBeforeSwitch(null, o),
+            go: (from) => this.openDemoTree(from),
+            retry: () => { void this.loadDemoTree(); },
+        });
+    },
+
+    /** The sample tree made and opened (after the open tree's changes went). */
+    async openDemoTree(from: FollowSwitchFrom): Promise<void> {
         const data = getDemoTree(demoImageMaker());
         const focusId = DEMO_FOCUS;
         // The Register card shows what the sample holds (each event with its date and
         // place) — unless the user already chose a card type; the Custom fields stay as they are.
         if (!SettingsManager.hasCardDensity()) SettingsManager.setCardDensity('register');
 
-        // Leaving the open tree as a switch does: its changes sent (when they go by themselves) first,
-        // the following of its research ended once the sample is open.
-        const from = await this.researchFollowBeforeSwitch(null);
         const newTreeId = await DataManager.importAsNewTree(data, strings.demo.treeName);
         // The sample is never sent to a research nor tied to one.
         TreeManager.markDemoTree(newTreeId);
@@ -1571,7 +1799,7 @@ export const importExportMethods = uiModule({
 
         this.showExportPasswordDialog(async (password: string | null) => {
             const includeAuditLog = (document.getElementById('export-audit-log-toggle') as HTMLInputElement)?.checked || false;
-            await this.downloadAllTreesJson(password, includeAuditLog, this.readExportPrivacyMode(), this.readExportContentOptions());
+            return await this.downloadAllTreesJson(password, includeAuditLog, this.readExportPrivacyMode(), this.readExportContentOptions());
         }, !quick, quick
             ? { quick: { hint: strings.fileCopy.quickHintAll(TreeManager.getTrees().length) } }
             : { format: 'all', allTrees: true });
@@ -1620,7 +1848,8 @@ export const importExportMethods = uiModule({
         a.click();
         URL.revokeObjectURL(a.href);
         if (privacyMode === 'full') {
-            TreeManager.noteFileCopy(Object.keys(allData) as TreeId[]);
+            TreeManager.noteFileCopy(Object.keys(allData) as TreeId[],
+                Object.fromEntries(Object.entries(allData).map(([id, t]) => [id, t.data])));
             // A full backup of every tree: the "Export all" reminder rests (Backups, ⋯ → Research).
             noteExportAll();
         }

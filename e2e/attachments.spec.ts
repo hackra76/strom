@@ -15,8 +15,14 @@ test('attachments: add an image, it survives a reload, then delete it', { tag: '
     await modal.locator('#input-attachment').setInputFiles('e2e/fixtures/avatar.png');
     const list = modal.locator('#attachments-list');
     await expect(list.locator('.attachment-row')).toHaveCount(1);
-    await list.locator('.attachment-note-input').fill('Birth certificate');
-    await list.locator('.attachment-note-input').blur();
+    // On a wide screen the row's ⋯ holds the actions; the note is edited in the Attachment dialog (spec 102 §2).
+    await list.locator('.attachment-more').click();
+    await page.locator('.materials-item-menu-row[data-action="edit"]').click();
+    const details = page.locator('.mdlg-overlay .mdlg');
+    await details.locator('.mat-edit-note').fill('Birth certificate');
+    await details.getByRole('button', { name: 'Save' }).click();
+    await expect(details).toHaveCount(0);
+    await expect(list.locator('.attachment-note-text')).toHaveText('Birth certificate');
     await expect(modal.locator('#attachments-total')).toContainText(/^This person: 1 attachment \d/);
     await modal.getByRole('button', { name: 'Save' }).click();
     await expect(modal).toBeHidden();
@@ -27,16 +33,15 @@ test('attachments: add an image, it survives a reload, then delete it', { tag: '
     await expect(page.locator('.toolbar')).toBeVisible();
     await cardAction(page, 'Jan', 'edit');
     await expect(modal.locator('#attachments-list .attachment-row')).toHaveCount(1);
-    await expect(modal.locator('.attachment-note-input')).toHaveValue('Birth certificate');
+    await expect(modal.locator('.attachment-note-text')).toHaveText('Birth certificate');
 
     // Delete it — the confirmation says which file.
-    await modal.locator('.attachment-actions button').click();
-    const confirm = page.locator('#confirmation-modal');
-    await expect(confirm).toBeVisible();
-    await expect(confirm).toHaveClass(/active/);
-    const confirmText = `${await confirm.locator('#confirm-title').innerText()}\n${await confirm.locator('#confirm-message').innerText()}`;
-    expect(confirmText).toContain('avatar.png');
-    await confirm.locator('#confirm-ok-btn').click();
+    await modal.locator('.attachment-more').click();
+    await page.locator('.materials-item-menu-row[data-action="removeFromTree"]').click();
+    const confirm = page.locator('.mdlg-overlay .mdlg');
+    await expect(confirm.locator('.mdlg-title')).toHaveText('Delete the file from the tree?');
+    await expect(confirm.locator('.mdlg-text').first()).toContainText('avatar.png');
+    await confirm.getByRole('button', { name: 'Delete the file' }).click();
     await expect(modal.locator('#attachments-list')).not.toContainText('avatar');
     await expect(modal.locator('#attachments-list .attachment-row')).toHaveCount(0);
     // Nothing of this person's in the file: no size line (the whole tree's is not theirs).

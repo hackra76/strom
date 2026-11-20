@@ -8,6 +8,7 @@
  * asks the user there before it writes or spends anything.
  */
 
+import { activatedElement } from './busy.js';
 import { DataManager } from '../data.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { formatLiveClock } from '../live-time.js';
@@ -103,6 +104,8 @@ interface SubmenuItem {
     val?: string;
     /** It asks for attention (an update): an amber dot at the end. */
     attn?: boolean;
+    /** More said to a screen reader than the label (what a dot means). */
+    srNote?: string;
     /** A tooltip (the overview's row while the overview is in its own window: a click brings it to the front). */
     title?: string;
 }
@@ -180,6 +183,7 @@ function itemAria(item: SubmenuItem): string {
     if (item.pill) aria.push(item.pill.text);
     if (item.ai) aria.push(r.aiBadge);
     if (item.sub) aria.push(item.sub);
+    if (item.srNote) aria.push(item.srNote);
     if (item.ext) aria.push(r.opensInResearchSr);
     return aria.join(', ');
 }
@@ -362,7 +366,11 @@ export const researchActionsMethods = uiModule({
         // The materials window, right under "Add materials…" (its count from the remembered list; none without it).
         if (this.materialsListOn()) {
             const total = this.materialsTotalCount();
-            materials.push({ id: 'research-item-materials', label: strings.materials.menu, method: 'openMaterials', ...(total !== null ? { val: total.toLocaleString(getCurrentLanguage()) } : {}) });
+            // Sort with the agent (spec 102 §13e): a green dot while it works, the waiting dot once its proposal is ready.
+            const sort = this.materialSortMenuMark();
+            const sortMark: Partial<SubmenuItem> = sort === 'run' ? { dot: true, srNote: strings.materials.agentSort.menuRun }
+                : sort === 'ready' ? { attn: true, srNote: strings.materials.agentSort.ready } : {};
+            materials.push({ id: 'research-item-materials', label: strings.materials.menu, method: 'openMaterials', ...(total !== null ? { val: total.toLocaleString(getCurrentLanguage()) } : {}), ...sortMark });
         }
         // Connect phone (spec 012): right after the materials, its state in a pill.
         const phoneItem = this.phoneMenuItem();
@@ -926,10 +934,11 @@ export const researchActionsMethods = uiModule({
     },
 
     researchActionLoadVersion(): void {
+        const el = activatedElement();
         this.closeActionsMenu();
         const researchId = this.activeResearchId();
         if (researchId && this.researchSyncCapable(researchId)) {
-            void this.researchLoadNewer();
+            void this.researchLoadNewer({}, el);
             return;
         }
         const url = this.activeResearchLink('app');
@@ -944,7 +953,8 @@ export const researchActionsMethods = uiModule({
     /** "Follow live": through the research's bridge here when known, else its link (one way for every place). */
     researchActionLive(): void {
         this.closeActionsMenu();
-        this.startFollowLive('menu');
+        // The menu closed: a progress toast carries the state while following starts (§2.1).
+        void this.startFollowLive('menu');
     },
 
     /** "Stop following": the tree is the user's again. */

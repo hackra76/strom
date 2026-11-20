@@ -91,6 +91,33 @@ test.describe('directions managed through the bridge', () => {
         await expect(directionRow(page, 'G0001').locator('.research-direction__chip')).toHaveCount(0);
     });
 
+    test('⋯ Pause on a folded row (§4, 4b): the menu closes, the row says "Pausing…" and its ⋯ the spinner; then paused', async ({ page }) => {
+        const b = await followManaged(page);
+        await openOverview(page);
+        const r = directionRow(page, 'G0002');
+        await expect(r).not.toHaveClass(/is-open/);
+        let letGo!: () => void;
+        const gate = new Promise<void>(res => { letGo = res; });
+        const write = (u: URL) => u.pathname.endsWith('/directions/G0002/state');
+        await page.route(write, async route => { await gate; await route.fallback(); });
+        await r.locator('.research-direction__more').click();
+        await page.locator('#live-direction-menu [data-do="pause"]').click();
+        await expect(page.locator('#live-direction-menu')).toHaveCount(0);
+        await expect(r).not.toHaveClass(/is-open/);
+        await expect(r.locator('.research-direction__meta .busy-st')).toHaveText('Pausing…');
+        await expect(r.locator('.research-direction__meta .busy-st .busy-spin')).toBeVisible();
+        const more = r.locator('.research-direction__more');
+        await expect(more).toHaveAttribute('data-busy', 'busy');
+        await expect(more.locator('.b-busy .busy-spin')).toBeVisible();
+        await more.click({ force: true });
+        await expect(page.locator('#live-direction-menu')).toHaveCount(0);
+        letGo();
+        await expect(r.locator('.research-direction__chip')).toHaveText(/^paused/);
+        await expect(r.locator('.busy-st')).toHaveCount(0);
+        expect(directionWrites(b).map(w => [w.path, w.body])).toEqual([['directions/G0002/state', { do: 'pause' }]]);
+        await page.unroute(write);
+    });
+
     test('end: the ⋯ asks first (Esc cancels, focus back), the reason goes with it', async ({ page }) => {
         const b = await followManaged(page);
         await openOverview(page);
@@ -162,6 +189,26 @@ test.describe('directions managed through the bridge', () => {
             .toHaveText(['Move down']);
     });
 
+    test('order: the moved row says "saving" at its end while the new order is written, its number as it is; then nothing', async ({ page }) => {
+        const b = await followManaged(page);
+        await openOverview(page);
+        let letGo!: () => void;
+        const gate = new Promise<void>(r => { letGo = r; });
+        const order = (u: URL) => u.pathname.endsWith('/directions/order');
+        await page.route(order, async route => { await gate; await route.fallback(); });
+        await directionRow(page, 'G0002').locator('.research-direction__handle').focus();
+        await page.keyboard.press('Alt+ArrowUp');
+        const row = directionRow(page, 'G0002');
+        await expect(row.locator('.research-direction__side > .busy-st')).toHaveText('saving');
+        await expect(row.locator('.research-direction__num')).toHaveText('2');
+        await expect(row.locator('.research-direction__num')).not.toHaveAttribute('aria-busy', 'true');
+        await expect(overview(page).locator('.research-direction__spin')).toHaveCount(0);
+        letGo();
+        await expect.poll(() => directionWrites(b).length).toBe(1);
+        await expect(row.locator('.busy-st')).toHaveCount(0);
+        await page.unroute(order);
+    });
+
     test('a refusal at the row in the research\'s words without Try again; an Undo that fails says so in an alert toast', async ({ page }) => {
         const b = await followManaged(page);
         await openOverview(page);
@@ -182,7 +229,8 @@ test.describe('directions managed through the bridge', () => {
         b.replies.push({ status: 409, body: { error: 'directions.state', text: 'Linie má rozdělaný zápis.' } });
         await page.locator('.toast[data-kind="direction"] .toast-action').click();
         const toast = page.locator('.toast[data-kind="direction"]');
-        await expect(toast).toHaveText('Undo failed, the change stays. · “Linie má rozdělaný zápis.”');
+        // Said in the same toast (it stays), the research's sentence after the mark.
+        await expect(toast).toContainText('Undo failed, the change stays. · “Linie má rozdělaný zápis.”');
         await expect(toast).toHaveAttribute('role', 'alert');
         await expect(toast.locator('.toast-action')).toHaveCount(0);
         await expect(directionRow(page, 'G0002').locator('.research-direction__chip')).toHaveText(/^paused/);
@@ -190,12 +238,16 @@ test.describe('directions managed through the bridge', () => {
     });
 
     test('a busy research: tried once more after 3 s, then a box with Try again at the row', async ({ page }) => {
+        // The 3 s before the second try run on Playwright's clock.
+        await page.clock.install();
         const b = await followManaged(page);
         await openOverview(page);
         b.replies.push(BUSY, BUSY);
         await directionRow(page, 'G0002').locator('.research-direction__head').click();
         await directionRow(page, 'G0002').locator('[data-do="pause"]').click();
-        await expect.poll(() => directionWrites(b).length, { timeout: 8000 }).toBe(2);
+        await expect.poll(() => directionWrites(b).length).toBe(1);
+        await page.clock.runFor(3000);
+        await expect.poll(() => directionWrites(b).length).toBe(2);
         const box = directionRow(page, 'G0002').locator('.research-direction__problem');
         await expect(box).toContainText('Not saved, the research is busy.');
         await expect(box).toHaveAttribute('role', 'alert');

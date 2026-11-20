@@ -7,7 +7,7 @@
  * folder again goes on, the files the research has are skipped.
  */
 
-import { researchActionLabel } from './research-open-mark.js';
+import { researchActionLabel, researchBridgeActionLabel } from './research-open-mark.js';
 import { DataManager } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { strings, getCurrentLanguage } from '../strings.js';
@@ -23,8 +23,10 @@ import {
 import { mediaCodesOn, mediaRefusalText } from '../media-refusal.js';
 import { isWriteHeldCode, joinSaid, writeHeldOfRefusal } from '../research-write-held.js';
 import { formatBytesShort } from './originals-ui.js';
+import { barHtml } from './prog-bar.js';
 import { onComputer, fetchWithTimeout, bridgeFailure } from './research-ui.js';
 import { uiModule } from './module.js';
+import { runBusy } from './busy.js';
 import { BRIDGE_ANSWER_MS } from '../bridge-ask.js';
 import { statusAskUrl } from '../status-parts.js';
 
@@ -86,6 +88,10 @@ interface Run {
     hidden: boolean;
     result: DoneReply | null;
     resume: (() => void) | null;
+    /** Pause asked: it comes once the file on its way is in, and only then is "Paused" said (B108). */
+    pauseAsked: boolean;
+    /** Who waits for the loop to reach a pause or its end (the states of Pause and Cancel). */
+    waits: (() => void)[];
 }
 
 let st: {
@@ -104,6 +110,21 @@ let run: Run | null = null;
 /** A batch id safe inside the line's inline handler (the bridge's ids are UUIDs or `b-…`). */
 const BATCH_LINK_ID = /^[A-Za-z0-9_.-]{1,120}$/;
 let downTimer: ReturnType<typeof setInterval> | null = null;
+
+/** The loop reached a pause or its end: whoever waits for it looks again. */
+function wakeRun(r: Run): void {
+    const waits = r.waits;
+    r.waits = [];
+    for (const w of waits) w();
+}
+
+/** Until the loop has reached what `done` says (a pause, the end). */
+function runReached(r: Run, done: () => boolean): Promise<void> {
+    return new Promise(resolve => {
+        const check = (): void => { if (done()) resolve(); else r.waits.push(check); };
+        check();
+    });
+}
 
 function esc(text: string): string {
     return text
@@ -476,7 +497,7 @@ export const batchMethods = uiModule({
         const b = strings.batch;
         const r = run!;
         const done = r.index;
-        const pct = r.totalBytes > 0 ? Math.min(100, Math.round(r.doneBytes / r.totalBytes * 100)) : 0;
+        const share = r.totalBytes > 0 ? r.doneBytes / r.totalBytes : 0;
         const link = this.researchOriginalsLink();
         const research = link ? this.researchStatusOf(link.researchId)?.name || r.name : r.name;
         const cur = r.queue[r.index];
@@ -487,11 +508,13 @@ export const batchMethods = uiModule({
             </details>` : '';
         return `
                 <div class="modal-content batch-content batch-progress${r.paused ? ' is-paused' : ''}">
-                    <div class="batch-progress-title">${r.paused ? '' : '<span class="research-sync-spinner" aria-hidden="true"></span>'}${esc(r.paused ? b.paused : b.progressTitle)}</div>
+                    <div class="batch-progress-title">${r.paused ? '' : '<i class="busy-spin s12" aria-hidden="true"></i>'}${esc(r.paused ? b.paused : b.progressTitle)}</div>
                     <div class="batch-progress-sub">${esc(b.progressSub(r.name, research))}</div>
-                    <div class="batch-progress-count" role="status"><strong>${esc(b.progressCount(done, r.total))}</strong>
-                        <span>${esc(b.progressBytes(formatBytesShort(r.doneBytes), formatBytesShort(r.totalBytes)))}</span></div>
-                    <div class="batch-bar"><span style="width:${pct}%"></span></div>
+                    <div class="prog batch-prog">
+                        <div class="prog-line batch-progress-count" role="status"><span>${esc(b.progressSize(formatBytesShort(r.doneBytes), formatBytesShort(r.totalBytes)))}</span>
+                            <strong class="prog-k">${esc(b.progressCount(done, r.total))}</strong></div>
+                        ${barHtml(share, { paused: r.paused })}
+                    </div>
                     ${r.paused ? `<p class="batch-paused-note">${esc(r.held || (r.lost ? b.bridgeLost : b.pausedNote))}${r.held && r.heldSeal && this.activeResearchLink('seal')
                         ? ` <button type="button" class="link-button" data-act="seal">${this.researchSyncActionLabel('sealTakeOver', strings.sync.held.sealButton)}</button>` : ''}</p>`
                         : cur ? `<p class="batch-now">${esc(b.now(cur.path, formatBytesShort(cur.size)))}</p>` : ''}
@@ -500,10 +523,10 @@ export const batchMethods = uiModule({
                     <p class="batch-keep-tab">${esc(b.keepTabHide)}</p>
                 </div>
                 <div class="buttons batch-footer">
-                    <button type="button" class="secondary is-danger-text" data-act="cancel-run">${esc(b.cancel)}</button>
+                    <button type="button" class="secondary is-danger-text" data-act="cancel-run" data-action="batch-cancel">${esc(b.cancel)}</button>
                     <span class="batch-foot-note"></span>
                     <button type="button" class="secondary" data-act="hide">${esc(b.hide)}</button>
-                    <button type="button" class="primary" data-act="${r.paused ? 'resume' : 'pause'}">${esc(r.paused ? b.resumeBtn : b.pause)}</button>
+                    <button type="button" class="primary" data-act="${r.paused ? 'resume' : 'pause'}" data-action="${r.paused ? 'batch-resume' : 'batch-pause'}">${esc(r.paused ? b.resumeBtn : b.pause)}</button>
                 </div>`;
     },
 
@@ -531,6 +554,7 @@ export const batchMethods = uiModule({
                     ${refusedRow}
                     ${!stored && r.result?.tasks ? `<div class="batch-done-row"><span>${esc(b.tasks)}</span><strong>${r.result.tasks}</strong></div>` : ''}
                     <p class="batch-done-text">${esc(materials && stored ? b.doneTextMaterials : archive ? b.doneTextArchive : stored ? b.doneTextStored : b.doneText)}</p>
+                    ${materials ? this.batchSortHtml(received) : ''}
                     ${open && !materials ? `<button type="button" class="research-sync-link" data-act="open-research">${researchActionLabel(b.openInResearch, researchLinkMark('open'))}</button>` : ''}
                 </div>
                 <div class="buttons batch-footer">${materials ? `
@@ -540,6 +564,26 @@ export const batchMethods = uiModule({
                     <button type="button" class="primary" data-act="open-materials">${esc(b.openInMaterials)}</button>` : `
                     <span class="batch-foot-note"></span>
                     <button type="button" class="primary" data-act="close">${esc(strings.batch.done)}</button>`}
+                </div>`;
+    },
+
+    /**
+     * The end of a batch beside a research whose agent sorts (spec 102 §13a):
+     * what the new files lack and the button that opens the dialog of Sort
+     * with the agent. Nothing is sent from here; an older research is only said.
+     */
+    batchSortHtml(received: number): string {
+        const r = run!;
+        const gate = this.materialSortGate();
+        if (!gate || !r.id || received <= 0) return '';
+        const s = strings.materials.agentSort;
+        if (gate === 'older') return `<p class="batch-sort batch-sort-older">${esc(s.older)}</p>`;
+        const persons = !!r.personId;
+        const off = gate === 'offRun' ? ` aria-disabled="true" title="${esc(s.offRun)}"` : '';
+        return `<div class="batch-sort">
+                    <div class="batch-sort-title">${esc(s.doneSortTitle(received, persons ? 0 : received))}</div>
+                    <p class="batch-sort-text">${esc(gate === 'offRun' ? s.offRun : s.doneSortText)}</p>
+                    <button type="button" class="secondary batch-sort-btn" data-act="sort-agent"${off}>${researchBridgeActionLabel(s.sort, 'material-sort')}</button>
                 </div>`;
     },
 
@@ -585,11 +629,30 @@ export const batchMethods = uiModule({
                 case 'next': if (s && s.step === 'check') { s.step = 'send'; this.renderBatchDialog(); } break;
                 case 'expand-all': if (s) { batchFolderPaths(s.items).forEach(p => s.full.add(p)); s.full.add(''); s.collapsed.clear(); this.renderBatchDialog(); } break;
                 case 'go': void this.startBatchRun(); break;
-                case 'pause': if (run) { run.paused = true; this.renderBatchDialog(); } break;
+                case 'pause': {
+                    // The file on its way goes on (up to a minute): "Pausing…" on the button until it is in (B108).
+                    const r = run;
+                    if (!r || r.paused || r.pauseAsked) break;
+                    r.pauseAsked = true;
+                    void runBusy(el, () => runReached(r, () => r.paused || r.finished), { label: strings.busy.pausing, kind: 'local' });
+                    break;
+                }
                 case 'resume': this.resumeBatchRun(); break;
                 case 'seal': this.researchSyncAction('sealTakeOver'); break;
                 case 'hide': this.hideBatchDialog(); break;
                 case 'cancel-run': void this.cancelBatchRun(); break;
+                case 'sort-agent': {
+                    // Only the dialog opens: what is sent and what it costs are said there before anything goes.
+                    if (el.getAttribute('aria-disabled') === 'true') break;
+                    const id = run?.id;
+                    const name = run?.name ?? '';
+                    this.closeBatchDialog();
+                    this.openMaterials(id ? { batch: id } : {});
+                    // The batch's files asked from the research before the dialog: the button gone with its
+                    // dialog, a progress toast says it (§2.1).
+                    if (id) void runBusy(el, () => this.openSortForBatch(id, name), { kind: 'bridge', toastWhenGone: true });
+                    break;
+                }
                 case 'open-materials': {
                     const id = run?.id;
                     this.closeBatchDialog();
@@ -722,6 +785,7 @@ export const batchMethods = uiModule({
             person, personId: s.personId, note: s.note.trim(), queue, index: 0, total: queue.length,
             totalBytes: queue.reduce((sum, i) => sum + i.size, 0), doneBytes: 0, received: 0, skipped: 0, skippedAsked: 0, refused: [],
             current: '', paused: false, lost: false, held: '', heldSeal: false, cancelled: false, finished: false, hidden: false, result: null, resume: null,
+            pauseAsked: false, waits: [],
         };
         s.step = 'progress';
         window.addEventListener('beforeunload', onLeave);
@@ -748,8 +812,13 @@ export const batchMethods = uiModule({
             if (force || Date.now() - lastDraw > 250) { lastDraw = Date.now(); this.renderBatchDialog(); }
         };
         while (r.index < r.queue.length && !r.cancelled) {
+            if (r.pauseAsked) {
+                r.pauseAsked = false;
+                r.paused = true;
+            }
             if (r.paused) {
                 draw(true);
+                wakeRun(r);
                 await new Promise<void>(resolve => { r.resume = resolve; });
                 r.resume = null;
                 continue;
@@ -774,12 +843,15 @@ export const batchMethods = uiModule({
             r.paused = true;
             r.lost = closed === 'down';
             draw(true);
+            wakeRun(r);
             await new Promise<void>(resolve => { r.resume = resolve; });
             r.resume = null;
         }
         r.finished = true;
         window.removeEventListener('beforeunload', onLeave);
         writeUnfinished(r.treeId, null);
+        // The Materials window open under it says the batch in its strip and reads the list again (spec 102 §8).
+        this.materialsBatchAdded(r.result?.inputs ?? r.received);
         if (r.hidden || !document.getElementById(DIALOG_ID)) {
             const link = this.researchOriginalsLink();
             const archive = !!link && this.researchModeOf(link.researchId) === 'archive';
@@ -790,6 +862,7 @@ export const batchMethods = uiModule({
         } else {
             draw(true);
         }
+        wakeRun(r);
         this.refreshResearchSyncUi();
     },
 
@@ -945,6 +1018,7 @@ export const batchMethods = uiModule({
         const bridge = parseLiveBridge(storedResearchBridge(run.researchId)?.base);
         if (bridge) run.base = bridge.base;
         run.paused = false;
+        run.pauseAsked = false;
         run.lost = false;
         run.held = '';
         run.heldSeal = false;
@@ -959,7 +1033,11 @@ export const batchMethods = uiModule({
         if (!ok) return;
         r.cancelled = true;
         r.paused = false;
+        r.pauseAsked = false;
         r.resume?.();
+        // The file on its way goes on and the batch is closed with what came: "Cancelling…" until then (B109).
+        const el = document.querySelector<HTMLElement>(`#${DIALOG_ID} [data-action="batch-cancel"]`);
+        if (el && !r.finished) await runBusy(el, () => runReached(r, () => r.finished), { label: strings.busy.cancelling, kind: 'local' });
     },
 
     /** Hide the window while it sends: the block in ⋯ → Research says how far it is, with "Show". */

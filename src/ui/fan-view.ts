@@ -21,9 +21,13 @@
 
 import type { PersonId, StromData } from '../types.js';
 import {
-    buildFanModel, buildFanSvg, fanLineages, FanModel, FanShape, FanSvgOptions,
+    buildFanModel, buildFanSvg, fanLineages, FanHighlight, FanModel, FanShape, FanSvgOptions,
 } from '../fan-chart.js';
-import { FanColorMode, FanTheme, fanLegend, fanHasRepeats, fanRodColors, FanLegendItem } from '../fan-colors.js';
+import {
+    FanColorMode, FanTheme, fanLegend, fanHasRepeats, FanLegendItem, FanRodGroup, FanRodSlot, parseFanRodSlot, FAN_PALETTES, fanRodOtherSwatch,
+} from '../fan-colors.js';
+import { assignFanRodColors, FanRodAssignment, FanRodLegend, fanRodLegend } from '../fan-rod-assign.js';
+import { RodId, rodLabels, rodOf, realRodMembers, realRodSpouses } from '../lineage.js';
 import { fanScreenSizes, clearFanMeasureCache } from '../fan-labels.js';
 import { FanZoom, FanView as FanZoomView, FanZoomPoint } from '../fan-zoom.js';
 import { fanNavNodes, fanNavMove, FanNavDir } from '../fan-nav.js';
@@ -31,6 +35,7 @@ import { fanYears } from '../fan-labels.js';
 import { shownNameFull } from '../person-name.js';
 import { strings } from '../strings.js';
 import { syncDepthStepper } from './depth-stepper.js';
+import { syncFanLegendLift } from './legend-lift.js';
 import { isMobile } from '../breakpoints.js';
 import { FAN_STORAGE_KEYS } from '../storage-keys.js';
 
@@ -64,12 +69,28 @@ export interface FanViewHost {
     addParentLabel(): string;
     /** The family line chosen in the tree view (its legend row marked). */
     selectedRod?(): string | null;
+    /** The chosen family line while its highlight holds the pill (no other group covers it); else null. */
+    highlightedRod?(): string | null;
+    /**
+     * A legend row or a sector's menu (spec 114 §5): the family line becomes
+     * the tree's chosen line (spec 039, one state with the Family view); null:
+     * the whole tree again.
+     */
+    selectRod?(id: string | null): void;
+    /**
+     * The mouse over a legend row (spec 114 §5): the line's sectors shown as
+     * when highlighted, the others less dimmed; no pill, nothing kept. Null
+     * ends the preview (the chosen line, if any, shows again).
+     */
+    previewRod?(group: { hit: ReadonlySet<PersonId>; faint: ReadonlySet<PersonId> } | null): void;
     /** The centre pinned while following the research agent (its label replaces the origin pill). */
     pinnedCenter?(): PersonId | null;
     /** Extra items of a person's menu (pin / release the centre while following), after re-centring. */
     menuExtra?(id: PersonId, isCentre: boolean): Array<{ id: FanMenuItemId; label: string; run: () => void }>;
     /** "Release" on the pinned centre's label. */
     unpinCenter?(): void;
+    /** The centre shown or its pin changed: ⌂ "Focus default person" takes its state again (spec 111 §7). */
+    homeChanged?(): void;
     /** A sector's menu (or its sheet) closed. */
     menuClosed?(): void;
     /** After every redraw of the SVG (the evidence highlight is put back). */
@@ -86,6 +107,11 @@ export interface FanViewHost {
     remembersPrefs?(): boolean;
     /** The person selected in another window (spec 079 §2): their sectors outlined. */
     windowSelected?(): string | null;
+    /**
+     * The family lines' slots the view remembers changed (spec 114 §3): the
+     * main window tells its satellites; empty when the memory was forgotten.
+     */
+    rodColorsChanged?(memory: Array<[string, string]>): void;
 }
 
 /** One sector's menu (§5.4). */
@@ -96,7 +122,7 @@ export interface FanMenuSpec {
     items: Array<{ id: FanMenuItemId; label: string; kbd?: string; run: () => void }>;
 }
 
-export type FanMenuItemId = 'recenter' | 'pin' | 'unpin' | 'detail' | 'page' | 'first' | 'add';
+export type FanMenuItemId = 'recenter' | 'pin' | 'unpin' | 'detail' | 'page' | 'rod' | 'first' | 'add';
 
 /**
  * The re-centring swap: a short cross-fade without any change of size, the
@@ -129,6 +155,13 @@ function readLegendOpen(): boolean | null {
     } catch { return null; }
 }
 
+function readLegendOtherOpen(): boolean {
+    try { return localStorage.getItem(FAN_STORAGE_KEYS.legendOtherOpen) === '1'; } catch { return false; }
+}
+
+/** The legend's rods in the three themes (the same rows, their swatches differ). */
+interface RodLegends { light: FanRodLegend; dark: FanRodLegend; print: FanRodLegend }
+
 export class FanViewController {
     private readonly host: FanViewHost;
     private container: HTMLElement | null = null;
@@ -138,6 +171,16 @@ export class FanViewController {
     private modelKey = '';
     private redrawFrame = 0;
     private legendOpen: boolean;
+    /** "Other" (the smaller family lines) expanded in the legend (spec 114 §4). */
+    private legendOtherOpen: boolean;
+    /** The legend's rods of the current assignment. */
+    private rodLegendCache: { a: FanRodAssignment; l: RodLegends } | null = null;
+    /** The legend's markup last put in (unchanged markup is not put in again: focus and hover stay). */
+    private legendHtml: string | null = null;
+    /** The family line previewed under the mouse (spec 114 §5). */
+    private previewId: string | null = null;
+    /** The row just clicked: no preview of it until the mouse goes to another one. */
+    private previewHeld: string | null = null;
     /** The view the screen showed before the browser printed the whole fan. */
     private printView: FanZoomView | null = null;
     private printing = false;
@@ -179,11 +222,16 @@ export class FanViewController {
     private flashTimer: ReturnType<typeof setTimeout> | null = null;
     /** The next draw puts the keyboard focus (if it is in the fan) on the focus disc. */
     private refocusDisc = false;
+    /** The family lines' slots of the previous states (spec 114 §3), while the view stays open on this tree. */
+    private rodColorMemory = new Map<RodId, FanRodSlot>();
+    /** The family lines' colours of the current model (computed once per model, rod mode only). */
+    private rodAssignment: FanRodAssignment | null = null;
 
     constructor(host: FanViewHost) {
         this.host = host;
         // §0.5: open on a computer, closed on a phone (where the legend is a chip and a sheet).
         this.legendOpen = readLegendOpen() ?? !isMobile();
+        this.legendOtherOpen = readLegendOtherOpen();
     }
 
     /** The current fan model (null before the first draw or without a focus). */
@@ -194,6 +242,80 @@ export class FanViewController {
     /** The zoom of the view (null before the first draw). */
     getZoom(): FanZoom | null {
         return this.zoom;
+    }
+
+    // ------------------------------------------------------------ family-line colours (spec 114)
+
+    /**
+     * The family lines' colours of the current model in rod mode (null in the
+     * other modes): assigned once per model, from the memory of the previous
+     * states; the drawing, the legend, print and the poster read them.
+     */
+    getRodAssignment(): FanRodAssignment | null {
+        return this.rodColors();
+    }
+
+    /**
+     * The highlighted family line as a poster or an image prints it (spec 114
+     * §7): its id and its people in the tree, or null when no line's highlight
+     * is on.
+     */
+    getPrintHighlight(): FanHighlight | null {
+        const id = this.host.highlightedRod?.() ?? null;
+        if (!id) return null;
+        const index = fanLineages(this.host.data());
+        const rodId = id as RodId;
+        const hit = new Set(realRodMembers(index, rodId));
+        return hit.size ? { rodId, hit } : null;
+    }
+
+    private rodColors(): FanRodAssignment | null {
+        const model = this.model;
+        if (!model || this.host.settings().colorMode !== 'rod') return null;
+        const index = fanLineages(model.data);
+        if (this.rodAssignment && this.rodAssignmentModel === model && this.rodAssignment.index === index) return this.rodAssignment;
+        const a = assignFanRodColors(model, index, this.rodColorMemory);
+        this.rodAssignment = a;
+        this.rodAssignmentModel = model;
+        const before = this.rodColorMemory;
+        // A state drawn after another one: the memory is this view's own from now on.
+        if (before.size) this.rodMemoryOwn = true;
+        this.rodColorMemory = new Map(a.memory);
+        const same = before.size === a.memory.size && [...a.memory].every(([id, s]) => before.get(id) === s);
+        if (!same) this.host.rodColorsChanged?.([...a.memory]);
+        return a;
+    }
+
+    private rodAssignmentModel: FanModel | null = null;
+    /** The memory came from states this view drew one after another (no longer taken from the main window). */
+    private rodMemoryOwn = false;
+
+    /** The memory goes with the view or the tree (§3): the next opening is deterministic again. */
+    private forgetRodColors(): void {
+        this.rodAssignment = null;
+        this.rodAssignmentModel = null;
+        this.rodMemoryOwn = false;
+        if (!this.rodColorMemory.size) return;
+        this.rodColorMemory = new Map();
+        this.host.rodColorsChanged?.([]);
+    }
+
+    /**
+     * The main window's memory of the slots (a satellite window, spec 114 §3):
+     * taken as this view's starting memory while it has none of its own
+     * (only its first state drawn); slots that do not fit here are assigned anew.
+     */
+    adoptRodColors(memory: ReadonlyArray<readonly [string, string]>): void {
+        if (this.rodMemoryOwn) return;
+        const mem = new Map<RodId, FanRodSlot>();
+        for (const [id, slot] of memory) {
+            if (typeof id === 'string' && typeof slot === 'string' && parseFanRodSlot(slot)) mem.set(id as RodId, slot as FanRodSlot);
+        }
+        if (!mem.size) return;
+        this.rodColorMemory = mem;
+        this.rodAssignment = null;
+        this.rodAssignmentModel = null;
+        if (this.host.active() && this.host.settings().colorMode === 'rod') this.redraw();
     }
 
     // ------------------------------------------------------------ drawing
@@ -220,6 +342,8 @@ export class FanViewController {
         });
         this.model = model;
         if (!model) { chart.innerHTML = ''; this.renderLegend(); return; }
+        // The colours of the new state from the memory before anything is drawn (§3: never drawn without it, then fixed).
+        this.rodColors();
         const zoom = this.ensureZoom(chart, model);
         // §1.6: a new focus, shape or depth (or a frame that grew) starts from the whole fan.
         const b = model.bounds;
@@ -253,10 +377,12 @@ export class FanViewController {
         chart.innerHTML = buildFanSvg(model, {
             esc: this.host.esc,
             editable: this.host.editable(),
+            printHighlight: true,
             addParentLabel: this.host.addParentLabel(),
             showKekule: this.host.showKekule(),
             relTypeLabel: this.host.relTypeLabel,
             colorMode: this.host.settings().colorMode,
+            ...(this.rodColors() ? { rodColors: this.rodColors()! } : {}),
             ppu: vb.ppu,
             viewport: { x: vb.x, y: vb.y, w: vb.w, h: vb.h },
             sizes: fanScreenSizes(isMobile()),
@@ -300,8 +426,27 @@ export class FanViewController {
             onLongPress: (target, point) => this.pressMenu(target, point, 'sheet'),
             onContextMenu: (target, point, e) => this.pressMenu(target, point, 'context', e),
             onViewChange: () => this.scheduleRedraw(),
+            insets: () => this.pillInsets(chart),
         });
         return this.zoom;
+    }
+
+    /**
+     * The bands of the surface the tree's highlight pill covers (spec 114 §6:
+     * a family line's pill stood over the fan's top ring, on a phone it stands
+     * over its bottom): the whole fan keeps clear of them.
+     */
+    private pillInsets(chart: HTMLElement): { top: number; bottom: number } {
+        const out = { top: 0, bottom: 0 };
+        const pill = document.getElementById('evidence-pill');
+        if (!pill || pill.hidden || pill.getClientRects().length === 0) return out;
+        const p = pill.getBoundingClientRect(), s = chart.getBoundingClientRect();
+        if (!(p.width > 0 && p.height > 0 && s.height > 0) || p.right <= s.left || p.left >= s.right) return out;
+        if (p.bottom <= s.top || p.top >= s.bottom) return out;
+        const GAP = 8;
+        if (p.top + p.height / 2 < s.top + s.height / 2) out.top = Math.ceil(p.bottom - s.top + GAP);
+        else out.bottom = Math.ceil(s.bottom - p.top + GAP);
+        return out;
     }
 
     // ------------------------------------------------------------ taps
@@ -379,6 +524,8 @@ export class FanViewController {
      * renderer calls it on every render of another view.
      */
     deactivate(): void {
+        this.forgetRodColors();
+        this.setPreview(null);
         if (!this.origin && !this.shown && !this.menuKey && !this.swap && !this.flashKey) return;
         this.origin = null;
         this.shown = null;
@@ -548,6 +695,7 @@ export class FanViewController {
         if (this.pillTimer) { clearTimeout(this.pillTimer); this.pillTimer = null; }
         const pinned = this.host.pinnedCenter?.() ?? null;
         this.updateCentrePin(!!pinned && pinned === focus && this.host.active() ? pinned : null);
+        if (!show || (pinned && pinned === focus)) this.stage()?.classList.remove('fan-home-below');
         if (show && !(pinned && pinned === focus)) {
             const p = this.host.data().persons[origin!];
             const name = p ? shownNameFull(p) : '';
@@ -572,6 +720,48 @@ export class FanViewController {
 
     /** "Centre: Name · Release" at the top left while the pinned centre is shown (null: none). */
     private updateCentrePin(id: PersonId | null): void {
+        this.updateCentrePinBox(id);
+        this.placeHome();
+        this.host.homeChanged?.();
+        // ⌂ joined to the pin widens it: placed again.
+        if (this.centrePin && !this.centrePin.hidden) this.placePill(this.centrePin);
+    }
+
+    /**
+     * ⌂ "Focus default person" (spec 111 §7): its own small pill at the top
+     * left (the original person's pill stands beside it), joined to the front
+     * of "Centre: Name · Release" while the pinned centre is shown.
+     */
+    private placeHome(): void {
+        const btn = document.getElementById('fan-home-btn');
+        const own = document.getElementById('fan-home-pill');
+        if (!btn || !own) return;
+        const pin = this.centrePin && !this.centrePin.hidden ? this.centrePin : null;
+        const host = pin ?? own;
+        if (btn.parentElement === host) return;
+        const hadFocus = document.activeElement === btn;
+        if (pin) {
+            let sep = pin.querySelector<HTMLElement>(':scope > .focus-home-sep');
+            if (!sep) {
+                sep = document.createElement('span');
+                sep.className = 'focus-home-sep';
+                sep.setAttribute('aria-hidden', 'true');
+            }
+            pin.prepend(btn, sep);
+        } else {
+            this.centrePin?.querySelector(':scope > .focus-home-sep')?.remove();
+            own.appendChild(btn);
+        }
+        if (hadFocus) btn.focus({ preventScroll: true });
+    }
+
+    /** ⌂ stands in its own pill now (not hidden, not joined to the pin). */
+    private homeShown(): boolean {
+        const btn = document.getElementById('fan-home-btn');
+        return !!btn && !btn.hidden && btn.parentElement?.id === 'fan-home-pill';
+    }
+
+    private updateCentrePinBox(id: PersonId | null): void {
         const stage = this.stage();
         if (!id || !stage) {
             if (this.centrePin) this.centrePin.hidden = true;
@@ -629,6 +819,8 @@ export class FanViewController {
         if (!pill || pill.hidden || !stage) return;
         pill.style.top = '';
         pill.style.maxWidth = '';
+        const origin = pill === this.pill;
+        if (origin) stage.classList.remove('fan-home-below');
         const s = stage.getBoundingClientRect();
         if (s.width === 0) return;
         const obstacles = ['#evidence-pill', '#live-follow-pill', '#live-panel', '#fan-legend-chip', '#fan-legend', '#fan-zoom-controls']
@@ -644,6 +836,11 @@ export class FanViewController {
             if (!hit) return;
             if (hit.left - r.left - GAP >= 150) {
                 pill.style.maxWidth = `${Math.floor(hit.left - r.left - GAP)}px`;
+            } else if (origin && !stage.classList.contains('fan-home-below') && this.homeShown()
+                && hit.left - (s.left + 12) - GAP >= 150) {
+                // No room beside ⌂ but at the stage's edge: the pill keeps the row, ⌂ goes under it
+                // (the fan's middle stays free).
+                stage.classList.add('fan-home-below');
             } else {
                 pill.style.top = `${Math.ceil(hit.bottom - s.top + GAP)}px`;
                 pill.style.maxWidth = '';
@@ -658,8 +855,11 @@ export class FanViewController {
         pill.addEventListener('click', () => this.goOrigin());
         const replace = () => {
             this.placeChip();
+            this.placeHome();
             if (!pill.hidden) this.placePill();
             if (this.centrePin && !this.centrePin.hidden) this.placePill(this.centrePin);
+            // The highlight's pill came or went: the whole fan keeps clear of it.
+            if (this.host.active()) this.zoom?.refit();
         };
         if (typeof MutationObserver === 'function') new MutationObserver(replace).observe(document.body, { childList: true });
         if (typeof ResizeObserver === 'function') {
@@ -696,6 +896,8 @@ export class FanViewController {
             items.push(...(this.host.menuExtra?.(pid, kind === 'focus') ?? []));
             items.push({ id: 'detail', label: S.personDetail, run: () => this.host.personDetail(pid) });
             items.push({ id: 'page', label: S.personPage, run: () => this.host.personPage(pid) });
+            const rod = this.rodMenuItem(pid);
+            if (rod) items.push(rod);
             const first = el.getAttribute('data-fan-repeat-of');
             if (first) {
                 const n = /^a(\d+)$/.exec(first);
@@ -710,6 +912,23 @@ export class FanViewController {
             title: male ? S.emptyFather : S.emptyMother,
             sub: num ? S.number(num) : '',
             items: [{ id: 'add', label: male ? S.addFather : S.addMother, run: () => this.host.addParent(child, male ? 'male' : 'female') }],
+        };
+    }
+
+    /**
+     * "Highlight the X family line" / "Clear the family line highlight"
+     * (spec 114 §5): in the family-line colours, for a person with a line.
+     */
+    private rodMenuItem(pid: PersonId): FanMenuSpec['items'][number] | null {
+        const a = this.rodColors();
+        const rod = a && this.host.selectRod ? rodOf(a.index, pid) : null;
+        if (!a || !rod) return null;
+        const S = strings.fan;
+        const on = (this.host.selectedRod?.() ?? null) === rod;
+        return {
+            id: 'rod',
+            label: on ? S.menuUnhighlightRod : S.menuHighlightRod(this.rodName(a, rod)),
+            run: () => this.host.selectRod?.(on ? null : rod),
         };
     }
 
@@ -881,6 +1100,12 @@ export class FanViewController {
         const inside = x >= vb.x && x <= vb.x + vb.w && y >= vb.y && y <= vb.y + vb.h;
         this.draw();
         if (!inside) zoom.animateTo({ z: zoom.zoom(), cx: x, cy: y });
+    }
+
+    /** Whether the fan drawn now shows the person (a sector of theirs, the centre among them). */
+    hasPerson(id: string): boolean {
+        const m = this.model;
+        return !!m && [...m.sectors, ...m.desc].some(s => s.person?.id === id);
     }
 
     /** The sectors of the person selected in another window (not the focus: the centre is them already). */
@@ -1068,13 +1293,38 @@ export class FanViewController {
             const color = t.closest<HTMLElement>('.fan-color-btn');
             if (color?.dataset.fanColor) { this.host.setColorMode(color.dataset.fanColor as FanColorMode); return; }
             if (t.closest('#fan-legend-head')) { this.toggleLegend(); return; }
+            const rod = t.closest<HTMLElement>('[data-fan-rod]');
+            if (rod?.dataset.fanRod) {
+                // §6: a tap in the sheet closes it, so the fan shows the line (the chip names it).
+                const inSheet = !!rod.closest('#fan-sheet-items');
+                this.toggleRod(rod.dataset.fanRod);
+                if (inSheet) this.closeSheet();
+                return;
+            }
+            if (t.closest('.fan-legend-other')) { this.toggleLegendOther(); return; }
             if (t.closest('#fan-legend-chip')) { this.openSheet(); return; }
             if (t.closest('[data-fan-sheet-close]')) { this.closeSheet(); return; }
         });
         container.addEventListener('keydown', (e) => {
             if (e.key === 'Escape' && this.sheetOpen()) { e.preventDefault(); e.stopPropagation(); this.closeSheet(); return; }
+            if (this.legendRowKeys(e)) return;
             this.radioKeys(e);
         });
+        // §5: the mouse over a family line's row previews it (a mouse only; touch has no hover).
+        const legendItems = container.querySelector<HTMLElement>('#fan-legend-items');
+        if (legendItems && typeof matchMedia === 'function' && matchMedia('(hover: hover)').matches) {
+            legendItems.addEventListener('pointerover', (e) => {
+                if (e.pointerType !== 'mouse') return;
+                const id = (e.target as Element).closest?.<HTMLElement>('[data-fan-rod]')?.dataset.fanRod ?? null;
+                if (id && id === this.previewHeld) return;
+                this.previewHeld = null;
+                this.setPreview(id);
+            });
+            legendItems.addEventListener('pointerleave', () => {
+                this.previewHeld = null;
+                this.setPreview(null);
+            });
+        }
         const gen = container.querySelector<HTMLSelectElement>('#fan-gen-native');
         gen?.addEventListener('change', () => this.host.setGenerations(parseInt(gen.value, 10)));
         const desc = container.querySelector<HTMLSelectElement>('#fan-desc-native');
@@ -1171,11 +1421,30 @@ export class FanViewController {
         const model = this.model;
         if (!model) return [];
         const mode = this.host.settings().colorMode;
-        const rc = mode === 'rod' ? fanRodColors(fanLineages(model.data)) : null;
+        const rc = this.rodColors();
         const of = (theme: FanTheme) => fanLegend(model, mode, theme, rc);
         const light = of('light'), dark = of('dark'), print = of('print');
         return light.map((item, i) => ({ item, light: item, dark: dark[i] ?? item, print: print[i] ?? item }));
     }
+
+    /** The family lines of the legend in the three themes (computed once per assignment, the lines named once). */
+    private rodLegends(): RodLegends | null {
+        const a = this.rodColors();
+        if (!a) return null;
+        if (this.rodLegendCache?.a === a) return this.rodLegendCache.l;
+        const labelOf = (id: RodId) => this.rodName(a, id);
+        const l = { light: fanRodLegend(a, 'light', labelOf), dark: fanRodLegend(a, 'dark', labelOf), print: fanRodLegend(a, 'print', labelOf) };
+        this.rodLegendCache = { a, l };
+        return l;
+    }
+
+    /** A family line's name as the tree overview writes it (the names computed once per index). */
+    private rodName(a: FanRodAssignment, id: RodId): string {
+        if (this.rodLabelCache?.index !== a.index) this.rodLabelCache = { index: a.index, labels: rodLabels(a.index) };
+        return this.rodLabelCache.labels.get(id) ?? '';
+    }
+
+    private rodLabelCache: { index: FanRodAssignment['index']; labels: Map<RodId, string> } | null = null;
 
     private swatch(r: { light: FanLegendItem; dark: FanLegendItem; print: FanLegendItem }): string {
         const v = (name: string, a: FanLegendItem) => `--${name}:${a.color};--${name}2:${a.color2 ?? a.color};`;
@@ -1184,13 +1453,9 @@ export class FanViewController {
 
     private legendItemsHtml(): string {
         const esc = this.host.esc;
-        const legend = this.legendRows();
-        // The family line chosen in the tree view (spec 039 §4.2): its row marked; a line
-        // without a colour of its own marks "Other families".
-        const sel = this.host.settings().colorMode === 'rod' ? this.host.selectedRod?.() ?? null : null;
-        const selKey = sel === null ? null : legend.some(r => r.item.key === sel) ? sel : 'rodOther';
-        const rows = legend.map(r =>
-            `<div class="fan-legend-row sel-opt${r.item.key === selKey ? ' is-selected' : ''}" data-sel-form="row" data-fan-legend="${esc(r.item.key)}">${this.swatch(r)}`
+        const rods = this.host.settings().colorMode === 'rod' ? this.rodLegends() : null;
+        const rows = rods ? [this.rodLegendHtml(rods)] : this.legendRows().map(r =>
+            `<div class="fan-legend-row sel-opt" data-sel-form="row" data-fan-legend="${esc(r.item.key)}">${this.swatch(r)}`
             + `<span class="fan-legend-label">${esc(r.item.label)}</span>`
             + (r.item.who ? `<span class="fan-legend-who">${esc(r.item.who)}</span>` : '')
             + '</div>');
@@ -1201,10 +1466,75 @@ export class FanViewController {
         return rows.join('');
     }
 
+    /**
+     * The family lines of the fan (spec 114 §4): a part per side (the
+     * father's, the mother's, the descendants) with its heading, then "Other"
+     * (the smaller lines, each in its colour, expandable; K1.7) and "no family
+     * line". The rows are buttons (§5): pressed is the tree's chosen line
+     * (spec 039); a chosen smaller line marks "Other" while it is closed.
+     */
+    private rodLegendHtml(L: RodLegends): string {
+        const S = strings.fan;
+        const esc = this.host.esc;
+        const sel = this.host.selectedRod?.() ?? null;
+        const coloured = sel !== null && L.light.groups.some(g => g.items.some(i => i.key === sel));
+        const small = sel !== null && L.light.other.some(i => i.key === sel);
+        const pressed = coloured || (small && this.legendOtherOpen) ? sel : null;
+        const heads: Record<FanRodGroup, string> = { P: S.legendFatherSide, M: S.legendMotherSide, D: S.legendDescendants };
+        const greyOf = (theme: FanTheme): FanLegendItem => ({ key: '', label: '', color: FAN_PALETTES[theme].grey });
+        const greySw = this.swatch({ light: greyOf('light'), dark: greyOf('dark'), print: greyOf('print') });
+        const arrow = (a: string) => `<span class="fan-legend-arrow" aria-hidden="true">${a}</span>`;
+        const row = (r: { light: FanLegendItem; dark: FanLegendItem; print: FanLegendItem }, sub: boolean): string => {
+            const i = r.light;
+            const aria = S.legendRowAria(i.label, i.count ?? 0) + (i.focus ? `, ${S.legendCentreAria}` : '');
+            return `<button type="button" class="fan-legend-row fan-legend-rod sel-opt${sub ? ' fan-legend-sub' : ''}" data-sel-form="row"`
+                + ` data-fan-legend="${esc(i.key)}" data-fan-rod="${esc(i.key)}" aria-pressed="${i.key === pressed}" aria-label="${esc(aria)}" tabindex="-1">`
+                + this.swatch(r)
+                + `<span class="fan-legend-label">${esc(i.label)}${i.focus ? `<span class="fan-legend-centre"> · ${esc(S.legendCentre)}</span>` : ''}</span>`
+                + `<span class="fan-legend-who">${esc(i.who ?? '')}</span>${sub ? arrow('') : ''}</button>`;
+        };
+        const noRod = (sub: boolean) => `<div class="fan-legend-row fan-legend-norod sel-opt${sub ? ' fan-legend-sub' : ''}" data-sel-form="row" data-fan-legend="noRod">${greySw}`
+            + `<span class="fan-legend-label">${esc(S.legendNoRod)}</span><span class="fan-legend-who">${L.light.noRod}×</span>${sub ? arrow('') : ''}</div>`;
+        let html = '';
+        L.light.groups.forEach((g, gi) => {
+            html += `<div class="fan-legend-group">${esc(heads[g.group])}</div>`;
+            g.items.forEach((light, k) => {
+                html += row({ light, dark: L.dark.groups[gi]?.items[k] ?? light, print: L.print.groups[gi]?.items[k] ?? light }, false);
+            });
+        });
+        if (L.light.otherRods) {
+            const open = this.legendOtherOpen;
+            const otherOf = (l: FanRodLegend): FanLegendItem => ({ key: '', label: '', ...fanRodOtherSwatch(l.other) });
+            const otherSw = this.swatch({ light: otherOf(L.light), dark: otherOf(L.dark), print: otherOf(L.print) });
+            html += `<button type="button" class="fan-legend-row fan-legend-other sel-opt${small && !open ? ' is-selected' : ''}" data-sel-form="row"`
+                + ` data-fan-legend="rodOther" aria-expanded="${open}" tabindex="-1">${otherSw}`
+                + `<span class="fan-legend-label">${esc(S.legendOther(L.light.otherRods))}</span>`
+                + `<span class="fan-legend-who">${L.light.otherPeople}×</span>${arrow(open ? '▾' : '▸')}</button>`;
+            if (open) {
+                L.light.other.forEach((light, k) => { html += row({ light, dark: L.dark.other[k] ?? light, print: L.print.other[k] ?? light }, true); });
+                if (L.light.noRod) html += noRod(true);
+            }
+        } else if (L.light.noRod) html += noRod(false);
+        return html ? `<div class="fan-legend-rods" role="group" aria-label="${esc(S.legendRowsAria)}">${html}</div>` : '';
+    }
+
+    /** The chip's three dots: the first line of each side; a side missing takes the father's side's next line (§4). */
+    private chipDots(): Array<{ light: string; dark: string }> {
+        const L = this.host.settings().colorMode === 'rod' ? this.rodLegends() : null;
+        if (!L) return this.legendRows().slice(0, 3).map(r => ({ light: r.light.color, dark: r.dark.color }));
+        const pick = (gi: number, k: number) => ({ light: L.light.groups[gi].items[k].color, dark: L.dark.groups[gi]?.items[k]?.color ?? L.light.groups[gi].items[k].color });
+        const dots = L.light.groups.map((_, gi) => pick(gi, 0));
+        const p = L.light.groups.findIndex(g => g.group === 'P');
+        for (let k = 1; dots.length < 3 && p >= 0 && k < L.light.groups[p].items.length; k++) dots.push(pick(p, k));
+        if (!dots.length) dots.push({ light: FAN_PALETTES.light.grey, dark: FAN_PALETTES.dark.grey });
+        return dots.slice(0, 3);
+    }
+
     private renderLegend(): void {
         const c = this.container;
         if (!c) return;
         const mode = this.host.settings().colorMode;
+        if (mode !== 'rod' || !this.legendOpen) this.setPreview(null);
         const label = this.colorLabel(mode);
         const esc = this.host.esc;
         const items = this.legendItemsHtml();
@@ -1213,28 +1543,115 @@ export class FanViewController {
         const list = c.querySelector<HTMLElement>('#fan-legend-items');
         legend?.classList.toggle('is-open', this.legendOpen);
         legend?.toggleAttribute('hidden', !this.model);
+        // Back / forward stand above the card at its height (T54 H1).
+        if (legend) syncFanLegendLift(legend);
         if (head) {
             head.innerHTML = `<span class="fan-legend-title">${esc(strings.fan.legend)} · ${esc(label)}</span>`
                 + `<span class="fan-legend-arrow" aria-hidden="true">${this.legendOpen ? '▾' : '▸'}</span>`;
             head.setAttribute('aria-expanded', this.legendOpen ? 'true' : 'false');
         }
-        if (list) list.innerHTML = items;
+        const sheetItems = c.querySelector<HTMLElement>('#fan-sheet-items');
+        if (items !== this.legendHtml) {
+            this.legendHtml = items;
+            // The row with the keyboard focus keeps it (a click re-renders the rows).
+            const active = document.activeElement;
+            const lists = [list, sheetItems].filter((e): e is HTMLElement => !!e);
+            const holder = lists.find(e => active instanceof HTMLElement && e.contains(active)) ?? null;
+            const key = holder && active instanceof HTMLElement ? active.closest<HTMLElement>('[data-fan-legend]')?.dataset.fanLegend ?? null : null;
+            for (const e of lists) e.innerHTML = items;
+            for (const e of lists) this.legendRoving(e);
+            if (holder) {
+                const again = [...holder.querySelectorAll<HTMLElement>('button[data-fan-legend]')].find(b => b.dataset.fanLegend === key)
+                    ?? holder.querySelector<HTMLElement>('.fan-legend-rods button[tabindex="0"]');
+                again?.focus({ preventScroll: true });
+            }
+        }
         const chip = c.querySelector<HTMLElement>('#fan-legend-chip');
         if (chip) {
-            const dots = this.legendRows().slice(0, 3)
-                .map(r => `<span class="fan-chip-dot" style="--sl:${r.light.color};--sd:${r.dark.color}"></span>`).join('');
-            chip.innerHTML = `<span class="fan-chip-dots" aria-hidden="true">${dots}</span>`
-                + `<span class="fan-chip-label">${esc(label)}</span><span class="fan-chip-arrow" aria-hidden="true">▴</span>`;
-            chip.setAttribute('aria-label', strings.fan.colorsChip(label));
+            // §6: a highlighted line in the fan: its swatch and name (the pill below carries the ×).
+            const rod = this.chipRod();
+            let html: string;
+            if (rod) {
+                html = this.swatch(rod) + `<span class="fan-chip-label">${esc(rod.light.label)}</span>`;
+                chip.setAttribute('aria-label', strings.fan.colorsChipRod(label, rod.light.label));
+            } else {
+                const dots = this.chipDots()
+                    .map(d => `<span class="fan-chip-dot" style="--sl:${d.light};--sd:${d.dark}"></span>`).join('');
+                html = `<span class="fan-chip-dots" aria-hidden="true">${dots}</span><span class="fan-chip-label">${esc(label)}</span>`;
+                chip.setAttribute('aria-label', strings.fan.colorsChip(label));
+            }
+            html += '<span class="fan-chip-arrow" aria-hidden="true">▴</span>';
+            if (chip.innerHTML !== html) chip.innerHTML = html;
+            chip.classList.toggle('has-rod', !!rod);
             chip.toggleAttribute('hidden', !this.model);
         }
-        const sheetItems = c.querySelector<HTMLElement>('#fan-sheet-items');
-        if (sheetItems) sheetItems.innerHTML = items;
+    }
+
+    /** The chip's family line: the chosen one while it is highlighted and drawn in the fan (colours by family lines). */
+    private chipRod(): { light: FanLegendItem; dark: FanLegendItem; print: FanLegendItem } | null {
+        const id = this.host.highlightedRod?.() ?? null;
+        const L = id && this.host.settings().colorMode === 'rod' ? this.rodLegends() : null;
+        if (!L || !id) return null;
+        const find = (l: FanRodLegend) => l.groups.flatMap(g => g.items).concat(l.other).find(i => i.key === id) ?? null;
+        const light = find(L.light);
+        if (!light) return null;
+        return { light, dark: find(L.dark) ?? light, print: find(L.print) ?? light };
+    }
+
+    /** One tab stop in the legend's rows: the pressed row, else "Other" when it marks the chosen line, else the first. */
+    private legendRoving(list: HTMLElement, to?: HTMLElement): void {
+        const rows = [...list.querySelectorAll<HTMLElement>('.fan-legend-rods > button')];
+        const on = to ?? rows.find(b => b.getAttribute('aria-pressed') === 'true') ?? rows.find(b => b.classList.contains('is-selected')) ?? rows[0];
+        for (const b of rows) b.tabIndex = b === on ? 0 : -1;
+    }
+
+    /** ↑ / ↓ / Home / End between the legend's rows ("Other" among them); Enter and Space are the buttons' own. */
+    private legendRowKeys(e: KeyboardEvent): boolean {
+        if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) return false;
+        const row = (e.target as Element).closest?.<HTMLElement>('.fan-legend-rods > button');
+        const list = row?.closest<HTMLElement>('#fan-legend-items, #fan-sheet-items');
+        if (!row || !list) return false;
+        const rows = [...list.querySelectorAll<HTMLElement>('.fan-legend-rods > button')];
+        const i = rows.indexOf(row);
+        const n = e.key === 'Home' ? 0 : e.key === 'End' ? rows.length - 1
+            : Math.max(0, Math.min(rows.length - 1, i + (e.key === 'ArrowUp' ? -1 : 1)));
+        e.preventDefault();
+        e.stopPropagation();
+        this.legendRoving(list, rows[n]);
+        rows[n].focus();
+        return true;
     }
 
     /** The legend again (the chosen family line changed). */
     refreshLegend(): void {
         this.renderLegend();
+    }
+
+    /** A family line's row: chosen as the tree's line (spec 039), pressed again: the whole tree (§5). */
+    private toggleRod(id: string): void {
+        this.previewHeld = id;
+        this.setPreview(null);
+        const sel = this.host.selectedRod?.() ?? null;
+        this.host.selectRod?.(sel === id ? null : id);
+    }
+
+    /** "Other" expanded or closed (kept on the device; a satellite window in its memory only). */
+    private toggleLegendOther(): void {
+        this.legendOtherOpen = !this.legendOtherOpen;
+        if (this.host.remembersPrefs?.() !== false) {
+            try { localStorage.setItem(FAN_STORAGE_KEYS.legendOtherOpen, this.legendOtherOpen ? '1' : '0'); } catch { /* ignore */ }
+        }
+        this.renderLegend();
+    }
+
+    /** The preview of a family line under the mouse (null: none, the chosen line shows again). */
+    private setPreview(id: string | null): void {
+        if (id === this.previewId) return;
+        const a = id ? this.rodColors() : null;
+        this.previewId = a ? id : null;
+        if (!a || !id) { this.host.previewRod?.(null); return; }
+        const rod = id as RodId;
+        this.host.previewRod?.({ hit: new Set(realRodMembers(a.index, rod)), faint: new Set(realRodSpouses(a.index, rod)) });
     }
 
     private toggleLegend(): void {

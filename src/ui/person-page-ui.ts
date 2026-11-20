@@ -7,6 +7,7 @@
  * "Save as HTML" dialog with sharing on phones and tablets.
  */
 
+import { personMedia } from '../media.js';
 import { DataManager } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { strings, getCurrentLanguage } from '../strings.js';
@@ -34,6 +35,7 @@ import { lifeChartHtml } from '../person-page-chart.js';
 import { FanZoom, fanZoomModifier } from '../fan-zoom.js';
 import { PERSON_PAGE_CSS } from '../person-page-css.js';
 import { uiModule } from './module.js';
+import { portraitWholePhoto } from './portrait-actions-ui.js';
 import type { SetRef } from './family-pages-ui.js';
 import { openImageViewer } from './image-viewer.js';
 import { personSubtitle } from './person-sources-ui.js';
@@ -102,13 +104,14 @@ async function shrinkAttachments(list: readonly Attachment[]): Promise<Map<strin
 
 /** The tree with one person's attachments swapped for their reduced copies (the tree itself untouched). */
 function withShrunkAttachments(data: StromData, personId: PersonId, shrunk: ReadonlyMap<string, string>): StromData {
-    const p = data.persons[personId];
-    if (!p?.attachments || !shrunk.size) return data;
-    const attachments = p.attachments.map(a => {
+    const own = personMedia(data, personId);
+    if (!own.length || !shrunk.size) return data;
+    const media = { ...(data.media ?? {}) };
+    for (const a of own) {
         const small = shrunk.get(a.id);
-        return small ? { ...a, dataUrl: small, mimeType: 'image/jpeg', sizeBytes: Math.round(small.length * 0.75) } : a;
-    });
-    return { ...data, persons: { ...data.persons, [personId]: { ...p, attachments } } };
+        if (small) media[a.id] = { ...a, dataUrl: small, mimeType: 'image/jpeg', sizeBytes: Math.round(small.length * 0.75) };
+    }
+    return { ...data, media };
 }
 const PRIVACY_MODES = PERSON_PAGE_PRIVACY_MODES;
 
@@ -749,7 +752,10 @@ export const personPageMethods = uiModule({
         const zoom = target.closest<HTMLElement>('[data-pp-zoom]');
         if (zoom) {
             const src = (zoom.querySelector('img') ?? zoom.closest('.pp-fig')?.querySelector('img'))?.getAttribute('src');
-            if (src) openImageViewer(src, () => zoom.focus({ preventScroll: true }));
+            // A portrait cut from a photo of the tree: Portrait | Whole photo (spec 107 §2).
+            const person = zoom.classList.contains('pp-portrait') && state ? DataManager.getPerson(state.current.personId) : null;
+            const whole = person && src === person.photo ? portraitWholePhoto(person) : null;
+            if (src) openImageViewer(src, () => zoom.focus({ preventScroll: true }), undefined, whole);
             return;
         }
         const differs = target.closest<HTMLElement>('[data-pp-differs]');
@@ -834,6 +840,9 @@ export const personPageMethods = uiModule({
         if (action === 'materials') {
             if (person?.refn && this.materialsListOn()) {
                 this.openMaterials({ person: person.refn });
+            } else if (!this.materialsListOn() && this.materialsWindowOn()) {
+                // Every tree's window (spec 102 §1), filtered to the person as from their attachments.
+                this.openMaterials({ person: personId, group: 'added' });
             } else {
                 this.closePersonPage({ focus: false });
                 this.showPersonMaterials(personId);
@@ -983,7 +992,10 @@ export const personPageMethods = uiModule({
             `<button type="button" class="pp-menu-item${narrow ? ' pp-menu-item--narrow' : ''}" role="menuitem" data-pp-menu="${key}">${esc(label)}</button>`;
         // Phones (and a phone held sideways) have Save and Print here; wider windows have them in the header.
         menu.innerHTML = item('save', P.save, true) + item('print', P.print, true)
-            + (canEdit ? item('edit', P.edit) : '') + item('focus', P.focus);
+            + (canEdit ? item('edit', P.edit) : '')
+            // Edit portrait crop (spec 107 §2): only an editable person with a portrait.
+            + (canEdit && DataManager.getPerson(personId)?.photo ? item('crop', P.editCrop) : '')
+            + item('focus', P.focus);
         menu.hidden = false;
         overlayEl()?.querySelector('.pp-more')?.setAttribute('aria-expanded', 'true');
         [...menu.querySelectorAll<HTMLElement>('.pp-menu-item')].find(el => el.getClientRects().length > 0)?.focus();
@@ -1019,6 +1031,9 @@ export const personPageMethods = uiModule({
             this.snapshotPersonPage();
             this.pushDialog('person-modal');
             this.showEditPersonModal(personId);
+        } else if (key === 'crop') {
+            // The editor opens over the page; Done writes at once and the page redraws (strom:user-change).
+            this.editPersonPortrait(personId);
         } else if (key === 'focus') {
             this.closePersonPage({ focus: false });
             this.runPersonMenuAction(personId, 'focus');
@@ -1270,7 +1285,7 @@ export const personPageMethods = uiModule({
         });
         refresh();
         // Reduce the large attachment images meanwhile; the size and the file follow.
-        const shrinking = shrinkAttachments(data.persons[personId]?.attachments ?? []).then(map => {
+        const shrinking = shrinkAttachments(personMedia(data, personId)).then(map => {
             if (!map.size) return;
             shrunk = map;
             fullProt = protectPersonPageTree(fileData(), 'full', now);

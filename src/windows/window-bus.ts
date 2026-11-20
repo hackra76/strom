@@ -11,6 +11,7 @@
 
 import type { TreeId } from '../types.js';
 import type { SatelliteKind } from './window-role.js';
+import type { AgentFollow } from './agent-follow-state.js';
 
 export const WINDOW_CHANNEL = 'strom-windows';
 
@@ -35,6 +36,23 @@ export interface WindowStatus {
     canRedo: boolean;
     /** The satellites the main window knows (one missing from it says hello again: a main window after its reload). */
     windows: string[];
+    /**
+     * The revision of the agent's state (`agent-state`, spec 097 K1.3) the
+     * main window sent last (null: none yet): a window whose mirror stands
+     * elsewhere missed one and asks for the whole state.
+     */
+    agentRev?: number | null;
+    /**
+     * Each window's own following of the agent as it last said (spec 097 §7:
+     * the order of taking over); only the windows that have one.
+     */
+    agents?: Record<string, AgentFollow>;
+    /**
+     * The main window follows the research agent now (spec 097 §4, attached:
+     * not paused): a choice sent to it with `focus` is only marked there
+     * (spec 110 §4). Missing: no.
+     */
+    followingAgent?: boolean;
 }
 
 /** Where a satellite stands on screen (K4 layout). */
@@ -46,8 +64,12 @@ export interface WindowBounds {
 }
 
 export type WindowMessageBody =
-    /** sat → main: after start and after its reload. `state`: the view's own state (K4). */
-    | { type: 'hello'; windowId: string; kind: SatelliteKind; treeId: TreeId | null; state?: unknown }
+    /**
+     * sat → main: after start and after its reload. `state`: the view's own
+     * state (K4). `agent`: the window's own following of the agent (spec 097
+     * §1–§3; none without a live session), for the order of taking over (§7).
+     */
+    | { type: 'hello'; windowId: string; kind: SatelliteKind; treeId: TreeId | null; state?: unknown; agent?: AgentFollow | null }
     /** main → sat: the view's starting state from openSatellite (once, before `tree`). */
     | { type: 'init'; to: string; kind: SatelliteKind; state: unknown }
     /**
@@ -65,8 +87,20 @@ export type WindowMessageBody =
     | { type: 'edit'; windowId: string; editId: string; treeId: TreeId; baseRevision: number; json: string; label: string }
     /** main → sat: the edit's result; `ok: false` = not applied (a fresh `tree` follows to that window). */
     | { type: 'edit-result'; to: string; editId: string; ok: boolean; revision: number; reason?: EditRefusal }
-    /** all → all: the selected person (only windows following the selection send and take it). */
-    | { type: 'select'; personId: string | null; treeId: TreeId | null; origin: string }
+    /**
+     * all → all: the selected person (only windows following the selection
+     * send and take it). A satellite's says what the choice does in the main
+     * window (`intent`, spec 110: `focus` makes the person its centre, `mark`
+     * or none only marks) and numbers its choices (`seq`, rising in the
+     * window: the main window takes only the newest).
+     */
+    | { type: 'select'; personId: string | null; treeId: TreeId | null; origin: string; intent?: 'mark' | 'focus'; seq?: number }
+    /**
+     * sat → main: what a choice in the window does in the main window now
+     * (spec 110 §1: its send mode, `mark` while it sends nothing or its view
+     * offers no choice); another than `focus` ends a run of its choices there.
+     */
+    | { type: 'send-mode'; windowId: string; mode: 'mark' | 'focus' }
     /** sat → main: undo / redo from the main window's history (the result comes as `patch`). */
     | { type: 'undo' }
     | { type: 'redo' }
@@ -89,8 +123,23 @@ export type WindowMessageBody =
     | { type: 'research-menu'; to: string; reqId: string; items: unknown[] }
     /** main → overview window: the research's state (§6, K3). */
     | { type: 'research-state'; state: unknown }
-    /** sat → main: the window switched its view (its kind in the main window's list, its address). */
-    | { type: 'view'; windowId: string; kind: SatelliteKind }
+    /**
+     * main → sat: the agent's state as the main window has it (spec 097 K1.3,
+     * src/windows/agent-state.ts): the sections changed since the last
+     * revision, or all of them (to one window after its hello or its ask).
+     * No bridge address or token crosses.
+     */
+    | { type: 'agent-state'; to?: string; state: unknown }
+    /**
+     * main → sat: the slots of the fan's family lines the main window remembers
+     * (spec 114 §3), after every change of them (to one window after its
+     * hello); a satellite starts its fan from them. Empty: forgotten.
+     */
+    | { type: 'fan-rod-colors'; to?: string; treeId: TreeId | null; memory: Array<[string, string]> }
+    /** sat → main: the whole agent's state for this window (its mirror missed a revision, a new main window). */
+    | { type: 'agent-state-req'; windowId: string }
+    /** sat → main: the window switched its view (its kind in the main window's list, its address), or its following of the agent changed. */
+    | { type: 'view'; windowId: string; kind: SatelliteKind; agent?: AgentFollow | null }
     /**
      * sat → main: this window opened another one itself (§2 ⧉ "Open another
      * window"); its starting state goes to it as `init` after its hello.
@@ -100,6 +149,8 @@ export type WindowMessageBody =
     | { type: 'bye'; windowId: string; bounds?: WindowBounds }
     /** main → all: the main window is going away. */
     | { type: 'main-bye' }
+    /** sat → all: this window takes over after the main window closed (spec 097 §7); the others wait for it. */
+    | { type: 'taking-over'; windowId: string }
     /** second tab / sat → main: an address or a launch to open there (?person= ?live= ?send= ?import-url=, files). */
     | { type: 'link'; search?: string; files?: unknown[] }
     /** main → sat: close yourself (a window the main window holds no reference to). */
@@ -120,8 +171,8 @@ export interface ChannelLike {
     close(): void;
 }
 
-const TYPES = new Set<string>(['hello', 'init', 'tree', 'patch', 'edit', 'edit-result', 'select', 'undo', 'redo', 'status',
-    'focus-req', 'focused', 'research-action', 'research-action-result', 'research-menu-req', 'research-menu', 'research-state', 'view', 'spawn', 'bye', 'main-bye', 'link', 'close']);
+const TYPES = new Set<string>(['hello', 'init', 'tree', 'patch', 'edit', 'edit-result', 'select', 'send-mode', 'undo', 'redo', 'status',
+    'focus-req', 'focused', 'research-action', 'research-action-result', 'research-menu-req', 'research-menu', 'research-state', 'agent-state', 'agent-state-req', 'fan-rod-colors', 'view', 'spawn', 'bye', 'main-bye', 'taking-over', 'link', 'close']);
 
 function isWindowMessage(data: unknown): data is WindowMessage {
     if (!data || typeof data !== 'object') return false;

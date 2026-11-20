@@ -8,7 +8,8 @@ import { openApp, seedTree, waitForPersist, type SeedPerson } from './helpers.js
  * cell's Copy · Only "{value}" · Without "{value}" (an empty cell: only empty
  * / only filled), the filters "= / ≠" as chips, kept with a saved view; a
  * father's Only lists the siblings, not the children of a namesake; on a
- * phone the row's sheet starts with the same choices.
+ * phone the row's sheet starts with the same choices. Several exclusions
+ * apply at once, each its own chip (spec 103 K1.1–K1.4).
  */
 
 const FAMILY: Record<string, SeedPerson> = {
@@ -63,12 +64,12 @@ test.describe('desktop (1440)', () => {
         await expect(row(page, 'p:b1')).toHaveAttribute('aria-selected', 'true');
         const bubble = page.locator('.tv-bubble');
         await expect(bubble).toBeVisible();
-        // The cell cursor's outline (2px --primary, inset; not a selection) in the light and the dark scheme.
+        // The cell cursor's outline (a hairline of --primary, inset, T54 H3; not a selection) in the light and the dark scheme.
         for (const scheme of ['light', 'dark'] as const) {
             await page.emulateMedia({ colorScheme: scheme });
             // Read until the outline settled after the click and the scheme switch (a single read can catch it mid-change).
             await expect.poll(() => place.evaluate(e => { const s = getComputedStyle(e); return { style: s.outlineStyle, width: s.outlineWidth }; }))
-                .toEqual({ style: 'solid', width: '2px' });
+                .toEqual({ style: 'solid', width: '1px' });
         }
         await page.emulateMedia({ colorScheme: 'light' });
         // Escape closes the bubble and gives the focus back to the active cell.
@@ -124,9 +125,9 @@ test.describe('desktop (1440)', () => {
         const place = await cell(page, 'p:b1', 'bPlace');
         await place.click({ button: 'right' });
         await expect(place).toHaveClass(/is-active-cell/);
-        await expect(menuLabels(page)).toHaveText(['Copy', 'Only “Lhotka nad Brodem”', 'Without “Lhotka nad Brodem”', 'Edit cell', 'Show in tree', 'Open person', 'Edit…']);
+        await expect(menuLabels(page)).toHaveText(['Copy', 'Only “Lhotka nad Brodem”', 'Without “Lhotka nad Brodem”', 'Edit cell', 'Show in tree', 'Open person', 'Edit…', 'Pin row', 'Add to list']);
         await expect(page.locator('.tv-menu .tv-menu-item').first().locator('.tv-menu-hint')).toHaveText(/^(Ctrl\+C|⌘C)$/);
-        await expect(page.locator('.tv-menu .tv-menu-sep')).toHaveCount(1);
+        await expect(page.locator('.tv-menu .tv-menu-sep')).toHaveCount(3);
         await menuItem(page, 'Copy').click();
         await expect.poll(() => clipboard(page)).toBe('Lhotka nad Brodem');
 
@@ -156,7 +157,7 @@ test.describe('desktop (1440)', () => {
 
         // An empty cell: only empty / only filled.
         await (await cell(page, 'p:f', 'bPlace')).click({ button: 'right' });
-        await expect(menuLabels(page)).toHaveText(['Only empty', 'Only filled', 'Edit cell', 'Show in tree', 'Open person', 'Edit…']);
+        await expect(menuLabels(page)).toHaveText(['Only empty', 'Only filled', 'Edit cell', 'Show in tree', 'Open person', 'Edit…', 'Pin row', 'Add to list']);
         await menuItem(page, 'Only empty').click();
         await expect(status(page)).toHaveText('3 of 7 people');
 
@@ -169,7 +170,7 @@ test.describe('desktop (1440)', () => {
         await page.keyboard.press('Escape');
         // The row's own name keeps the row's actions alone.
         await row(page, 'p:b2').locator('.tv-name').click({ button: 'right' });
-        await expect(menuLabels(page)).toHaveText(['Show in tree', 'Open person', 'Edit…']);
+        await expect(menuLabels(page)).toHaveText(['Show in tree', 'Open person', 'Edit…', 'Pin row', 'Add to list']);
     });
 
     test('Only "{father}" lists the siblings (a namesake\'s son not), kept in a saved view and back after a reload', async ({ page }) => {
@@ -183,7 +184,7 @@ test.describe('desktop (1440)', () => {
         await expect(status(page)).toHaveText('2 of 7 people');
         await expect(row(page, 'p:b2')).toHaveCount(1);
         await expect(row(page, 'p:t')).toHaveCount(0);
-        await expect(colChips(page)).toHaveText(['Father = Radomír Šlapetný']);
+        await expect(colChips(page)).toHaveText(['Father = Radomír Šlapetný (b. 1850)']);
 
         await page.locator('#table-container .tv-view-saveas').click();
         const input = page.locator('.tv-fpanel.tv-vpanel .tv-vname-input');
@@ -196,8 +197,101 @@ test.describe('desktop (1440)', () => {
         if (!await page.locator('#table-container .tv-grid').isVisible()) await page.locator('#view-mode-table').click();
         await expect(page.locator('#table-container .tv-view-name')).toHaveText('Siblings');
         await expect(status(page)).toHaveText('2 of 7 people');
-        await expect(colChips(page)).toHaveText(['Father = Radomír Šlapetný']);
+        await expect(colChips(page)).toHaveText(['Father = Radomír Šlapetný (b. 1850)']);
         await expect(row(page, 'p:t')).toHaveCount(0);
+    });
+
+    test('Without one value, then another: both apply, each its own chip whose × drops it alone; kept in a saved view (spec 103 K1.1, K1.2, K1.4)', async ({ page }) => {
+        await openTable(page);
+        await (await cell(page, 'p:b1', 'bPlace')).click({ button: 'right' });
+        await menuItem(page, 'Without').click();
+        await expect(status(page)).toHaveText('5 of 7 people');
+        await (await cell(page, 'p:t', 'bPlace')).click({ button: 'right' });
+        await menuItem(page, 'Without').click();
+        // The first exclusion stays: neither place, the people without one remain.
+        await expect(colChips(page)).toHaveText(['Birthplace ≠ Lhotka nad Brodem', 'Birthplace ≠ Dolni Vresova']);
+        await expect(status(page)).toHaveText('3 of 7 people');
+        // Another column's Without joins them.
+        await (await cell(page, 'p:w', 'bDate')).click({ button: 'right' });
+        await menuItem(page, 'Without').click();
+        await expect(colChips(page)).toHaveCount(3);
+        await expect(status(page)).toHaveText('2 of 7 people');
+
+        // The × of the first chip drops that one alone.
+        await page.locator('#table-container .tv-chip--col').first().locator('.tv-chip-x').click();
+        await expect(colChips(page)).toHaveText(['Birthplace ≠ Dolni Vresova', /^Birth date ≠ /]);
+        await expect(status(page)).toHaveText('4 of 7 people');
+        await expect(row(page, 'p:b1')).toHaveCount(1);
+
+        await page.locator('#table-container .tv-view-saveas').click();
+        const input = page.locator('.tv-fpanel.tv-vpanel .tv-vname-input');
+        await input.fill('Two exclusions');
+        await input.press('Enter');
+        await waitForPersist(page, 'Two exclusions');
+        await page.reload();
+        await expect(page.locator('html')).not.toHaveClass(/app-loading/);
+        if (!await page.locator('#table-container .tv-grid').isVisible()) await page.locator('#view-mode-table').click();
+        await expect(page.locator('#table-container .tv-view-name')).toHaveText('Two exclusions');
+        await expect(colChips(page)).toHaveText(['Birthplace ≠ Dolni Vresova', /^Birth date ≠ /]);
+        await expect(status(page)).toHaveText('4 of 7 people');
+
+        // Clear filters drops them all.
+        await page.locator('#table-container .tv-chips-clear').click();
+        await expect(colChips(page)).toHaveCount(0);
+        await expect(status(page)).toHaveText('7 of 7 people');
+    });
+
+    test('"= A or B" in the chip: tick B, untick A, untick the last; namesakes with the birth year (spec 103 K1.5)', async ({ page }) => {
+        await openTable(page);
+        await (await cell(page, 'p:b1', 'bPlace')).click({ button: 'right' });
+        await menuItem(page, 'Only').click();
+        await expect(status(page)).toHaveText('2 of 7 people');
+        // The chip's form: "is" ticks the column's values, its own first.
+        await colChips(page).click();
+        const panel = page.locator('.tv-fpanel');
+        const values = panel.locator('.tv-ff-eqvalues .tv-ff-check');
+        await expect(panel.locator('.tv-ff-match')).toHaveValue('equals');
+        await expect(panel.locator('.tv-ff-text')).toBeHidden();
+        await expect(values).toHaveText(['Lhotka nad Brodem', 'Dolní Vřesová']);
+        await expect(values.locator('input')).toHaveCount(2);
+        await expect(values.nth(0).locator('input')).toBeChecked();
+        await expect(values.nth(1).locator('input')).not.toBeChecked();
+        await values.nth(1).locator('input').check();
+        await panel.locator('.tv-fpanel-apply').click();
+        await expect(colChips(page)).toHaveText(['Birthplace = Lhotka nad Brodem or Dolní Vřesová']);
+        await expect(status(page)).toHaveText('4 of 7 people');
+        for (const id of ['b1', 'b2', 'm', 't']) await expect(row(page, `p:${id}`)).toHaveCount(1);
+
+        // Untick A: B alone.
+        await colChips(page).click();
+        await expect(values).toHaveText(['Lhotka nad Brodem', 'Dolní Vřesová']);
+        await values.nth(0).locator('input').uncheck();
+        await panel.locator('.tv-fpanel-apply').click();
+        await expect(colChips(page)).toHaveText(['Birthplace = Dolní Vřesová']);
+        await expect(status(page)).toHaveText('2 of 7 people');
+        await expect(row(page, 'p:b1')).toHaveCount(0);
+        await expect(row(page, 'p:t')).toHaveCount(1);
+
+        // Untick the last: the chip goes.
+        await colChips(page).click();
+        await values.nth(0).locator('input').uncheck();
+        await panel.locator('.tv-fpanel-apply').click();
+        await expect(colChips(page)).toHaveCount(0);
+        await expect(status(page)).toHaveText('7 of 7 people');
+
+        // Namesakes: the birth year tells the fathers apart, in the chip and in its list.
+        await page.locator('#table-container .tv-view-btn').click();
+        await menuItem(page, 'Births and parents').click();
+        await (await cell(page, 'p:b1', 'father')).click({ button: 'right' });
+        await menuItem(page, 'Only').click();
+        await expect(colChips(page)).toHaveText(['Father = Radomír Šlapetný (b. 1850)']);
+        await colChips(page).click();
+        await expect(values).toHaveText(['Radomír Šlapetný (b. 1850)', 'Radomír Šlapetný (b. 1849)']);
+        await values.nth(1).locator('input').check();
+        await panel.locator('.tv-fpanel-apply').click();
+        await expect(colChips(page)).toHaveText(['Father = Radomír Šlapetný (b. 1850) or Radomír Šlapetný (b. 1849)']);
+        await expect(status(page)).toHaveText('3 of 7 people');
+        await expect(row(page, 'p:t')).toHaveCount(1);
     });
 
     test('the menu of a cell on another row than the selected one opens under that cell (T54 G7)', async ({ page }) => {
@@ -242,13 +336,31 @@ test.describe('phone (390)', () => {
         const sheet = page.locator('.bottom-sheet-menu');
         await expect(sheet).toBeVisible();
         const labels = sheet.locator('.bottom-sheet-item .bottom-sheet-label');
-        await expect(labels).toHaveText(['Copy', 'Only “4 Mar 1880”', 'Without “4 Mar 1880”', 'Show in tree', 'Open person', 'Edit…']);
+        await expect(labels).toHaveText(['Copy', 'Only “4 Mar 1880”', 'Without “4 Mar 1880”', 'Show in tree', 'Open person', 'Edit…', 'Add to list']);
         expect((await sheet.locator('.bottom-sheet-item').first().boundingBox())!.height).toBeGreaterThanOrEqual(44);
         await sheet.locator('.bottom-sheet-item', { hasText: 'Only' }).tap();
         await expect(sheet).toHaveCount(0);
         await expect(status(page)).toHaveText('1 of 7 people');
         // The name keeps the row's sheet as it was.
         await row(page, 'p:b1').locator('.tv-name').tap();
-        await expect(labels).toHaveText(['Show in tree', 'Open person', 'Edit…']);
+        await expect(labels).toHaveText(['Show in tree', 'Open person', 'Edit…', 'Add to list']);
+    });
+
+    test('the column\'s filter after an Only: tick a second value ("= A or B", spec 103 K1.5)', async ({ page }) => {
+        await openTable(page, true);
+        await (await cell(page, 'p:b1', 'bDate')).tap();
+        await page.locator('.bottom-sheet-menu .bottom-sheet-item', { hasText: 'Only' }).tap();
+        await expect(status(page)).toHaveText('1 of 7 people');
+        await page.locator('#table-container .tv-headrow [data-col="bDate"] .tv-head-menu').dispatchEvent('click');
+        await page.locator('.bottom-sheet-item, .tv-menu-item', { hasText: 'Filter…' }).first().tap();
+        const sheet = page.locator('.tv-fsheet');
+        const values = sheet.locator('.tv-ff-eqvalues .tv-ff-check');
+        await expect(values.first()).toHaveText('4 Mar 1880');
+        await expect(values.first().locator('input')).toBeChecked();
+        expect((await values.nth(1).boundingBox())!.height).toBeGreaterThanOrEqual(44);
+        await sheet.locator('.tv-ff-eqvalues .tv-ff-check', { hasText: '1885' }).tap();
+        await sheet.getByRole('button', { name: 'Apply' }).tap();
+        await expect(status(page)).toHaveText('2 of 7 people');
+        await expect(row(page, 'p:t')).toHaveCount(1);
     });
 });

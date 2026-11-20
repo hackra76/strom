@@ -127,6 +127,68 @@ test.describe('Add materials', () => {
         await expect(dialog.locator('[data-act="pick-files"]')).toHaveCount(0);
     });
 
+    test('a phone: while it runs, Cancel, Hide and Pause stack in one column inside the screen', async ({ page }) => {
+        await page.setViewportSize({ width: 390, height: 844 });
+        const b = await fakeBridge(page, { accepts: BATCH_ACCEPTS });
+        await openResearch(page, { media: true });
+        await poll(page);
+        await page.evaluate(() => (window.Strom.UI as any).showBatchDialog());
+        await addFiles(page, ['Krabice/a.jpg', 'Krabice/b.jpg']);
+        const dialog = page.locator('#batch-modal');
+        await dialog.locator('[data-act="next"]').click();
+        b.down = true;
+        await dialog.getByRole('button', { name: 'Send 2 files' }).click();
+        await expect(dialog.locator('.batch-progress-title')).toHaveText('Paused');
+        const footer = dialog.locator('.batch-footer');
+        expect(await footer.evaluate(f => f.scrollWidth - f.clientWidth)).toBeLessThanOrEqual(0);
+        for (const act of ['cancel-run', 'hide', 'resume']) {
+            const box = (await footer.locator(`[data-act="${act}"]`).boundingBox())!;
+            expect(box.x, act).toBeGreaterThanOrEqual(0);
+            expect(box.x + box.width, act).toBeLessThanOrEqual(390);
+        }
+    });
+
+    test('Pause says Pausing… until the file on its way is in, then Paused; Cancel batch says Cancelling… until the batch is closed', async ({ page }) => {
+        const b = await fakeBridge(page, { accepts: BATCH_ACCEPTS });
+        await openResearch(page, { media: true });
+        await poll(page);
+        let release!: () => void;
+        let held = new Promise<void>(r => { release = r; });
+        await page.route(url => url.pathname.includes('/media/'), async route => {
+            if (route.request().method() === 'PUT') await held;
+            await route.fallback();
+        });
+        await page.evaluate(() => (window.Strom.UI as any).showBatchDialog());
+        await addFiles(page, ['Krabice/a.jpg', 'Krabice/b.jpg', 'Krabice/c.jpg']);
+        const dialog = page.locator('#batch-modal');
+        await dialog.locator('[data-act="next"]').click();
+        await dialog.getByRole('button', { name: 'Send 3 files' }).click();
+        await expect(dialog.locator('.batch-now')).toBeVisible();
+        const pause = dialog.locator('[data-act="pause"]');
+        await pause.click();
+        // The file on its way still goes: not "Paused" yet, the button says it is pausing (through the redraws).
+        await expect(pause).toHaveAttribute('data-busy', 'busy');
+        await expect(pause).toContainText('Pausing…');
+        await page.waitForTimeout(600);
+        await expect(dialog.locator('.batch-progress-title')).toHaveText('Sending to the research');
+        await expect(dialog.locator('[data-act="pause"]')).toHaveAttribute('data-busy', 'busy');
+        release();
+        await expect(dialog.locator('.batch-progress-title')).toHaveText('Paused');
+        expect(b.mediaPuts).toHaveLength(1);
+
+        held = new Promise<void>(r => { release = r; });
+        await dialog.locator('[data-act="resume"]').click();
+        await expect(dialog.locator('.batch-progress-title')).toHaveText('Sending to the research');
+        await dialog.locator('[data-act="cancel-run"]').click();
+        await page.locator('#confirm-ok-btn').click();
+        const cancel = dialog.locator('[data-act="cancel-run"]');
+        await expect(cancel).toHaveAttribute('data-busy', 'busy');
+        await expect(cancel).toContainText('Cancelling…');
+        release();
+        await expect(dialog.locator('.batch-confirm-title')).toContainText('is in the research');
+        expect(b.batchDone).toHaveLength(1);
+    });
+
     test('files dropped onto the window open the review', async ({ page }) => {
         await fakeBridge(page, { accepts: BATCH_ACCEPTS });
         await openResearch(page, { media: true });
@@ -154,6 +216,11 @@ test.describe('Add materials', () => {
         await dialog.getByRole('button', { name: 'Send 2 files' }).click();
         await expect(dialog.locator('.batch-progress-title')).toHaveText('Paused');
         await expect(dialog.locator('.batch-paused-note')).toContainText('The research stopped responding');
+        // The one bar (2h): "k of n" at the right of the size, a 4 px paused bar.
+        await expect(dialog.locator('.batch-prog .prog-k')).toHaveText(/^\d of 2$/);
+        const bar = dialog.locator('.batch-prog .bar.is-paused');
+        await expect(bar).toHaveCount(1);
+        expect(await bar.evaluate(el => getComputedStyle(el).height)).toBe('4px');
         // Hidden: the block tells how far it is, with Show.
         await dialog.getByRole('button', { name: 'Hide' }).click();
         await expect(dialog).toHaveCount(0);

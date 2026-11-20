@@ -33,10 +33,12 @@ function list(files: MaterialFile[], extra: Partial<MaterialList> = {}): Materia
 }
 
 function att(id: string, init: Partial<Attachment> = {}): Attachment {
-    return { id, name: `${id}.jpg`, mimeType: 'image/jpeg', dataUrl: 'data:image/jpeg;base64,AA==', sizeBytes: 10, ...init };
+    return { id, name: `${id}.jpg`, mimeType: 'image/jpeg', dataUrl: 'data:image/jpeg;base64,AA==', sizeBytes: 10, places: [], ...init };
 }
 
-const caps = (over: Partial<MaterialCaps> = {}): MaterialCaps => ({ list: true, assign: true, thumb: true, bridgeUp: true, ...over });
+const caps = (over: Partial<MaterialCaps> = {}): MaterialCaps => ({
+    list: true, assign: true, thumb: true, bridgeUp: true, links: false, edit: false, uses: false, sort: false, sortRun: false, sourceOf: false, left: false, sameAs: false, delete: false, mediaApp: false, ...over,
+});
 
 /** A fetch answering from a queue of [status, body, headers]. */
 function fakeFetch(answers: [number, unknown, Record<string, string>?][]) {
@@ -54,6 +56,21 @@ function fakeFetch(answers: [number, unknown, Record<string, string>?][]) {
 beforeEach(() => setLanguage('en'));
 
 describe('parseMaterialList', () => {
+    it('reads where the research links and uses a file (spec 102: material.links, material.uses)', () => {
+        const l = parseMaterialList({ files: [
+            { id: 'I0001', sha: sha(1), name: 'a.jpg', origin: 'app', links: [{ type: 'person', ref: 'P0001' }, { type: 'family', ref: 'F0002', event: 'MARR' }, { ref: 'P1' }, 'x'],
+                uses: { excerpts: 3, sources: ['S0001', 'S0001', 7, 'S0002'], tasks: 2.5 } },
+            { id: 'I0002', sha: sha(2), name: 'b.jpg', origin: 'other', uses: { excerpts: -1 } },
+            { id: 'I0003', sha: sha(3), name: 'c.jpg', uses: 'many' },
+        ] });
+        expect(l.files[0].origin).toBe('app');
+        expect(l.files[0].links).toEqual([{ type: 'person', ref: 'P0001' }, { type: 'family', ref: 'F0002', event: 'MARR' }]);
+        expect(l.files[0].uses).toEqual({ excerpts: 3, sources: ['S0001', 'S0002'], tasks: 2 });
+        expect(l.files[1].origin).toBeUndefined();
+        expect(l.files[1].uses).toEqual({ excerpts: 0, sources: [], tasks: 0 });
+        expect(l.files[2].uses).toBeUndefined();
+    });
+
     it('keeps valid records and drops broken ones', () => {
         const l = parseMaterialList({
             files: [
@@ -197,9 +214,7 @@ describe('labels', () => {
         expect(batchFolderLabel({ batch: { id: 'b', name: 'Box' }, path: 'Letters/a.jpg' })).toBe('Box › Letters');
         expect(batchFolderLabel({ batch: { id: 'b', name: 'Box' }, path: 'a.jpg' })).toBe('Box');
         expect(batchFolderLabel({})).toBe(strings.materials.loose);
-        // A tree attachment without its original in the research: "In the tree", batch or not.
-        expect(batchFolderLabel({ origin: 'tree' })).toBe(strings.materials.inTreeGroup);
-        expect(batchFolderLabel({ origin: 'archive' })).toBe(strings.materials.loose);
+        expect(batchFolderLabel({ origin: 'tree' })).toBe(strings.materials.inTreeTag);
     });
 });
 
@@ -237,7 +252,9 @@ describe('gates', () => {
         expect(matThumb(env)).toBe(true);
         expect(matThumb({ ...env, bridgeUp: false })).toBe(false);
         expect(matThumb({ ...env, features: ['material.list', 'material.assign'] })).toBe(false);
-        expect(materialCaps({ ...env, onComputer: false })).toEqual({ list: false, assign: false, thumb: false, bridgeUp: true });
+        expect(materialCaps({ ...env, onComputer: false })).toEqual({
+            list: false, assign: false, thumb: false, bridgeUp: true, links: false, edit: false, uses: false, sort: false, sortRun: false, sourceOf: false, left: false, sameAs: false, delete: false, mediaApp: false,
+        });
     });
 });
 
@@ -251,14 +268,14 @@ describe('materialActions', () => {
     const by = Object.fromEntries(items.map(i => [i.key, i]));
     const ids = (a: { id: string }[]) => a.map(x => x.id);
 
-    it('archive item: open, assign, remove, hide, system, batch', () => {
+    it('archive item: open, link to, create a source, remove, hide, system, batch', () => {
         expect(ids(materialActions(by['m:I0001'], caps(), { person: 'P0001' })))
-            .toEqual(['open', 'assign', 'removeFromPerson', 'hide', 'openSystem', 'showInBatch']);
+            .toEqual(['open', 'attach', 'makeSource', 'removeFromPerson', 'hide', 'openSystem', 'showInBatch']);
     });
 
     it('a hidden item restores instead of hiding', () => {
         expect(ids(materialActions(by['m:I0003'], caps(), { person: 'P0001' })))
-            .toEqual(['open', 'assign', 'removeFromPerson', 'restore', 'openSystem']);
+            .toEqual(['open', 'attach', 'makeSource', 'removeFromPerson', 'restore', 'openSystem']);
     });
 
     it('a person only through the batch: removing offers the whole batch', () => {
@@ -267,16 +284,32 @@ describe('materialActions', () => {
         expect(remove).toEqual({ id: 'removeFromPerson', viaBatch: true });
     });
 
-    it('tree item: open, download, delete', () => {
-        expect(ids(materialActions(by['a:t'], caps(), { person: 'P0001' }))).toEqual(['open', 'download', 'deleteFromTree']);
+    it('tree item: open, title and details, link to, create a source, download, use as portrait, remove from the tree', () => {
+        expect(ids(materialActions(by['a:t'], caps(), { person: 'P0001' }))).toEqual(['open', 'edit', 'attach', 'makeSource', 'download', 'useAsPortrait', 'removeFromTree']);
+    });
+
+    it('use as portrait only for a picture the tree shows (not a PDF, not only its original)', () => {
+        const pdf = personMaterials({ attachments: [att('p', { mimeType: 'application/pdf', name: 'p.pdf' })] })[0];
+        expect(ids(materialActions(pdf, caps()))).toEqual(['open', 'edit', 'attach', 'makeSource', 'download', 'removeFromTree']);
+        const only = personMaterials({ attachments: [att('o', { originalOnly: true, dataUrl: '' })] })[0];
+        expect(ids(materialActions(only, caps()))).not.toContain('useAsPortrait');
     });
 
     it('an older research: no writes; bridge down: writes disabled', () => {
         expect(ids(materialActions(by['m:I0001'], caps({ assign: false }), { person: 'P0001' })))
             .toEqual(['open', 'openSystem', 'showInBatch']);
         const down = materialActions(by['m:I0001'], caps({ bridgeUp: false }), { person: 'P0001' });
-        expect(down.filter(a => a.disabled === 'bridgeDown').map(a => a.id)).toEqual(['assign', 'removeFromPerson', 'hide']);
+        expect(down.filter(a => a.disabled === 'bridgeDown').map(a => a.id)).toEqual(['attach', 'makeSource', 'removeFromPerson', 'hide']);
         expect(down.find(a => a.id === 'open')?.disabled).toBeUndefined();
+    });
+
+    it("title and details outside the tree: only with material.edit, disabled while the bridge is down; the tree's file always", () => {
+        expect(ids(materialActions(by['m:I0001'], caps(), { person: 'P0001' }))).not.toContain('edit');
+        expect(ids(materialActions(by['m:I0001'], caps({ edit: true }), { person: 'P0001' }))).toContain('edit');
+        const down = materialActions(by['m:I0001'], caps({ edit: true, bridgeUp: false }), { person: 'P0001' });
+        expect(down.find(a => a.id === 'edit')?.disabled).toBe('bridgeDown');
+        const tree = materialActions(by['a:t'], caps({ bridgeUp: false }), { person: 'P0001' });
+        expect(tree.find(a => a.id === 'edit')?.disabled).toBeUndefined();
     });
 });
 

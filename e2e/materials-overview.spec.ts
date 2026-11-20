@@ -220,7 +220,7 @@ test.describe('Materials window: loading, grouping and views', () => {
         await win(page).locator('[data-mw="view-list"]').click();
         await expect(win(page).locator('.mw-canvas .mw-li')).toHaveCount(3);
         await expect(win(page).locator('.mw-canvas .mw-tile')).toHaveCount(0);
-        expect(JSON.parse(await page.evaluate(() => localStorage.getItem('strom.materials.view') ?? '{}'))).toEqual({ group: 'date', view: 'list' });
+        expect(JSON.parse(await page.evaluate(() => localStorage.getItem('strom.materials.view') ?? '{}'))).toMatchObject({ group: 'date', appGroup: 'added', view: 'list' });
         await win(page).locator('.close-btn').click();
         await openWindow(page);
         await expect(win(page)).toHaveAttribute('data-group', 'date');
@@ -300,12 +300,15 @@ test.describe('Materials window: selecting', () => {
         await expect(win(page).locator('.mw-tile[aria-selected="true"]')).toHaveCount(3);
         await bar.locator('.mw-selwhole').click();
         await expect(bar.locator('.mw-selcount')).toHaveText('6 files selected');
+        await expect(win(page).locator('.mw-skipped')).toBeHidden();
         // The tree's attachment: counted, said to stay, left out of the action.
-        await win(page).locator('.mw-group-toggle', { hasText: 'In the tree' }).click();
+        await win(page).locator('.mw-group-toggle', { hasText: 'Single files' }).click();
         await win(page).locator('.mw-tile', { hasText: 'jen-strom.png' }).click();
         await expect(bar.locator('.mw-selcount')).toHaveText('7 files selected');
         await expect(win(page).locator('.mw-skipped')).toHaveText('1 only in the tree stay unchanged.');
-        await bar.locator('[data-mw="sel-assign"]').click();
+        // Assign… is in ⋯ (spec 102 §8b); the tree's file stays out of it.
+        await bar.locator('[data-mw="sel-more"]').click();
+        await page.locator('.mw-pop-selMenu [data-action="sel-assign"]').click();
         const acts = await actions(page);
         expect(acts[0].id).toBe('assign');
         expect(acts[0].keys).toHaveLength(6);
@@ -334,14 +337,63 @@ test.describe('Materials window: selecting', () => {
         await expect(win(page).locator('.mw-selbar .mw-selcount')).toHaveText('3 files selected');
     });
 
-    test('an older research (no assigning): no Select, no "Show hidden"', async ({ page }) => {
+    test('B88: a batch\'s ⋯ whose files are not read yet holds while they are read (the item busy, the others waiting); Escape cancels; then it acts', async ({ page }) => {
+        const two = [...files, ...[8, 9].map(n => materialFile(n, { batch: 'b-old', name: `stara-${n}.jpg`, path: `stara-${n}.jpg`, at: '2026-08-01T10:00:00.000Z' }))];
+        const both = [...batches, { id: 'b-old', name: 'Stará obálka', at: '2026-08-01T10:00:00.000Z' }];
+        let letGo!: () => void;
+        let gate = new Promise<void>(r => { letGo = r; });
+        await setup(page, {
+            files: two, batches: both,
+            before: async p => {
+                await holdFullList(p);
+                await p.route(u => u.href.startsWith(`${BRIDGE}/material`) && /[?&]batch=b-old/.test(u.search), async route => { await gate; await route.fallback(); });
+            },
+        });
+        await openWindow(page);
+        const old = groupHead(page, 'Stará obálka');
+        await expect(old).toBeVisible();
+        const more = old.locator('[data-mw="batch-menu"]');
+        await more.click();
+        const menu = page.locator('.mw-pop-batchMenu');
+        const select = menu.locator('[data-action="select"]');
+        await select.click();
+        await expect(menu).toBeVisible();
+        await expect(select).toHaveAttribute('aria-busy', 'true');
+        await expect(select.locator('.busy-slot .busy-spin.s12')).toBeVisible();
+        await expect(select).toHaveText(/^Select whole batch/);
+        await expect(menu.locator('[data-action="hide"]')).toHaveAttribute('aria-disabled', 'true');
+        await menu.locator('[data-action="hide"]').click({ force: true });
+        await expect(menu).toBeVisible();
+        // Escape: the menu closes, the reading is cancelled, the ⋯ focused; nothing selected.
+        await page.keyboard.press('Escape');
+        await expect(menu).toHaveCount(0);
+        await expect(more).toBeFocused();
+        letGo();
+        await page.waitForTimeout(300);
+        await expect(win(page).locator('.mw-selbar')).toBeHidden();
+
+        // Again, answered: the menu closes and the whole batch is selected.
+        gate = new Promise<void>(r => { letGo = r; });
+        await more.click();
+        await menu.locator('[data-action="select"]').click();
+        await expect(menu.locator('[data-action="select"]')).toHaveAttribute('aria-busy', 'true');
+        letGo();
+        await expect(menu).toHaveCount(0);
+        await expect(win(page).locator('.mw-selbar .mw-selcount')).toHaveText('2 files selected');
+    });
+
+    test('an older research (no assigning): no "Show hidden"; selecting without Assign or Hide (spec 102 §8)', async ({ page }) => {
         await setup(page, { files, batches, features: ['material.list'] });
         await openWindow(page);
         await expect(tiles(page).first()).toBeVisible();
-        await expect(win(page).locator('[data-mw="select"]')).toHaveCount(0);
         await expect(win(page).locator('[data-mw="hidden"]')).toHaveCount(0);
-        await tiles(page).first().click({ modifiers: ['Shift'] });
-        await expect(win(page).locator('.mw-selbar')).toBeHidden();
+        await win(page).locator('[data-mw="select"]').click();
+        await tiles(page).first().click();
+        await expect(win(page).locator('.mw-selbar')).toBeVisible();
+        // Title… needs material.edit: off, with the reason.
+        await expect(win(page).locator('[data-mw="sel-title"]')).toHaveAttribute('aria-disabled', 'true');
+        // Nothing for ⋯ (Assign and Hide need material.assign).
+        await expect(win(page).locator('[data-mw="sel-more"]')).toHaveCount(0);
     });
 });
 
@@ -358,7 +410,9 @@ test.describe('Materials window: the research not running', () => {
         await poll(page);
         await openWindow(page);
         await expect(win(page)).toHaveAttribute('data-state', 'stale');
-        await expect(win(page).locator('.mw-status')).toContainText('The research is not running · state from');
+        // What can be edited now (spec 102 §12a): the tree's files, not the material outside it.
+        await expect(win(page).locator('.mw-status')).toContainText('The research is not running · as of');
+        await expect(win(page).locator('.mw-status')).toContainText('Titles and links of files in the tree can be edited');
         // The first group (the batch) is open, the single files closed.
         await expect(tiles(page)).toHaveCount(1);
         await win(page).locator('.mw-canvas [data-mw="batch-menu"]').first().click();
@@ -367,12 +421,16 @@ test.describe('Materials window: the research not running', () => {
         await page.keyboard.press('Escape');
         await win(page).locator('[data-mw="select"]').click();
         await tiles(page).first().click();
-        await expect(win(page).locator('[data-mw="sel-assign"]')).toHaveAttribute('aria-disabled', 'true');
+        await win(page).locator('[data-mw="sel-more"]').click();
+        await expect(page.locator('.mw-pop-selMenu [data-action="sel-assign"]')).toHaveAttribute('aria-disabled', 'true');
+        await page.keyboard.press('Escape');
         // Running again: the strip goes, quietly.
         bridge.down = false;
         await poll(page);
         await expect(win(page).locator('.mw-status')).toBeHidden();
-        await expect(win(page).locator('[data-mw="sel-assign"]')).not.toHaveAttribute('aria-disabled', 'true');
+        await win(page).locator('[data-mw="sel-more"]').click();
+        await expect(page.locator('.mw-pop-selMenu [data-action="sel-assign"]')).not.toHaveAttribute('aria-disabled', 'true');
+        await page.keyboard.press('Escape');
     });
 
     test('never listed: the empty state and the tree\'s attachments', async ({ page }) => {
@@ -380,7 +438,7 @@ test.describe('Materials window: the research not running', () => {
         await openWindow(page);
         await expect(win(page)).toHaveAttribute('data-state', 'nocache');
         await expect(win(page).locator('.mw-empty.is-nocache')).toContainText('Materials from the archive load once the research runs.');
-        const tree = groupHead(page, 'Attachments in the tree');
+        const tree = groupHead(page, 'Single files');
         await expect(tree).toBeVisible();
         await expect(tree.locator('.mw-group-count')).toHaveText('2');
         await expect(tiles(page)).toHaveCount(2);
@@ -556,7 +614,7 @@ test.describe('Materials window: sizes', () => {
             await page.keyboard.press('Escape');
             await expect(win(page).locator('.mw-filters-btn')).toHaveText('Filter · 1');
             // The header stays one row: the active chip is counted in the button, not drawn beside it.
-            await expect(win(page).locator('.mw-chips')).toBeHidden();
+            await expect(win(page).locator('.mw-chips:visible')).toHaveCount(0);
             expect((await win(page).locator('.mw-head').boundingBox())!.height).toBeLessThan(70);
             const hidden = win(page).locator('.mw-tile.is-hidden');
             await expect(hidden).toHaveCount(1);

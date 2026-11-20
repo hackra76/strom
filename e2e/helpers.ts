@@ -122,6 +122,16 @@ export async function openApp(
 }
 
 /**
+ * Reload the page and wait, as openApp does, until the startup tree is read
+ * (html.app-loading gone). The load event comes before it: a research menu
+ * opened or a bridge polled in between finds no tree yet and does nothing.
+ */
+export async function reloadApp(page: Page): Promise<void> {
+    await page.reload();
+    await expect(page.locator('html')).not.toHaveClass(/app-loading/);
+}
+
+/**
  * A page opened beside the app's main window as a whole app of its own: a
  * browser without Web Locks (no window roles, every tab loads and saves the
  * trees; another tab's save is told over tab-sync). Without it, another tab
@@ -145,6 +155,18 @@ export async function asWindowlessTab(page: Page): Promise<void> {
  * loads at the first try; research-adopt-ids walks the tries.
  */
 export const AFTER_HAND_OVER = { timeout: 4_000 + 5_000 };
+
+/**
+ * The hand-over ended linked in its dialog (A175: the dialog stays with its steps): the sentence there,
+ * every step done, then the dialog closed (its Close).
+ */
+export async function closeHandedOver(page: Page, opts: { timeout?: number } = AFTER_HAND_OVER): Promise<void> {
+    const dialog = page.locator('#research-adopt-modal');
+    await expect(dialog.locator('.research-adopt-end')).toHaveText('The tree is linked with the research.', opts);
+    await expect(dialog.locator('ul.steps > li.done')).toHaveCount(4);
+    await dialog.locator('#research-adopt-close').click();
+    await expect(dialog).toHaveCount(0);
+}
 
 /** The visible person modal (add/edit). */
 export function personModal(page: Page): Locator {
@@ -418,7 +440,8 @@ export async function importJsonAsNewTree(page: Page, filePath: string, treeName
 export async function controlCardComesBack(page: Page): Promise<void> {
     await openApp(page);
     await page.getByRole('button', { name: 'Try a sample tree' }).click();
-    await expect(card(page, 'Johan')).toBeVisible();
+    // WebKit on a loaded machine (the whole suite in parallel) takes longer than 5 s to draw the sample tree.
+    await expect(card(page, 'Johan')).toBeVisible({ timeout: 15000 });
     const block = page.locator('.control-block');
     const panel = page.locator('#minimap-panel');
     // A fit while a zoom or the opening view still glides is taken over by the

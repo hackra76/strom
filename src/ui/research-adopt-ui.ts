@@ -27,7 +27,7 @@ import { NO_CITATION_FEATURES, researchCitationsOut, type ResearchCitationsOut }
 import {
     parseLiveBridge, sanitizeAdoptOffer, sanitizeAdoptReply, newAdoptToken, researchNewUrl, contentFingerprint, researchSchemeUrl,
     readResearchHeader, applyAdoptIds, AdoptOffer, AdoptIds, researchGedcomTitles, researchSendsSourceFields, TitlesInGedcom, sanitizeLiveStatus, statusAgentless, type BrowserInfo,
-    researchLinkMark,
+    researchLinkMark, researchKeepsAppMedia, researchMediaOut, NO_MEDIA_FEATURES, type ResearchMediaOut,
 } from '../research-link.js';
 import { newTieSendMode } from '../research-sync.js';
 import { uiModule } from './module.js';
@@ -35,9 +35,17 @@ import { onComputer, fetchWithTimeout, fetchStatus, readResearchTreeFile, postSy
 import { parseGedcom, convertToStrom } from '../ged-parser.js';
 import { normalizeModal } from './modal-skeleton.js';
 import { canPromptInstall, promptInstall } from '../pwa.js';
+import { whilePicking } from './file-pick.js';
 import { setPendingAdopt, clearPendingAdopt } from './pending-adopt.js';
 import { researchSendModeCardsHtml, researchSendPrinciplesHtml, researchSendModeChecked, researchTrialTagHtml } from './research-tree-settings-ui.js';
 import { researchSendMode } from './research-sync-ui.js';
+import { AdoptProgress, type AdoptPhase, type AdoptStep } from './adopt-progress.js';
+import { TreeEditLock } from './tree-edit-lock.js';
+import { holdLeave } from './busy-leave.js';
+import { BUSY_TIMEOUTS, busyToast } from './busy.js';
+import { downloadStep, type TreeDownloadWatch } from './tree-load-progress.js';
+import { safeFileName } from '../filenames.js';
+import type { ProgressToastHandle } from './toast.js';
 
 const ADOPT_ID = 'research-adopt-modal';
 const ELSEWHERE_ID = 'research-elsewhere-modal';
@@ -48,8 +56,6 @@ const READY_ID = 'research-ready-modal';
 const APP_ICON_SVG = '<svg class="install-ready-app-icon" viewBox="0 0 24 24" aria-hidden="true"><rect width="24" height="24" rx="5.3" fill="#3f6b4f"/><g transform="translate(3.6 3.6) scale(0.7)" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 19a4 4 0 0 1-2.24-7.32A3.5 3.5 0 0 1 9 6.03V6a3 3 0 1 1 6 0v.04a3.5 3.5 0 0 1 3.24 5.65A4 4 0 0 1 16 19Z"/><path d="M12 19v3"/></g></svg>';
 /** How long the research has to come back for the tree. */
 const TOKEN_MAX_AGE_MS = 60 * 60 * 1000;
-/** Strom Research takes photos and attachments over with a tree (not yet: it skips data URLs). */
-const RESEARCH_TAKES_IMAGES = false;
 /** Tries at the research's version right after a hand-over (ms to wait before each): it may write it a moment later. */
 const ADOPT_LOAD_WAITS = [0, 1000, 3000];
 
@@ -80,29 +86,34 @@ async function researchMovesTrees(base: string): Promise<boolean> {
  * any research reads right. And whether it reads the sources' place field by
  * field (sources.fields): not reached, not.
  */
-async function researchTitlesAt(base: string): Promise<{ titles: TitlesInGedcom; sourceFields: boolean; citations: ResearchCitationsOut }> {
+async function researchTitlesAt(base: string): Promise<{ titles: TitlesInGedcom; sourceFields: boolean; citations: ResearchCitationsOut; media: ResearchMediaOut }> {
     try {
         const res = await fetchWithTimeout(`${base}/status`, 4000);
-        if (!res.ok) return { titles: 'tags', sourceFields: false, citations: NO_CITATION_FEATURES };
+        if (!res.ok) return { titles: 'tags', sourceFields: false, citations: NO_CITATION_FEATURES, media: NO_MEDIA_FEATURES };
         const body = await res.json() as { features?: unknown } | null;
         const features = Array.isArray(body?.features) ? body.features.filter((f): f is string => typeof f === 'string') : null;
         // The sources' place field by field only to a research that reads it (sources.fields).
         // The main citations only to a research that keeps them (citations.main).
-        return { titles: researchGedcomTitles({ features }), sourceFields: researchSendsSourceFields({ features }), citations: researchCitationsOut({ features }) };
+        return { titles: researchGedcomTitles({ features }), sourceFields: researchSendsSourceFields({ features }), citations: researchCitationsOut({ features }),
+            media: researchMediaOut({ features }) };
     } catch {
-        return { titles: 'tags', sourceFields: false, citations: NO_CITATION_FEATURES };
+        return { titles: 'tags', sourceFields: false, citations: NO_CITATION_FEATURES, media: NO_MEDIA_FEATURES };
     }
 }
 
-/** Whether the research behind this bridge works without an agent: an archive, or one waiting for its agent (its /status). Not said: not. */
-async function researchAgentlessAt(base: string): Promise<boolean> {
+/**
+ * What the research behind this bridge says of itself for a hand-over (its /status; not said: not):
+ * it works without an agent (an archive, or one waiting for its agent), and it keeps the tree's
+ * photos and attachments (`media.app`, spec 108) — a hand-over with them only adds them there.
+ */
+async function researchAdoptStatusAt(base: string): Promise<{ agentless: boolean; takesImages: boolean }> {
     try {
         const res = await fetchWithTimeout(`${base}/status`, 4000);
-        if (!res.ok) return false;
+        if (!res.ok) return { agentless: false, takesImages: false };
         const status = sanitizeLiveStatus(await res.json());
-        return !!status && statusAgentless(status);
+        return { agentless: !!status && statusAgentless(status), takesImages: researchKeepsAppMedia(status) };
     } catch {
-        return false;
+        return { agentless: false, takesImages: false };
     }
 }
 
@@ -114,6 +125,162 @@ async function researchTakesEmpty(base: string): Promise<boolean> {
     } catch {
         return false;
     }
+}
+
+/** How long the research has to take the tree (§10.3, a whole tree: 120 s). */
+const ADOPT_POST_MS = BUSY_TIMEOUTS.tree;
+
+/** What a hand-over goes on with once the person said yes. */
+interface AdoptRunCtx {
+    raw: string;
+    base: string;
+    ged: string;
+    tree: TreeMetadata;
+    data: StromData;
+    choice: { images: boolean; sendMode: ResearchSendMode };
+    offer: AdoptOffer;
+    fromInstall: boolean;
+    ownInstall: boolean;
+    moved: { tree: TreeMetadata; from: AppBrowser } | null;
+}
+
+/** Kept across a retry: the backup is made once, the GEDCOM is what "Export GEDCOM" saves. */
+interface AdoptRunState {
+    backupDone: boolean;
+    backupSaved: boolean;
+    content: string | null;
+}
+
+type AdoptOutcome =
+    | { kind: 'linked'; researchId: string; hasPeople: boolean }
+    | { kind: 'empty' }
+    | { kind: 'held'; held: ResearchWriteHeld }
+    | { kind: 'unreached'; err: unknown }
+    | { kind: 'timeout' }
+    | { kind: 'refused' };
+
+/** Waiting for the research to come back for a tree: 30 s from the click (§10.3). */
+const ADOPT_WAIT_MS = 30_000;
+
+interface AdoptWait {
+    treeId: TreeId;
+    stop: AbortController;
+    toast: ProgressToastHandle | null;
+    /** Its limit passed (or it ended otherwise): a new start opens again. */
+    ended: boolean;
+}
+
+let adoptWait: AdoptWait | null = null;
+
+/** The research came back for a tree (here, or in another tab), or the wait was stopped: it ends quietly. */
+export function endResearchAdoptWait(): void {
+    const wait = adoptWait;
+    adoptWait = null;
+    if (!wait) return;
+    wait.ended = true;
+    wait.stop.abort();
+    wait.toast?.close();
+}
+
+/** The hand-over running now (one at a time): its dialog back. */
+let adoptRunning: { show: () => void } | null = null;
+
+/** The GEDCOM that was to go to the research, saved as a file (the safe way when the hand-over failed). */
+function downloadAdoptGedcom(content: string, tree: TreeMetadata): void {
+    const url = URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${safeFileName(tree.name, 'family-tree')}.ged`;
+    a.click();
+    URL.revokeObjectURL(url);
+    TreeManager.noteFileCopy([tree.id]);
+}
+
+/**
+ * The adopt dialog in its running mode (2a, 2b): the heading, one lead line, the list of steps and a
+ * sentence under it; the footer by state (running: the edits note + "Continue in the background";
+ * linked: Close · Open the research; failed: Close · Export GEDCOM).
+ */
+function adoptRunView(overlay: HTMLElement, treeName: string): {
+    host: HTMLElement; foot: HTMLElement;
+    running(): void; linked(openLabel: string | null): void;
+    failed(text: string, retry: () => void, close: () => void, exportGedcom: () => void): void;
+} {
+    const b = strings.busy;
+    const modal = overlay.querySelector<HTMLElement>('.modal')!;
+    modal.classList.add('research-adopt-running');
+    // No longer a decision (its Escape would look for "Don't hand over"): Escape folds it away, or closes it at the end.
+    modal.removeAttribute('data-dialog-kind');
+    overlay.querySelector('.research-adopt-moved')?.remove();
+    const h2 = modal.querySelector<HTMLElement>('#research-adopt-title');
+    if (h2) h2.textContent = b.adoptHeading;
+    modal.querySelector('.audit-log-subtitle')?.remove();
+    modal.querySelector('.research-adopt-counts-line')?.remove();
+    const body = modal.querySelector<HTMLElement>('.research-send-dialog-body')!;
+    body.innerHTML = '';
+    body.classList.add('research-adopt-progress');
+    const lead = document.createElement('p');
+    lead.className = 'research-adopt-lead';
+    lead.textContent = b.adoptLead(treeName);
+    body.appendChild(lead);
+    const host = document.createElement('div');
+    host.className = 'research-adopt-steps';
+    body.appendChild(host);
+    const foot = modal.querySelector<HTMLElement>('.buttons')!;
+    const button = (id: string, label: string, cls: string): HTMLButtonElement => {
+        const el = document.createElement('button');
+        el.type = 'button';
+        el.id = id;
+        el.className = cls;
+        el.innerHTML = label;
+        foot.appendChild(el);
+        return el;
+    };
+    const clearMsg = (): void => { host.querySelectorAll('.research-adopt-end').forEach(m => m.remove()); };
+    const message = (text: string, err: boolean): HTMLElement => {
+        clearMsg();
+        const msg = document.createElement('div');
+        msg.className = `busy-msg research-adopt-end${err ? ' is-err' : ''}`;
+        msg.setAttribute('role', err ? 'alert' : 'status');
+        const span = document.createElement('span');
+        span.className = 'busy-msg__text';
+        span.textContent = text;
+        msg.appendChild(span);
+        host.appendChild(msg);
+        return msg;
+    };
+    return {
+        host, foot,
+        running(): void {
+            clearMsg();
+            foot.innerHTML = '';
+            const note = document.createElement('span');
+            note.className = 'grow research-adopt-wait-note';
+            note.textContent = b.editsWaitAdoptNote;
+            foot.appendChild(note);
+            button('research-adopt-background', esc(b.adoptBackground), 'secondary').focus();
+        },
+        linked(openLabel: string | null): void {
+            message(b.adoptLinked, false);
+            foot.innerHTML = '';
+            const close = button('research-adopt-close', esc(strings.buttons.close), openLabel ? 'secondary' : 'primary');
+            const open = openLabel ? button('research-adopt-open', openLabel, 'primary') : null;
+            (open ?? close).focus();
+        },
+        failed(text: string, retry: () => void, close: () => void, exportGedcom: () => void): void {
+            const msg = message(text, true);
+            const again = document.createElement('button');
+            again.type = 'button';
+            again.className = 'link busy-msg__retry';
+            again.textContent = b.retry;
+            again.addEventListener('click', retry);
+            msg.appendChild(again);
+            foot.innerHTML = '';
+            button('research-adopt-close', esc(strings.buttons.close), 'secondary').addEventListener('click', close);
+            button('research-adopt-export', esc(strings.research.sendExportGedcom), 'secondary').addEventListener('click', exportGedcom);
+            again.focus();
+        },
+    };
 }
 
 export const researchAdoptMethods = uiModule({
@@ -140,7 +307,7 @@ export const researchAdoptMethods = uiModule({
      * the install dialog's Install step (its "I already have it" takes an
      * installed research too).
      */
-    startResearchAdopt(treeId: TreeId): void {
+    startResearchAdopt(treeId: TreeId, el?: HTMLElement | null): void {
         if (needsTransfer(currentAppBrowser())) {
             void (async () => {
                 if (DataManager.getCurrentTreeId() !== treeId) await this.switchToTree(treeId, { follow: false });
@@ -148,16 +315,49 @@ export const researchAdoptMethods = uiModule({
             })();
             return;
         }
+        // Started for this tree already and still opening or waiting (a second click, Enter): nothing again.
+        if (adoptWait?.treeId === treeId && !adoptWait.ended) return;
         const token = newAdoptToken();
         const url = researchNewUrl(token, currentAppBrowser(), undefined, announcedResearchScheme());
         if (!url || !TreeManager.getTreeMetadata(treeId)) return;
         TreeManager.setResearchAdoptToken(treeId, { token, at: new Date().toISOString() });
-        this.handOverResearchLink(url);
-        // No time limit: setting up takes as long as it takes. Closing the
-        // toast keeps the token — the research can still come back.
-        // The link may have opened nothing (the research was uninstalled, or never was here): the install line.
-        this.showToast(strings.research.awaitingAdopt, Infinity, { spinner: true, closable: true, kind: 'adopt',
-            action: { label: strings.research.awaitingNotInstalled, run: () => this.showResearchInstall('install') } });
+        void this.awaitResearchAdopt(treeId, url, el ?? null);
+    },
+
+    /**
+     * The research's set-up opened by `url` (A173, A94): "Opening the research…" while the link goes
+     * (10 s: the research proves nothing for `new`), then waiting for it to come back for the tree, at
+     * most 30 s from the click (§10.3) with "Stop waiting" and the install line (the link may have
+     * opened nothing: the research uninstalled, or never here). Then a neutral end with Try again;
+     * the token stays — the research can still come back.
+     */
+    async awaitResearchAdopt(treeId: TreeId, url: string, el: HTMLElement | null): Promise<void> {
+        endResearchAdoptWait();
+        const b = strings.busy;
+        const r = strings.research;
+        const stop = new AbortController();
+        const wait: AdoptWait = { treeId, stop, toast: null, ended: false };
+        adoptWait = wait;
+        const startedAt = Date.now();
+        const install = { label: r.awaitingNotInstalled, run: () => { endResearchAdoptWait(); this.showResearchInstall('install'); } };
+        const result = await this.launchResearchLink(url, 'terminal', el, { quietLimit: true, signal: stop.signal });
+        if (adoptWait !== wait || stop.signal.aborted) return;
+        if (result !== 'limit') {
+            wait.ended = true;
+            return;
+        }
+        const toast = this.showProgressToast({ title: b.adoptWaiting, startedAt, cancel: () => endResearchAdoptWait(), cancelLabel: b.stopWaiting, more: install },
+            { step: b.adoptWaitingSub });
+        toast.el.classList.add('toast--adopt-wait');
+        wait.toast = toast;
+        await new Promise<void>(resolve => {
+            const timer = setTimeout(resolve, Math.max(0, startedAt + ADOPT_WAIT_MS - Date.now()));
+            stop.signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); });
+        });
+        if (adoptWait !== wait || stop.signal.aborted) return;
+        wait.ended = true;
+        toast.fail(b.adoptWaitEnd, { label: b.retry, run: () => { void this.awaitResearchAdopt(treeId, url, null); } },
+            { title: b.notOpened, more: install, neutral: true });
     },
 
     /** Tree manager row menu: start research with that tree. */
@@ -201,6 +401,11 @@ export const researchAdoptMethods = uiModule({
     },
 
     async adoptFromResearchNow(raw: string): Promise<void> {
+        // A hand-over runs already (the research's ?adopt= again meanwhile): its dialog, never a second one.
+        if (adoptRunning) {
+            adoptRunning.show();
+            return;
+        }
         const r = strings.research;
         const bridge = parseLiveBridge(raw);
         if (!bridge) {
@@ -208,7 +413,8 @@ export const researchAdoptMethods = uiModule({
             return;
         }
         const cancelUrl = `${bridge.base}/cancel`;
-        document.querySelector('.toast')?.remove();
+        endResearchAdoptWait();
+        document.querySelector('.toast:not(.toast--progress)')?.remove();
         let offer: AdoptOffer | null = null;
         try {
             const res = await this.connectResearchBridge(() => fetchWithTimeout(`${bridge.base}/adopt`, CONNECT_TIMEOUT_MS));
@@ -253,7 +459,7 @@ export const researchAdoptMethods = uiModule({
             // An older research (1.12.0) takes no tree from Safari or a phone, where such a tree usually is:
             // told it is not handed over (it stops waiting at once instead of asking for another copy for
             // half an hour), and said here with the way to update it. A later line takes its empty research.
-            const oldResearch = !!offer && !offer.transfer && !await researchMovesTrees(bridge.base);
+            const oldResearch = !!offer && !offer.transfer && !await busyToast(strings.busy.connectingResearch, () => researchMovesTrees(bridge.base));
             postCancel(cancelUrl, oldResearch ? 'cancelled' : 'no-tree');
             // Another browser or profile has it: the address to open there (the research keeps waiting).
             if (offer) this.showResearchElsewhere(raw, offer.until, oldResearch);
@@ -272,15 +478,19 @@ export const researchAdoptMethods = uiModule({
         }
         // The tree going over is the one on screen behind the dialog.
         if (DataManager.getCurrentTreeId() !== tree.id) await this.switchToTree(tree.id, { follow: false });
+        // The research's status asked before the dialog (each ask up to 4 s): a progress toast says it (§2.1).
+        const empty = !Object.values(data.persons).some(p => !p.isPlaceholder);
+        const status = await busyToast(strings.busy.connectingResearch, async () =>
+            empty && !await researchTakesEmpty(bridge.base) ? null : await researchAdoptStatusAt(bridge.base));
         // Nobody in it yet (installed from the welcome screen, a tree from Safari's): an older research
         // refuses it (400 tree.empty) — not offered, the research told, and said how it starts (C1).
-        if (!Object.values(data.persons).some(p => !p.isPlaceholder) && !await researchTakesEmpty(bridge.base)) {
+        if (!status) {
             postCancel(cancelUrl, 'cancelled');
             await this.endEmptyHandOver(tree.id, fromInstall ? offer.token : null);
             return;
         }
-        const agentless = await researchAgentlessAt(bridge.base);
-        const choice = await this.askResearchAdopt(tree, offer, data, { install: ownInstall || !!moved, ...(moved ? { movedFrom: moved.from } : {}), agentless });
+        const { agentless, takesImages } = status;
+        const choice = await this.askResearchAdopt(tree, offer, data, { install: ownInstall || !!moved, ...(moved ? { movedFrom: moved.from } : {}), agentless, takesImages });
         if (choice === null) {
             postCancel(cancelUrl, 'cancelled');
             // The installation's hand-over declined: nothing waits to be finished any more.
@@ -289,46 +499,160 @@ export const researchAdoptMethods = uiModule({
             if (moved) await this.dropResearchTransfer(moved.tree.id, moved.from);
             return;
         }
+        await this.runResearchAdopt({ raw, base: bridge.base, ged: bridge.ged, tree, data, choice, offer, fromInstall, ownInstall, moved });
+    },
+
+    /**
+     * The hand-over itself, watched in its dialog (A175, screens 2a–2c): the dialog stays open and shows
+     * its steps; "Continue in the background" (or Esc) folds it into a progress toast with "Show". Edits
+     * to the tree and leaving the page wait meanwhile. It ends in the dialog (linked: Close · Open the
+     * research; failed: the sentence with Try again, Close · Export GEDCOM) or, folded away, in the toast.
+     */
+    async runResearchAdopt(ctx: AdoptRunCtx): Promise<void> {
+        const overlay = document.getElementById(ADOPT_ID);
+        if (!overlay || adoptRunning) return;
+        const b = strings.busy;
+        const r = strings.research;
+        const state: AdoptRunState = { backupDone: false, backupSaved: false, content: null };
+        let inDialog = true;
+        const view = adoptRunView(overlay, ctx.tree.name);
+        let progress: AdoptProgress | null = null;
+        const show = (): void => {
+            if (inDialog) return;
+            inDialog = true;
+            document.body.appendChild(overlay);
+            this.pushDialog(ADOPT_ID);
+            progress?.attach(view.host);
+            (overlay.querySelector<HTMLElement>('.buttons button') ?? null)?.focus();
+        };
+        const fold = (): void => {
+            if (!inDialog) return;
+            inDialog = false;
+            overlay.remove();
+            this.dialogStack = this.dialogStack.filter(d => d !== ADOPT_ID);
+            progress?.background();
+        };
+        const close = (): void => {
+            inDialog = false;
+            progress?.closeToast();
+            this.closeResearchAdoptDialog();
+        };
+        const exportGedcom = (): void => {
+            if (state.content) downloadAdoptGedcom(state.content, ctx.tree);
+        };
+        const attempt = async (): Promise<void> => {
+            const run = new AdoptProgress({ onShow: show });
+            progress = run;
+            adoptRunning = { show };
+            view.running();
+            run.attach(view.host);
+            this.researchAdoptResolve = fold;
+            view.foot.querySelector('#research-adopt-background')?.addEventListener('click', fold);
+            const release = [TreeEditLock.hold('adopt', b.editsWaitAdopt), holdLeave('adopt', ctx.tree.id)];
+            let outcome: AdoptOutcome;
+            try {
+                outcome = await this.handResearchAdopt(ctx, state, (p) => run.phase(p), (step, meta) => run.meta(step, meta));
+            } catch (err) {
+                console.warn('Handing the tree to the research failed', err);
+                outcome = { kind: 'refused' };
+            } finally {
+                release.forEach(f => f());
+                adoptRunning = null;
+            }
+            if (outcome.kind === 'linked') {
+                run.finish();
+                if (ctx.ownInstall || ctx.moved) {
+                    close();
+                    if (ctx.fromInstall) this.finishResearchInstall(ctx.offer.token);
+                    void this.showResearchReady(ctx.base, outcome.researchId, ctx.offer.name || r.defaultName, outcome.hasPeople, ctx.moved?.from);
+                    return;
+                }
+                if (!inDialog) {
+                    run.toastHandle?.done(r.adopted(ctx.tree.name));
+                    this.closeResearchAdoptDialog();
+                    return;
+                }
+                const url = this.researchLinkAvailable('open') ? researchSchemeUrl('open', { tree: outcome.researchId }, announcedResearchScheme()) : null;
+                view.linked(url ? researchActionLabel(r.openResearch, researchLinkMark('open')) : null);
+                this.researchAdoptResolve = close;
+                view.foot.querySelector('#research-adopt-close')?.addEventListener('click', close);
+                const open = view.foot.querySelector<HTMLButtonElement>('#research-adopt-open');
+                if (open && url) {
+                    open.addEventListener('click', () => {
+                        void this.launchResearchLink(url, 'terminal', open).then(res => { if (res === 'opened') close(); });
+                    });
+                }
+                return;
+            }
+            // Settled elsewhere: its own dialog, the hand-over's here goes.
+            if (outcome.kind === 'empty' || outcome.kind === 'held' || outcome.kind === 'unreached') {
+                close();
+                if (outcome.kind === 'empty') await this.endEmptyHandOver(ctx.tree.id, ctx.fromInstall ? ctx.offer.token : null);
+                else if (outcome.kind === 'held') await this.showResearchWriteHeld(outcome.held);
+                // Not reached (B1 of the Windows round: Edge asks about "Apps on device" only now, at the
+                // hand-over itself, and it was blocked): said as at the start, naming the setting. Once allowed
+                // the hand-over is offered again (B2); the tab keeps ?adopt= meanwhile, a reload asks again.
+                else if (await this.showResearchConnectFailed(outcome.err, { param: 'adopt', value: ctx.raw })) await this.adoptFromResearchNow(ctx.raw);
+                return;
+            }
+            run.fail();
+            const unchanged = state.backupSaved ? b.adoptUnchanged : b.adoptUnchangedPlain;
+            const text = outcome.kind === 'timeout' ? `${b.errTimeout(ADOPT_POST_MS / 1000)} ${unchanged}` : `${b.adoptNotTaken} ${unchanged}`;
+            const retry = (): void => { void attempt(); };
+            // Folded away: the toast says it (it stays), its Try again brings the dialog back with the steps.
+            if (!inDialog) {
+                run.toastHandle?.fail(text, { label: b.retry, run: () => { show(); retry(); } },
+                    { title: b.adoptFailedTitle, more: { label: r.sendExportGedcom, run: exportGedcom } });
+            }
+            this.researchAdoptResolve = close;
+            view.failed(text, retry, close, exportGedcom);
+        };
+        await attempt();
+    },
+
+    /**
+     * The steps of a hand-over (a backup, the GEDCOM, the research taking it, its version loaded), each
+     * reported to `phase`; what it ended in. The backup is made once, a retry goes on from the GEDCOM.
+     */
+    async handResearchAdopt(ctx: AdoptRunCtx, state: AdoptRunState, phase: (p: AdoptPhase) => void, meta: (step: AdoptStep, text: string) => void): Promise<AdoptOutcome> {
+        const { tree, data, choice } = ctx;
+        phase({ step: 'backup' });
         // A backup before the tree first goes to the research (whatever the backup setting).
-        if (DataManager.getCurrentTreeId() === tree.id && await DataManager.snapshotNow('pre-first-send')) {
-            patchResearchAutoState(tree.id, { firstSendBackup: true });
+        if (!state.backupDone) {
+            state.backupDone = true;
+            if (DataManager.getCurrentTreeId() === tree.id && await DataManager.snapshotNow('pre-first-send')) {
+                state.backupSaved = true;
+                patchResearchAutoState(tree.id, { firstSendBackup: true });
+            }
         }
-        // The research does not take photos over yet: they stay here only.
+        // Photos and attachments go only to a research that keeps them (`media.app`), when asked: else they stay here only.
         // A research that knows no titles gets the names without them (B-1): they stay here.
-        const { titles, sourceFields, citations } = await researchTitlesAt(bridge.base);
+        const { titles, sourceFields, citations, media } = await researchTitlesAt(ctx.base);
+        const persons = Object.values(data.persons).filter(p => !p.isPlaceholder).length;
+        phase({ step: 'gedcom', meta: strings.busy.adoptPeople(persons, persons.toLocaleString(getCurrentLanguage())) });
+        // The step is on screen before the export holds the page a moment.
+        await new Promise(resolve => setTimeout(resolve, 0));
         // (A tree the research has not had yet: its citations in the order of K1.1, never the list's own.)
-        const exported = exportToGedcom(choice.images ? data : stripMedia(data), tree.name, { titles, sourceFields, citationMain: citations.citationMain });
+        const exported = exportToGedcom(choice.images ? data : stripMedia(data), tree.name, { titles, sourceFields, citationMain: citations.citationMain, ...media });
+        state.content = exported.content;
+        phase({ step: 'taking' });
         let reply: { tree: string; head: string | null; ids: AdoptIds | null } | null = null;
-        let refusedEmpty = false;
-        let held: ResearchWriteHeld | null = null;
         try {
-            const res = await postSync(`${bridge.base}/adopt`, exported.content, 120000);
+            const res = await postSync(`${ctx.base}/adopt`, exported.content, ADOPT_POST_MS);
             if (res.ok) reply = sanitizeAdoptReply(await res.json());
             // Held until something is settled in the research (sealed elsewhere, files not downloaded, its disk full).
             else if (res.status === 409 || res.status === 507) {
-                held = await res.json().then((b: { code?: unknown; error?: unknown; params?: unknown }) => writeHeldOfCode(b?.code, b?.error, b?.params), () => null);
-            } else if (res.status === 400) refusedEmpty = await res.json().then((b: { code?: unknown }) => b?.code === 'tree.empty', () => false);
+                const held = await res.json().then((b: { code?: unknown; error?: unknown; params?: unknown }) => writeHeldOfCode(b?.code, b?.error, b?.params), () => null);
+                if (held) return { kind: 'held', held };
+            } else if (res.status === 400 && await res.json().then((b: { code?: unknown }) => b?.code === 'tree.empty', () => false)) {
+                return { kind: 'empty' };
+            }
         } catch (err) {
             console.warn('Handing the tree to the research failed', err);
-            // Not reached (B1 of the Windows round: Edge asks about "Apps on device" only now, at the
-            // hand-over itself, and it was blocked): said as at the start, naming the setting. Once allowed
-            // the hand-over is offered again (B2); the tab keeps ?adopt= meanwhile, a reload asks again.
-            if (await this.showResearchConnectFailed(err, { param: 'adopt', value: raw })) await this.adoptFromResearchNow(raw);
-            return;
+            if (err instanceof DOMException && (err.name === 'AbortError' || err.name === 'TimeoutError')) return { kind: 'timeout' };
+            return { kind: 'unreached', err };
         }
-        if (refusedEmpty) {
-            await this.endEmptyHandOver(tree.id, fromInstall ? offer.token : null);
-            return;
-        }
-        // Its sentence, the tree staying here as it is; never handed over again by itself (017 U7).
-        if (held) {
-            await this.showResearchWriteHeld(held);
-            return;
-        }
-        if (!reply) {
-            await this.showAlert(r.adoptFailed, 'error');
-            return;
-        }
+        if (!reply) return { kind: 'refused' };
         // The research's numbers for what went over (its `ids`, by this file's xrefs): every later
         // send names its people, even when its version below does not come.
         let taken = data;
@@ -363,9 +687,11 @@ export const researchAdoptMethods = uiModule({
         // connected now (sending by itself, the state in the bar), not only
         // after the research opens the app again.
         let status: Awaited<ReturnType<typeof fetchStatus>> = null;
-        try { status = await fetchStatus(`${bridge.base}/status`, 4000); } catch { /* connected at the next open */ }
-        if (status?.treeId !== reply.tree) noteResearchBridge(reply.tree, bridge.base);
-        const loaded = await this.loadResearchAfterAdopt(tree.id, bridge.ged, reply.tree, reply.head);
+        try { status = await fetchStatus(`${ctx.base}/status`, 4000); } catch { /* connected at the next open */ }
+        if (status?.treeId !== reply.tree) noteResearchBridge(reply.tree, ctx.base);
+        phase({ step: 'loading' });
+        const loaded = await this.loadResearchAfterAdopt(tree.id, ctx.ged, reply.tree, reply.head,
+            { progress: (got, total) => { const d = downloadStep(got, total); if (d.size) meta('loading', d.size); } });
         if (!loaded && !numbered && hasPeople) console.warn('The research numbers did not come with the hand-over: sending waits for its version', reply.tree);
         this.refreshResearchSyncUi();
         this.updateTreeSwitcher();
@@ -374,12 +700,7 @@ export const researchAdoptMethods = uiModule({
         TreeRenderer.render();
         // Linked with the research: its places not on the map, offered once (spec 034 U5 point 7).
         this.armPlacesOffer(tree.id);
-        if (ownInstall || moved) {
-            if (fromInstall) this.finishResearchInstall(offer.token);
-            void this.showResearchReady(bridge.base, reply.tree, offer.name || r.defaultName, hasPeople, moved?.from);
-            return;
-        }
-        this.showToast(r.adopted(tree.name), 6000);
+        return { kind: 'linked', researchId: reply.tree, hasPeople };
     },
 
     /**
@@ -389,13 +710,14 @@ export const researchAdoptMethods = uiModule({
      * (it may write it a moment after answering); every miss says why in the
      * console. True when it loaded.
      */
-    async loadResearchAfterAdopt(treeId: TreeId, gedUrl: string, researchId: string, head: string | null): Promise<boolean> {
+    async loadResearchAfterAdopt(treeId: TreeId, gedUrl: string, researchId: string, head: string | null, watch?: TreeDownloadWatch): Promise<boolean> {
         for (const wait of ADOPT_LOAD_WAITS) {
             if (wait) await new Promise(resolve => setTimeout(resolve, wait));
             let text: string;
             let images: ReadonlyMap<string, string> | undefined;
+            let media: true | undefined;
             try {
-                ({ text, images } = await readResearchTreeFile(gedUrl, this.researchStatusOf(researchId)?.features));
+                ({ text, images, media } = await readResearchTreeFile(gedUrl, this.researchStatusOf(researchId)?.features, watch));
             } catch (err) {
                 console.warn('Loading the research version after the hand-over failed', err);
                 continue;
@@ -407,7 +729,8 @@ export const researchAdoptMethods = uiModule({
                 continue;
             }
             try {
-                const done = await this.applyResearch(convertToStrom(parseGedcom(text), { images }).data, header, { quiet: true, ...(head ? { head } : {}) });
+                const done = await this.applyResearch(convertToStrom(parseGedcom(text), { images }).data, { ...header, ...(media ? { appMedia: true as const } : {}) },
+                    { quiet: true, ...(head ? { head } : {}) });
                 if (done !== treeId) console.warn('The research version after the hand-over was not loaded into the tree', { done, treeId });
                 return done === treeId;
             } catch (err) {
@@ -504,7 +827,8 @@ export const researchAdoptMethods = uiModule({
                 // (a browser offers once: a click with no offer left takes the row away).
                 const row = el.closest('.install-ready-app');
                 if (!canPromptInstall()) { row?.remove(); return; }
-                void promptInstall().then(ok => {
+                // The system's install question is its own state (A177): nothing shown, only no second question.
+                void whilePicking(el, () => promptInstall()).then(ok => {
                     if (!ok) return;
                     row?.remove();
                     this.showToast(strings.research.transferInstalling, 6000);
@@ -660,7 +984,7 @@ export const researchAdoptMethods = uiModule({
         (copy ?? overlay.querySelector<HTMLElement>('.buttons .primary'))?.focus();
     },
 
-    askResearchAdopt(tree: TreeMetadata, offer: AdoptOffer, data: ReturnType<typeof DataManager.getData>, opts: { install?: boolean; movedFrom?: AppBrowser; agentless?: boolean } = {}): Promise<{ images: boolean; sendMode: ResearchSendMode } | null> {
+    askResearchAdopt(tree: TreeMetadata, offer: AdoptOffer, data: ReturnType<typeof DataManager.getData>, opts: { install?: boolean; movedFrom?: AppBrowser; agentless?: boolean; takesImages?: boolean } = {}): Promise<{ images: boolean; sendMode: ResearchSendMode } | null> {
         document.getElementById(ADOPT_ID)?.remove();
         const r = strings.research;
         // As the research counts them: people with a name (an unnamed "?" stays out of its count).
@@ -668,8 +992,8 @@ export const researchAdoptMethods = uiModule({
         const families = countFamilies(data);
         const sources = Object.keys(data.sources ?? {}).length;
         const images = countImages(data);
-        // "Include photos and attachments" waits until the research takes them over.
-        const files = RESEARCH_TAKES_IMAGES ? images.photos + images.attachments + images.excerpts : 0;
+        // "Include photos and attachments" only for a research that keeps them (`media.app`, spec 108).
+        const files = opts.takesImages ? images.photos + images.attachments + images.excerpts : 0;
         const researchName = offer.name || r.defaultName;
         const t = strings.treeSettings;
         // Into an archive (or a research waiting for its agent) by itself, with an agent by hand (audit 017 a-D5).
@@ -718,17 +1042,21 @@ export const researchAdoptMethods = uiModule({
         this.pushDialog(ADOPT_ID);
         normalizeModal(overlay.querySelector('.modal') as HTMLElement);
         return new Promise((resolve) => {
+            const confirm = overlay.querySelector('#research-adopt-confirm') as HTMLButtonElement;
             const finish = (value: { images: boolean; sendMode: ResearchSendMode } | null): void => {
-                this.closeResearchAdoptDialog();
+                // Handed over: the dialog stays and shows its steps (A175); a second click goes nowhere.
+                confirm.onclick = null;
+                this.researchAdoptResolve = null;
+                if (value === null) this.closeResearchAdoptDialog();
                 resolve(value);
             };
             this.researchAdoptResolve = () => finish(null);
             (overlay.querySelector('#research-adopt-cancel') as HTMLButtonElement).onclick = () => finish(null);
-            (overlay.querySelector('#research-adopt-confirm') as HTMLButtonElement).onclick = () => {
+            confirm.onclick = () => {
                 const box = overlay.querySelector<HTMLInputElement>('#research-adopt-images');
                 finish({ images: box ? box.checked : false, sendMode: researchSendModeChecked(overlay, 'research-adopt-send-mode') ?? sendModeFirst });
             };
-            (overlay.querySelector('#research-adopt-confirm') as HTMLButtonElement).focus();
+            confirm.focus();
         });
     },
 

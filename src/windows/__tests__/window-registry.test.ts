@@ -327,6 +327,35 @@ describe('the list of windows', () => {
     });
 });
 
+describe('the windows\' own following of the agent (spec 097 §7)', () => {
+    it('a status without any window following says no agents', async () => {
+        const a = await connect();
+        expect(last(a.of('status'))?.agents).toBeUndefined();
+    });
+
+    it('a window\'s state from its hello and its view messages, in the list (not as a change of it)', async () => {
+        const a = await connect();
+        expect(registry.list()[0].agent).toBeUndefined();
+        const changes = vi.fn();
+        registry.onChange(changes);
+        a.bus.post({ type: 'view', windowId: a.id, kind: 'table', agent: 'detached' });
+        await settle();
+        expect(registry.list()[0]).toMatchObject({ id: a.id, kind: 'table', agent: 'detached' });
+        expect(changes).not.toHaveBeenCalled();
+        // The status says it at once, not only with the next heartbeat (a main window closing meanwhile).
+        expect(last(a.of('status'))?.agents).toEqual({ [a.id]: 'detached' });
+        a.bus.post({ type: 'hello', windowId: a.id, kind: 'table', treeId: TREE, agent: 'paused' });
+        await settle();
+        expect(registry.list()[0].agent).toBe('paused');
+        // The status names it for every window (the order of taking over).
+        expect(last(a.of('status'))?.agents).toEqual({ [a.id]: 'paused' });
+        a.bus.post({ type: 'view', windowId: a.id, kind: 'family', agent: null });
+        await settle();
+        expect(registry.list()[0]).toMatchObject({ kind: 'family' });
+        expect(registry.list()[0].agent).toBeUndefined();
+    });
+});
+
 describe('selection', () => {
     it('a selection from a satellite reaches the main view and is not sent back', async () => {
         const sat = await connect();
@@ -335,7 +364,7 @@ describe('selection', () => {
         registry.onSelect(seen);
         sat.bus.post({ type: 'select', personId: 'p1', treeId: TREE, origin: sat.id });
         await settle();
-        expect(seen).toHaveBeenCalledWith('p1', sat.id);
+        expect(seen).toHaveBeenCalledWith('p1', sat.id, { intent: 'mark', seq: null });
         expect(sat.of('select')).toHaveLength(0);
 
         registry.announceSelection('p2');
@@ -344,6 +373,44 @@ describe('selection', () => {
         registry.announceSelection('p2');
         await settle();
         expect(sat.of('select')).toHaveLength(1);
+    });
+
+    it('a choice sent with focus (spec 110): its intent and number reach the main view; the end of a window\'s sending is said', async () => {
+        const sat = await connect();
+        const seen = vi.fn();
+        const ended = vi.fn();
+        registry.onSelect(seen);
+        registry.onSendEnded(ended);
+        sat.bus.post({ type: 'select', personId: 'p1', treeId: TREE, origin: sat.id, intent: 'focus', seq: 7 });
+        await settle();
+        expect(seen).toHaveBeenCalledWith('p1', sat.id, { intent: 'focus', seq: 7 });
+        sat.bus.post({ type: 'send-mode', windowId: sat.id, mode: 'focus' });
+        await settle();
+        expect(ended).not.toHaveBeenCalled();
+        sat.bus.post({ type: 'send-mode', windowId: sat.id, mode: 'mark' });
+        await settle();
+        expect(ended.mock.calls).toEqual([[sat.id]]);
+        sat.bus.post({ type: 'bye', windowId: sat.id });
+        await settle();
+        expect(ended.mock.calls).toEqual([[sat.id], [sat.id]]);
+    });
+});
+
+describe('the main window following the agent (spec 110 §4)', () => {
+    it('its status says so to the other windows', async () => {
+        registry.stop();
+        let following = false;
+        registry = new WindowRegistry({
+            bus: new WindowBus('main-1', hub.channel()),
+            host: dataManagerHost({ treeName: () => treeName, treeExists: () => true, focusSelf: () => {}, hasFocus: () => true, followingAgent: () => following }),
+            openWindow: () => fakeWindow() as unknown as Window,
+        });
+        registry.start();
+        const sat = await connect();
+        expect(last(sat.of('status'))?.followingAgent).toBeUndefined();
+        following = true;
+        await settle(1100);
+        expect(last(sat.of('status'))?.followingAgent).toBe(true);
     });
 });
 
@@ -373,5 +440,36 @@ describe('links and research actions from other windows', () => {
         tab.bus.post({ type: 'link', search: '?live=x' });
         await settle();
         expect(handler).toHaveBeenCalledTimes(2);
+    });
+});
+
+describe('the fan\'s family-line colours (spec 114 §3)', () => {
+    it('go to every window after a change; a fan window saying hello or switching to the fan gets the last ones; empty forgets them', async () => {
+        const table = await connect();
+        const mem: Array<[string, string]> = [['rod-a', 'PS0'], ['rod-b', 'MS1']];
+        if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('strom:fan-rod-colors', { detail: mem }));
+        else registry.postFanRodColors(mem);
+        await settle();
+        expect(table.of('fan-rod-colors')).toEqual([expect.objectContaining({ treeId: TREE, memory: mem })]);
+        // A fan window opened later: the memory with its hello, to it alone.
+        const id = registry.openSatellite('fan')!;
+        const fan = listener(hub, id);
+        fan.bus.post({ type: 'hello', windowId: id, kind: 'fan', treeId: TREE });
+        await settle();
+        expect(fan.of('fan-rod-colors')).toEqual([expect.objectContaining({ to: id, treeId: TREE, memory: mem })]);
+        expect(table.of('fan-rod-colors')).toHaveLength(1);
+        // The table window switches to the fan: it gets them too.
+        table.bus.post({ type: 'view', windowId: table.id, kind: 'fan' });
+        await settle();
+        expect(last(table.of('fan-rod-colors'))).toMatchObject({ to: table.id, memory: mem });
+        // Forgotten (the fan closed here): an empty memory to all, nothing for the next window.
+        registry.postFanRodColors([]);
+        await settle();
+        expect(last(fan.of('fan-rod-colors'))).toMatchObject({ memory: [] });
+        const id2 = registry.openSatellite('fan')!;
+        const fan2 = listener(hub, id2);
+        fan2.bus.post({ type: 'hello', windowId: id2, kind: 'fan', treeId: TREE });
+        await settle();
+        expect(fan2.of('fan-rod-colors')).toHaveLength(0);
     });
 });

@@ -8,7 +8,9 @@
  * in src/ui/research-ui.ts. Nothing here touches the DOM or storage.
  */
 
-import { StromData, Person, PersonId, PartnershipId, Partnership, ResearchLink, Source, APP_VERSION, isPrimaryName, PlaceRecordBy, LifeEvent, EventRoleAt } from './types.js';
+import { keepPersonListData } from './person-lists-data.js';
+import { StromData, Person, PersonId, PartnershipId, Partnership, ResearchLink, Source, APP_VERSION, isPrimaryName, PlaceRecordBy, LifeEvent, EventRoleAt, PortraitSource, Attachment, MediaPlace } from './types.js';
+import { allMedia, isPersonPlace, personMedia, personMediaIndex, placePersonId, samePlace } from './media.js';
 import { eventIsShareable, eventValueIsOnTag } from './events.js';
 import { SUPPORTED_LANGUAGES, getStringsForLang } from './strings.js';
 import { withoutConvertedStandIns, isPurePlaceholder } from './single-parent.js';
@@ -20,6 +22,7 @@ import { readAgainSaid, waitingProposalsSaid, type ReadSourceProposal, type Read
 import { READ_CHOICES_NOW_FEATURE, READ_CHOOSE_FEATURE } from './read-choices.js';
 import { verifyStatusSaid, type LiveVerifyStatus } from './research-verify.js';
 import { researchPersonRef, researchFamilyRef, personResearchRef, familyResearchRef, confirmationEdits } from './verify.js';
+import { TASKS_AUDIT_FEATURE, sanitizeWaitingAudit, type WaitingAudit } from './research-audit.js';
 import { HISTORY_KINDS, isHistoryKind, parseHistoryKindList, type HistoryKind } from './history.js';
 import { sourcePlaceKey } from './source-location.js';
 
@@ -52,7 +55,7 @@ export const RESEARCH_LINK_ACTIONS = [
     'send', 'excerpt', 'app', 'open', 'chat', 'task', 'review', 'research',
     'new', 'update', 'sessions', 'conflict', 'story', 'sync-undo', 'setup', 'live',
     'direction', 'finish', 'media', 'archive', 'seal', 'experiment', 'history', 'fixes', 'doctor', 'places',
-    'history-kinds', 'history-align', 'hypothesis', 'hypotheses', 'work',
+    'history-kinds', 'history-align', 'hypothesis', 'hypotheses', 'work', 'book',
 ] as const;
 export type ResearchLinkAction = typeof RESEARCH_LINK_ACTIONS[number];
 
@@ -74,6 +77,8 @@ export const RESEARCH_LINK_MARKS: Readonly<Record<ResearchLinkAction, ResearchAc
     // The research answers without a terminal: an excerpt or an original in the system's viewer,
     // the tree into the app (as it is now, or followed live).
     excerpt: 'none', media: 'none', app: 'none', live: 'none',
+    // A book's folder in the shared inbox opens in the system's file manager (spec 105, V7): no terminal.
+    book: 'none',
     // Its terminal: shows, asks, writes tasks for later; nothing is paid on the click.
     send: 'terminal', open: 'terminal', task: 'terminal', review: 'terminal', research: 'terminal',
     new: 'terminal', update: 'terminal', sessions: 'terminal', conflict: 'terminal', story: 'terminal',
@@ -115,7 +120,7 @@ export function researchLinkMark(action: ResearchLinkAction, p: ResearchLinkMark
  * from the scan or take it back, stop the verification not yet begun, split the older sources'
  * locations into fields and undo that split (spec 075 §5, no agent: the research's code).
  */
-export const RESEARCH_BRIDGE_ACTIONS = ['verify', 'verify-bulk', 'fact-confirm', 'verify-stop', 'sources-split'] as const;
+export const RESEARCH_BRIDGE_ACTIONS = ['verify', 'verify-bulk', 'fact-confirm', 'verify-stop', 'sources-split', 'material-sort'] as const;
 export type ResearchBridgeAction = typeof RESEARCH_BRIDGE_ACTIONS[number];
 
 /**
@@ -128,6 +133,8 @@ export type ResearchBridgeMark = 'none' | 'bridgeAgent';
 export const RESEARCH_BRIDGE_MARKS: Readonly<Record<ResearchBridgeAction, ResearchBridgeMark>> = {
     verify: 'bridgeAgent', 'verify-bulk': 'bridgeAgent',
     'fact-confirm': 'none', 'verify-stop': 'none', 'sources-split': 'none',
+    // The agent proposes titles, dates and links for files in the research's background (spec 102 §13).
+    'material-sort': 'bridgeAgent',
 };
 
 /**
@@ -259,6 +266,11 @@ export function researchArchiveHost(value: unknown): string | null {
     return v.length <= 253 && /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/.test(v) ? v : null;
 }
 
+/** A book's id in the research ("B0003"), or null. */
+export function researchBookRef(id: unknown): string | null {
+    return typeof id === 'string' && /^B\d{1,7}$/.test(id.trim()) ? id.trim() : null;
+}
+
 /** A research direction's id ("G0002"), or null. */
 export function researchDirectionRef(id: unknown): string | null {
     return typeof id === 'string' && /^G\d{1,7}$/.test(id.trim()) ? id.trim() : null;
@@ -372,6 +384,9 @@ export interface ResearchLinkParams {
      * address (`do=start`), no new window and no terminal; without it the link also opens the app followed live.
      */
     liveDo?: 'start';
+    /** `book` (spec 105): the book of the research ("B0003") and what to do with it (only its folder for now). */
+    book?: string;
+    bookDo?: 'folder';
 }
 
 /** What a `work` link asks (spec 052 §5): automatic work, or only a number of tasks. */
@@ -558,6 +573,11 @@ export function researchSchemeUrl(action: ResearchLinkAction, p: ResearchLinkPar
             const n = workTasksCount(p.n);
             return n !== null ? `${base}&do=tasks&n=${n}` : null;
         }
+        case 'book': {
+            // spec 105: the book by its id and the fixed `do=folder` (the research's default) — nothing else.
+            const id = researchBookRef(p.book);
+            return id && (p.bookDo === undefined || p.bookDo === 'folder') ? `${base}&id=${id}&do=folder` : null;
+        }
         case 'places': {
             // spec 034: the fixed `do=run`, and one place only by its record id — never a place name.
             if (p.placesDo !== 'run') return null;
@@ -672,7 +692,10 @@ export function cleanText(value: unknown, max = MAX_TEXT): string {
     if (typeof value !== 'string') return '';
     // eslint-disable-next-line no-control-regex
     const flat = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
-    return flat.length > max ? flat.slice(0, max - 1) + '…' : flat;
+    if (flat.length <= max) return flat;
+    // Never cut between the two halves of a surrogate pair (an emoji, a rare CJK character).
+    const cut = /[\uD800-\uDBFF]/.test(flat[max - 2] ?? '') ? max - 2 : max - 1;
+    return flat.slice(0, cut) + '…';
 }
 
 /**
@@ -996,6 +1019,86 @@ export const READ_SYNC_FEATURE = 'read.sync';
  */
 export function researchSendsReadings(status: { features: readonly string[] | null } | null | undefined): boolean {
     return !!status?.features?.includes(READ_SYNC_FEATURE);
+}
+
+/**
+ * `/status.features` (Strom Research 1.35, spec 108): the archive keeps the
+ * tree's own files — portraits, couples' photos and attachments — from a
+ * write that says it carries all of them (`POST /sync?media=app`), and gives
+ * them back by reference (`/tree.ged?images=ref&media=app`). Without it a
+ * write carries them as ever and the research passes them by.
+ */
+export const MEDIA_APP_FEATURE = 'media.app';
+/**
+ * `/status.features` (Strom Research 1.35, spec 108 §3): the research keeps
+ * what the app says of a file — its date (`2 _DATE`), and later its title,
+ * kind and places (spec 102) — and takes a couple's original
+ * (`X-Strom-Family`, `accepts.media.family`).
+ */
+export const MATERIAL_LINKS_FEATURE = 'material.links';
+
+/** The research keeps the app's files from a write (`media.app`); not known: no. */
+export function researchKeepsAppMedia(status: { features: readonly string[] | null } | null | undefined): boolean {
+    return !!status?.features?.includes(MEDIA_APP_FEATURE);
+}
+
+/** How a tree's files go in the file a research's bridge gets (see GedcomExportOptions.appMedia / mediaDates). */
+export interface ResearchMediaOut {
+    /** The couple's photo marked as the family's picture (`2 _PRIM Y`): a research that keeps the app's files. */
+    appMedia: boolean;
+    /** Each file's date (`2 _DATE`): a research that keeps what the app says of a file. */
+    mediaDates: boolean;
+}
+
+/** A research that has said nothing: the files go as they always went. */
+export const NO_MEDIA_FEATURES: ResearchMediaOut = { appMedia: false, mediaDates: false };
+
+/** How a tree's files go to this research, by its `/status.features` (not reached: as ever). */
+export function researchMediaOut(status: { features: readonly string[] | null } | null | undefined): ResearchMediaOut {
+    const features = status?.features ?? [];
+    return { appMedia: features.includes(MEDIA_APP_FEATURE), mediaDates: features.includes(MATERIAL_LINKS_FEATURE) };
+}
+
+/**
+ * Does a write of this tree say it carries every file of the tree
+ * (`POST /sync?media=app`, spec 108 P4)? Then the archive takes off a file
+ * the tree no longer has. Only to a research that keeps the app's files, and
+ * only while the tree holds the research's files too: with images not taken
+ * (the import setting off, or its last load without them) it lacks the ones
+ * the research gave, and a write must never take those off — it only adds.
+ */
+export function researchSendDeclaresMedia(
+    status: { features: readonly string[] | null } | null | undefined,
+    tree: { importImages: boolean; loadedWithoutImages: boolean },
+): boolean {
+    return researchKeepsAppMedia(status) && tree.importImages && !tree.loadedWithoutImages;
+}
+
+/** The address a write goes to: `<base>/sync`, with `?media=app` when it says it carries every file. */
+export function researchSyncUrl(base: string, declaresMedia: boolean): string {
+    return `${base}/sync${declaresMedia ? '?media=app' : ''}`;
+}
+
+/**
+ * The tree's files have not reached the archive yet (spec 108 K2.7): a tree
+ * with portraits, couples' photos or attachments, linked to a research that
+ * keeps them, that has not gone there in a write that said it carries them.
+ * Then one write goes by itself even with nothing else to send — once, the
+ * mark kept by the research it went to (`sentTo`, ResearchAutoState.appMediaSent).
+ */
+export function researchMediaFirstSendDue(o: { declares: boolean; hasMedia: boolean; researchId: string; sentTo: string | undefined }): boolean {
+    return o.declares && o.hasMedia && o.sentTo !== o.researchId;
+}
+
+/**
+ * After a version with the tree's own files was loaded (spec 108 §5): the
+ * research its archive holds every file of the tree for (ResearchAutoState.appMediaSent),
+ * or undefined — files of the tree's own were carried over because the
+ * archive lacks them (`carried`, carryOverMedia), so one write with them is
+ * due again (researchMediaFirstSendDue) and they reach it without an edit.
+ */
+export function researchMediaSentAfterReturn(researchId: string, carried: number): string | undefined {
+    return carried > 0 ? undefined : researchId;
 }
 
 /** How a GEDCOM writes the titles of a name (see GedcomExportOptions.titles in ged-exporter.ts). */
@@ -1746,6 +1849,61 @@ export interface MediaCarryOver {
     data: StromData;
     /** Photos, attachments and excerpts of people / sources the update no longer has. */
     lost: number;
+    /**
+     * The tree's own portraits, couples' photos and attachments carried over
+     * because the update lacked them (excerpts and originals of a portrait
+     * not counted): a version with the tree's files (`media=app`) that still
+     * needs a write to hold them.
+     */
+    carried: number;
+}
+
+/** Most places of files the base of a tree keeps (a larger tree keeps only the first: the rest carried as ever). */
+export const MEDIA_BASE_MAX = 20000;
+
+/** One place of a file in the base (researchMediaKeys): its owner in the research, what it is there, its content. */
+function mediaPlaceKey(owner: string | null, kind: 'p' | 'c' | 'a', content: string | null | undefined): string | null {
+    if (!owner || !content) return null;
+    const text = `${owner}|${kind}|${content.startsWith('data:') ? imageToken(content) : content}`;
+    return `${fnv1a(text, 0x811c9dc5).toString(36)}.${fnv1a(text, 0x01000193).toString(36)}`;
+}
+
+/**
+ * An attachment's content for its key: the file it stands for by its hash
+ * (its original's — the archive's copy of it may be another picture of the
+ * same file), else its data. An original only carries no data of its own.
+ */
+function attachmentContent(a: { dataUrl?: string; originalOnly?: boolean; original?: { sha256?: string } }): string | null {
+    if (a.original?.sha256) return `sha:${a.original.sha256.toLowerCase()}`;
+    return a.originalOnly ? null : a.dataUrl || null;
+}
+
+/**
+ * The places of the tree's own files in a version of the research that
+ * came with them (`tree.ged?…&media=app`, spec 108 §5): each portrait,
+ * couple's photo and attachment as its owner in the research (P…, F…), what
+ * it is there and a sample of its content — the base a later version is read
+ * against (carryOverMedia `base`): a file at a place of the base that the
+ * archive no longer gives there was taken off (another window removed it),
+ * one not in the base was added here since and is kept. Small: no data.
+ */
+export function researchMediaKeys(data: StromData): string[] {
+    const out = new Set<string>();
+    const add = (key: string | null): void => {
+        if (key && out.size < MEDIA_BASE_MAX) out.add(key);
+    };
+    const files = personMediaIndex(data);
+    for (const p of Object.values(data.persons ?? {})) {
+        if (!p) continue;
+        const owner = researchPersonRef(p.refn);
+        if (!owner) continue;
+        add(mediaPlaceKey(owner, 'p', p.photo));
+        for (const a of files.get(p.id) ?? []) add(mediaPlaceKey(owner, 'a', attachmentContent(a)));
+    }
+    for (const u of Object.values(data.partnerships ?? {})) {
+        if (u?.photo) add(mediaPlaceKey(researchFamilyRef(u.researchId), 'c', u.photo));
+    }
+    return [...out];
 }
 
 /**
@@ -1753,7 +1911,10 @@ export interface MediaCarryOver {
  * cut in the app), so an update would drop them. Carry them over from the
  * previous state onto `next` (already through stabilizeIds, so ids match;
  * people without a REFN yet are paired by matchUnlinkedPersons):
- * - a person's photo when the research has none for them;
+ * - a person's photo when the research has none for them, and the original
+ *   it was cut from (photoSource, spec 107) while that original is still there;
+ * - a couple's photo when the research has none for that couple (same id,
+ *   else the same two people);
  * - attachments the research does not have (by id or content); a link to a
  *   source the update no longer has is dropped;
  * - excerpts without a `clip` (clipped ones belong to the research) to the
@@ -1764,50 +1925,211 @@ export interface MediaCarryOver {
  * - the tree's decisions on its data quality (carryOverTreeDecisions);
  * - the app's own fields of locations that did not move (keepPlaceOrigins).
  * What belongs to a person or source missing from `next` is counted as lost.
+ * `base` (spec 108 K2.3): `next` came with the tree's own files from a
+ * research that keeps them; the places its last such version gave
+ * (researchMediaKeys). A portrait, couple's photo or attachment at one of
+ * them is the archive's: never carried over, never lost. Null: no such
+ * version came yet (the first write with the files not gone) — all kept.
+ * With the files (a base or null), a file the archive names by its name
+ * alone (an original only) whose picture the previous state holds (an
+ * attachment with that original) keeps that picture in its place. Left out
+ * (undefined): a version without them, all as ever.
  * Returns a new object; neither input is changed.
  */
-export function carryOverMedia(next: StromData, previous: StromData): MediaCarryOver {
+export function carryOverMedia(next: StromData, previous: StromData, base?: ReadonlySet<string> | null): MediaCarryOver {
     let lost = 0;
+    let carried = 0;
+    /**
+     * A research that keeps the tree's own files, `next` a version with them
+     * (`base`: the places its last such version gave, researchMediaKeys):
+     * the archive is the truth for what it gave — a file at a place of the
+     * base is never carried over (the archive took it off) nor lost (it keeps
+     * it). Only files added here since are kept. Without a base all as ever.
+     */
+    const fromArchive = (owner: string | null, kind: 'p' | 'c' | 'a', content: string | null | undefined): boolean => {
+        if (!base) return false;
+        const key = mediaPlaceKey(owner, kind, content);
+        return !!key && base.has(key);
+    };
     const persons = { ...(next.persons ?? {}) };
     const unlinked = matchUnlinkedPersons(next, previous);
     const sources = next.sources ? { ...next.sources } : undefined;
     const sourceExists = (id: string | undefined): boolean => !!id && !!sources?.[id];
+    const currentId = (id: PersonId): PersonId | undefined => (persons[id] ? id : unlinked.get(id)) as PersonId | undefined;
+
+    // The couples' photos (spec 107), before the people: a portrait cut from
+    // one needs it in place. The research's own photo of the couple wins.
+    const partnerships = { ...(next.partnerships ?? {}) };
+    let unionsChanged = false;
+    /** Where each previous union with a photo is now (same id, else the same couple). */
+    const unionNow = new Map<PartnershipId, PartnershipId>();
+    for (const [uid, old] of Object.entries(previous.partnerships ?? {}) as [PartnershipId, Partnership][]) {
+        if (!old?.photo) continue;
+        const archived = fromArchive(researchFamilyRef(old.researchId), 'c', old.photo);
+        let cur: Partnership | undefined = partnerships[uid];
+        if (!cur) {
+            const a = currentId(old.person1Id), b = currentId(old.person2Id);
+            cur = a && b ? Object.values(partnerships).find(u =>
+                (u.person1Id === a && u.person2Id === b) || (u.person1Id === b && u.person2Id === a)) : undefined;
+        }
+        if (!cur) {
+            if (!archived) lost++;
+            continue;
+        }
+        unionNow.set(uid, cur.id);
+        // The same photo back without its original's hash (a research that does not keep it): the original stays named.
+        if (cur.photo === old.photo && old.photoOriginal && !cur.photoOriginal) {
+            partnerships[cur.id] = { ...cur, photoOriginal: old.photoOriginal };
+            unionsChanged = true;
+            continue;
+        }
+        if (cur.photo || archived) continue;
+        carried++;
+        partnerships[cur.id] = {
+            ...cur, photo: old.photo,
+            ...(old.photoOriginalName ? { photoOriginalName: old.photoOriginalName } : {}),
+            ...(old.photoDate ? { photoDate: old.photoDate } : {}),
+            ...(old.photoOriginal ? { photoOriginal: old.photoOriginal } : {}),
+        };
+        unionsChanged = true;
+    }
+
+    // The tree's files (data v24: StromData.media), by record: a record is
+    // replaced (never changed in place) when it takes a picture or a place.
+    const media: Record<string, Attachment> = { ...(next.media ?? {}) };
+    let mediaChanged = false;
+    const view = { media };
+    const previousFiles = personMediaIndex(previous);
+    /** The same file as `a` among `have`: by id, the same picture or (an original only, or with the files) the same original. */
+    const sameFileIn = (have: readonly Attachment[], a: Attachment): Attachment | undefined => {
+        const sha = a.original?.sha256?.toLowerCase();
+        return have.find(h => h.id === a.id
+            || (!!a.dataUrl && !a.originalOnly && !h.originalOnly && h.dataUrl === a.dataUrl)
+            || (!!sha && (a.originalOnly || base !== undefined) && h.original?.sha256?.toLowerCase() === sha));
+    };
+    const addPlaces = (rec: Attachment, places: readonly MediaPlace[]): void => {
+        const add = places.filter(pl => !rec.places.some(o => samePlace(o, pl)));
+        if (!add.length) return;
+        media[rec.id] = { ...rec, places: [...rec.places, ...add] };
+        mediaChanged = true;
+    };
 
     for (const [id, old] of Object.entries(previous.persons ?? {})) {
         if (!old) continue;
-        const media = (old.photo ? 1 : 0) + (old.attachments?.length ?? 0);
-        if (!media) continue;
-        const curId = (persons[id as PersonId] ? id : unlinked.get(id)) as PersonId | undefined;
+        const owner = researchPersonRef(old.refn);
+        const photoArchived = !!old.photo && fromArchive(owner, 'p', old.photo);
+        const oldFiles = previousFiles.get(id as PersonId) ?? [];
+        const ownAttachments = oldFiles.filter(a => !fromArchive(owner, 'a', attachmentContent(a)));
+        const count = (old.photo && !photoArchived ? 1 : 0) + ownAttachments.length;
+        /** With the tree's files: a picture held here of a file the archive may name by its name alone. */
+        const shows = base !== undefined && oldFiles.some(a => !a.originalOnly && a.original?.sha256);
+        if (!count && !shows) continue;
+        const curId = currentId(id as PersonId);
         const cur = curId ? persons[curId] : undefined;
         if (!curId || !cur) {
-            lost += media;
+            lost += count;
             continue;
         }
         const out = { ...cur };
         let changed = false;
-        if (old.photo && !cur.photo) {
+        if (old.photo && !cur.photo && !photoArchived) {
+            carried++;
             out.photo = old.photo;
             if (old.photoOriginalName) out.photoOriginalName = old.photoOriginalName;
             if (old.photoDate) out.photoDate = old.photoDate;
             changed = true;
         }
-        const have = cur.attachments ?? [];
-        const ids = new Set(have.map(a => a.id));
-        // An original only carries the shared page icon as its data: found by its hash, never by that.
-        const urls = new Set(have.filter(a => !a.originalOnly).map(a => a.dataUrl).filter(Boolean));
-        const shas = new Set(have.map(a => a.original?.sha256).filter(Boolean));
-        const extra = (old.attachments ?? [])
-            .filter(a => !ids.has(a.id) && !(a.dataUrl && !a.originalOnly && urls.has(a.dataUrl)) && !(a.originalOnly && shas.has(a.original?.sha256)))
-            .map(a => {
-                if (a.sourceId === undefined || sourceExists(a.sourceId)) return a;
-                const { sourceId: _gone, ...rest } = a;
-                return rest;
-            });
-        if (extra.length) {
-            out.attachments = [...have, ...extra];
+        // With the tree's files: one the archive names by its name alone keeps the picture held here of it.
+        if (base !== undefined) {
+            const shown = new Map(oldFiles.filter(a => !a.originalOnly && a.original?.sha256)
+                .map(a => [a.original!.sha256.toLowerCase(), a] as const));
+            for (const a of personMedia(view, curId)) {
+                const was = a.originalOnly && a.original?.sha256 ? shown.get(a.original.sha256.toLowerCase()) : undefined;
+                if (!was) continue;
+                const { originalOnly: _only, ...rest } = a;
+                media[a.id] = { ...rest, dataUrl: was.dataUrl, mimeType: was.mimeType, sizeBytes: was.sizeBytes, original: { ...a.original!, ...was.original! } };
+                mediaChanged = true;
+            }
+        }
+        const have = personMedia(view, curId);
+        for (const a of ownAttachments) {
+            if (sameFileIn(have, a)) continue;
+            // At this person as the file was (a fact, an event), at its sources still there.
+            const places: MediaPlace[] = [
+                ...a.places.filter(pl => placePersonId(pl) === id).map(pl => ({ ...pl, personId: curId } as MediaPlace)),
+                ...a.places.filter(pl => 'sourceId' in pl && sourceExists(pl.sourceId)),
+            ];
+            const there = media[a.id];
+            if (there) addPlaces(there, places);
+            else {
+                const { removed: _removed, ...rest } = a;
+                media[a.id] = { ...rest, places };
+                mediaChanged = true;
+            }
+            carried++;
             changed = true;
         }
+        // The original the portrait was cut from (spec 107): the research
+        // keeps no such link, so it comes along with the portrait it belongs
+        // to while its original is still there.
+        const src = old.photoSource;
+        if (src && old.photo && out.photo === old.photo && !cur.photoSource) {
+            let carriedSource: PortraitSource | undefined;
+            if (src.attachmentId) {
+                const att = oldFiles.find(a => a.id === src.attachmentId);
+                const now = att && personMedia(view, curId).find(a => a.id === att.id || (!a.originalOnly && a.dataUrl === att.dataUrl));
+                if (now) carriedSource = { ...src, attachmentId: now.id };
+            } else if (src.partnershipId) {
+                const uid = unionNow.get(src.partnershipId);
+                const union = uid ? partnerships[uid] : undefined;
+                if (union && union.photo === previous.partnerships[src.partnershipId]?.photo
+                    && (union.person1Id === curId || union.person2Id === curId)) carriedSource = { ...src, partnershipId: union.id };
+            }
+            if (carriedSource) {
+                out.photoSource = carriedSource;
+                changed = true;
+            }
+        }
         if (changed) persons[curId] = out;
+    }
+
+    // Files at couples and files of a source alone: the research's file does
+    // not carry them, so they come along to the couple (same id, else the
+    // same two people) and the source still there.
+    const unionOf = (uid: PartnershipId): PartnershipId | undefined => {
+        if (partnerships[uid]) return uid;
+        const old = previous.partnerships?.[uid];
+        if (!old) return undefined;
+        const a = currentId(old.person1Id), b = currentId(old.person2Id);
+        return a && b ? Object.values(partnerships).find(u =>
+            (u.person1Id === a && u.person2Id === b) || (u.person1Id === b && u.person2Id === a))?.id : undefined;
+    };
+    for (const a of allMedia(previous)) {
+        const atPerson = a.places.some(pl => isPersonPlace(pl));
+        const places: MediaPlace[] = [];
+        let gone = false;
+        for (const pl of a.places) {
+            if ('partnershipId' in pl) {
+                const uid = unionOf(pl.partnershipId);
+                if (uid) places.push({ ...pl, partnershipId: uid });
+                else gone = true;
+            } else if (!atPerson && 'sourceId' in pl) {
+                if (sourceExists(pl.sourceId)) places.push(pl);
+                else gone = true;
+            }
+        }
+        if (!places.length) {
+            if (gone && !atPerson) lost++;
+            continue;
+        }
+        const there = media[a.id] ?? sameFileIn(Object.values(media), a);
+        if (there) addPlaces(there, places);
+        else {
+            const { removed: _removed, ...rest } = a;
+            media[a.id] = { ...rest, places };
+            mediaChanged = true;
+            carried++;
+        }
     }
 
     for (const [id, old] of Object.entries(previous.sources ?? {})) {
@@ -1844,8 +2166,12 @@ export function carryOverMedia(next: StromData, previous: StromData): MediaCarry
     // of them) — the research's GEDCOM does not carry the marks.
     // The app's own fields of a location (who put it there, "Keep") — the
     // research's GEDCOM carries the coordinates only (spec 034).
-    const data = keepPlaceOrigins(carryOverTreeDecisions({ ...next, persons, ...(sources ? { sources } : {}) }, previous), previous);
-    return { data, lost };
+    // The lists of people and the date each person came into the tree are the
+    // tree's own (spec 084 §8): a person new here gets the research's date or now.
+    const data = keepPersonListData(
+        keepPlaceOrigins(carryOverTreeDecisions({ ...next, persons, ...(unionsChanged ? { partnerships } : {}), ...(sources ? { sources } : {}), ...(mediaChanged ? { media } : {}) }, previous), previous),
+        previous, new Date().toISOString());
+    return { data, lost, carried };
 }
 
 /**
@@ -2041,6 +2367,10 @@ export interface LiveWaiting {
     inbox?: WaitingInbox;
     /** The task link's actions the research offers at it (only those are ever offered). */
     actions?: WaitingAction[];
+    /** The one book the task waits for or works in ("B0002", spec 105); absent: none or several. */
+    book?: string;
+    /** What the research found wrong in how the task's waiting is recorded (spec 109; only with `tasks.audit`). */
+    audit?: WaitingAudit;
 }
 
 /** What a place question asks: pick a candidate, a location against another, a change of the written place. */
@@ -2109,6 +2439,12 @@ export interface WaitingInbox {
     dir: string;
     /** Files lying in the folder, not taken yet. */
     lying?: number;
+    /**
+     * The book's next free image number — only at a task that does not know
+     * how many it wants (K044). Its presence says the research numbers a file
+     * without a number itself; an older research leaves it out.
+     */
+    next?: number;
 }
 /** Each kind's chip. */
 const KIND_SECTION: Record<string, WaitingSection> = {
@@ -2286,12 +2622,19 @@ export interface LiveStatus {
     sourceProposals?: Record<string, ReadSourceProposal>;
     /** `busy` (with `status.busy` in `features`): sessions and runs working now; absent: not said (an archive, an older research). */
     busy?: LiveBusy;
+    /**
+     * `handoffs` (with `handoffs` in `features`, Strom Research 1.35): the ids of the links (`&handoff=<uuid>`) the
+     * research took in the last 60 s, lowercase, newest first; absent: not said (an older research).
+     */
+    handoffs?: string[];
     /** `work` (with `work.link` in `features`, spec 052 §5): the gate and a session's length; absent: not said (an archive, an older research). */
     work?: LiveWork;
     /** `caps`: what the bridge does with the directions; absent: an older research, an archive, a research waiting for its agent. */
     caps?: ResearchCaps;
     /** `offLine` (with `offLine.branches` in `features`): work outside the directions by branches; absent: not said. */
     offLine?: LiveOffLine;
+    /** `books` (with `books` in `features`, spec 105): the books of the tasks; absent: not said (an archive, a research waiting for its agent, an older one). */
+    books?: LiveBooks;
     /** `queueCounts` (with `queue.page` in `features`): the queue's counts for the filters; absent: not said. */
     queueCounts?: LiveQueueCounts;
     /** The agent's name (`agent.name`, or a bare name); absent: none said (an archive has none). */
@@ -2514,6 +2857,12 @@ export interface ResearchSendRecord {
     notWritten?: SyncNotWritten[];
     notWrittenCount?: number;
     skipped?: SyncReply['skipped'];
+    /**
+     * What a written send wrote of the tree's own files (`media`, at most 50; spec 108, a research with
+     * `media.app`), and how many it wrote in all (`mediaCount`, never fewer than listed); absent = none said.
+     */
+    media?: SyncMediaWritten[];
+    mediaCount?: number;
 }
 
 const SEND_STATES = new Set(['pending', 'written', 'discarded', 'replaced', 'nothing', 'undone', 'failed']);
@@ -2549,6 +2898,7 @@ export function sanitizeSends(value: unknown, codes = false): ResearchSendRecord
             // Written again since: `resent: true` (1.12.0-rc.21), or `again` (the mark of that send).
             ...(r.resent === true || r.again === true ? { again: 'yes' } : headerToken(r.again) ? { again: headerToken(r.again)! } : {}),
             ...(codes && (r.state === 'written' || r.state === 'nothing') ? sendNotWritten(r) : {}),
+            ...(r.state === 'written' ? sendMedia(r) : {}),
         });
     }
     return out;
@@ -2564,6 +2914,13 @@ function sendNotWritten(r: Record<string, unknown>): Pick<ResearchSendRecord, 'n
         ...(items.length || count ? { notWrittenCount: Math.max(items.length, count ?? 0) } : {}),
         ...(skipped.length ? { skipped } : {}),
     };
+}
+
+/** A written send record's `media` (at most 50) and `mediaCount` (never fewer than listed), when it says them. */
+function sendMedia(r: Record<string, unknown>): Pick<ResearchSendRecord, 'media' | 'mediaCount'> {
+    const items = sanitizeMediaWritten(r.media, 50);
+    const count = Math.max(items.length, asCount(r.mediaCount) ?? 0);
+    return { ...(items.length ? { media: items } : {}), ...(count ? { mediaCount: count } : {}) };
 }
 
 /** Conflicts as a count, or a list of them (`[{ person: "P12" }, …]`); null when not said. */
@@ -2626,6 +2983,8 @@ export interface ResearchAccepts {
     mediaMaxBytes: number | null;
     /** It takes a crop's region with a file (`accepts.media.region`). */
     mediaRegion: boolean;
+    /** It takes a couple's original (`accepts.media.family`: `X-Strom-Family` with `PUT /media/<sha256>`, spec 108); absent: no. */
+    mediaFamily?: true;
     /** It takes a file for a waiting task (`accepts.media.task`: `X-Strom-Task` with `PUT /media/<sha256>`); absent: no. */
     mediaTask?: true;
     /**
@@ -2724,6 +3083,7 @@ export function sanitizeAccepts(value: unknown): ResearchAccepts | null {
         media: !!asRecord(r.media),
         mediaMaxBytes: mediaMaxBytes(asRecord(r.media)?.max ?? asRecord(r.media)?.maxBytes),
         mediaRegion: asRecord(r.media)?.region === true,
+        ...(asRecord(r.media)?.family === true ? { mediaFamily: true as const } : {}),
         ...(asRecord(r.media)?.task === true ? { mediaTask: true as const } : {}),
         ...(asRecord(r.media)?.taskImages === true ? { mediaTaskImages: true as const } : {}),
         mediaTypes: mediaTypes(asRecord(r.media)?.types),
@@ -2788,6 +3148,10 @@ export interface LiveQueueItem {
     pos?: number;
     /** What the task makes (Strom Research 1.31): a person's story, or a piece of history; absent: neither said. */
     kind?: LiveQueueKind;
+    /** The one book the task waits for or works in ("B0002", spec 105); absent: none or several. */
+    book?: string;
+    /** Put forward by "Downloaded book first" (`queue.sameBook`): the book of the last session (spec 105). */
+    sameBook?: string;
 }
 
 /** The kinds of a queued task the research names. */
@@ -2860,6 +3224,157 @@ export const DIRECTIONS_PEOPLE_FEATURE = 'directions.people';
 export const DIRECTIONS_PLACES_FEATURE = 'directions.places';
 /** `/status.features`: branches outside the directions (`offLine.branches`, `GET|POST /offline…`). */
 export const OFF_LINE_BRANCHES_FEATURE = 'offLine.branches';
+
+// ==================== BOOKS OF THE TASKS (spec 105) ====================
+
+/** `/status.features`: the books of the tasks (`/status.books`, `book` on waiting and queued tasks, `POST /books`, the `book` link). */
+export const BOOKS_FEATURE = 'books';
+
+/** How a book's images may be downloaded (the research's word from the archive's terms). */
+export type LiveBookDownload = 'whole' | 'range' | 'selected' | 'none';
+
+/** One book of `/status.books.list`. Optional fields are absent when the research does not know them. */
+export interface LiveBook {
+    /** "B0003". */
+    id: string;
+    title: string;
+    /** "1784-1820" (shown with a dash, only when not in the title already). */
+    years?: string;
+    /** The archive that keeps the book (absent: not known). */
+    archive?: { id?: string; name: string; url?: string };
+    /** 'online-free' | 'online-login' or another word of the research. */
+    access?: string;
+    /** The book's viewer on the archive's website. */
+    url?: string;
+    tasks: number;
+    waiting: number;
+    open: number;
+    parked: number;
+    /** Images of the book (absent: not known). */
+    images?: number;
+    onDisk: number;
+    /** Images not on disk (only with `images`). */
+    missing?: number;
+    /** The images the tasks need ("57-58, 112"; range and selected). */
+    need?: string;
+    /** How many images `need` names (absent: not said, no count is shown). */
+    needCount?: number;
+    download: LiveBookDownload;
+    /** Offered in "Faster by downloading" (whole: even with nothing waiting). */
+    offer?: true;
+    /** The book's folder in the shared inbox. */
+    folder?: string;
+    /** Files in the folder not taken in yet (only > 0). */
+    pending?: number;
+}
+
+/** The research's settings of the books (`books.minTasks`, `queue.sameBook`), as `/status.books.settings` says them. */
+export interface LiveBooksSettings {
+    minTasks: number;
+    minTasksOwn: boolean;
+    sameBook: 'yes' | 'no';
+    sameBookOwn: boolean;
+    /** The default without the tree's own value (absent: 5 / 'no'). */
+    minTasksDefault?: number;
+    sameBookDefault?: 'yes' | 'no';
+}
+
+/** `/status.books`: the settings, the books something waits for or that are offered (at most 100) and how many more. */
+export interface LiveBooks {
+    settings: LiveBooksSettings;
+    list: LiveBook[];
+    more: number;
+}
+
+/** The fewest and the most tasks of "Book offered from this many tasks". */
+export const BOOKS_MIN_TASKS_MIN = 1;
+export const BOOKS_MIN_TASKS_MAX = 999;
+/** The defaults when the research does not say them. */
+export const BOOKS_MIN_TASKS_DEFAULT = 5;
+export const BOOKS_SAME_BOOK_DEFAULT: 'yes' | 'no' = 'no';
+/** Most books taken from one status (the research sends at most 100). */
+const MAX_BOOKS = 100;
+
+/** A value of "Book offered from this many tasks": a whole number 1–999, else null. */
+export function booksMinTasks(value: unknown): number | null {
+    return typeof value === 'number' && Number.isInteger(value) && value >= BOOKS_MIN_TASKS_MIN && value <= BOOKS_MIN_TASKS_MAX ? value : null;
+}
+
+const yesNo = (v: unknown): 'yes' | 'no' | null => v === 'yes' || v === 'no' ? v : null;
+
+/** `/status.books.settings` (and the `books.settings` of a `POST /books` answer), or null when it is not one. */
+export function sanitizeBooksSettings(value: unknown): LiveBooksSettings | null {
+    const r = asRecord(value);
+    if (!r) return null;
+    const minTasks = booksMinTasks(r.minTasks);
+    const sameBook = yesNo(r.sameBook);
+    if (minTasks === null || sameBook === null) return null;
+    const minDefault = booksMinTasks(r.minTasksDefault);
+    const sameDefault = yesNo(r.sameBookDefault);
+    return {
+        minTasks, minTasksOwn: r.minTasksOwn === true, sameBook, sameBookOwn: r.sameBookOwn === true,
+        ...(minDefault !== null ? { minTasksDefault: minDefault } : {}),
+        ...(sameDefault ? { sameBookDefault: sameDefault } : {}),
+    };
+}
+
+/** One book of `/status.books.list`, or null when its id is wrong. Untrusted input: every field is checked. */
+export function sanitizeBook(value: unknown): LiveBook | null {
+    const r = asRecord(value);
+    const id = researchBookRef(r?.id);
+    if (!r || !id) return null;
+    const a = asRecord(r.archive);
+    const archiveName = a ? cleanText(a.name, 160) : '';
+    const archiveId = a && typeof a.id === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(a.id) ? a.id : null;
+    const archiveUrl = a ? webUrl(a.url) : null;
+    const years = cleanText(r.years, 40);
+    const access = typeof r.access === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(r.access) ? r.access : null;
+    const url = webUrl(r.url);
+    const images = asCount(r.images);
+    const missing = images !== null ? asCount(r.missing) : null;
+    const need = cleanText(r.need, 200);
+    const needCount = need ? asCount(r.needCount) : null;
+    const download: LiveBookDownload = r.download === 'whole' || r.download === 'range' || r.download === 'selected' ? r.download : 'none';
+    const folder = cleanText(r.folder, 200);
+    const pending = asCount(r.pending);
+    return {
+        id, title: cleanText(r.title, 200) || id,
+        ...(years ? { years } : {}),
+        ...(archiveName ? { archive: { ...(archiveId ? { id: archiveId } : {}), name: archiveName, ...(archiveUrl ? { url: archiveUrl } : {}) } } : {}),
+        ...(access ? { access } : {}),
+        ...(url ? { url } : {}),
+        tasks: asCount(r.tasks) ?? 0, waiting: asCount(r.waiting) ?? 0, open: asCount(r.open) ?? 0, parked: asCount(r.parked) ?? 0,
+        ...(images !== null ? { images } : {}),
+        onDisk: asCount(r.onDisk) ?? 0,
+        ...(missing !== null ? { missing } : {}),
+        ...(need ? { need } : {}),
+        ...(needCount !== null && needCount > 0 ? { needCount } : {}),
+        download,
+        ...(r.offer === true && download !== 'none' ? { offer: true as const } : {}),
+        ...(folder ? { folder } : {}),
+        ...(pending ? { pending } : {}),
+    };
+}
+
+/** `/status.books`, or null when it is not one (no valid settings). */
+export function sanitizeBooks(value: unknown): LiveBooks | null {
+    const r = asRecord(value);
+    const settings = sanitizeBooksSettings(r?.settings);
+    if (!r || !settings) return null;
+    const list: LiveBook[] = [];
+    const seen = new Set<string>();
+    for (const raw of Array.isArray(r.list) ? r.list : []) {
+        if (list.length >= MAX_BOOKS) break;
+        const b = sanitizeBook(raw);
+        if (b && !seen.has(b.id)) { seen.add(b.id); list.push(b); }
+    }
+    return { settings, list, more: asCount(r.more) ?? 0 };
+}
+
+/** The books are shown: a research that announces them and said its part `books` (else everything stays as before). */
+export function booksOn(s: { features?: readonly string[] | null; books?: LiveBooks } | null | undefined): boolean {
+    return !!s?.features?.includes(BOOKS_FEATURE) && !!s.books;
+}
 /** `/status.features`: a task's own place in the queue (`POST /queue/<T…>`, `queue[].why`). */
 export const QUEUE_OWN_FEATURE = 'queue.own';
 /** `/status.features`: the whole queue by pages (`GET /queue`), each task's `pos` and `/status.queueCounts`. */
@@ -3000,8 +3515,12 @@ export function sanitizeWorking(value: unknown, helpsSaid = false): LiveWorker[]
 
 const TASK_KINDS: readonly WaitingTaskKind[] = ['takeover', 'check', 'images', 'letter', 'family', 'web', 'other'];
 
-/** Longest archive terms kept with a permission question. */
-const MAX_TERMS = 600;
+/**
+ * Longest "on" kept with a waiting item: an archive's terms, or the whole
+ * instruction of a manual step (archive, book, year, where to save, what is
+ * enough; commonly 300-500 characters). Only an extreme text is cut.
+ */
+const MAX_WAITING_ON = 1500;
 /** Most waiting items taken (a research may wait on many; other lists keep MAX_ITEMS). */
 export const MAX_WAITING = 200;
 
@@ -3065,6 +3584,8 @@ export function sanitizeWaitingInbox(value: unknown): WaitingInbox | null {
     if (folder) out.folder = folder;
     const lying = asCount(r.lying);
     if (lying !== null) out.lying = lying;
+    const next = imageNumber(r.next);
+    if (next !== null && out.want === undefined) out.next = next;
     return out;
 }
 
@@ -3178,7 +3699,7 @@ export function waitingPlaceFields(r: Record<string, unknown>): Partial<LiveWait
  * announces `waiting.groups` (kind, section, group, phase … are read only then).
  * A place question (kind 'place') is read with or without them.
  */
-export function sanitizeWaiting(value: unknown, groups = false, branches = false): LiveWaiting[] {
+export function sanitizeWaiting(value: unknown, groups = false, branches = false, audit = false): LiveWaiting[] {
     if (!Array.isArray(value)) return [];
     const out: LiveWaiting[] = [];
     for (const item of value.slice(0, MAX_WAITING)) {
@@ -3204,7 +3725,7 @@ export function sanitizeWaiting(value: unknown, groups = false, branches = false
         const hypo = groups && !story && !host && r.kind === 'hypothesis' ? researchHypothesisRef(r.id) : null;
         const kind: LiveWaiting['kind'] = story ? 'story' : host ? 'permission' : placeQ ? 'place' : branch ? 'branch' : hypo ? 'hypothesis' : task ?? undefined;
         out.push({
-            id: host ? `permission:${host}` : cleanText(r.id, 40), what, on: cleanText(r.on, host ? MAX_TERMS : 120), at: cleanText(r.at ?? r.since, 40),
+            id: host ? `permission:${host}` : cleanText(r.id, 40), what, on: cleanText(r.on, MAX_WAITING_ON), at: cleanText(r.at ?? r.since, 40),
             ...(person ? { person } : {}), ...(research ? { research } : {}),
             ...(story ? { kind: 'story' as const } : {}), ...(partner && partner !== person ? { partner } : {}),
             ...(host ? { kind: 'permission' as const, host } : {}),
@@ -3213,9 +3734,18 @@ export function sanitizeWaiting(value: unknown, groups = false, branches = false
             ...(placeQ ?? {}),
             ...(branch ? { kind: 'branch' as const, branch, tasks: asCount(r.tasks) ?? 0, persons: asCount(r.persons ?? r.newPersons) ?? 0 } : {}),
             ...(groups ? waitingGroupFields(r, kind) : {}),
+            ...(researchBookRef(r.book) ? { book: researchBookRef(r.book)! } : {}),
+            ...(audit ? waitingAuditField(r) : {}),
         });
     }
     return out;
+}
+
+/** A task's finding (`tasks.audit`, spec 109): only at a task ("T…"), only a well-formed one. */
+function waitingAuditField(r: Record<string, unknown>): Partial<LiveWaiting> {
+    if (!researchTaskRef(r.id)) return {};
+    const audit = sanitizeWaitingAudit(r.audit);
+    return audit ? { audit } : {};
 }
 
 /** A hypothesis item's own fields (V13): the agent's proposal (a version's letter or 'none') and `pick`. Anything else is dropped. */
@@ -3254,11 +3784,14 @@ export function sanitizeQueue(value: unknown, offLine = false, branches = false,
         const pos = state === 'next' && typeof r.pos === 'number' && Number.isInteger(r.pos) && r.pos >= 1 && r.pos <= 10_000_000 ? r.pos : null;
         // What it makes (a story, history): only the kinds known here.
         const kind = r.kind === 'story' || r.kind === 'history' ? r.kind : null;
+        // The book of the task (spec 105): only a valid id.
+        const book = researchBookRef(r.book);
+        const sameBook = researchBookRef(r.sameBook);
         if (state) out.push({
             id, text, state, ...(person ? { person } : {}), ...(research ? { research } : {}),
             ...(off ? { offLine: off } : {}), ...(helps ? { helps } : {}),
             ...(branch ? { branch } : {}), ...(own ? { own } : {}), ...(why ? { why } : {}), ...(pos ? { pos } : {}),
-            ...(kind ? { kind } : {}),
+            ...(kind ? { kind } : {}), ...(book ? { book } : {}), ...(sameBook ? { sameBook } : {}),
         });
     }
     return out;
@@ -3592,6 +4125,20 @@ export function recentAddsCount(recent: LiveRecent | null, adds: readonly LiveCo
 export const MAX_STATUS_FEATURES = 200;
 
 /** The bridge status. Untrusted input: every field is checked. */
+/** `/status.features` (Strom Research 1.35): the bridge says the links it took (`handoffs`), the proof that a link opened. */
+export const HANDOFFS_FEATURE = 'handoffs';
+
+/** The research's `handoffs`: UUIDs only (lowercase), at most 64. */
+export function sanitizeHandoffs(value: unknown): string[] {
+    if (!Array.isArray(value)) return [];
+    const out: string[] = [];
+    for (const v of value) {
+        if (out.length >= 64) break;
+        if (typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) out.push(v.toLowerCase());
+    }
+    return out;
+}
+
 export function sanitizeLiveStatus(value: unknown): LiveStatus | null {
     const r = asRecord(value);
     if (!r) return null;
@@ -3608,7 +4155,8 @@ export function sanitizeLiveStatus(value: unknown): LiveStatus | null {
         persons: asCount(r.persons),
         families: asCount(r.families),
         working: sanitizeWorking(r.working, !!features?.includes(WORKING_HELPS_FEATURE)),
-        waiting: sanitizeWaiting(r.waiting, !!features?.includes(WAITING_GROUPS_FEATURE), !!features?.includes(OFF_LINE_BRANCHES_FEATURE)),
+        waiting: sanitizeWaiting(r.waiting, !!features?.includes(WAITING_GROUPS_FEATURE), !!features?.includes(OFF_LINE_BRANCHES_FEATURE),
+            !!features?.includes(TASKS_AUDIT_FEATURE)),
         links: sanitizeResearchLinks(r.links),
         queue: sanitizeQueue(r.queue, !!features?.includes(TASKS_OFF_LINE_FEATURE), !!features?.includes(OFF_LINE_BRANCHES_FEATURE), undefined,
             !!features?.includes(OFF_LINE_BRANCHES_FEATURE) || !!features?.includes(QUEUE_NEXT_FEATURE)),
@@ -3631,6 +4179,7 @@ export function sanitizeLiveStatus(value: unknown): LiveStatus | null {
         ...(features?.includes(READ_FEATURE) && sanitizeReads(r.reads) ? { reads: sanitizeReads(r.reads)! } : {}),
         ...treeSaid(tree, features),
         ...(features?.includes(SEAL_FOREIGN_FEATURE) && (r.seal === 'here' || r.seal === 'elsewhere') ? { seal: r.seal } : {}),
+        ...(features?.includes(HANDOFFS_FEATURE) ? { handoffs: sanitizeHandoffs(r.handoffs) } : {}),
         ...(features?.includes(NOT_DOWNLOADED_FEATURE) && asCount(r.notDownloaded) !== null ? { notDownloaded: asCount(r.notDownloaded)! } : {}),
         ...experimentsSaid(r, features),
         ...hypothesesSaid(r, features),
@@ -3643,6 +4192,7 @@ export function sanitizeLiveStatus(value: unknown): LiveStatus | null {
         ...(features?.includes(WORK_LINK_FEATURE) && sanitizeLiveWork(r.work) ? { work: sanitizeLiveWork(r.work)! } : {}),
         ...(sanitizeResearchCaps(r.caps) ? { caps: sanitizeResearchCaps(r.caps)! } : {}),
         ...(features?.includes(OFF_LINE_BRANCHES_FEATURE) && sanitizeOffLine(r.offLine) ? { offLine: sanitizeOffLine(r.offLine)! } : {}),
+        ...(features?.includes(BOOKS_FEATURE) && sanitizeBooks(r.books) ? { books: sanitizeBooks(r.books)! } : {}),
         ...(features?.includes(QUEUE_PAGE_FEATURE) && sanitizeQueueCounts(r.queueCounts) ? { queueCounts: sanitizeQueueCounts(r.queueCounts)! } : {}),
         ...agentSaid(r.agent),
         ...(sanitizeBrowser(r) ? { browser: sanitizeBrowser(r)! } : {}),
@@ -4214,6 +4764,73 @@ export interface SyncReply {
     ids: AdoptIds | null;
     /** How the research took each source sent as an entry of a reading (`readings`, `read.sync`). */
     readings: SyncReading[];
+    /** What it wrote of the tree's own files (`media`, spec 108: a research with `media.app`); [] = none said. */
+    media: SyncMediaWritten[];
+    /** How many of them it wrote in all (the listed ones at least; 0 = none). */
+    mediaCount: number;
+}
+
+/** The kinds of a change of the tree's own files a write names (`media[].kind`, spec 108). */
+export const MEDIA_WRITTEN_KINDS = ['media.photo', 'media.photo.removed', 'media.couplePhoto', 'media.couplePhoto.removed',
+    'media.attachment', 'media.attachment.removed', 'media.edit', 'media.link', 'media.unlink'] as const;
+export type MediaWrittenKind = typeof MEDIA_WRITTEN_KINDS[number];
+
+/**
+ * One change of the tree's own files a write wrote (`media[]` of a send's
+ * answer and of `/status.sends`, spec 108): a portrait, a couple's photo or
+ * an attachment added, replaced or taken off, its details edited, or its place
+ * at an event or a source given or taken. Its place: a person ("P0001"), a
+ * couple ("F0003") or a source ("S0012") — at least one —, at an event its
+ * owner and the event ("E0042"); `record` the research's record of the file.
+ */
+export interface SyncMediaWritten {
+    kind: MediaWrittenKind;
+    person: string;
+    family: string;
+    source: string;
+    event: string;
+    /** The research's record of the file ("I0042"). */
+    record: string;
+    /** The file's title, the user's ('' = not said). */
+    title: string;
+    /** `media.edit`: what of the record changed ("title", "date"…); [] = not said. */
+    fields: string[];
+}
+
+const MEDIA_KIND_SET: ReadonlySet<string> = new Set(MEDIA_WRITTEN_KINDS);
+
+/**
+ * The `media[]` of a send's answer or of `/status.sends`, checked (at most
+ * `max`; untrusted): a known kind with its record and a place it is of, the
+ * ids by their shape, the title as plain text, the edited fields as short
+ * words. Anything else is left out.
+ */
+export function sanitizeMediaWritten(value: unknown, max = 200): SyncMediaWritten[] {
+    const id = (v: unknown, shape: RegExp): string => typeof v === 'string' && shape.test(v.trim()) ? v.trim() : '';
+    const out: SyncMediaWritten[] = [];
+    for (const x of Array.isArray(value) ? value.slice(0, max) : []) {
+        const r = asRecord(x);
+        if (!r || typeof r.kind !== 'string' || !MEDIA_KIND_SET.has(r.kind)) continue;
+        const record = id(r.record, /^I\d{1,9}$/);
+        const person = id(r.person, /^P\d{1,9}$/);
+        const family = id(r.family, /^F\d{1,9}$/);
+        const source = id(r.source, /^S\d{1,9}$/);
+        if (!record || (!person && !family && !source)) continue;
+        out.push({
+            kind: r.kind as MediaWrittenKind, person, family, source, event: id(r.event, /^E\d{1,9}$/), record,
+            title: cleanText(r.title, 200),
+            fields: Array.isArray(r.fields)
+                ? [...new Set(r.fields.slice(0, 12).filter((f): f is string => typeof f === 'string' && /^[a-z][a-zA-Z]{0,19}$/.test(f)))] : [],
+        });
+    }
+    return out;
+}
+
+/** How many a list said it holds (`mediaCount`, `media` of an answer without one): never fewer than kept. */
+function mediaCountOf(value: unknown, items: unknown, kept: number): number {
+    const said = asCount(value);
+    const listed = Array.isArray(items) ? Math.min(items.length, 1_000_000) : 0;
+    return Math.max(kept, said ?? listed);
 }
 
 /**
@@ -4376,10 +4993,11 @@ export function sanitizeSkipped(value: unknown, codes: boolean): SyncReply['skip
 export function sanitizeSyncReply(value: unknown, features?: readonly string[] | null): SyncReply {
     const codes = !!features?.includes(SYNC_NW_CODES_FEATURE);
     const r = asRecord(value);
-    if (!r) return { ok: false, changes: null, error: '', inbox: null, intake: '', head: '', applied: null, pending: false, conflicts: null, conflictPersons: [], conflictIds: [], conflictTakeIds: [], kept: null, reason: '', skipped: [], code: '', undoneSince: [], takenBack: null, notWritten: [], personConflicts: [], ids: null, readings: [] };
+    if (!r) return { ok: false, changes: null, error: '', inbox: null, intake: '', head: '', applied: null, pending: false, conflicts: null, conflictPersons: [], conflictIds: [], conflictTakeIds: [], kept: null, reason: '', skipped: [], code: '', undoneSince: [], takenBack: null, notWritten: [], personConflicts: [], ids: null, readings: [], media: [], mediaCount: 0 };
     const idsRec = asRecord(r.ids);
     const idPersons = adoptIdMap(idsRec?.persons, /^P\d{1,9}$/);
     const idSources = adoptIdMap(idsRec?.sources, /^S\d{1,9}$/);
+    const media = sanitizeMediaWritten(r.media);
     return {
         ok: r.ok === true,
         changes: asCount(r.changes),
@@ -4404,6 +5022,8 @@ export function sanitizeSyncReply(value: unknown, features?: readonly string[] |
         personConflicts: personConflictsOf(r.conflicts),
         ids: Object.keys(idPersons).length || Object.keys(idSources).length ? { persons: idPersons, sources: idSources } : null,
         readings: sanitizeSyncReadings(r.readings),
+        media,
+        mediaCount: mediaCountOf(r.mediaCount, r.media, media.length),
     };
 }
 

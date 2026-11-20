@@ -12,11 +12,13 @@
 
 import { StromData, Person, PersonId, Partnership, PartnershipId, EventParticipant, personSourceIds, partnershipSourceIds } from './types.js';
 import { placeKey } from './places.js';
+import { allMedia, mediaSourceIds, placePartnershipId, placePersonId, pruneMedia } from './media.js';
 import { dismissalsWithin } from './quality-dismiss.js';
 import { cleanLineageOverrides } from './lineage.js';
 import { placeRecordsFor } from './place-records.js';
 import { placeAliasesFor } from './place-groups.js';
 import { pruneImportOrigin } from './import-origin.js';
+import { subsetForSubtree } from './person-lists-data.js';
 
 /**
  * Build a deep-copied StromData containing only `seedIds` (plus glue partners),
@@ -78,8 +80,14 @@ export function extractSubtree(data: StromData, seedIds: Set<PersonId>): StromDa
     for (const p of Object.values(persons)) {
         personSourceIds(p).forEach(s => usedSources.add(s));
         p.events?.forEach(ev => ev.sourceIds?.forEach(s => usedSources.add(s)));
-        p.attachments?.forEach(a => { if (a.sourceId) usedSources.add(a.sourceId); });
     }
+    // The files of the kept people and couples, with the sources they are documents of.
+    const keptMedia = new Set(allMedia(data).filter(a => a.places.some(pl => {
+        const pid = placePersonId(pl);
+        const uid = placePartnershipId(pl);
+        return (!!pid && !!persons[pid]) || (!!uid && !!partnerships[uid]);
+    })));
+    for (const a of keptMedia) mediaSourceIds(a).forEach(s => usedSources.add(s));
     for (const u of Object.values(partnerships)) {
         partnershipSourceIds(u).forEach(s => usedSources.add(s));
     }
@@ -89,8 +97,7 @@ export function extractSubtree(data: StromData, seedIds: Set<PersonId>): StromDa
     };
     if (data.sources) {
         const sources: StromData['sources'] = {};
-        const keptAttachments = new Set<string>();
-        for (const p of Object.values(persons)) p.attachments?.forEach(a => keptAttachments.add(a.id));
+        const keptAttachments = new Set([...keptMedia].map(a => a.id));
         for (const [sid, src] of Object.entries(data.sources)) {
             if (!usedSources.has(sid)) continue;
             const copy = structuredClone(src);
@@ -106,6 +113,11 @@ export function extractSubtree(data: StromData, seedIds: Set<PersonId>): StromDa
         }
         if (Object.keys(sources).length > 0) result.sources = sources;
     }
+    // The files go along with the places they keep (a source's document with its kept source too).
+    for (const a of allMedia(data)) {
+        if (keptMedia.has(a) || mediaSourceIds(a).some(sid => !!result.sources?.[sid])) (result.media ??= {})[a.id] = structuredClone(a);
+    }
+    pruneMedia(result);
 
     // 5. Tree-level registries travel with the new tree. Coordinates are pruned
     //    to places the kept persons still use; surname groups are cheap facts
@@ -147,6 +159,11 @@ export function extractSubtree(data: StromData, seedIds: Set<PersonId>): StromDa
     if (data.researchDirections) result.researchDirections = data.researchDirections;
     // The saved views of the Table view are about columns, not people: whole.
     if (data.tableViews?.length) result.tableViews = structuredClone(data.tableViews);
+    // Lists of people (spec 084 §7): a fixed list keeps the people who came
+    // along (none = no list); an automatic one works on what the part has.
+    const lists = subsetForSubtree(data.personLists, new Set(Object.keys(persons)));
+    if (lists) result.personLists = lists;
+    if (data.personListsDropped?.length) result.personListsDropped = [...data.personListsDropped];
     // The GEDCOM files the tree was loaded from come along; marks of parent
     // links to people left behind go (pruneImportOrigin).
     if (data.imports?.length) result.imports = structuredClone(data.imports);

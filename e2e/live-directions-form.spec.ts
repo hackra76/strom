@@ -157,6 +157,8 @@ test.describe('the direction form', () => {
     });
 
     test('busy: tried once more after 3 s, then said in the form with Try again; a refusal in the research\'s words', async ({ page }) => {
+        // The 3 s before the second try run on Playwright's clock.
+        await page.clock.install();
         const b = await followManaged(page);
         await openOverview(page);
         await openNew(page);
@@ -166,7 +168,9 @@ test.describe('the direction form', () => {
         await f.locator('#direction-form-submit').click();
         await expect(f.locator('#direction-form-submit')).toHaveText('Creating…');
         await expect(f.locator('.modal')).toHaveClass(/is-sending/);
-        await expect.poll(() => directionWrites(b).length, { timeout: 8000 }).toBe(2);
+        await expect.poll(() => directionWrites(b).length).toBe(1);
+        await page.clock.runFor(3000);
+        await expect.poll(() => directionWrites(b).length).toBe(2);
         const box = f.locator('.direction-form__problem');
         await expect(box).toContainText('Not saved, the research is busy.');
         await expect(box).toHaveAttribute('role', 'alert');
@@ -221,10 +225,10 @@ test.describe('the direction form', () => {
         await page.keyboard.press('Enter');
         await expect(toast).toContainText('2 úkoly jsou teď mimo linii.');
 
-        // Its Undo refused: an alert toast (8 s, no action) with the research's sentence.
+        // Its Undo refused: said in the same toast (it stays, an alert, no action) with the research's sentence.
         b.replies.push({ status: 409, body: { error: 'directions.state', text: 'Linie má rozdělaný zápis.' } });
         await toast.locator('.toast-action').click();
-        await expect(toast).toHaveText('Undo failed, the change stays. · “Linie má rozdělaný zápis.”');
+        await expect(toast).toContainText('Undo failed, the change stays. · “Linie má rozdělaný zápis.”');
         await expect(toast).toHaveAttribute('role', 'alert');
         await expect(toast.locator('.toast-action')).toHaveCount(0);
 

@@ -30,11 +30,17 @@ import {
     Source,
     generateAttachmentId,
     Attachment,
+    MediaPlace,
+    MediaBy,
+    MaterialKind,
     ParentChildRelType,
     generatePartnershipId,
     LAST_FOCUSED,
     LastFocusedMarker,
     TableView,
+    PersonList,
+    PersonListRule,
+    PersonListSort,
     STROM_DATA_VERSION, PERSON_CITATION_FIELDS, PARTNERSHIP_CITATION_FIELDS, PersonCitationField, isGender, oppositeGender, isPrimaryName, PrimaryName, mergedPrimaryName,
     EmbeddedDataEnvelope,
     isEmbeddedEnvelope,
@@ -58,12 +64,14 @@ import { extractSubtree } from './subtree.js';
 import { collectPlaces, renamePlace, placeKey, orphanedPlaceKeys, splitPlaceHouses, SplitPlaceHousesResult } from './places.js';
 import { StorageManager } from './storage.js';
 import { surnameForms, addSurnameGroup, removeSurnameGroup, surnameKey } from './surnames.js';
-import { cleanLineageOverrides, LineagePatch } from './lineage.js';
+import { buildLineages, cleanLineageOverrides, LineagePatch, type LineageIndex } from './lineage.js';
 import { sanitizeQualityDismissed, sanitizeSurnameRejections, dismissalKey, surnameRejectionKey } from './quality-dismiss.js';
 import { ChangePacket, applyPacketOntoData } from './share-diff.js';
 import { createSnapshot, getSnapshotPayload, SnapshotReason, hasAutoSnapshotOnDay } from './snapshots.js';
-import { ValidationIssue, stripUnsafeMediaDataUrls, translateValidationType } from './validation.js';
+import { ValidationIssue, stripUnsafeMediaDataUrls, cleanPortraitSources, isSafePhotoDataUrl, translateValidationType } from './validation.js';
+import { isPortraitSourceShape } from './photo.js';
 import { cloneTreeData } from './clone.js';
+import { sanitizeMediaRecords, moveLegacyAttachments, pruneMedia, findMedia, treeMedia, personMedia, mediaOf, mediaAt, placeKey as mediaPlaceKey, putMedia, dropMediaPlaces, deleteMedia, placePersonId } from './media.js';
 import { UndoManager, type UndoMark } from './undo.js';
 import { applyLivingPrivacy, applyContentOptions, resolveContentOptions, ContentOptions, PrivacyMode } from './privacy.js';
 import { safeFileName } from './filenames.js';
@@ -78,6 +86,14 @@ import { cleanPlaceGeoMeta, sanitizePlaceRecords, sanitizePlaceRefs } from './pl
 import { addPlaceAlias, sanitizePlaceAliases } from './place-groups.js';
 import { sanitizeTableViews } from './table-views-data.js';
 import {
+    earlierAddedAt, isListNameTaken, newPersonListId, onPersonDeleted, onPersonsMerged, personListsOf, sanitizeAddedAt,
+    sanitizePersonListRule, sanitizePersonLists, sanitizePersonListsDropped, suggestListName,
+} from './person-lists-data.js';
+import {
+    listDisplayName, listPersonIds, personToastName, rulePersonIds, ruleLabel, sortListIds, withChecklist, withDoneToggled,
+    withFrozen, withManualOrder, withPersonMoved, withPersonsAdded, withPersonsRemoved, withRuleFilled, withSort, type ListEnv,
+} from './person-lists.js';
+import {
     SharedEventCommon, SharedEventCommonField, SharedEventEdit, SharedEventSaveResult, SharedEventIndex, PersonSharedEvent,
     SHARED_EVENT_COMMON_FIELDS, applyEventFields, buildSharedEventIndex, cleanEventShares, commonFieldsOf, newShareIdFor,
     personSharedEvents, shareCopiesOf, tidyShares, MARRIAGE_EVENT_ID,
@@ -87,6 +103,8 @@ import {
 import { eventIsShareable } from './events.js';
 import { buildPersonNameIndex, type ParticipantRef, type PersonNameIndex } from './participant-match.js';
 import { foldName } from './godparents.js';
+import { normalizeSha256 } from './sha256.js';
+import { startupPerson } from './default-person.js';
 
 /** Extended updates for Partnership */
 
@@ -215,6 +233,49 @@ export function unlinkExcerptsFromAttachment(data: StromData, attachmentId: stri
 }
 
 /**
+ * A deleted attachment was the original of a portrait (spec 107 §4d): the
+ * portrait stays, only its link to the original (photoSource) goes — its
+ * crop can then change only within the finished square.
+ */
+export function unlinkPortraitFromAttachment(data: StromData, attachmentId: string): void {
+    for (const person of Object.values(data.persons ?? {})) {
+        if (person?.photoSource?.attachmentId === attachmentId) delete person.photoSource;
+    }
+}
+
+/**
+ * A union's photo is gone (removed, or the union deleted, spec 107 §6e,
+ * 10d): the partners' portraits cut from it stay, their photoSource goes.
+ */
+export function unlinkPortraitsFromUnion(data: StromData, partnershipId: PartnershipId): void {
+    for (const person of Object.values(data.persons ?? {})) {
+        if (person?.photoSource?.partnershipId === partnershipId) delete person.photoSource;
+    }
+}
+
+/**
+ * A union is folded into another one of the same couple (a merge of two
+ * people): its photo fills the kept union's when that has none, and the
+ * portraits cut from it point at the kept union; otherwise they lose the link.
+ */
+export function foldUnionPhoto(data: StromData, from: Partnership, into: Partnership): void {
+    if (from.photo && !into.photo) {
+        into.photo = from.photo;
+        if (from.photoOriginalName) into.photoOriginalName = from.photoOriginalName;
+        else delete into.photoOriginalName;
+        if (from.photoDate) into.photoDate = from.photoDate;
+        else delete into.photoDate;
+        if (from.photoOriginal) into.photoOriginal = from.photoOriginal;
+        else delete into.photoOriginal;
+        for (const person of Object.values(data.persons ?? {})) {
+            if (person?.photoSource?.partnershipId === from.id) person.photoSource.partnershipId = into.id;
+        }
+        return;
+    }
+    unlinkPortraitsFromUnion(data, from.id);
+}
+
+/**
  * v13: the date forms a record wrote (gedcomDates) go back into a GEDCOM file
  * as they are, so only one-line keyword forms stay; a crafted or broken file
  * may carry anything there.
@@ -293,6 +354,10 @@ export function migrateData(data: unknown): StromData {
         if (person && typeof person === 'object' && 'dismissedMarriedSuggestion' in person
             && (typeof person.dismissedMarriedSuggestion !== 'string' || !person.dismissedMarriedSuggestion.trim())) {
             delete person.dismissedMarriedSuggestion;
+        }        // v22 (spec 084): when the person came into the tree, an ISO time or nothing.
+        if (person && typeof person === 'object' && 'addedAt' in person) {
+            const at = sanitizeAddedAt(person.addedAt);
+            if (at) person.addedAt = at; else delete person.addedAt;
         }
     }
     // Preserve the source catalog if present.
@@ -313,10 +378,19 @@ export function migrateData(data: unknown): StromData {
     if ((typeof d.version === 'number' ? d.version : 1) < 20) convertLegacyCensusEvents(result);
     cleanEventShares(result);
 
+    // v24 (spec 102): the tree's files are records with their places; the
+    // attachments of a tree of v23 and older move into them (one record per
+    // file), then only places that name what is in the tree stay.
+    const media = sanitizeMediaRecords(d.media);
+    if (media) result.media = media;
+    moveLegacyAttachments(result);
+
     // Photos/attachments/excerpts must be image (or PDF) data URLs — anything
     // else (data:text/html…) from a crafted file is dropped before it can be
     // stored or rendered. After the sources are in: excerpts live there.
     stripUnsafeMediaDataUrls(result);
+    // v23 (spec 107): only portrait sources whose original is still there.
+    cleanPortraitSources(result);
 
     // Preserve place coordinates. This object is rebuilt field by field, so
     // anything not named here is dropped on EVERY load — tree switch, app
@@ -373,6 +447,11 @@ export function migrateData(data: unknown): StromData {
     // v17: the saved views of the Table view (src/table-views-data.ts).
     const tableViews = sanitizeTableViews(d.tableViews);
     if (tableViews) result.tableViews = tableViews;
+    // v22: the lists of people and the ready-made lists deleted (src/person-lists-data.ts).
+    const personLists = sanitizePersonLists(d.personLists);
+    if (personLists) result.personLists = personLists;
+    const personListsDropped = sanitizePersonListsDropped(d.personListsDropped);
+    if (personListsDropped) result.personListsDropped = personListsDropped;
 
     // v15: the GEDCOM files loaded into the tree and the origin of facts and
     // links from them (src/import-origin.ts). Only valid records; marks that
@@ -401,6 +480,8 @@ export function migrateData(data: unknown): StromData {
 
     // A child with one known parent is kept one way: a family with a "?" stand-in (src/single-parent.ts).
     normalizeSingleParents(result);
+    // The places of the files name only what is in the tree (after the people and couples are settled).
+    pruneMedia(result);
 
     return result;
 }
@@ -1499,6 +1580,8 @@ class DataManagerClass {
      * mutation methods. During a batch this defers to commitBatch (no push/save).
      */
     private commitMutation(description: string, silent = false, mark?: UndoMark, toast?: MutationToast): void {
+        // The files' places name only what is still in the tree (a person, couple, event or source deleted).
+        pruneMedia(this.data);
         if (this.batchActive) {
             this.batchDirty = true;
             if (this.batchFirstDescription === null) this.batchFirstDescription = description;
@@ -1575,7 +1658,7 @@ class DataManagerClass {
      * for flows with their own result UI such as the family wizard) skips the
      * Undo toast. `description === null` uses the first inner mutation's.
      */
-    commitBatch(description: string | null, silent = true): void {
+    commitBatch(description: string | null, silent = true, toast?: MutationToast): void {
         if (!this.batchActive) return;
         if (--this.batchDepth > 0) return;
         this.batchActive = false;
@@ -1587,7 +1670,7 @@ class DataManagerClass {
             this.pendingBefore = null;   // nothing changed — no undo step
             return;
         }
-        this.commitMutation(desc, silent);
+        this.commitMutation(desc, silent, undefined, toast);
     }
 
     /**
@@ -1595,13 +1678,15 @@ class DataManagerClass {
      * Undo toast (review V12). The batch is closed on every path, including a
      * throw. `description === null` names the step after the first inner
      * mutation (e.g. "adding Jan Novák" for a create-then-edit save).
+     * `toast`: the Undo toast's own sentence when it says more than the
+     * history's entry ("Portrait updated.").
      */
-    runBatch<T>(description: string | null, fn: () => T): T {
+    runBatch<T>(description: string | null, fn: () => T, toast?: MutationToast): T {
         this.beginBatch();
         try {
             return fn();
         } finally {
-            this.commitBatch(description, false);
+            this.commitBatch(description, false, toast);
         }
     }
 
@@ -2047,6 +2132,248 @@ class DataManagerClass {
         return true;
     }
 
+    // ==================== LISTS OF PEOPLE (spec 084) ====================
+
+    private lineageIndexCache: { data: StromData; revision: number; index: LineageIndex } | null = null;
+
+    /** The lineage index of the open tree, built once per state of the data (lists, rods, selections). */
+    getLineageIndex(): LineageIndex {
+        const c = this.lineageIndexCache;
+        if (c && c.data === this.data && c.revision === this.revision) return c.index;
+        const index = buildLineages(this.data);
+        this.lineageIndexCache = { data: this.data, revision: this.revision, index };
+        return index;
+    }
+
+    /** Lists cannot be changed (Q1): a read-only or locked tree, a live research's tree, a newer app's data, another window's read-only copy. */
+    listsReadOnly(): boolean {
+        return this.isReadOnly() || this.isTreeLocked();
+    }
+
+    /** The tree's lists, the ready-made "Added in the last 30 days" first while it is not stored. */
+    getPersonLists(): PersonList[] {
+        return personListsOf(this.data);
+    }
+
+    getPersonList(id: string): PersonList | undefined {
+        return personListsOf(this.data).find(l => l.id === id);
+    }
+
+    /** The people of a list in its order (none for an unknown id). */
+    getPersonListIds(id: string, env: ListEnv = {}): PersonId[] {
+        const list = this.getPersonList(id);
+        return list ? listPersonIds(this.getLineageIndex(), list, env) : [];
+    }
+
+    /** Whether another list has this name (without diacritics and case). */
+    isPersonListNameTaken(name: string, exceptId?: string): boolean {
+        return isListNameTaken(personListsOf(this.data), name, exceptId, listDisplayName);
+    }
+
+    /** The name itself when free, else "{name} (2)" with the next free number. */
+    suggestPersonListName(name: string, exceptId?: string): string {
+        return suggestListName(personListsOf(this.data), name, exceptId, listDisplayName);
+    }
+
+    /** Stores a changed list (the ready-made one is stored the first time it changes) in one undo step. */
+    private storePersonList(list: PersonList, description: string, silent: boolean, toast?: MutationToast, audit = false): void {
+        this.beginMutation();
+        const stored = this.data.personLists ?? [];
+        const at = stored.findIndex(l => l.id === list.id);
+        const copy = structuredClone(list);
+        this.data.personLists = at >= 0 ? stored.map((l, i) => (i === at ? copy : l))
+            : list.builtin ? [copy, ...stored] : [...stored, copy];
+        this.commitMutation(description, silent, undefined, toast);
+        if (audit && this.currentTreeId) AuditLogManager.log(this.currentTreeId, 'personList.save', strings.lists.audit.saved(listDisplayName(list)));
+    }
+
+    /** One change of a list: `change` gets the list and returns it changed (the same object = nothing to do). */
+    private changePersonList(id: string, change: (list: PersonList, now: string) => PersonList,
+        opts: { silent?: boolean; toast?: (next: PersonList) => MutationToast | undefined; audit?: boolean } = {}): PersonList | null {
+        if (this.listsReadOnly()) return null;
+        const list = this.getPersonList(id);
+        if (!list) return null;
+        const next = change(list, new Date().toISOString());
+        if (next === list) return list;
+        this.storePersonList(next, strings.lists.undo.edit(listDisplayName(next)), opts.silent ?? true, opts.toast?.(next), opts.audit);
+        return next;
+    }
+
+    /**
+     * A new list (spec 084 §6). A fixed list made from a rule takes the
+     * rule's people now (`personIds` given: those, e.g. the Table's rows in
+     * its order); a name already used gets the next free "(2)". The default
+     * order: by generation for ancestors / descendants, by date added for the
+     * "added" rule, manual for a fixed list of given people, else oldest first.
+     */
+    createPersonList(input: { name: string; dynamic: boolean; rule?: PersonListRule; personIds?: PersonId[]; sort?: PersonListSort; checklist?: boolean }, env: ListEnv = {}): PersonList | null {
+        if (this.listsReadOnly()) return null;
+        const rule = input.rule ? sanitizePersonListRule(input.rule) : null;
+        if (input.dynamic && !rule) return null;
+        const name = this.suggestPersonListName(input.name.trim() || (rule ? ruleLabel(rule, this.getLineageIndex()) : ''));
+        if (!name) return null;
+        const index = this.getLineageIndex();
+        if (rule && (rule.kind === 'ancestors' || rule.kind === 'descendants') && !rule.personName) {
+            const p = this.data.persons[rule.personId];
+            if (p) rule.personName = shownName(p);
+        }
+        const sort: PersonListSort = input.sort
+            ?? (rule?.kind === 'ancestors' || rule?.kind === 'descendants' ? 'gen'
+                : rule?.kind === 'added' ? 'added'
+                : !input.dynamic && input.personIds ? 'manual' : 'old');
+        const list: PersonList = {
+            id: newPersonListId(personListsOf(this.data)), name, dynamic: input.dynamic,
+            sort: input.dynamic && sort === 'manual' ? 'old' : sort,
+            updated: new Date().toISOString(),
+        };
+        if (rule) list.rule = rule;
+        if (!input.dynamic) {
+            const ids = input.personIds ?? (rule ? sortListIds(index, list, rulePersonIds(index, rule, env), sort === 'manual' ? 'old' : sort, env) : []);
+            list.personIds = [...new Set(ids)].filter(id => !!this.data.persons[id] && !this.data.persons[id].isPlaceholder);
+            if (input.checklist) list.checklist = true;
+        }
+        this.storePersonList(list, strings.lists.undo.create(name), false, { text: strings.lists.toast.saved(name) }, true);
+        return list;
+    }
+
+    /** A new name; false when another list has it (or it is empty). */
+    renamePersonList(id: string, name: string): boolean {
+        const clean = name.trim();
+        if (!clean || this.isPersonListNameTaken(clean, id)) return false;
+        return !!this.changePersonList(id, (l, now) => (l.name === clean ? l : { ...l, name: clean, updated: now }), { audit: true });
+    }
+
+    /** A copy under the next free name ("… (2)"), with its people and what is done; never a ready-made one. */
+    duplicatePersonList(id: string): PersonList | null {
+        if (this.listsReadOnly()) return null;
+        const list = this.getPersonList(id);
+        if (!list) return null;
+        const copy: PersonList = structuredClone(list);
+        delete copy.builtin;
+        copy.id = newPersonListId(personListsOf(this.data));
+        copy.name = this.suggestPersonListName(listDisplayName(list));
+        copy.updated = new Date().toISOString();
+        this.storePersonList(copy, strings.lists.undo.create(copy.name), true, undefined, true);
+        return copy;
+    }
+
+    /** Deletes a list with an Undo toast; the ready-made one is never made again (Q3). */
+    deletePersonList(id: string): boolean {
+        if (this.listsReadOnly()) return false;
+        const list = this.getPersonList(id);
+        if (!list) return false;
+        const name = listDisplayName(list);
+        this.beginMutation();
+        const next = (this.data.personLists ?? []).filter(l => l.id !== id);
+        if (next.length) this.data.personLists = next; else delete this.data.personLists;
+        if (list.builtin && !this.data.personListsDropped?.includes(list.builtin)) {
+            this.data.personListsDropped = [...(this.data.personListsDropped ?? []), list.builtin];
+        }
+        this.commitMutation(strings.lists.undo.delete(name), false, undefined, { text: strings.lists.toast.deleted(name) });
+        if (this.currentTreeId) AuditLogManager.log(this.currentTreeId, 'personList.delete', strings.lists.audit.deleted(name));
+        return true;
+    }
+
+    /**
+     * People added to a fixed list by hand (§4): those already in it are not
+     * added twice; nothing new = no change (false). The toast names one
+     * person, else says how many came.
+     */
+    addPersonsToList(id: string, ids: PersonId[]): boolean {
+        const list = this.getPersonList(id);
+        // An automatic list takes nobody by hand (its rule fills it).
+        if (!list || list.dynamic) return false;
+        const have = new Set(list.personIds ?? []);
+        const real = [...new Set(ids)].filter(pid => !!this.data.persons[pid] && !this.data.persons[pid].isPlaceholder && !have.has(pid));
+        if (!real.length) return false;
+        return !!this.changePersonList(id, (l, now) => withPersonsAdded(l, real, now), {
+            silent: false,
+            toast: next => {
+                if (real.length !== 1) return { text: strings.lists.toast.addedN(real.length, listDisplayName(next)) };
+                const p = personToastName(this.data, real[0]);
+                return { text: strings.lists.toast.added(p.name, listDisplayName(next), p.gender) };
+            },
+        });
+    }
+
+    /** People taken out of a fixed list (Undo toast; one person: named). */
+    removePersonsFromList(id: string, ids: PersonId[]): boolean {
+        return !!this.changePersonList(id, (l, now) => withPersonsRemoved(l, ids, now), {
+            silent: false,
+            toast: () => {
+                if (ids.length !== 1) return undefined;
+                const p = personToastName(this.data, ids[0]);
+                return { text: strings.lists.toast.removed(p.name, p.gender) };
+            },
+        });
+    }
+
+    /** A person moved in a fixed list's manual order (Alt+↑/↓, Move up / down). */
+    movePersonInList(id: string, personId: PersonId, delta: number): boolean {
+        return !!this.changePersonList(id, (l, now) => withPersonMoved(l, personId, delta, now));
+    }
+
+    /** A new manual order of a fixed list (drag and drop). */
+    setPersonListOrder(id: string, ids: PersonId[]): boolean {
+        return !!this.changePersonList(id, (l, now) => withManualOrder(l, ids, now));
+    }
+
+    setPersonListSort(id: string, sort: PersonListSort): boolean {
+        return !!this.changePersonList(id, (l, now) => withSort(l, sort, now));
+    }
+
+    /** A new rule (Edit rule…); `dynamic` switches between automatic and fixed (a fixed one takes the rule's people now). */
+    setPersonListRule(id: string, rule: PersonListRule, dynamic: boolean, env: ListEnv = {}): boolean {
+        const clean = sanitizePersonListRule(rule);
+        if (!clean) return false;
+        const index = this.getLineageIndex();
+        if ((clean.kind === 'ancestors' || clean.kind === 'descendants') && !clean.personName) {
+            const p = this.data.persons[clean.personId];
+            if (p) clean.personName = shownName(p);
+        }
+        return !!this.changePersonList(id, (l, now) => {
+            const next: PersonList = { ...l, rule: clean, dynamic, updated: now };
+            if (dynamic) {
+                delete next.personIds; delete next.removed; delete next.checklist;
+                if (next.sort === 'manual') next.sort = 'old';
+            } else if (l.dynamic) {
+                next.personIds = sortListIds(index, next, rulePersonIds(index, clean, env), l.sort, env);
+            }
+            return next;
+        }, { audit: true });
+    }
+
+    /** "Freeze" (§7): fixed with the people it has now (toast with Undo). */
+    freezePersonList(id: string, env: ListEnv = {}): boolean {
+        return !!this.changePersonList(id, (l, now) => withFrozen(this.getLineageIndex(), l, now, env), {
+            silent: false, toast: () => ({ text: strings.lists.toast.frozen }), audit: true,
+        });
+    }
+
+    /**
+     * "Add from the rule" (§7): how many people came (toast with Undo); 0 =
+     * the list is complete (nothing changes: the caller shows `lists.toast.full`).
+     */
+    fillPersonList(id: string, env: ListEnv = {}): number {
+        let added = 0;
+        this.changePersonList(id, (l, now) => {
+            const r = withRuleFilled(this.getLineageIndex(), l, now, env);
+            added = r.added;
+            return r.list;
+        }, { silent: false, toast: () => ({ text: strings.lists.toast.filled(added) }) });
+        return added;
+    }
+
+    /** "Tick off done" on or off (a fixed list only; off keeps what is done). */
+    setPersonListChecklist(id: string, on: boolean): boolean {
+        return !!this.changePersonList(id, (l, now) => withChecklist(l, on, now));
+    }
+
+    /** A person of a checklist ticked off or back: one undo step, no toast (§13). */
+    togglePersonListDone(id: string, personId: PersonId, done?: boolean): boolean {
+        return !!this.changePersonList(id, (l, now) => withDoneToggled(l, personId, now, done));
+    }
+
     // ==================== DATA QUALITY ====================
 
     /**
@@ -2324,6 +2651,8 @@ class DataManagerClass {
         }
         // Which surname the person goes by: only with a married surname.
         if (person.marriedSurname && isPrimaryName(personData.primaryName)) person.primaryName = personData.primaryName;
+        // When the person came into the tree (spec 084 §8); a placeholder gets it once it becomes a person.
+        if (!isPlaceholder) person.addedAt = new Date().toISOString();
 
         this.data.persons[person.id] = person;
         this.commitMutation(strings.undo.addPerson(auditPersonName(person)));
@@ -2534,6 +2863,7 @@ class DataManagerClass {
             if ((first && first !== '?') || (last && person.lastName !== lastNameBefore)) {
                 person.isPlaceholder = false;
                 if (first === '?') person.firstName = '';
+                if (!person.addedAt) person.addedAt = new Date().toISOString();
             }
         }
         if (updates.gender !== undefined) person.gender = updates.gender;
@@ -2584,9 +2914,23 @@ class DataManagerClass {
         // isDeceased is tri-state (true / false / undefined); apply verbatim when provided.
         if ('isDeceased' in updates) person.isDeceased = updates.isDeceased;
         if ('photo' in updates) {
-            // The date from the file belongs to the picture it came with.
-            if ((updates.photo || undefined) !== person.photo) delete person.photoDate;
-            person.photo = updates.photo || undefined;
+            const photo = updates.photo || undefined;
+            // The date from the file belongs to the picture it came with, and
+            // so does the original it was cut from (spec 107): a new or
+            // removed portrait drops it unless it comes with its own.
+            if (photo !== person.photo) {
+                delete person.photoDate;
+                if (!('photoSource' in updates)) delete person.photoSource;
+            }
+            person.photo = photo;
+            if (!photo) delete person.photoSource;
+        }
+        if ('photoSource' in updates) {
+            // The original of the portrait from the crop editor: only a
+            // well-formed one beside a portrait (a load drops one whose
+            // attachment or union photo is gone, see cleanPortraitSources).
+            if (person.photo && isPortraitSourceShape(updates.photoSource)) person.photoSource = structuredClone(updates.photoSource);
+            else delete person.photoSource;
         }
 
         if (JSON.stringify(person) === personBefore) {
@@ -3141,6 +3485,8 @@ class DataManagerClass {
         this.beginMutation();
         delete this.data.sources![sourceId];
         if (Object.keys(this.data.sources!).length === 0) delete this.data.sources;
+        // A file that was the source's document stays where else it is (a person's attachment).
+        dropMediaPlaces(this.data, place => 'sourceId' in place && place.sourceId === sourceId);
         for (const person of Object.values(this.data.persons)) {
             for (const field of PERSON_CITATION_FIELDS) {
                 const ids = person[field];
@@ -3156,9 +3502,6 @@ class DataManagerClass {
                     if (ev.sourceIds.length === 0) delete ev.sourceIds;
                 }
                 cleanCitationQuay(ev, ['sourceIds']);
-            }
-            for (const att of person.attachments ?? []) {
-                if (att.sourceId === sourceId) delete att.sourceId;
             }
             rewriteStorySources(person.story, ids => ids.filter(id => id !== sourceId));
         }
@@ -3694,32 +4037,49 @@ class DataManagerClass {
 
     // ==================== ATTACHMENTS ====================
 
-    /** Attach a document to a person. Returns the created attachment, or null. */
-    addAttachment(personId: PersonId, attachment: Omit<Attachment, 'id'>): Attachment | null {
+    /**
+     * Attach a document to a person: a new file record with the person's
+     * place (and the source's, `sourceId`: the person's scan of that source).
+     * Returns the created record, or null.
+     */
+    addAttachment(personId: PersonId, attachment: Omit<Attachment, 'id' | 'places'> & { places?: MediaPlace[] }, sourceId?: string): Attachment | null {
         const person = this.data.persons[personId];
         if (!person) return null;
         if (this.isPersonLocked(personId)) return null;
 
         this.beginMutation();
-        const newAttachment: Attachment = { ...attachment, id: generateAttachmentId() };
-        if (!person.attachments) person.attachments = [];
-        person.attachments.push(newAttachment);
+        const places: MediaPlace[] = [{ personId }];
+        if (sourceId && this.data.sources?.[sourceId]) places.push({ sourceId });
+        const newAttachment: Attachment = { ...attachment, id: generateAttachmentId(), places, addedAt: attachment.addedAt ?? new Date().toISOString() };
+        putMedia(this.data, newAttachment);
         this.commitMutation(strings.undo.addAttachment(auditPersonName(person)));
         AuditLogManager.log(this.currentTreeId, 'attachment.add', strings.auditLog.addedAttachment(auditPersonName(person)));
         return newAttachment;
     }
 
+    /**
+     * Take a document off a person: their places go, with the source's place
+     * it came with when the person was its only one; a file left nowhere goes
+     * from the tree (as an attachment did before data v24).
+     */
     removeAttachment(personId: PersonId, attachmentId: string): boolean {
         const person = this.data.persons[personId];
-        if (!person?.attachments?.some(a => a.id === attachmentId)) return false;
+        const att = findMedia(this.data, attachmentId);
+        if (!person || !att?.places.some(p => placePersonId(p) === personId)) return false;
         if (this.isPersonLocked(personId)) return false;
 
         this.beginMutation();
-        person.attachments = person.attachments.filter(a => a.id !== attachmentId);
-        if (person.attachments.length === 0) delete person.attachments;
-        // Excerpts cut from this page keep their image; they just can no
-        // longer be re-cropped.
-        unlinkExcerptsFromAttachment(this.data, attachmentId);
+        const othersHold = att.places.some(p => (placePersonId(p) !== undefined && placePersonId(p) !== personId) || 'partnershipId' in p);
+        const gone = dropMediaPlaces(this.data, (place, a) => a.id === attachmentId
+            && (placePersonId(place) === personId || (!othersHold && 'sourceId' in place)));
+        if (gone.includes(attachmentId)) {
+            // Excerpts cut from this page keep their image; they just can no
+            // longer be re-cropped.
+            unlinkExcerptsFromAttachment(this.data, attachmentId);
+        }
+        // The portrait cut from it stays, without its original (spec 107 §4d).
+        if (person.photoSource?.attachmentId === attachmentId) delete person.photoSource;
+        if (gone.includes(attachmentId)) unlinkPortraitFromAttachment(this.data, attachmentId);
         this.commitMutation(strings.undo.removeAttachment(auditPersonName(person)));
         AuditLogManager.log(this.currentTreeId, 'attachment.remove', strings.auditLog.removedAttachment(auditPersonName(person)));
         return true;
@@ -3727,8 +4087,8 @@ class DataManagerClass {
 
     updateAttachmentNote(personId: PersonId, attachmentId: string, note: string): boolean {
         const person = this.data.persons[personId];
-        const att = person?.attachments?.find(a => a.id === attachmentId);
-        if (!person || !att) return false;
+        const att = findMedia(this.data, attachmentId);
+        if (!person || !att?.places.some(p => placePersonId(p) === personId)) return false;
         if (this.isPersonLocked(personId)) return false;
 
         this.beginMutation();
@@ -3737,6 +4097,361 @@ class DataManagerClass {
         this.commitMutation(strings.undo.editAttachment(auditPersonName(person)));
         AuditLogManager.log(this.currentTreeId, 'attachment.update', strings.auditLog.updatedAttachment(auditPersonName(person)));
         return true;
+    }
+
+    // ==================== FILES OF THE TREE (data v24, spec 102 §0) ====================
+
+    /** A file of the tree by its id (also one taken out of it). */
+    getMedia(id: string): Attachment | undefined {
+        return findMedia(this.data, id);
+    }
+
+    /** The files at exactly this place, in their order. */
+    mediaOf(place: MediaPlace): Attachment[] {
+        return mediaOf(this.data, place);
+    }
+
+    /** The person's files: those with any place of theirs (themselves, a fact, an event), in their order. */
+    personMedia(personId: PersonId): Attachment[] {
+        return personMedia(this.data, personId);
+    }
+
+    /** Every person a file is with may be changed (a file of no person: the tree). */
+    private mediaEditable(att: Attachment): boolean {
+        if (this.isTreeLocked()) return false;
+        return att.places.every(p => { const pid = placePersonId(p); return !pid || !this.isPersonLocked(pid); });
+    }
+
+    /** Change a file's detail as one undo step. */
+    private editMedia(id: string, label: (name: string) => string, change: (att: Attachment) => boolean): boolean {
+        const att = findMedia(this.data, id);
+        if (!att || !this.mediaEditable(att)) return false;
+        const before = JSON.stringify(att);
+        const probe = cloneTreeData(att);
+        if (!change(probe) || JSON.stringify(probe) === before) return false;
+        this.beginMutation();
+        change(att);
+        const name = att.title || att.name;
+        this.commitMutation(label(name));
+        AuditLogManager.log(this.currentTreeId, 'attachment.update', label(name));
+        return true;
+    }
+
+    /** A file's title ('' = none, its name stands for it); `by` the agent's (spec 102 §13). */
+    setMediaTitle(id: string, title: string, by: MediaBy = 'user'): boolean {
+        const text = title.trim();
+        return this.editMedia(id, strings.undo.mediaTitle, att => {
+            if (text) att.title = text; else delete att.title;
+            if (text && by === 'agent') att.titleBy = 'agent'; else delete att.titleBy;
+            return true;
+        });
+    }
+
+    /** A file's kind (undefined = none). */
+    setMediaKind(id: string, kind: MaterialKind | undefined, by: MediaBy = 'user'): boolean {
+        return this.editMedia(id, strings.undo.mediaKind, att => {
+            if (kind) att.kind = kind; else delete att.kind;
+            if (kind && by === 'agent') att.kindBy = 'agent'; else delete att.kindBy;
+            return true;
+        });
+    }
+
+    /** The file's title, kind, date and note may be changed here (not read-only, every person of it unlocked). */
+    canEditMedia(id: string): boolean {
+        const att = findMedia(this.data, id);
+        return !!att && !this.isReadOnly() && this.mediaEditable(att);
+    }
+
+    /**
+     * A file's title, kind, date and note at once (spec 102 §2: the viewer's
+     * and the Attachment dialog's Save) as one undo step. A field left out
+     * stays; '' / null clears it.
+     */
+    setMediaDetails(id: string, details: { title?: string; kind?: MaterialKind | null; date?: string; note?: string }): boolean {
+        if (this.isReadOnly()) return false;
+        return this.editMedia(id, strings.undo.mediaDetails, att => {
+            if (details.title !== undefined) {
+                const text = details.title.trim();
+                if (text !== (att.title ?? '')) delete att.titleBy;
+                if (text) att.title = text; else delete att.title;
+            }
+            if (details.kind !== undefined) {
+                if ((details.kind ?? undefined) !== att.kind) delete att.kindBy;
+                if (details.kind) att.kind = details.kind; else delete att.kind;
+            }
+            if (details.date !== undefined) {
+                const text = details.date.trim();
+                if (text !== (att.date ?? '')) delete att.dateBy;
+                if (text) att.date = text; else delete att.date;
+            }
+            if (details.note !== undefined) {
+                const text = details.note.trim();
+                if (text) att.note = text; else delete att.note;
+            }
+            return true;
+        });
+    }
+
+    /**
+     * Title, kind or date of many files at once (spec 102 §8: Title… / Kind… /
+     * Date… for a selection) as one undo step. Files that cannot change here
+     * (locked person, missing) are left out; returns the ids changed.
+     */
+    setMediaDetailsMany(changes: readonly { id: string; details: { title?: string; kind?: MaterialKind | null; date?: string } }[]): string[] {
+        if (this.isReadOnly()) return [];
+        const apply = (att: Attachment, d: { title?: string; kind?: MaterialKind | null; date?: string }): void => {
+            if (d.title !== undefined) {
+                const text = d.title.trim();
+                if (text !== (att.title ?? '')) delete att.titleBy;
+                if (text) att.title = text; else delete att.title;
+            }
+            if (d.kind !== undefined) {
+                if ((d.kind ?? undefined) !== att.kind) delete att.kindBy;
+                if (d.kind) att.kind = d.kind; else delete att.kind;
+            }
+            if (d.date !== undefined) {
+                const text = d.date.trim();
+                if (text !== (att.date ?? '')) delete att.dateBy;
+                if (text) att.date = text; else delete att.date;
+            }
+        };
+        const todo: { att: Attachment; details: { title?: string; kind?: MaterialKind | null; date?: string } }[] = [];
+        for (const c of changes) {
+            const att = findMedia(this.data, c.id);
+            if (!att || !this.mediaEditable(att)) continue;
+            const probe = cloneTreeData(att);
+            apply(probe, c.details);
+            if (JSON.stringify(probe) !== JSON.stringify(att)) todo.push({ att, details: c.details });
+        }
+        if (!todo.length) return [];
+        this.beginMutation();
+        for (const t of todo) apply(t.att, t.details);
+        const label = todo.length === 1 ? strings.undo.mediaDetails(todo[0].att.title || todo[0].att.name) : strings.undo.mediaDetailsN(todo.length);
+        this.commitMutation(label);
+        AuditLogManager.log(this.currentTreeId, 'attachment.update', label);
+        return todo.map(t => t.att.id);
+    }
+
+    /** A file's date as written (GEDCOM-like text; '' = none). */
+    setMediaDate(id: string, date: string, by: MediaBy = 'user'): boolean {
+        const text = date.trim();
+        return this.editMedia(id, strings.undo.mediaDate, att => {
+            if (text) att.date = text; else delete att.date;
+            if (text && by === 'agent') att.dateBy = 'agent'; else delete att.dateBy;
+            return true;
+        });
+    }
+
+    /**
+     * A file of the tree that is the same file (spec 102 §12h): the same
+     * original (SHA-256), else the same copy; only one with a place in the tree.
+     */
+    sameFileMedia(file: { original?: { sha256: string } | null; dataUrl?: string; originalOnly?: boolean }): Attachment | undefined {
+        const sha = file.original?.sha256?.toLowerCase();
+        const url = !file.originalOnly && file.dataUrl ? file.dataUrl : '';
+        if (!sha && !url) return undefined;
+        return treeMedia(this.data).find(a => (sha ? a.original?.sha256?.toLowerCase() === sha : !a.originalOnly && a.dataUrl === url));
+    }
+
+    /** Put a file at one more place (a person, a fact, an event, a couple, a source that is in the tree). */
+    addMediaPlace(id: string, place: MediaPlace): boolean {
+        const att = findMedia(this.data, id);
+        if (!att || mediaAt(att, place) || !this.placeExists(place)) return false;
+        const pid = placePersonId(place);
+        if (!this.mediaEditable(att) || (pid && this.isPersonLocked(pid))) return false;
+        this.beginMutation();
+        att.places.push(place);
+        const name = att.title || att.name;
+        this.commitMutation(strings.undo.mediaPlaceAdd(name));
+        AuditLogManager.log(this.currentTreeId, 'attachment.update', strings.undo.mediaPlaceAdd(name));
+        return true;
+    }
+
+    /**
+     * Link files to places as one undo step (spec 102 §4 "Link to…"): a file
+     * of the tree (`id`) gets the places it does not have yet; material
+     * outside the tree (`record`) becomes a file of the tree with them, the
+     * archive's original named in `record.original`. A file taken out of the
+     * tree comes back with the new places only. Returns the ids of the files
+     * that changed (none: nothing was written). `toast`: the Undo toast's sentence.
+     */
+    linkMedia(files: Array<{ id: string } | { record: Omit<Attachment, 'id' | 'places'> }>, places: MediaPlace[], opts: { toast?: string } = {}): string[] {
+        if (this.isReadOnly()) return [];
+        const targets = places.filter(p => this.placeExists(p) && !(placePersonId(p) && this.isPersonLocked(placePersonId(p)!)));
+        if (!targets.length) return [];
+        const plan: Array<{ att?: Attachment; record?: Omit<Attachment, 'id' | 'places'>; add: MediaPlace[] }> = [];
+        for (const f of files) {
+            if ('id' in f) {
+                const att = findMedia(this.data, f.id);
+                if (!att || !this.mediaEditable(att)) continue;
+                const add = targets.filter(p => !mediaAt(att, p));
+                if (add.length) plan.push({ att, add });
+            } else {
+                plan.push({ record: f.record, add: [...targets] });
+            }
+        }
+        if (!plan.length) return [];
+        this.beginMutation();
+        const changed: string[] = [];
+        for (const step of plan) {
+            if (step.att) {
+                if (step.att.removed) delete step.att.removed;
+                step.att.places.push(...step.add.map(p => ({ ...p })));
+                changed.push(step.att.id);
+            } else if (step.record) {
+                const att: Attachment = { ...step.record, id: generateAttachmentId(), places: step.add.map(p => ({ ...p })), addedAt: step.record.addedAt ?? new Date().toISOString() };
+                putMedia(this.data, att);
+                changed.push(att.id);
+            }
+        }
+        const first = findMedia(this.data, changed[0]);
+        const name = changed.length === 1 && first ? (first.title || first.name) : String(changed.length);
+        this.commitMutation(strings.undo.mediaPlaceAdd(name), false, undefined, opts.toast ? { text: opts.toast } : undefined);
+        AuditLogManager.log(this.currentTreeId, 'attachment.update', strings.undo.mediaPlaceAdd(name));
+        return changed;
+    }
+
+    /**
+     * Take a file off one place. Its last place: the file goes from the tree
+     * (a tree without an archive, spec 102 §9) unless `keep`, which takes it
+     * out as removeMedia does. `toast`: the Undo toast's sentence (§3's ×).
+     */
+    removeMediaPlace(id: string, place: MediaPlace, opts: { keep?: boolean; toast?: string } = {}): boolean {
+        const att = findMedia(this.data, id);
+        if (!att || !mediaAt(att, place) || !this.mediaEditable(att)) return false;
+        this.beginMutation();
+        const key = mediaPlaceKey(place);
+        const last = att.places.length === 1;
+        if (last && opts.keep) att.removed = { at: new Date().toISOString(), places: [...att.places] };
+        const gone = dropMediaPlaces(this.data, (p, a) => a.id === id && mediaPlaceKey(p) === key);
+        const pid = placePersonId(place);
+        const person = pid ? this.data.persons[pid] : undefined;
+        if (person?.photoSource?.attachmentId === id && !att.places.some(p => placePersonId(p) === pid)) delete person.photoSource;
+        if (gone.includes(id)) this.forgetMediaLinks(id);
+        const name = att.title || att.name;
+        this.commitMutation(strings.undo.mediaPlaceRemove(name), false, undefined, opts.toast ? { text: opts.toast } : undefined);
+        AuditLogManager.log(this.currentTreeId, 'attachment.remove', strings.undo.mediaPlaceRemove(name));
+        return true;
+    }
+
+    /**
+     * Take a file out of the tree (spec 102 §9): with `keep` (a tree with an
+     * archive) the record stays with the places it had for "Restore"
+     * (`removed`); without it the record goes (O1). One undo step.
+     */
+    removeMedia(id: string, opts: { keep?: boolean; reason?: 'unrelated' | 'duplicate'; toast?: string } = {}): boolean {
+        const att = findMedia(this.data, id);
+        if (!att || (!att.places.length && opts.keep) || !this.mediaEditable(att)) return false;
+        this.beginMutation();
+        if (opts.keep) {
+            att.removed = { at: new Date().toISOString(), ...(opts.reason ? { reason: opts.reason } : {}), places: [...att.places] };
+            att.places = [];
+            for (const person of Object.values(this.data.persons)) {
+                if (person.photoSource?.attachmentId === id) delete person.photoSource;
+            }
+        } else {
+            deleteMedia(this.data, [id]);
+            this.forgetMediaLinks(id);
+        }
+        const name = att.title || att.name;
+        this.commitMutation(strings.undo.mediaRemove(name), false, undefined, opts.toast ? { text: opts.toast } : undefined);
+        AuditLogManager.log(this.currentTreeId, 'attachment.remove', strings.undo.mediaRemove(name));
+        return true;
+    }
+
+    /**
+     * Take several files out of the tree in one undo step (spec 102 §8, the
+     * selection's Remove from the tree…): as removeMedia for each — `keep`
+     * says which stay taken out (kept by an archive), the rest go. Files that
+     * cannot change here are skipped. Returns the ids taken out.
+     */
+    removeMediaMany(ids: readonly string[], opts: { keep?: boolean | ((id: string) => boolean); reason?: 'unrelated' | 'duplicate'; toast?: string } = {}): string[] {
+        const keeps = (id: string) => typeof opts.keep === 'function' ? opts.keep(id) : !!opts.keep;
+        const atts = [...new Set(ids)].map(id => findMedia(this.data, id))
+            .filter((a): a is Attachment => !!a && a.places.length > 0 && this.mediaEditable(a));
+        if (!atts.length) return [];
+        this.beginMutation();
+        const at = new Date().toISOString();
+        const kept = new Set<string>();
+        const gone: string[] = [];
+        for (const att of atts) {
+            if (keeps(att.id)) {
+                att.removed = { at, ...(opts.reason ? { reason: opts.reason } : {}), places: [...att.places] };
+                att.places = [];
+                kept.add(att.id);
+            } else {
+                gone.push(att.id);
+            }
+        }
+        for (const person of Object.values(this.data.persons)) {
+            if (person.photoSource?.attachmentId && kept.has(person.photoSource.attachmentId)) delete person.photoSource;
+        }
+        if (gone.length) {
+            deleteMedia(this.data, gone);
+            for (const id of gone) this.forgetMediaLinks(id);
+        }
+        const label = atts.length === 1 ? strings.undo.mediaRemove(atts[0].title || atts[0].name) : strings.undo.mediaRemoveMany(atts.length);
+        this.commitMutation(label, false, undefined, opts.toast ? { text: opts.toast } : undefined);
+        AuditLogManager.log(this.currentTreeId, 'attachment.remove', label);
+        return atts.map(a => a.id);
+    }
+
+    /**
+     * Take a person off several files in one undo step (spec 102 §8, the
+     * selection's Remove a person…): every place of the files at that person.
+     * A file left without a place goes from the tree as §3's × does (kept by
+     * an archive it stays there; otherwise it is deleted, O1). Returns the ids
+     * changed.
+     */
+    removeMediaPerson(ids: readonly string[], personId: PersonId, opts: { toast?: string } = {}): string[] {
+        const atts = [...new Set(ids)].map(id => findMedia(this.data, id))
+            .filter((a): a is Attachment => !!a && this.mediaEditable(a) && a.places.some(p => placePersonId(p) === personId));
+        if (!atts.length) return [];
+        const set = new Set(atts.map(a => a.id));
+        this.beginMutation();
+        const gone = dropMediaPlaces(this.data, (p, a) => set.has(a.id) && placePersonId(p) === personId);
+        const person = this.data.persons[personId];
+        if (person?.photoSource?.attachmentId && set.has(person.photoSource.attachmentId)) delete person.photoSource;
+        for (const id of gone) this.forgetMediaLinks(id);
+        const name = person ? (`${person.firstName} ${person.lastName}`.trim() || personId) : personId;
+        const label = strings.undo.mediaPersonRemove(name, atts.length);
+        this.commitMutation(label, false, undefined, opts.toast ? { text: opts.toast } : undefined);
+        AuditLogManager.log(this.currentTreeId, 'attachment.remove', label);
+        return atts.map(a => a.id);
+    }
+
+    /** Bring a file taken out back to the places it had that are still in the tree (spec 102 §9). */
+    restoreMedia(id: string, opts: { toast?: string } = {}): boolean {
+        const att = findMedia(this.data, id);
+        if (!att?.removed || this.isTreeLocked()) return false;
+        const places = att.removed.places.filter(p => this.placeExists(p));
+        if (!places.length) return false;
+        this.beginMutation();
+        att.places = places;
+        delete att.removed;
+        const name = att.title || att.name;
+        this.commitMutation(strings.undo.mediaRestore(name), false, undefined, opts.toast ? { text: opts.toast } : undefined);
+        AuditLogManager.log(this.currentTreeId, 'attachment.add', strings.undo.mediaRestore(name));
+        return true;
+    }
+
+    /** The place names what is in the tree. */
+    private placeExists(place: MediaPlace): boolean {
+        if ('personId' in place) {
+            const person = this.data.persons[place.personId];
+            return !!person && (!place.eventId || !!person.events?.some(e => e.id === place.eventId));
+        }
+        if ('partnershipId' in place) {
+            const union = this.data.partnerships[place.partnershipId];
+            return !!union && (!place.eventId || !!union.events?.some(e => e.id === place.eventId));
+        }
+        return !!this.data.sources?.[place.sourceId];
+    }
+
+    /** A file gone from the tree: excerpts cut from it and portraits cut from it keep their image, not the link. */
+    private forgetMediaLinks(id: string): void {
+        unlinkExcerptsFromAttachment(this.data, id);
+        unlinkPortraitFromAttachment(this.data, id);
     }
 
     // ==================== PARENT-CHILD RELATIONSHIP TYPE ====================
@@ -3842,7 +4557,10 @@ class DataManagerClass {
         tidyPlaceholders(this.data, others);
         // …and the own records of a part at another's event lose the link to it.
         tidyShares(this.data, shareIds);
-        this.commitMutation(strings.undo.deletePerson(deletedName));
+        // …and it leaves the lists of people; the toast then says from how many (spec 084 §7).
+        const inLists = onPersonDeleted(this.data, id);
+        this.commitMutation(strings.undo.deletePerson(deletedName), false, undefined,
+            inLists > 0 ? { text: strings.lists.toast.personDeleted(deletedName, inLists) } : undefined);
         // Audit log
         AuditLogManager.log(this.currentTreeId, 'person.delete', strings.auditLog.deletedPerson(deletedName));
         // Invalidate cross-tree cache when person is deleted
@@ -3929,6 +4647,34 @@ class DataManagerClass {
         }
         if (updates.note !== undefined && (updates.note || undefined) !== partnership.note) { partnership.note = updates.note || undefined; changed = true; }
         if (updates.isPrimary !== undefined && (updates.isPrimary || undefined) !== partnership.isPrimary) { partnership.isPrimary = updates.isPrimary || undefined; changed = true; }
+        if (updates.photo !== undefined && (updates.photo || undefined) !== partnership.photo
+            && (!updates.photo || isSafePhotoDataUrl(updates.photo))) {
+            // The couple's photo (spec 107): a new or removed one takes its name
+            // and date along, and the portraits cut from it lose their original.
+            const photo = updates.photo || undefined;
+            if (photo) partnership.photo = photo; else delete partnership.photo;
+            delete partnership.photoOriginalName;
+            delete partnership.photoDate;
+            delete partnership.photoOriginal;
+            unlinkPortraitsFromUnion(this.data, partnership.id);
+            changed = true;
+        }
+        if (partnership.photo) {
+            if (updates.photoOriginalName !== undefined && (updates.photoOriginalName || undefined) !== partnership.photoOriginalName) {
+                if (updates.photoOriginalName) partnership.photoOriginalName = updates.photoOriginalName; else delete partnership.photoOriginalName;
+                changed = true;
+            }
+            if (updates.photoDate !== undefined && (updates.photoDate || undefined) !== partnership.photoDate) {
+                if (updates.photoDate) partnership.photoDate = updates.photoDate; else delete partnership.photoDate;
+                changed = true;
+            }
+            // The original behind the photo (spec 108 K2.4), set with the photo it belongs to.
+            const sha = normalizeSha256(updates.photoOriginal?.sha256);
+            if (updates.photoOriginal !== undefined && sha && sha !== partnership.photoOriginal?.sha256) {
+                partnership.photoOriginal = { ...updates.photoOriginal, sha256: sha };
+                changed = true;
+            }
+        }
 
         if (!changed) {
             this.pendingBefore = null;   // nothing changed — no undo step
@@ -3970,6 +4716,7 @@ class DataManagerClass {
             partner.partnerships = partner.partnerships.filter(pid => pid !== partnershipId);
         }
 
+        unlinkPortraitsFromUnion(this.data, partnershipId);
         delete this.data.partnerships[partnershipId];
     }
 
@@ -4223,6 +4970,8 @@ class DataManagerClass {
             p2.partnerships = p2.partnerships.filter(pid => pid !== partnership.id);
         }
 
+        // The couple's photo goes with the union; portraits cut from it stay (spec 107, 10d).
+        unlinkPortraitsFromUnion(this.data, partnership.id);
         delete this.data.partnerships[partnership.id];
         this.commitMutation(strings.undo.removePartnership(p1Name, p2Name));
         // Audit log
@@ -4480,33 +5229,13 @@ class DataManagerClass {
      * Returns { personId, depthUp, depthDown } or null for "use first person with default depths"
      */
     getStartupFocus(): { personId: PersonId; depthUp?: number; depthDown?: number } | null {
-        const setting = this.data.defaultPersonId;
-
-        if (setting === undefined) {
-            // First person
-            return null;
+        // One rule with the target of "Focus default person" (src/default-person.ts).
+        const start = startupPerson(this.data);
+        if (!start || start.reason === 'first' || start.reason === 'fallbackFirst') return null;
+        if (start.reason === 'last') {
+            return { personId: start.id, depthUp: this.data.lastFocusDepthUp, depthDown: this.data.lastFocusDepthDown };
         }
-
-        if (setting === LAST_FOCUSED) {
-            // Last focused, with depths
-            if (this.data.lastFocusPersonId && this.data.persons[this.data.lastFocusPersonId]) {
-                return {
-                    personId: this.data.lastFocusPersonId,
-                    depthUp: this.data.lastFocusDepthUp,
-                    depthDown: this.data.lastFocusDepthDown
-                };
-            }
-            // Fallback to first person
-            return null;
-        }
-
-        // Specific person ID - check if valid
-        if (this.data.persons[setting]) {
-            return { personId: setting };
-        }
-
-        // Fallback to first person
-        return null;
+        return { personId: start.id };
     }
 
     /**
@@ -4659,6 +5388,11 @@ class DataManagerClass {
      * the same as a full JSON download.
      */
     async buildAttachedFileJson(treeId: TreeId): Promise<string> {
+        return (await this.buildAttachedFile(treeId)).json;
+    }
+
+    /** buildAttachedFileJson with the data the file carries (its pictures count as copied). */
+    async buildAttachedFile(treeId: TreeId): Promise<{ json: string; data: StromData }> {
         const data = await storedTreeForExport(treeId);
         if (!data) throw new Error('no tree data');
         const json = JSON.stringify(data, null, 2);
@@ -4668,9 +5402,9 @@ class DataManagerClass {
             const { CryptoSession } = await import('./crypto.js');
             if (!CryptoSession.isUnlocked()) throw new Error('locked');
             const encrypted = await CryptoSession.encrypt(json);
-            return JSON.stringify(encrypted, null, 2);
+            return { json: JSON.stringify(encrypted, null, 2), data };
         }
-        return json;
+        return { json, data };
     }
 
     /** Download a tree as JSON; returns the file name (null when there is no tree). */
@@ -4711,11 +5445,11 @@ class DataManagerClass {
         a.download = `${safeName || 'family-tree'}.json`;
         a.click();
         URL.revokeObjectURL(a.href);
-        if (privacyMode === 'full') TreeManager.noteFileCopy([treeId]);
+        if (privacyMode === 'full') TreeManager.noteFileCopy([treeId], { [treeId]: treeData });
         return a.download;
     }
 
-    async exportFocusedJSON(visiblePersonIds: Set<PersonId>, password?: string | null, privacyMode: PrivacyMode = 'full', content: boolean | ContentOptions = false): Promise<void> {
+    async exportFocusedJSON(visiblePersonIds: Set<PersonId>, password?: string | null, privacyMode: PrivacyMode = 'full', content: boolean | ContentOptions = false, fileName = 'family-tree-focus.json'): Promise<void> {
         // Self-consistent slice (glue + cleaned relations + pruned sources),
         // shared with "make a tree from this view".
         const sliced = extractSubtree(this.data, visiblePersonIds);
@@ -4737,7 +5471,7 @@ class DataManagerClass {
         const blob = new Blob([dataStr], { type: 'application/json' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = 'family-tree-focus.json';
+        a.download = fileName;
         a.click();
         URL.revokeObjectURL(a.href);
     }
@@ -4935,6 +5669,9 @@ class DataManagerClass {
                     if (partner) {
                         partner.partnerships = partner.partnerships.filter(pid => pid !== removePartnershipId);
                     }
+                    // The couple's photo: the kept union's, else the removed one's (spec 107).
+                    if (existingPartnership) foldUnionPhoto(this.data, removePartnership, existingPartnership);
+                    else unlinkPortraitsFromUnion(this.data, removePartnershipId);
                     delete this.data.partnerships[removePartnershipId];
                 } else {
                     // keep_both - transfer the partnership to keepPerson (rare case)
@@ -5006,12 +5743,14 @@ class DataManagerClass {
         const touchedShares = applyPersonMergeShares(this.data, keepPerson, shareRows, sharedChoices);
         // A citation only the removed person had keeps its own QUAY.
         for (const field of PERSON_CITATION_FIELDS) unionCitations(keepPerson, removePerson, field);
-        if (removePerson.attachments && removePerson.attachments.length > 0) {
-            if (!keepPerson.attachments) keepPerson.attachments = [];
-            const seenAtt = new Set(keepPerson.attachments.map(a => a.id));
-            for (const att of removePerson.attachments) {
-                if (!seenAtt.has(att.id)) keepPerson.attachments.push(att);
+        // The removed person's files become the kept one's (a file both had is there once).
+        for (const att of personMedia(this.data, removePerson.id)) {
+            const moved: MediaPlace[] = [];
+            for (const place of att.places) {
+                const now: MediaPlace = placePersonId(place) === removePerson.id ? { ...place, personId: keepPerson.id } as MediaPlace : place;
+                if (!moved.some(q => mediaPlaceKey(q) === mediaPlaceKey(now))) moved.push(now);
             }
+            att.places = moved;
         }
         // Carry the removed person's own parent relationship types for parents
         // the kept person actually ended up with (keep's own entry wins).
@@ -5072,6 +5811,12 @@ class DataManagerClass {
             if (child.parentIds.includes(keepId) && !child.importedParents![keepId]) child.importedParents![keepId] = from;
         }
         pruneImportOrigin(this.data);
+
+        // 6e. Lists of people (spec 084 §7): the removed person's place in a
+        // list passes to the kept one; the earlier date of coming into the tree stays.
+        const addedAt = earlierAddedAt(keepPerson.addedAt, removePerson.addedAt);
+        if (addedAt) keepPerson.addedAt = addedAt;
+        onPersonsMerged(this.data, keepId, removeId);
 
         // 7. Delete the removed person
         delete this.data.persons[removeId];
@@ -5234,6 +5979,7 @@ class DataManagerClass {
                 const p2 = this.data.persons[partnership.person2Id];
                 if (p1) p1.partnerships = p1.partnerships.filter(id => id !== partnershipId);
                 if (p2) p2.partnerships = p2.partnerships.filter(id => id !== partnershipId);
+                unlinkPortraitsFromUnion(this.data, partnershipId);
                 delete this.data.partnerships[partnershipId];
                 repaired = true;
                 break;
@@ -5355,6 +6101,7 @@ class DataManagerClass {
                 if (person) {
                     person.partnerships = person.partnerships.filter(id => id !== partnershipId);
                 }
+                unlinkPortraitsFromUnion(this.data, partnershipId);
                 delete this.data.partnerships[partnershipId];
                 repaired = true;
                 break;
@@ -5380,6 +6127,7 @@ class DataManagerClass {
                 const dp2 = this.data.persons[duplicate.person2Id];
                 if (dp1) dp1.partnerships = dp1.partnerships.filter(id => id !== duplicateId);
                 if (dp2) dp2.partnerships = dp2.partnerships.filter(id => id !== duplicateId);
+                foldUnionPhoto(this.data, duplicate, kept);
                 delete this.data.partnerships[duplicateId];
                 repaired = true;
                 break;

@@ -27,6 +27,10 @@ import { PersonPicker } from '../person-picker.js';
 import * as CrossTree from '../cross-tree.js';
 import { uiModule } from './module.js';
 import { shownName } from '../person-name.js';
+import { runBusy, runHeavy, activatedElement, nextPaint, busyButtonHtml, type BusyCtl } from './busy.js';
+import { computeUnder } from './canvas-busy.js';
+import { SPLIT_SHOWN_AT_ONCE } from './split-ui.js';
+import { busyProg } from './busy-prog.js';
 
 /** Everything the shared split-families dialog needs, whatever opened it. */
 interface SplitFamiliesRun {
@@ -38,6 +42,11 @@ interface SplitFamiliesRun {
     focusPersonId: PersonId;
     /** Dialog to reopen on close (e.g. the tree manager). */
     parentDialogId?: string;
+}
+
+/** The run's tree is large: its families' computation says its state at once (§8). */
+function splitRunLong(run: SplitFamiliesRun): boolean {
+    return Object.keys(run.data.persons).length >= SPLIT_SHOWN_AT_ONCE;
 }
 
 export const splitFamiliesMethods = uiModule({
@@ -65,21 +74,23 @@ export const splitFamiliesMethods = uiModule({
      * is the person on screen — it only decides which family is listed first; the
      * partition is the same whatever it is.
      */
-    showSplitFamiliesDialog(): void {
-        if (DataManager.isReadOnly()) return;
+    showSplitFamiliesDialog(): Promise<void> {
+        if (DataManager.isReadOnly()) return Promise.resolve();
         const treeId = DataManager.getCurrentTreeId();
         const data = DataManager.getData();
         const focus = TreeRenderer.getFocusPersonId();
         const realCount = Object.values(data.persons).filter(p => !p.isPlaceholder).length;
         if (!treeId || !focus || realCount < 2) {
             this.showToast(strings.splitFamilies.tooSmall);
-            return;
+            return Promise.resolve();
         }
-        this.openSplitFamiliesDialog({
+        // §8: the families found (and their previews drawn) under the working state of the choice, or the canvas
+        // overlay when its menu closed; at once for a large tree.
+        return computeUnder(activatedElement(), () => this.openSplitFamiliesDialog({
             treeId,
             data,
             focusPersonId: focus,
-        });
+        }), { label: strings.busy.findingFamilies, atOnce: realCount >= SPLIT_SHOWN_AT_ONCE }).then(() => undefined);
     },
 
     /**
@@ -89,6 +100,13 @@ export const splitFamiliesMethods = uiModule({
      */
     async showSplitFamiliesPickerDialog(treeId: string, parentDialogId?: string): Promise<void> {
         const id = treeId as TreeId;
+        const people = TreeManager.getTreeMetadata(id)?.personCount ?? 0;
+        await computeUnder(activatedElement(), () => this.openSplitFamiliesFor(id, parentDialogId),
+            { label: strings.busy.findingFamilies, atOnce: people >= SPLIT_SHOWN_AT_ONCE });
+    },
+
+    /** The tree read and its families proposed (`showSplitFamiliesPickerDialog`). */
+    async openSplitFamiliesFor(id: TreeId, parentDialogId?: string): Promise<void> {
         const data = id === DataManager.getCurrentTreeId()
             ? DataManager.getData()
             : await TreeManager.getTreeData(id);
@@ -179,7 +197,7 @@ export const splitFamiliesMethods = uiModule({
                 <div class="splitfam-mode sel-seg" role="radiogroup" aria-label="${s.modeLabel}">
                     ${([['surname', s.modeSurname], ['lineage', s.modeLineage], ['perspective', s.modePerspective]] as [SplitMode, string][])
                         .map(([m, label]) => `<button type="button" class="splitfam-mode-btn sel-opt${this.splitFamiliesMode === m ? ' active' : ''}" data-sel-form="seg"
-                            data-mode="${m}" aria-pressed="${this.splitFamiliesMode === m}">${label}</button>`).join('')}
+                            data-mode="${m}" aria-pressed="${this.splitFamiliesMode === m}" data-busy="idle">${busyButtonHtml(label, '', undefined, { own: true })}</button>`).join('')}
                 </div>
                 <p class="splitfam-mode-hint">${{
                     surname: s.modeSurnameHint, lineage: s.modeLineageHint, perspective: s.modePerspectiveHint,
@@ -200,19 +218,30 @@ export const splitFamiliesMethods = uiModule({
         const close = (): void => this.closeSplitFamiliesDialog();
         (overlay.querySelector('#splitfam-cancel') as HTMLButtonElement).onclick = close;
         (overlay.querySelector('#splitfam-close-x') as HTMLButtonElement).onclick = close;
-        (overlay.querySelector('#splitfam-go') as HTMLButtonElement).onclick = () => void this.performSplitFamilies();
+        const go = overlay.querySelector('#splitfam-go') as HTMLButtonElement;
+        // One working state from the click (§8): painted first, each tree's step said; a second click makes nothing more.
+        // 8b: the button says "Creating…", the step with "k/n" and a bar above the footer; the end ✓ "Created" and the
+        // sentence in the dialog, the button then locked (the trees are made once).
+        go.onclick = () => void runBusy(go, ctl => this.performSplitFamilies(ctl),
+            { label: strings.busy.creating, heavy: 'now', stepsInToast: true, done: strings.busy.done.created });
         // Switching what counts as one family recomputes and redraws the whole
         // dialog in place (same run) — unless the other cut cannot split at all.
         overlay.querySelectorAll('.splitfam-mode-btn').forEach(btn => {
             (btn as HTMLButtonElement).onclick = () => {
                 const m = btn.getAttribute('data-mode') as SplitMode;
                 if (m === this.splitFamiliesMode) return;
-                if (decomposeIntoFamilies(run.data, run.focusPersonId, m, persp).length < 2) {
-                    this.showToast(strings.splitFamilies.oneFamilyInMode);
-                    return;
-                }
-                this.splitFamiliesMode = m;
-                this.openSplitFamiliesDialog(run);
+                // §8: the other cut computed and the dialog drawn again under the segment's working state: the
+                // spinner in the segment (its width kept), the words in the hint line under the segments.
+                const hint = overlay.querySelector<HTMLElement>('.splitfam-mode-hint') ?? undefined;
+                void runBusy(btn as HTMLElement, async () => {
+                    await nextPaint();
+                    if (decomposeIntoFamilies(run.data, run.focusPersonId, m, persp).length < 2) {
+                        this.showToast(strings.splitFamilies.oneFamilyInMode);
+                        return;
+                    }
+                    this.splitFamiliesMode = m;
+                    this.openSplitFamiliesDialog(run);
+                }, { label: strings.busy.findingFamilies, heavy: splitRunLong(run) ? 'now' : true, ...(hint ? { wordsIn: hint } : {}) });
             };
         });
         if (this.splitFamiliesMode === 'perspective') this.bindSplitFamiliesPerspective(overlay, run);
@@ -299,7 +328,7 @@ export const splitFamiliesMethods = uiModule({
             (btn as HTMLButtonElement).onclick = () => {
                 const id = btn.getAttribute('data-id') as PersonId;
                 persp.baseIds = persp.baseIds.filter(b => b !== id);
-                reopen();
+                void runHeavy(btn as HTMLElement, reopen, { label: strings.busy.findingFamilies, atOnce: splitRunLong(run) });
             };
         });
         const addBtn = overlay.querySelector('#splitfam-persp-add') as HTMLButtonElement | null;
@@ -441,7 +470,7 @@ export const splitFamiliesMethods = uiModule({
      * so the cross-tree badge links the families. The original is left as it was;
      * one audit entry records the split. Unticked families are simply not made.
      */
-    async performSplitFamilies(): Promise<void> {
+    async performSplitFamilies(ctl?: BusyCtl): Promise<void> {
         const chosen = this.selectedSplitFamiliesIndexes();
         if (chosen.length === 0) return;
 
@@ -453,9 +482,21 @@ export const splitFamiliesMethods = uiModule({
         // splitting a non-active tree from the manager must not switch context.
         const activeBefore = TreeManager.getActiveTreeId();
         let createdPersons = 0;
+        // 8b: the progress above the footer (its own line, not the button's words).
+        const modal = document.querySelector<HTMLElement>('#split-families-modal .splitfam-modal');
+        const footer = modal?.querySelector('.splitfam-footer') ?? null;
+        modal?.querySelector('.busy-prog, .busy-prog-done')?.remove();
+        const prog = ctl && modal ? busyProg(modal, footer) : null;
 
-        for (const index of chosen) {
+        for (const [k, index] of chosen.entries()) {
             const component = this.splitFamiliesComponents[index];
+            // "Creating tree 2 of 5: …", painted before that tree's work (B214).
+            if (ctl) {
+                const words = strings.busy.creatingTreeK(k + 1, chosen.length, this.readSplitFamilyName(index));
+                ctl.step(words, k + 1, chosen.length);
+                prog?.set(words, k + 1, chosen.length);
+                await nextPaint();
+            }
             // The exact tree previewed (structuredClone so tree creation cannot
             // mutate the cache), opened on the family's default person.
             const src = this.splitFamiliesShown[index]?.data ?? extractSubtree(data, seedIdsFor(component));
@@ -474,10 +515,21 @@ export const splitFamiliesMethods = uiModule({
         // New trees mean new cross-tree matches (the shared connector cards).
         CrossTree.invalidateCache();
 
-        this.closeSplitFamiliesDialog();
         this.updateTreeSwitcher();
         void this.updateTreeManagerList();
         TreeRenderer.render();
+        if (prog && modal?.isConnected) {
+            // 8b: the dialog stays with "3 trees created."; Create is locked, Cancel becomes Close.
+            prog.done(`${strings.splitFamilies.done(chosen.length)}.`);
+            const go = modal.querySelector<HTMLButtonElement>('#splitfam-go');
+            if (go) go.disabled = true;
+            modal.querySelectorAll<HTMLElement>('.splitfam-row input, .splitfam-mode-btn, .splitfam-persp input, .splitfam-persp select, .splitfam-persp button')
+                .forEach(x => { (x as HTMLInputElement).disabled = true; });
+            const cancel = modal.querySelector<HTMLButtonElement>('#splitfam-cancel');
+            if (cancel) cancel.textContent = strings.buttons.close;
+            return;
+        }
+        this.closeSplitFamiliesDialog();
         this.showToast(strings.splitFamilies.done(chosen.length));
     },
 

@@ -12,6 +12,7 @@ import { test, expect, Page, Locator, BrowserContext } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { openApp } from './helpers.js';
 import { rodsTree } from './rods-fixture.js';
+import { syntheticTree } from '../src/__tests__/helpers/synthetic-tree';
 
 async function setup(page: Page): Promise<string> {
     await openApp(page);
@@ -44,6 +45,8 @@ async function openBook(page: Page, context: BrowserContext): Promise<Page> {
         page.locator('#book-modal #book-open').click(),
     ]);
     await book.waitForLoadState('domcontentloaded');
+    // 8c: "Preparing the book…" first, the book itself after its chapters.
+    await book.locator('.book-toolbar').waitFor();
     return book;
 }
 
@@ -701,4 +704,92 @@ test.describe('family book: a long surname without spaces', () => {
             await book.close();
         });
     }
+});
+
+// Waiting buttons §8, 8c / 3f: the book's window opens in the click with "Preparing the book…", the chapters
+// are built one by one ("chapter k of n"), then the book replaces it.
+test.describe('family book: prepared in parts (8c)', () => {
+    test.use({ viewport: { width: 1440, height: 900 } });
+
+    test('the window says Preparing the book… at once, each chapter\'s step, then the book', async ({ page, context }) => {
+        await setup(page);
+        const dialog = await openDialog(page);
+        // What the book's window says before the book: every text of its step line, in order.
+        await page.evaluate(() => {
+            const w = window as unknown as { __bookSeen: { first: string; steps: string[] }; open: typeof window.open };
+            w.__bookSeen = { first: '', steps: [] };
+            const open = window.open.bind(window);
+            window.open = ((...args: Parameters<typeof window.open>) => {
+                const win = open(...args);
+                if (win) queueMicrotask(() => {
+                    w.__bookSeen.first = win.document.querySelector('.bp-st')?.textContent ?? '';
+                    const k = win.document.querySelector('.bp-k');
+                    // The first chapter's step is there before the page paints (the work waits for the window).
+                    if (k?.textContent) w.__bookSeen.steps.push(k.textContent);
+                    if (k) new MutationObserver(recs => {
+                        for (const r of recs) for (const n of r.addedNodes) w.__bookSeen.steps.push(n.textContent ?? '');
+                    }).observe(k, { childList: true });
+                });
+                return win;
+            }) as typeof window.open;
+        });
+        const book = await openBook(page, context);
+        await expect(dialog).not.toHaveClass(/active/);
+        await expect(book.locator('.book-title-page h1')).toBeVisible();
+        await expect(book.locator('.bp')).toHaveCount(0);
+        const seen = await page.evaluate(() => (window as unknown as { __bookSeen: { first: string; steps: string[] } }).__bookSeen);
+        expect(seen.first).toBe('Preparing the book…');
+        expect(seen.steps.length).toBeGreaterThan(1);
+        const n = Number(seen.steps[0].match(/^chapter 1 of (\d+)$/)?.[1]);
+        expect(n).toBeGreaterThan(1);
+        expect(seen.steps).toEqual(Array.from({ length: n }, (_, i) => `chapter ${i + 1} of ${n}`));
+        await expect(book.locator('.book-family-head')).toHaveCount(n);
+    });
+});
+
+
+test.describe('the estimate of a large tree\'s book (C14, waiting buttons §8)', () => {
+    test('the dialog opens first with "Counting the pages…" and Open waiting, then the estimate; a choice back counts nothing again', async ({ page }) => {
+        test.setTimeout(90_000);
+        await page.setViewportSize({ width: 1440, height: 900 });
+        await openApp(page);
+        const { data, rootId } = syntheticTree({ persons: 5200, seed: 11 });
+        await page.evaluate(async ({ data, rootId }) => {
+            const S = window.Strom;
+            await S.DataManager.importAsNewTree(data, 'Synthetic');
+            S.TreeRenderer.setFocus(rootId);
+            await S.TreeRenderer.renderAsync();
+        }, { data, rootId });
+        // What the estimate line says while the dialog is open (watched, the count blocks the page).
+        await page.evaluate(() => {
+            const w = window as unknown as { __said: string[] };
+            w.__said = [];
+            const modal = document.getElementById('book-modal')!;
+            new MutationObserver(() => {
+                const est = modal.querySelector('.book-estimate');
+                const open = modal.querySelector<HTMLButtonElement>('#book-open');
+                if (modal.classList.contains('active') && est) w.__said.push(`${est.textContent}|${open?.disabled}`);
+            }).observe(modal, { attributes: true, childList: true, subtree: true, characterData: true });
+        });
+        await page.evaluate(() => window.Strom.UI.showBookDialog('book'));
+        const dialog = page.locator('#book-modal');
+        await expect(dialog).toHaveClass(/active/);
+        await expect(dialog.locator('.book-estimate')).toHaveText(/^about \d+ pages · \d+ people · \d+ chapters$/);
+        await expect(dialog.locator('#book-open')).toBeEnabled();
+        const said = await page.evaluate(() => (window as unknown as { __said: string[] }).__said);
+        expect(said).toContain('Counting the pages…|true');
+        // A switch: counted again; the switch back: the kept estimate at once, no new count (a count read
+        // too soon after the click passed while it was still running, and failed on a slow machine).
+        const notes = dialog.locator('[data-switch="notes"]');
+        const saidSince = () => page.evaluate(() => (window as unknown as { __said: string[] }).__said.splice(0));
+        await saidSince();
+        await notes.click();
+        await expect(notes).toHaveAttribute('aria-checked', 'true');
+        await expect(dialog.locator('.book-estimate')).toHaveText(/^about \d+ pages/);
+        expect(await saidSince()).toContain('Counting the pages…|true');
+        await notes.click();
+        await expect(notes).toHaveAttribute('aria-checked', 'false');
+        expect(await dialog.locator('.book-estimate').textContent()).toMatch(/^about \d+ pages/);
+        expect((await saidSince()).filter(x => x.startsWith('Counting'))).toEqual([]);
+    });
 });

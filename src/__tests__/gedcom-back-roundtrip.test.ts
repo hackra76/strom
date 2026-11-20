@@ -480,14 +480,51 @@ describe('a person’s picture by a link to a media record (1 OBJE @O1@), as a f
     });
 });
 
+describe('links to media records in a file of another program (1 OBJE @O1@): a person\'s as a family\'s', () => {
+    const GRAMPS = [
+        '0 HEAD', '1 SOUR GRAMPS', '2 VERS 5.1', '1 GEDC', '2 VERS 5.5.1', '1 CHAR UTF-8',
+        '0 @I1@ INDI', '1 NAME Radhošť /Kmínek/', '1 SEX M', '1 OBJE @O1@', '1 FAMS @F1@',
+        '0 @I2@ INDI', '1 NAME Dobromila /Kmínková/', '1 SEX F', '1 FAMS @F1@',
+        '0 @F1@ FAM', '1 HUSB @I1@', '1 WIFE @I2@', '1 OBJE @O2@',
+        '0 @O1@ OBJE', '1 FILE photos/radhost.jpg', '2 FORM jpg', '2 TITL Radhošť',
+        '0 @O2@ OBJE', '1 FILE photos/svatba.jpg', '2 FORM jpg', '2 TITL Svatba',
+        '0 TRLR',
+    ].join('\n');
+    const ORIGIN_GRAMPS: GedcomImportOrigin = { at: '2026-11-17', file: 'kminkovi.ged', encoding: 'utf-8' };
+
+    it('both go back with "Back to" as their records wrote them, under the person and under the family', () => {
+        const data = migrateData(load(GRAMPS, ORIGIN_GRAMPS).data);
+        const back = exportToGedcom(data, 'Kmínkovi', { content: CONTENT_PRESETS.back, origins: true, backTo: data.imports![0].id }).content;
+        const person = record(back, '@I1@');
+        const family = record(back, '@F1@');
+        const at = (rec: string[], file: string) => rec.indexOf(`2 FILE ${file}`);
+        expect(person.slice(at(person, 'photos/radhost.jpg') - 1, at(person, 'photos/radhost.jpg') + 3))
+            .toEqual(['1 OBJE', '2 FILE photos/radhost.jpg', '3 FORM jpg', '3 TITL Radhošť']);
+        expect(family.slice(at(family, 'photos/svatba.jpg') - 1, at(family, 'photos/svatba.jpg') + 3))
+            .toEqual(['1 OBJE', '2 FILE photos/svatba.jpg', '3 FORM jpg', '3 TITL Svatba']);
+        // Neither record of its own goes back.
+        expect(back).not.toMatch(/^0 @O[12]@ OBJE$/m);
+    });
+});
+
 describe('an e-mail written right under the person (1 EMAIL, not GEDCOM 5.5.1)', () => {
     const file = MYHERITAGE.replace('1 SEX F\n', '1 SEX F\n1 EMAIL libuna@@example.org\n');
 
-    it('is named in the import summary as not carried over', () => {
+    it('goes into the person\'s note as a labelled line, not counted as left out', () => {
         const r = load(file);
-        expect(r.stats.droppedTagSummary ?? '').toContain('EMAIL');
+        expect(r.stats.droppedTagSummary ?? '').not.toContain('EMAIL');
+        const women = Object.values(r.data.persons).filter(p => (p.notes ?? '').includes('E-mail: '));
+        expect(women).toHaveLength(1);
+        expect(women[0].notes!.split('\n')).toContain('E-mail: libuna@example.org');
         // The e-mail under RESI is carried over, never counted.
         expect(load(MYHERITAGE).stats.droppedTagSummary ?? '').not.toContain('EMAIL');
+    });
+
+    it('goes back with "Back to" as the file wrote it, not as a line of the note', () => {
+        const data = migrateData(load(file).data);
+        const back = backTo(data);
+        expect(back).toMatch(/^1 EMAIL libuna@@example\.org$/m);
+        expect(back).not.toContain('E-mail: libuna');
     });
 });
 

@@ -13,6 +13,10 @@ import { TreeManager } from '../tree-manager.js';
 import { Attachment, PersonId } from '../types.js';
 import { strings } from '../strings.js';
 import { dataUrlByteSize } from '../photo.js';
+import { MaterialCaps, attachmentItem, isPortraitCandidate, materialDate, personMaterials, cachedMaterialList } from '../materials.js';
+import { researchPersonRef } from '../research-link.js';
+import { mediaUseLabel, mediaUses } from '../media-uses.js';
+import { canEditPortrait } from './portrait-actions-ui.js';
 import { ORIGINAL_ONLY_DATA_URL } from '../validation.js';
 import {
     compressImageAttachment, readFileAsDataUrl, personMedia,
@@ -20,6 +24,7 @@ import {
 } from '../attachments.js';
 import { uiModule } from './module.js';
 import { openImageViewer, ViewerOriginal } from './image-viewer.js';
+import { runBusy, activatedElement, BUSY_TIMEOUTS } from './busy.js';
 import { emptyStateHtml } from './empty-state.js';
 
 import { iconSvg } from '../icons.js';
@@ -54,7 +59,7 @@ function esc(text: string): string {
 }
 
 /** Human-readable byte size (kB / MB). */
-function formatBytes(bytes: number): string {
+export function formatBytes(bytes: number): string {
     if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
     return `${Math.max(1, Math.round(bytes / 1024))} kB`;
 }
@@ -71,7 +76,38 @@ function isImage(att: Attachment): boolean {
  */
 
 /** Convert a data URL to a Blob (for opening PDFs via an object URL). */
+/** No research: the menu offers the tree's own actions only. */
+const NO_CAPS: MaterialCaps = { list: false, assign: false, thumb: false, bridgeUp: false, links: false, edit: false, uses: false, sort: false, sortRun: false, sourceOf: false, left: false, sameAs: false, delete: false, mediaApp: false };
+
+/** The row's name: the title (the whole of it on hover), else the file's name (spec 102 §2). */
+function attachmentNameHtml(att: Attachment, esc: (t: string) => string): string {
+    const title = att.title?.trim();
+    return title ? `<span class="attachment-name" title="${esc(title)}">${esc(title)}</span>` : `<span class="attachment-name">${esc(att.name)}</span>`;
+}
+
+/** The row's line under the name: file · kind · date · size (the file only under a title). */
+function attachmentMeta(att: Attachment, size: string): string {
+    return [
+        att.title?.trim() ? att.name : '',
+        att.kind ? strings.materials.kind[att.kind] : '',
+        att.date ? materialDate(att.date) : '',
+        size,
+    ].filter(Boolean).join(' · ');
+}
+
+/** The row's ⋯ (not on a phone, whose row keeps its own buttons). */
+function attachmentMoreHtml(att: Attachment, esc: (t: string) => string): string {
+    const label = strings.materials.moreActions;
+    return `<button type="button" class="attachment-more" aria-haspopup="menu" aria-label="${esc(label)}" title="${esc(label)}" data-attachment-id="${esc(att.id)}">⋯</button>`;
+}
+
 export const attachmentsMethods = uiModule({
+    /** The edited person's files in the Materials window, by person (spec 102 §1). */
+    openPersonMaterialsWindow(): void {
+        if (!this.currentId) return;
+        this.openMaterials({ person: this.currentId, group: 'added' });
+    },
+
     /** Render the attachments list + total for the currently edited person. */
     renderAttachmentsList(): void {
         const container = document.getElementById('attachments-list');
@@ -80,8 +116,11 @@ export const attachmentsMethods = uiModule({
         const person = DataManager.getPerson(this.currentId);
         if (!person) return;
 
-        const attachments = person.attachments ?? [];
+        const attachments = DataManager.personMedia(person.id);
         const locked = DataManager.isPersonLocked(this.currentId);
+        // The attachment the portrait is cut from: its tag, and no "As portrait…" (spec 107 §4).
+        const sourceId = this.portraitSourceAttachmentShown(person);
+        const canPortrait = canEditPortrait(this.currentId);
 
         if (attachments.length === 0) {
             // Compact empty state: the "Add attachment" button sits right below.
@@ -97,13 +136,20 @@ export const attachmentsMethods = uiModule({
                 const thumb = isImage(att)
                     ? `<span class="attachment-thumb" data-attachment-id="${esc(att.id)}"><img src="${esc(att.dataUrl)}" alt=""></span>`
                     : `<span class="attachment-thumb" title="PDF" data-attachment-id="${esc(att.id)}">${iconSvg('file', { size: 18 })}</span>`;
+                // The note: a field on a phone's row; elsewhere its text (the Attachment dialog changes it).
                 const noteField = locked
                     ? (att.note ? `<span class="attachment-size">${esc(att.note)}</span>` : '')
-                    : `<input type="text" class="attachment-note-input" value="${esc(att.note ?? '')}"
+                    : `${att.note ? `<span class="attachment-note-text">${esc(att.note)}</span>` : ''}<input type="text" class="attachment-note-input" value="${esc(att.note ?? '')}"
                            data-i18n-placeholder="attachments.notePlaceholder"
                            data-attachment-id="${esc(att.id)}">`;
+                const isSource = att.id === sourceId;
+                const tag = isSource
+                    ? `<span class="attachment-tag" title="${esc(strings.attachments.portraitTagTitle)}">${esc(strings.attachments.portraitTag)}</span>` : '';
+                const asPortrait = canPortrait && !locked && !isSource && isPortraitCandidate(att)
+                    ? `<button type="button" class="secondary attachment-portrait-btn" data-attachment-id="${esc(att.id)}">${esc(strings.attachments.asPortrait)}</button>` : '';
                 const del = locked ? '' : `
                     <div class="attachment-actions">
+                        ${asPortrait}
                         <button type="button" class="attachment-delete-btn" title="${esc(strings.attachments.delete)}" aria-label="${esc(strings.attachments.delete)}"
                             data-attachment-id="${esc(att.id)}">${iconSvg('trash')}</button>
                     </div>`;
@@ -112,15 +158,16 @@ export const attachmentsMethods = uiModule({
                     { sha: att.original?.sha256, bytes: att.original?.bytes, personId: this.currentId ?? undefined, previewBytes: att.sizeBytes },
                     att.original?.mimeType ?? att.mimeType, `data-attachment-id="${esc(att.id)}"`);
                 return `
-                    <div class="attachment-row">
+                    <div class="attachment-row has-more">
                         ${thumb}
                         <div class="attachment-main">
-                            <span class="attachment-name">${esc(att.name)}</span>
-                            <span class="attachment-size">${esc(formatBytes(att.sizeBytes))}</span>
+                            <span class="attachment-name-row">${attachmentNameHtml(att, esc)}${tag}</span>
+                            <span class="attachment-size">${esc(attachmentMeta(att, formatBytes(att.sizeBytes)))}</span>
                             ${origLine}
                             ${noteField}
                         </div>
                         ${fullLink}
+                        ${attachmentMoreHtml(att, esc)}
                         ${del}
                     </div>`;
             }).join('');
@@ -133,12 +180,31 @@ export const attachmentsMethods = uiModule({
             container.querySelectorAll<HTMLInputElement>('.attachment-note-input[data-attachment-id]').forEach(el => {
                 el.addEventListener('change', () => this.updateAttachmentNoteFromInput(el.dataset.attachmentId ?? '', el.value));
             });
+            container.querySelectorAll<HTMLElement>('.attachment-portrait-btn[data-attachment-id]').forEach(el => {
+                el.addEventListener('click', () => {
+                    if (this.currentId) void this.useAttachmentAsPortrait(this.currentId, el.dataset.attachmentId ?? '');
+                });
+            });
             container.querySelectorAll<HTMLElement>('.attachment-delete-btn[data-attachment-id]').forEach(el => {
-                el.addEventListener('click', () => { void this.deleteAttachment(el.dataset.attachmentId ?? ''); });
+                el.addEventListener('click', () => { void this.removeAttachmentFromPerson(el.dataset.attachmentId ?? ''); });
             });
             container.querySelectorAll<HTMLElement>('.media-full-quality[data-attachment-id]').forEach(el => {
                 el.addEventListener('click', () => this.openAttachmentFullQuality(el.dataset.attachmentId ?? ''));
             });
+            container.querySelectorAll<HTMLElement>('.attachment-more[data-attachment-id]').forEach(el => {
+                el.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.showAttachmentMenu(el.dataset.attachmentId ?? '', el);
+                });
+            });
+        }
+
+        // The person's files in the Materials window (a tree without a research that lists them; spec 102 §1).
+        const all = document.getElementById('attachments-all-materials');
+        if (all) {
+            const show = attachments.length > 0 && this.materialsWindowOn() && !this.materialsListOn();
+            all.hidden = !show;
+            all.textContent = show ? strings.materials.allForPerson(attachments.length) : '';
         }
 
         // What this person brings into the file, each part named (the whole
@@ -199,7 +265,7 @@ export const attachmentsMethods = uiModule({
         const row = document.createElement('div');
         row.className = 'attachment-row attachment-preparing';
         row.setAttribute('role', 'status');
-        row.innerHTML = `<span class="attachment-preparing-spin research-sync-spinner" aria-hidden="true"></span>`
+        row.innerHTML = `<i class="attachment-preparing-spin busy-spin" aria-hidden="true"></i>`
             + `<div class="attachment-main"><span class="attachment-name"></span><span class="media-state">${this.escapeHtml(strings.media.preparing(formatBytes(bytes)))}</span></div>`;
         row.querySelector('.attachment-name')!.textContent = name;
         container.appendChild(row);
@@ -236,6 +302,9 @@ export const attachmentsMethods = uiModule({
             return;
         }
 
+        // The same file already in the tree (spec 102 §12h): linked there instead, or asked.
+        const same = await this.sameFileTwice(personId, { original, dataUrl });
+        if (same && same !== 'new') return;
         DataManager.addAttachment(personId, {
             name: file.name,
             mimeType,
@@ -251,10 +320,26 @@ export const attachmentsMethods = uiModule({
         }
     },
 
+    /** The attachment row's ⋯ menu: the item as the materials know it (with the research's file when there is one). */
+    showAttachmentMenu(attachmentId: string, anchor: HTMLElement): void {
+        if (!this.currentId) return;
+        const person = DataManager.getPerson(this.currentId);
+        const att = person ? DataManager.personMedia(person.id).find(a => a.id === attachmentId) : undefined;
+        if (!person || !att) return;
+        const ctx = this.materialsContext();
+        const list = ctx ? cachedMaterialList(ctx.treeId) : null;
+        const refn = researchPersonRef(person.refn);
+        const item = (list ? personMaterials({ refn: person.refn, attachments: DataManager.personMedia(person.id) }, list) : [])
+            .find(i => i.attachment?.id === attachmentId) ?? attachmentItem(att, refn);
+        this.showMaterialItemMenu(item, anchor, ctx?.caps ?? NO_CAPS, {
+            open: () => (att.originalOnly ? this.openAttachmentFullQuality(att.id) : this.previewAttachment(att.id)),
+        });
+    },
+
     /** Image → fullscreen overlay; PDF → new tab via an object URL. */
     previewAttachment(attachmentId: string): void {
         if (!this.currentId) return;
-        const att = DataManager.getPerson(this.currentId)?.attachments?.find(a => a.id === attachmentId);
+        const att = DataManager.personMedia(this.currentId).find(a => a.id === attachmentId);
         if (!att) return;
         if (isImage(att)) {
             const sha = att.original?.sha256;
@@ -277,7 +362,7 @@ export const attachmentsMethods = uiModule({
     /** "Full quality" on an attachment's row: here (from the bridge) or in the research. */
     openAttachmentFullQuality(attachmentId: string): void {
         if (!this.currentId) return;
-        const att = DataManager.getPerson(this.currentId)?.attachments?.find(a => a.id === attachmentId);
+        const att = DataManager.personMedia(this.currentId).find(a => a.id === attachmentId);
         const sha = att?.original?.sha256;
         if (!att || !sha) return;
         this.openFullQuality(sha, att.original?.mimeType ?? att.mimeType, att.original?.bytes ?? 0, isImage(att) && !att.originalOnly ? att.dataUrl : null);
@@ -296,11 +381,30 @@ export const attachmentsMethods = uiModule({
         }
         if (mode !== 'app') return;
         if (mimeType === 'application/pdf') {
-            const ctl = new AbortController();
-            void this.fetchOriginal(sha, () => { /* a tab opens when it is here */ }, ctl.signal).then(({ url }) => {
-                window.open(url, '_blank');
-                setTimeout(() => URL.revokeObjectURL(url), 60_000);
-            }, () => this.showToast(strings.media.loadFailed, 6000));
+            // C94: the link says the download from the click (a toast when it is gone), and the tab opens now, on
+            // the click (one opened after the download may be blocked), saying the load until the file is in it.
+            const el = activatedElement();
+            const m = strings.media;
+            const tab = window.open('', '_blank');
+            try {
+                if (tab) {
+                    tab.document.title = m.loadingOriginal;
+                    tab.document.body.textContent = `${m.loadingOriginal}…`;
+                }
+            } catch { /* not this page's tab to write */ }
+            const host = el ?? document.createElement('button');
+            void runBusy(host, async (ctl) => {
+                try {
+                    const { url } = await this.fetchOriginal(sha, () => { /* the tab shows it when it is here */ }, ctl.signal);
+                    if (tab && !tab.closed) tab.location.href = url;
+                    else window.open(url, '_blank');
+                    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+                } catch {
+                    tab?.close();
+                    ctl.end({ ok: false, kind: 'error', text: this.originalGone(sha) ? m.gone : m.loadFailed });
+                    if (this.originalGone(sha)) this.renderAttachmentsList();
+                }
+            }, { label: el ? strings.busy.generic : m.loadingOriginal, kind: 'bridge', timeoutMs: BUSY_TIMEOUTS.write, atOnce: true, toastWhenGone: true });
             return;
         }
         openImageViewer(previewUrl ?? '', undefined, { ...this.viewerOriginal(sha), autoLoad: true });
@@ -339,7 +443,7 @@ export const attachmentsMethods = uiModule({
         const line = (icon: string, text: string, cls: string, title = ''): string =>
             `<span class="media-state ${cls}"${title ? ` title="${esc(title)}"` : ''}>${icon}<span>${esc(text)}</span></span>`;
         const ring = '<span class="media-ring" aria-hidden="true"></span>';
-        const spin = '<span class="media-spinner" aria-hidden="true"></span>';
+        const spin = '<i class="busy-spin s12" aria-hidden="true"></i>';
         switch (state.kind) {
             case 'queued': {
                 const bigger = state.bytes > 0 && item.previewBytes !== undefined && Math.abs(state.bytes - item.previewBytes) > 1024;
@@ -382,17 +486,18 @@ export const attachmentsMethods = uiModule({
                     </div>`;
         const note = locked
             ? (att.note ? `<span class="attachment-size">${esc(att.note)}</span>` : '')
-            : `<input type="text" class="attachment-note-input" value="${esc(att.note ?? '')}" placeholder="${esc(strings.attachments.notePlaceholder)}" data-attachment-id="${esc(att.id)}">`;
+            : `${att.note ? `<span class="attachment-note-text">${esc(att.note)}</span>` : ''}<input type="text" class="attachment-note-input" value="${esc(att.note ?? '')}" placeholder="${esc(strings.attachments.notePlaceholder)}" data-attachment-id="${esc(att.id)}">`;
         return `
-                    <div class="attachment-row is-original-only">
+                    <div class="attachment-row is-original-only has-more">
                         <span class="attachment-type-tile" aria-hidden="true">${esc(letters)}</span>
                         <div class="attachment-main">
-                            <span class="attachment-name">${esc(att.name)}</span>
-                            <span class="attachment-size">${esc(meta)}</span>
+                            ${attachmentNameHtml(att, esc)}
+                            <span class="attachment-size">${esc(attachmentMeta(att, meta))}</span>
                             ${state}
                             ${note}
                         </div>
                         ${link}
+                        ${attachmentMoreHtml(att, esc)}
                         ${del}
                     </div>`;
     },
@@ -415,6 +520,8 @@ export const attachmentsMethods = uiModule({
         }
         const mimeType = file.type || originalMimeOf(file.name);
         const original = { ...prepared, mimeType };
+        const same = await this.sameFileTwice(personId, { original, originalOnly: true });
+        if (same && same !== 'new') return true;
         const outcome = await this.queueOriginal(original, file, { personId });
         if (outcome === 'queued' || outcome === 'sent' || outcome === 'known' || outcome === 'knownFilled') {
             DataManager.addAttachment(personId, { name: file.name, mimeType, dataUrl: ORIGINAL_ONLY_DATA_URL, sizeBytes: 0, original, originalOnly: true });
@@ -446,33 +553,28 @@ export const attachmentsMethods = uiModule({
         DataManager.updateAttachmentNote(this.currentId, attachmentId, note);
     },
 
-    async deleteAttachment(attachmentId: string, ownerId?: PersonId): Promise<void> {
-        const personId = ownerId ?? this.currentId;
-        if (!personId) return;
-        // Name the file — a list of scans all confirming "Delete this
-        // attachment?" tells you nothing about which one you hit.
-        const person = DataManager.getPerson(personId);
-        const att = person?.attachments?.find(a => a.id === attachmentId);
-        if (!att) return;
-        const d = strings.danger;
-        const m = strings.media;
-        // Its original: waiting → discard it too (ticked), or send it and let the research detach it;
-        // in the research → it stays there, only detached.
-        const state = this.mediaStateOf({ sha: att.original?.sha256, bytes: att.original?.bytes, personId });
-        const queuedOriginal = state?.kind === 'queued' || state?.kind === 'sending';
-        // An archive keeps no attachments: only the original stays there (an attachment without one: no note).
-        const archiveNote = this.researchArchiveDeleteNote();
-        const note = state?.kind === 'inResearch'
-            ? archiveNote ? { tag: archiveNote.tag, text: strings.sync.archiveDeleteAttachmentNote } : { tag: strings.research.brand, text: m.deleteDetach }
-            : undefined;
-        const confirmed = await this.showConfirm(d.undoHint, d.deleteAttachmentTitle(att.name), {
-            confirmLabel: d.deleteAttachment, variant: 'danger', note,
-            ...(queuedOriginal ? { checkbox: { label: m.deleteDiscard(formatBytes(att.original?.bytes ?? 0)), hint: m.deleteDiscardHint, checked: true } } : {}),
+    /**
+     * A phone's trash on the person's attachment row (spec 102 §9): the file
+     * leaves this person (toast with Undo); its last place asks as Remove
+     * from the tree…, or beside an archive the file stays there.
+     */
+    async removeAttachmentFromPerson(attachmentId: string): Promise<void> {
+        const person = this.currentId ? DataManager.getPerson(this.currentId) : null;
+        const att = person ? DataManager.personMedia(person.id).find(a => a.id === attachmentId) : undefined;
+        if (!person || !att) return;
+        const ctx = this.materialsContext();
+        const list = ctx ? cachedMaterialList(ctx.treeId) : null;
+        const item = (list ? personMaterials({ refn: person.refn, attachments: DataManager.personMedia(person.id) }, list) : [])
+            .find(i => i.attachment?.id === attachmentId) ?? attachmentItem(att, researchPersonRef(person.refn));
+        const data = DataManager.getData();
+        const use = mediaUses(data, att.id).find(u => u.kind === 'person' && u.personId === person.id && u.place);
+        if (!use) {
+            if (await this.openRemoveFromTreeDialog(item)) this.renderAttachmentsList();
+            return;
+        }
+        await this.removeMaterialUse(item, att.id, use, mediaUseLabel(data, use).text, ctx, {
+            expanded: false, expand: () => { /* no list here */ }, where: 'dialog',
+            changed: () => this.renderAttachmentsList(),
         });
-        if (!confirmed) return;
-        const sha = att.original?.sha256;
-        if (queuedOriginal && sha) await this.settleQueuedOriginal(sha, this.confirmChecked);
-        DataManager.removeAttachment(personId, attachmentId);
-        this.renderAttachmentsList();
     },
 });

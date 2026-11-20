@@ -44,6 +44,7 @@ import * as CrossTree from '../cross-tree.js';
 import { AuditLogManager } from '../audit-log.js';
 import { uiModule } from './module.js';
 import { shownName } from '../person-name.js';
+import { personMedia, placePersonId } from '../media.js';
 
 /** Options of UI.showConfirm (see there). */
 export interface ConfirmOptions {
@@ -54,8 +55,8 @@ export interface ConfirmOptions {
     cancel?: string;
     /** 'danger' paints the confirm button in --danger instead of the primary green. */
     variant?: 'default' | 'danger';
-    /** A small line under the message with a label before it (a delete in a research archive). */
-    note?: { tag: string; text: string };
+    /** A small line under the message, with a label before it when given (a delete in a research archive). */
+    note?: { tag?: string; text: string };
     /**
      * A checkbox under the message ("Also discard the original waiting…");
      * its state at the confirm is in `UI.confirmChecked`.
@@ -165,7 +166,8 @@ export const dialogsMethods = uiModule({
             // No options in a simple confirm; a note goes there when given.
             if (optionsEl) {
                 const note = options?.note
-                    ? `<p class="confirm-note"><span class="research-sync-tag research-sync-tag--inline">${this.escapeHtml(options.note.tag)}</span> ${this.escapeHtml(options.note.text)}</p>`
+                    ? `<p class="confirm-note">${options.note.tag
+                        ? `<span class="research-sync-tag research-sync-tag--inline">${this.escapeHtml(options.note.tag)}</span> ` : ''}${this.escapeHtml(options.note.text)}</p>`
                     : '';
                 const check = options?.checkbox ? `
                     <label class="confirm-check">
@@ -373,7 +375,12 @@ export const dialogsMethods = uiModule({
         // A link "linked in the view only" that stands on the person: it no longer holds afterwards.
         const shown = (TreeRenderer.getViewLayer()?.links ?? []).filter(l => l.anchorId === personId || l.islandIds.includes(personId));
         const viewLinks = shown.map(l => strings.viewLinks.deleteNote(l.hypo, l.variant)).join(' ');
-        const message = [lead, links, viewLinks, d.undoHint].filter(Boolean).join(' ');
+        // Its files (spec 102 §9g): those with other places stay without it, those only with it go with it.
+        const files = personMedia(DataManager.getData(), personId);
+        // With an archive the files stay there either way (spec 102 §9g): one sentence for all of them.
+        const only = this.materialsContext()?.caps.list ? 0 : files.filter(a => a.places.every(p => placePersonId(p) === personId)).length;
+        const filesText = [files.length > only ? strings.personModal.deleteFiles(files.length - only) : '', only ? strings.personModal.deleteFilesOnly(only) : ''];
+        const message = [lead, links, viewLinks, ...filesText, d.undoHint].filter(Boolean).join(' ');
         // The shared events stay with the others (spec 085 §3d): "Census 1921 (Prokop, Terezie)".
         const shared = DataManager.personSharedEvents(personId).map(se => {
             const title = sharedEventTitle({ type: se.type, customLabel: se.customLabel,

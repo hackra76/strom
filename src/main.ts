@@ -19,6 +19,7 @@ import { initModalSkeleton } from './ui/modal-skeleton.js';
 import { setHelpResearchVersion, setHelpTour } from './ui/help-ui.js';
 import { activeResearchId } from './ui/history-ui.js';
 import { initToolbarFit } from './ui/toolbar-fit.js';
+import { initDefaultFocusButtons } from './ui/default-focus.js';
 import { DebugOptions, DebugStep, DebugPhase } from './layout/pipeline/debug-types.js';
 import { CryptoSession } from './crypto.js';
 import { AppMode, APP_VERSION, TreeId } from './types.js';
@@ -30,11 +31,17 @@ import { FILE_COPY_EVENT, RESEARCH_BASE_EVENT } from './tree-manager.js';
 import { SNAPSHOTS_TRIMMED_EVENT, SNAPSHOT_CREATED_EVENT, SnapshotTrim } from './snapshots.js';
 import { collectPoolGarbage } from './media-pool.js';
 import { keepLifelineChipsFor } from './lifeline-view.js';
-import { parseDeepLink, deepLinkTreeMatches, stripDeepLinkParams } from './deep-link.js';
+import { parseDeepLink, stripDeepLinkParams } from './deep-link.js';
 import { shouldRegisterServiceWorker, registerServiceWorker, linkManifest, isBetaBuild, appModeFor, captureInstallPrompt, INSTALL_AVAILABILITY_EVENT, isSafariOnComputer, safariAppName } from './pwa.js';
 import { decideWindowRole, getWindowRole, setWindowRole, satelliteViewMode, tryBecomeMain, type SatelliteKind, type SatelliteParams } from './windows/window-role.js';
-import { startMainWindow, startSatelliteClient, startSatelliteSelection, forwardSatelliteLaunches, showSecondTab, openLinksFromOtherWindows, makeSatelliteMain, openMainWindow, wireSatelliteViewStart, keptSatelliteState, keepSatelliteState } from './windows/window-start.js';
-import { mountSatStates } from './windows/sat-states.js';
+import { startMainWindow, startSatelliteClient, startSatelliteSelection, forwardSatelliteLaunches, showSecondTab, openLinksFromOtherWindows, makeSatelliteMain, takeOverAsMain, openMainWindow, wireSatelliteViewStart, keptSatelliteState, keepSatelliteState } from './windows/window-start.js';
+import { mountSatStates, SWITCHED_TOAST_MS } from './windows/sat-states.js';
+import { startAgentMirror } from './windows/agent-mirror.js';
+import { startAgentFollowState, type AgentFollow } from './windows/agent-follow-state.js';
+import { hasStoredResearchBridge, setBridgelessWindow, storedResearchBridge } from './research-device.js';
+import { adoptLiveFollowOn, setLiveFollowScope } from './ui/live-follow-ui.js';
+import { rememberLiveBridge } from './ui/research-ui.js';
+import { Takeover } from './windows/takeover.js';
 import { wireWindowDrafts } from './windows/window-drafts.js';
 import { peekBecomeMainMark, retryBecomeMain, takeBecomeMainMark } from './windows/become-main.js';
 import { formatLiveClock } from './live-time.js';
@@ -315,6 +322,35 @@ function updateWindowTitle(): void {
 }
 
 /**
+ * A satellite's own following of the agent follows the main window's status
+ * (spec 097 §1, §6): attached once it follows live (detached as the window
+ * left it), and at the end of the session the strip goes, the tree can be
+ * edited again (the status does that) and a toast says so. The main window's
+ * list hears the window's state (§7); the strip looks again at each change.
+ */
+function wireAgentFollow(client: SatelliteClient, state: ReturnType<typeof startAgentFollowState>, update: () => void): void {
+    let lastMain: string | null = null;
+    client.on('status', (status) => {
+        const main = client.mainWindowId;
+        const sameMain = main !== null && main === lastMain;
+        lastMain = main;
+        state.setLive(status.live, sameMain);
+    });
+    let was: AgentFollow | null = null;
+    state.onChange(({ value, ended }) => {
+        const before = was;
+        was = value;
+        client.setAgentFollow(value);
+        if (value === null) UI.resetLiveFollowHere();
+        else if (before === null) queueMicrotask(() => UI.syncLiveFollow());
+        if (ended) UI.showToast(strings.win.followEnded, SWITCHED_TOAST_MS);
+        update();
+        // The Table's agent row: tinted, scrolled to again once attached, its hidden note (§5).
+        UI.tableAgentFollowChanged();
+    });
+}
+
+/**
  * A satellite window (spec 079 §2): the view of the main window's tree. No
  * storage is read or written here — no tree, no tree index, no settings, no
  * last view or reload point; the research, links from outside, the welcome
@@ -350,8 +386,33 @@ function startSatelliteWindow(params: SatelliteParams, debugOptions: DebugOption
         },
     });
     startSatelliteSelection(client);
+    // The research (spec 097 K1.3): only the main window talks to its bridge; this window draws the agent's
+    // state from its mirror of the main window's and follows the agent by its own state (§1–§3).
+    setBridgelessWindow(true);
+    const mirror = startAgentMirror(client);
+    const agentFollow = startAgentFollowState(params.windowId);
+    setLiveFollowScope({
+        on: () => agentFollow.following,
+        setOn: (on) => { if (on) agentFollow.attach(); else agentFollow.detach(); },
+        setPaused: (paused) => agentFollow.setPaused(paused),
+    });
+    // Before the states' own listener: the strip is first written with the window's state as it is now.
+    wireAgentFollow(client, agentFollow, () => states.update());
     // A refused edit was not applied: its Undo pill (standing or waiting) goes before the toast says so.
     client.on('conflict', () => UI.dismissUndoToast());
+    // The fan starts from the main window's colours of the family lines (spec 114 §3).
+    client.on('fan-rod-colors', (m) => {
+        if (m.treeId === client.treeId) TreeRenderer.getFanView()?.adoptRodColors(m.memory);
+    });
+    // The main window closed while it followed a research (§7): one window takes over, the others say so once it is there.
+    const takeover = new Takeover(client, {
+        researchId: () => mirror.live()?.researchId ?? mirror.status()?.researchId ?? null,
+        followOn: () => mirror.follow().on,
+        hasBridge: (researchId) => hasStoredResearchBridge(researchId),
+        become: (live, locked) => takeOverAsMain(client, client.kind, live, locked),
+        changed: () => states.update(),
+        takenOver: () => UI.showToast(strings.win.takenOver, SWITCHED_TOAST_MS),
+    }).start();
     // Its states under the header or in place of the view (§3).
     const states = mountSatStates(document, client, {
         goToMain: () => { void client.requestMainFocus(); },
@@ -361,6 +422,29 @@ function startSatelliteWindow(params: SatelliteParams, debugOptions: DebugOption
         toast: (message, ms) => UI.showToast(message, ms),
         formatTime: (ts) => formatLiveClock(ts, Date.now(), getCurrentLanguage()),
         content: () => document.getElementById('tree-container'),
+        // The window's own following of the agent (spec 097 §1–§3, §6).
+        agent: () => {
+            const follow = agentFollow.value;
+            const mode = TreeRenderer.getViewMode();
+            return {
+                follow,
+                idle: follow === 'attached' && !UI.liveFollowHasTarget(),
+                noJump: mode === 'descendants' || mode === 'timeline',
+                lost: !!mirror.live()?.lostSince,
+                takeover: takeover.stripPhase,
+            };
+        },
+        detach: () => UI.setLiveFollow(false),
+        attach: () => UI.setLiveFollow(true),
+        back: () => UI.liveFollowBack(),
+    });
+    mirror.onChange((changed) => {
+        UI.agentMirrorApplied(changed);
+        // Whom the agent works on, the bridge lost or back: following here and the strip look again.
+        if (changed.includes('live')) {
+            UI.syncLiveFollow();
+            states.update();
+        }
     });
     // A refused edit's draft comes back once the fresh tree is in (§3.4, 3d).
     wireWindowDrafts(client, {
@@ -387,6 +471,8 @@ function startSatelliteWindow(params: SatelliteParams, debugOptions: DebugOption
     setWindowControlsRefresher(followSatelliteView(client, (kind) => {
         satelliteKind = kind;
         header.refresh();
+        // Following in the view shown (§4): the descendants and the timeline have no jumps.
+        states.update();
         updateWindowTitle();
     }));
 
@@ -611,7 +697,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         const params = new URLSearchParams(window.location.search);
         let resumingLive = false;
         try {
-            resumingLive = !!sessionStorage.getItem('strom.live');
+            // Taking over after the main window closed (spec 097 §7): following comes back as after a reload.
+            resumingLive = !!sessionStorage.getItem('strom.live') || !!becomeMark?.live;
         } catch { /* no storage */ }
         if (params.has('import-url') || params.has('live') || resumingLive) {
             document.documentElement.classList.add('external-opening');
@@ -673,6 +760,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     const becameMain = takeBecomeMainMark();
     if (role.role === 'main' && becameMain?.tree && becameMain.table !== undefined && DataManager.getCurrentTreeId() === becameMain.tree) {
         UI.setTableWindowStart(becameMain.tree, becameMain.table);
+    }
+    // It took over while the closed main window followed a research (spec 097 §7): that research is followed
+    // again as after a reload (its bridge address as stored in this browser), ◎ as it was.
+    const tookOver = role.role === 'main' ? becameMain?.live : undefined;
+    if (tookOver && DataManager.getCurrentTreeId() === tookOver.treeId) {
+        const base = storedResearchBridge(tookOver.researchId)?.base;
+        if (base) {
+            rememberLiveBridge(base, tookOver.treeId);
+            adoptLiveFollowOn(tookOver.follow);
+        }
     }
     // The main window: the satellites get their tree from here (spec 079 §0).
     // ⧉ after the view tabs, the indicator of open windows, the Table tab's shortcuts (§1, §4).
@@ -737,6 +834,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // The add button folds to ＋ where the desktop toolbar does not fit its labels
     initToolbarFit();
+
+    // ⌂ "Focus default person" beside "Focused on" (spec 111)
+    initDefaultFocusButtons();
 
     // Set debug options before rendering
     if (debugOptions.enabled) {
@@ -809,7 +909,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Opening from outside: ?import-url= / ?live= (Strom Research on this
         // computer) and the installed app's file handler (launchQueue). Reads
         // its parameters before handleUrlImportParam may clear the address.
-        UI.initExternalOpen();
+        const externalOpen = UI.initExternalOpen();
         // Where a research tree stands with its research (a research that says so).
         UI.initResearchSync();
         // The other research trees' state (switcher marks, "Elsewhere" in the panel).
@@ -831,16 +931,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Sync URL with current tree slug (for refresh persistence and bookmarking)
         syncUrlTreeParam();
 
-        // A link to a person or to "Waiting for you" (the macOS widget, spec 019 U4).
+        // A link to a person or to "Waiting for you" (the macOS widget, spec 019 U4). With ?import-url= / ?live=
+        // (`strom app --person`) once that research's tree is in: it may not be in this browser yet (081).
         if (startDeepLink && !hasEmbeddedData) {
-            const currentId = DataManager.getCurrentTreeId();
-            const current = currentId ? TreeManager.getTreeMetadata(currentId) : null;
-            const matches = deepLinkTreeMatches(
-                startParams,
-                current ? { id: current.id, researchId: current.research?.id ?? null } : null,
-                TreeManager.getTreeFromUrl(startParams),
-            );
-            void UI.openDeepLink(startDeepLink, matches);
+            const link = startDeepLink;
+            if (externalOpen) void externalOpen.then(() => UI.openDeepLinkFor(link, startParams));
+            else void UI.openDeepLinkFor(link, startParams);
         }
         // Links other windows passed on (a second tab's ?person=, a satellite's launch): from now on, as this window's own.
         openLinksFromOtherWindows();
@@ -854,6 +950,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Where the data is: the "changes only in the browser" indicator, and
         // the notice at an edit no file holds (src/file-copy.ts).
         void UI.refreshUnsavedIndicator();
+        // Research trees an older index knows no pictures of (spec 108): learnt from their stored data, then painted again.
+        void TreeManager.learnMediaFingerprints().then(n => { if (n > 0) UI.refreshUnsavedForResearch(); }).catch(() => undefined);
         window.addEventListener(PERSISTENCE_EVENT, () => { void UI.refreshUnsavedIndicator(); });
         window.addEventListener(FILE_COPY_EVENT, (e) => {
             void UI.handleFileCopyChange((e as CustomEvent<{ treeId: string }>).detail.treeId);

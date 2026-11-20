@@ -11,6 +11,7 @@
  * See src/ui/module.ts for the composition pattern.
  */
 
+import { mediaPersonId } from '../media.js';
 import { researchMarkFlags, setResearchActionLabel } from './research-open-mark.js';
 import { DataManager } from '../data.js';
 import { Person, PersonId } from '../types.js';
@@ -24,23 +25,26 @@ import {
 } from '../materials.js';
 import { MultiPersonPicker } from '../person-picker.js';
 import { nameWithoutYears } from '../materials-overview.js';
-import { MaterialActionCtx, MaterialsContext, appendBreakable } from './materials-ui.js';
+import { materialPersonLabel } from '../media-uses.js';
+import { MaterialActionCtx, MaterialRefusal, MaterialsContext, appendBreakable } from './materials-ui.js';
 import { uiModule } from './module.js';
+import { undoInToast, type ToastAction, type ToastWorkEnd } from './toast.js';
+import { setBusy } from './busy.js';
 
 const TOAST_MS = 8000;
 const PICKER_ID = 'mdlg-assign-picker';
 const MAX_PEOPLE = 50;
 
 /** One open dialog over the materials (and over the viewer). */
-interface MaterialDialog {
+export interface MaterialDialog {
     box: HTMLElement;
     body: HTMLElement;
     foot: HTMLElement;
     /** The research's refusal inside the dialog (null: hide it). */
     /** A refusal's sentence; its action carries the mark of the research link it launches (none: stays here). */
     error(text: string | null, action?: { label: string; run: () => void; mark?: ResearchActionMark }): void;
-    /** The confirm button busy while the research answers. */
-    busy(on: boolean): void;
+    /** The confirm button working while the research answers (its words, default "Saving…"; §1). */
+    busy(on: boolean, label?: string): void;
     close(): void;
 }
 
@@ -53,7 +57,7 @@ function h<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: s
     return el;
 }
 
-function button(label: string, cls: string, run: () => void): HTMLButtonElement {
+export function button(label: string, cls: string, run: () => void): HTMLButtonElement {
     const b = h('button', `mdlg-btn${cls ? ` ${cls}` : ''}`, label);
     b.type = 'button';
     // Disabled while the research answers: a click that still arrives (a script's, a double one) sends nothing.
@@ -68,7 +72,7 @@ const FOCUSABLE = 'button:not(:disabled), [href], input:not(:disabled), select, 
  * leaves keys alone while it is open), Esc and the backdrop close it, Tab
  * stays inside.
  */
-function materialDialog(opts: { title: string; sub?: string; modifier?: string; bubbleAt?: HTMLElement; onClose?: () => void }): MaterialDialog {
+export function materialDialog(opts: { title: string; sub?: string; modifier?: string; bubbleAt?: HTMLElement; onClose?: () => void; escape?: () => boolean }): MaterialDialog {
     openDialog?.close();
     const back = document.activeElement as HTMLElement | null;
     const overlay = h('div', `mdlg-overlay${opts.bubbleAt ? ' is-bubble' : ''}`);
@@ -111,6 +115,8 @@ function materialDialog(opts: { title: string; sub?: string; modifier?: string; 
         if (e.key === 'Escape') {
             e.preventDefault();
             e.stopImmediatePropagation();
+            // Something inside takes Esc first (a row being edited closes, the dialog stays).
+            if (opts.escape?.()) return;
             dialog.close();
             return;
         }
@@ -135,12 +141,11 @@ function materialDialog(opts: { title: string; sub?: string; modifier?: string; 
             err.appendChild(h('span', '', text));
             if (action) err.appendChild(setResearchActionLabel(button(action.label, '', action.run), action.label, action.mark ?? 'none'));
         },
-        busy(on) {
+        busy(on, label = strings.busy.saving) {
             box.setAttribute('aria-busy', String(on));
-            foot.querySelectorAll<HTMLButtonElement>('.mdlg-btn.is-primary, .mdlg-btn.is-danger').forEach(b => {
-                if (on) { b.dataset.wasDisabled = String(b.disabled); b.disabled = true; }
-                else { b.disabled = b.dataset.wasDisabled === 'true'; delete b.dataset.wasDisabled; }
-            });
+            // The working state on the button (B81–B84): locked at once, its words after 120 ms, a second click
+            // goes nowhere.
+            foot.querySelectorAll<HTMLButtonElement>('.mdlg-btn.is-primary, .mdlg-btn.is-danger').forEach(b => setBusy(b, on, { label }));
         },
         close() {
             if (closed) return;
@@ -198,8 +203,19 @@ export const materialActionsMethods = uiModule({
      * (`ctx.selection`) and "Restore" under a hidden tile.
      */
     materialAction(id: MaterialActionId, items: MaterialItem[], ctx: MaterialActionCtx = {}): boolean {
-        if (!['assign', 'removeFromPerson', 'hide', 'restore'].includes(id)) return false;
+        if (!['assign', 'attach', 'removeFromPerson', 'hide', 'restore'].includes(id)) return false;
         const mc = this.materialsContext();
+        // The tree's own writes (spec 102 §4, §9): Link to… for files, Restore of files taken out of the tree.
+        if (id === 'attach') {
+            ctx.settled?.();
+            this.openAttachDialog(items, { personId: this.materialContextPerson(), done: () => this.materialActionDone(ctx) });
+            return true;
+        }
+        if (id === 'restore' && items.some(i => i.removedId)) {
+            this.restoreRemovedMaterials(items.filter(i => i.removedId));
+            items = items.filter(i => !i.removedId);
+            if (!items.length) { ctx.settled?.(); return true; }
+        }
         if (!mc) { ctx.settled?.(); return false; }
         if (!mc.caps.bridgeUp || !mc.base || !mc.caps.assign) { ctx.settled?.(); return true; }
         const files = researchFiles(items);
@@ -226,11 +242,11 @@ export const materialActionsMethods = uiModule({
     /** A person's name for the texts: the tree's name, else the research's (without years), else the REFN. */
     materialPersonName(refn: string): string {
         for (const p of DataManager.getAllPersons()) {
-            if (researchPersonRef(p.refn) === refn) return fullName(p) || refn;
+            if (researchPersonRef(p.refn) === refn) return materialPersonLabel(fullName(p));
         }
         const ctx = this.materialsContext();
         const known = ctx ? cachedMaterialList(ctx.treeId)?.people?.[refn] : undefined;
-        return known ? nameWithoutYears(known) : refn;
+        return known ? materialPersonLabel(nameWithoutYears(known)) : refn;
     },
 
     /** After a write went through: the selection ends, the window redraws. */
@@ -249,6 +265,18 @@ export const materialActionsMethods = uiModule({
             : act === 'retry' ? { label: m.retry, run: retry }
             : seal ? { label: seal.label, run: () => this.researchSyncAction(seal.action), ...researchMarkFlags(this.researchSyncActionMark(seal.action)) } : undefined;
         this.showToast(materialErrorText(err, mc.agent), TOAST_MS, { closable: true, kind: 'materials', ...(action ? { action } : {}) });
+    },
+
+    /** The same refusal as a sentence at its element (§5): Try again, Reload or the research's own way beside it. */
+    materialErrorEnd(mc: MaterialsContext, err: MaterialError, retry: () => void): MaterialRefusal {
+        const m = strings.materials;
+        const act = materialErrorAction(err);
+        const seal = err.held ? this.researchSealAction(err.held)[0] : undefined;
+        const text = materialErrorText(err, mc.agent);
+        if (act === 'retry') return { text, retry };
+        if (act === 'reload') return { text, alt: { label: m.reload, run: () => void this.reloadMaterialList() } };
+        if (seal) return { text, alt: { label: seal.label, run: () => this.researchSyncAction(seal.action), ...researchMarkFlags(this.researchSyncActionMark(seal.action)) } };
+        return { text };
     },
 
     /** A refusal inside a dialog (it stays open; Reload closes it once the list is loaded again). */
@@ -291,19 +319,41 @@ export const materialActionsMethods = uiModule({
         return res;
     },
 
-    /** Undo of assigns: the requests in order; a refusal stops and says so. */
-    async undoMaterialAssign(mc: MaterialsContext, reqs: AssignRequest[]): Promise<void> {
-        await writeOnce(`undo:${JSON.stringify(reqs)}`, async () => {
-            for (let i = 0; i < reqs.length; i++) {
-                const res = await this.writeAssign(mc, reqs[i]);
-                if (!res.ok) {
-                    const rest = reqs.slice(i);
-                    this.materialErrorToast(mc, res.error, () => void this.undoMaterialAssign(mc, rest));
-                    return;
-                }
-            }
-            this.refreshMaterialsWindow();
-        });
+    /**
+     * A toast's "Undo" of assigns, working in the toast (§4, 4d): "Undoing…", the requests in order, then
+     * "Undone." there; a refusal that another try may change says so there with "Try again" (from the request it
+     * stopped at); any other refusal goes to its own toast with its way on (Reload, the research's own way).
+     */
+    materialAssignUndo(mc: MaterialsContext, reqs: AssignRequest[]): ToastAction {
+        let rest = reqs;
+        return {
+            label: strings.undo.undo, work: { label: strings.busy.reverting },
+            run: async (): Promise<ToastWorkEnd | undefined> => {
+                const failed = await writeOnce(`undo:${JSON.stringify(rest)}`, async () => {
+                    for (let i = 0; i < rest.length; i++) {
+                        const res = await this.writeAssign(mc, rest[i]);
+                        if (!res.ok) {
+                            rest = rest.slice(i);
+                            return res.error;
+                        }
+                    }
+                    rest = [];
+                    this.refreshMaterialsWindow();
+                    return 'done' as const;
+                });
+                // null: the same undo is written already (its own toast says its end).
+                if (failed === 'done') return { ok: true, text: strings.busy.undone };
+                if (!failed) return undefined;
+                return this.materialWorkFailed(mc, failed, () => void this.materialAssignUndo(mc, rest).run());
+            },
+        };
+    },
+
+    /** A refusal of a toast's work: its sentence there when another try may change it, else its own toast (null). */
+    materialWorkFailed(mc: MaterialsContext, err: MaterialError, retry: () => void): ToastWorkEnd | undefined {
+        if (materialErrorAction(err) === 'retry') return { ok: false, text: materialErrorText(err, mc.agent), whole: true };
+        this.materialErrorToast(mc, err, retry);
+        return undefined;
     },
 
     // ==================== ASSIGN (5a) ====================
@@ -383,7 +433,7 @@ export const materialActionsMethods = uiModule({
             }
             this.showToast(m.assignedToast(n, names.length ? names : add.map(p => this.materialPersonName(p))), TOAST_MS, {
                 closable: true, kind: 'materials',
-                ...(undo.length ? { action: { label: strings.undo.undo, run: () => void this.undoMaterialAssign(mc, undo) } } : {}),
+                ...(undo.length ? { action: this.materialAssignUndo(mc, undo) } : {}),
             });
             this.materialActionDone(ctx);
         };
@@ -439,7 +489,9 @@ export const materialActionsMethods = uiModule({
         const before = currentRecords(mc.treeId, files);
         const res = await this.writeAssign(mc, { files: files.map(i => i.file!.id), remove: [refn] });
         if (!res.ok) {
-            this.materialErrorToast(mc, res.error, () => void this.removeFromFiles(mc, files, refn, ctx));
+            const retry = (): void => void this.removeFromFiles(mc, files, refn, ctx);
+            if (ctx.refused) ctx.refused(this.materialErrorEnd(mc, res.error, retry));
+            else this.materialErrorToast(mc, res.error, retry);
             return;
         }
         const kept = res.value.kept.filter(k => k.person === refn);
@@ -449,14 +501,18 @@ export const materialActionsMethods = uiModule({
             const batchName = batchOf(mc.treeId, batchId)?.name ?? batchId;
             this.showToast(m.keptToast(kept.length, name, batchName), TOAST_MS, {
                 closable: true, kind: 'materials',
-                action: { label: m.removeFromBatch, run: () => void this.removeFromWholeBatch(mc, batchId, batchName, refn, ctx) },
+                // Works in the toast (§4): "Removing…", then its end there with Undo.
+                action: {
+                    label: m.removeFromBatch, work: { label: strings.busy.removing, failed: strings.busy.errRefused },
+                    run: () => this.removeFromWholeBatchInToast(mc, batchId, batchName, refn, ctx),
+                },
             });
         } else {
             const undo = assignUndoRequests(before, res.value.files);
             const what = files.length === 1 ? files[0].title : m.assignWhat.filesOnly(files.length);
             this.showToast(m.removedToast(name, what), TOAST_MS, {
                 closable: true, kind: 'materials',
-                ...(undo.length ? { action: { label: strings.undo.undo, run: () => void this.undoMaterialAssign(mc, undo) } } : {}),
+                ...(undo.length ? { action: this.materialAssignUndo(mc, undo) } : {}),
             });
         }
         this.materialActionDone(ctx);
@@ -473,11 +529,23 @@ export const materialActionsMethods = uiModule({
         });
     },
 
+    /** "Remove from the whole batch" of a toast, working in it: its end there, Undo with it. */
+    async removeFromWholeBatchInToast(mc: MaterialsContext, batchId: string, batchName: string, refn: string, ctx: MaterialActionCtx): Promise<ToastWorkEnd | undefined> {
+        const res = await writeOnce(`batch-remove:${batchId}:${refn}`, () => this.writeAssign(mc, { batch: batchId, remove: [refn] }));
+        if (!res) return undefined;
+        if (!res.ok) return this.materialWorkFailed(mc, res.error, () => void this.removeFromWholeBatch(mc, batchId, batchName, refn, ctx));
+        this.materialActionDone(ctx);
+        return {
+            ok: true, text: strings.materials.removedToast(this.materialPersonName(refn), batchName),
+            action: this.materialAssignUndo(mc, [{ batch: batchId, add: [refn] }]),
+        };
+    },
+
     materialBatchRemovedToast(mc: MaterialsContext, batchId: string, batchName: string, refn: string, ctx: MaterialActionCtx): void {
         const undo: AssignRequest = { batch: batchId, add: [refn] };
         this.showToast(strings.materials.removedToast(this.materialPersonName(refn), batchName), TOAST_MS, {
             closable: true, kind: 'materials',
-            action: { label: strings.undo.undo, run: () => void this.undoMaterialAssign(mc, [undo]) },
+            action: this.materialAssignUndo(mc, [undo]),
         });
         this.materialActionDone(ctx);
     },
@@ -524,8 +592,12 @@ export const materialActionsMethods = uiModule({
 
     openHideDialog(mc: MaterialsContext, files: MaterialItem[], ctx: MaterialActionCtx): void {
         const m = strings.materials;
+        // Hide… is for material outside the tree; a file in the tree is removed from it instead (spec 102 §9).
+        files = files.filter(i => !i.attachment?.places?.length);
         if (!files.length) return;
-        const dialog = materialDialog({ title: m.hideTitle(files.length) });
+        // Asked from another dialog: it comes back when this one ends without a write (after one, below).
+        let wrote = false;
+        const dialog = materialDialog({ title: m.hideTitle(files.length), onClose: () => { if (!wrote) ctx.back?.(); } });
         // One file: the sentence names it; several: the general sentence.
         const one = files.length === 1 ? files[0] : null;
         const textEl = h('p', 'mdlg-text', one ? undefined : (mc.agent ? m.hideTextResearch : m.hideText));
@@ -546,27 +618,11 @@ export const materialActionsMethods = uiModule({
             input.type = 'radio';
             input.name = 'mdlg-hide-reason';
             input.value = reason;
-            input.checked = reason === 'unrelated';
+            input.checked = reason === (ctx.hideReason ?? 'unrelated');
             label.append(input, h('span', '', m.reason[reason]));
             set.appendChild(label);
         }
         dialog.body.appendChild(set);
-        // Files that are also the tree's attachments: deleting those is a separate, unticked choice.
-        const withAttachment = files.filter(i => i.origin === 'both' && i.attachment);
-        let alsoDelete: HTMLInputElement | null = null;
-        if (withAttachment.length) {
-            const label = h('label', 'mdlg-check');
-            alsoDelete = h('input');
-            alsoDelete.type = 'checkbox';
-            alsoDelete.name = 'mdlg-hide-delete';
-            const text = h('span', 'mdlg-check-text');
-            text.append(
-                h('span', '', withAttachment.length === 1 ? m.hideAlsoDelete : m.hideAlsoDeleteN(withAttachment.length)),
-                h('span', 'mdlg-check-hint', m.hideAlsoDeleteHint),
-            );
-            label.append(alsoDelete, text);
-            dialog.body.appendChild(label);
-        }
         const go = button(m.hideConfirm, 'is-primary', () => void run());
         dialog.foot.append(button(strings.buttons.cancel, '', () => dialog.close()), go);
         set.querySelector<HTMLInputElement>('input:checked')?.focus();
@@ -582,54 +638,32 @@ export const materialActionsMethods = uiModule({
                 this.materialErrorInDialog(dialog, mc, res.error, () => void run());
                 return;
             }
+            wrote = true;
             dialog.close();
             await mergeIntoCache(mc.treeId, res.value.files, res.value.people);
-            const undoDesc = alsoDelete?.checked ? this.deleteMaterialAttachments(withAttachment) : null;
             this.showToast((mc.agent ? m.hiddenToastResearch : m.hiddenToast)(files.length), TOAST_MS, {
                 closable: true, kind: 'materials',
+                // Undo works in the toast (B85): "Undoing…", then its end there.
                 action: {
-                    label: strings.undo.undo,
-                    run: () => {
-                        if (undoDesc && DataManager.lastUndoDescription() === undoDesc) this.performUndo();
-                        void this.writeHidden(mc, ids, false, undefined);
-                    },
+                    label: strings.undo.undo, work: { label: strings.busy.reverting },
+                    run: () => undoInToast(said => this.writeHidden(mc, ids, false, undefined, said)),
                 },
             });
             this.materialActionDone(ctx);
+            ctx.back?.();
         };
     },
 
-    /** The tree's attachments of hidden files deleted as one undo step; its description (null: nothing deleted). */
-    deleteMaterialAttachments(items: MaterialItem[]): string | null {
-        const targets: { personId: PersonId; attId: string }[] = [];
-        for (const item of items) {
-            const attId = item.attachment?.id;
-            if (!attId) continue;
-            const owner = DataManager.getAllPersons().find(p => p.attachments?.some(a => a.id === attId));
-            if (owner && !DataManager.isPersonLocked(owner.id)) targets.push({ personId: owner.id, attId });
-        }
-        if (!targets.length) return null;
-        const first = DataManager.getPerson(targets[0].personId);
-        const desc = first ? strings.undo.removeAttachment(fullName(first)) : null;
-        DataManager.runBatch(desc, () => {
-            for (const t of targets) DataManager.removeAttachment(t.personId, t.attId);
-        });
-        if (document.getElementById('person-modal')?.classList.contains('active')) {
-            this.renderAttachmentsList();
-            this.renderMaterialsSection();
-        }
-        this.refreshMaterialsWindow();
-        this.materialViewerListChanged();
-        return DataManager.lastUndoDescription();
-    },
-
     /** Hide or restore files quietly (an undo); a refusal says so in a toast. */
-    async writeHidden(mc: MaterialsContext, ids: string[], hidden: boolean, reason: HiddenReason | undefined): Promise<boolean> {
+    /** `said`: a refusal's words go there (a toast's Undo working in it) instead of a toast of their own. */
+    async writeHidden(mc: MaterialsContext, ids: string[], hidden: boolean, reason: HiddenReason | undefined,
+        said?: (text: string) => void): Promise<boolean> {
         const res = await writeOnce(`hidden:${hidden}:${reason ?? ''}:${ids.join(',')}`,
             () => this.writeHide(mc, { files: ids, hidden, ...(reason ? { reason } : {}) }));
         if (!res) return false;
         if (!res.ok) {
-            this.materialErrorToast(mc, res.error, () => void this.writeHidden(mc, ids, hidden, reason));
+            if (said) said(materialErrorText(res.error, mc.agent));
+            else this.materialErrorToast(mc, res.error, () => void this.writeHidden(mc, ids, hidden, reason));
             return false;
         }
         await mergeIntoCache(mc.treeId, res.value.files, res.value.people);
@@ -657,12 +691,13 @@ export const materialActionsMethods = uiModule({
         this.showToast(m.restoredToast(files.length), TOAST_MS, {
             closable: true, kind: 'materials',
             action: {
-                label: strings.undo.undo,
-                run: () => void (async () => {
+                label: strings.undo.undo, work: { label: strings.busy.reverting },
+                run: () => undoInToast(async said => {
                     for (const [reason, group] of byReason) {
-                        if (!await this.writeHidden(mc, group, true, (reason || undefined) as HiddenReason | undefined)) return;
+                        if (!await this.writeHidden(mc, group, true, (reason || undefined) as HiddenReason | undefined, said)) return false;
                     }
-                })(),
+                    return true;
+                }),
             },
         });
         this.materialActionDone(ctx);

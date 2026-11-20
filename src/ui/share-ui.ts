@@ -13,12 +13,14 @@ import { TreeManager } from '../tree-manager.js';
 import { TreeRenderer } from '../renderer.js';
 import { SettingsManager } from '../settings.js';
 import { AppExporter } from '../export.js';
-import { MergerUI } from '../merge/index.js';
+import { MergerUI, mergeAnalysisLong, MERGE_ANALYSIS_LONG_AT } from '../merge/index.js';
 import { classifyShareFile } from '../share.js';
 import { strings } from '../strings.js';
 import { PrivacyMode } from '../privacy.js';
 import { EmbeddedDataEnvelope, StromData, TreeId } from '../types.js';
 import { uiModule } from './module.js';
+import { activatedElement, busyLocal, busyToast, runHeavy } from './busy.js';
+import { holdLeave } from './busy-leave.js';
 import { autoGrowAll } from './autogrow.js';
 import { safeFileName } from '../filenames.js';
 
@@ -119,23 +121,31 @@ export const shareUiMethods = uiModule({
             ...(this.shareReplyToExportId ? { replyToExportId: this.shareReplyToExportId } : {}),
         };
 
-        this.closeShareDialog();
-
-        if (scope === 'changes') {
-            await this.exportChangePacket(treeId, senderName, senderMessage);
-            return;
-        }
-
-        if (scope === 'branch') {
-            const focusedData = TreeRenderer.getFocusedData();
-            const treeName = TreeManager.getActiveTreeMetadata()?.name || 'Family Tree';
-            if (!focusedData) return;
-            const safe = treeName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-            await AppExporter.exportFocusAsApp(focusedData, `${safe || 'strom'}-share.html`, password, privacyMode, false,
-                { ...share, treeName, trackTreeId: treeId });
-        } else {
-            await AppExporter.exportApp(treeId, password, privacyMode, false, share);
-        }
+        // The dialog stays while the file is made (§1: its button "Saving…", leaving asks); it goes once the
+        // file is handed to the browser, a failure stays at the button with "Try again".
+        const btn = activatedElement() ?? document.querySelector<HTMLElement>('#share-modal .buttons .primary');
+        const made = await busyLocal(btn, strings.busy.saving, async () => {
+            const release = holdLeave('export');
+            try {
+                if (scope === 'changes') {
+                    await this.exportChangePacket(treeId, senderName, senderMessage);
+                } else if (scope === 'branch') {
+                    const focusedData = TreeRenderer.getFocusedData();
+                    const treeName = TreeManager.getActiveTreeMetadata()?.name || 'Family Tree';
+                    if (focusedData) {
+                        const safe = treeName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+                        await AppExporter.exportFocusAsApp(focusedData, `${safe || 'strom'}-share.html`, password, privacyMode, false,
+                            { ...share, treeName, trackTreeId: treeId });
+                    }
+                } else {
+                    await AppExporter.exportApp(treeId, password, privacyMode, false, share);
+                }
+                return true;
+            } finally {
+                release();
+            }
+        }, () => ({ ok: false, kind: 'error', text: strings.busy.fileSaveFailed, retry: () => { void this.submitShareDialog(); } }));
+        if (made) this.closeShareDialog();
     },
 
     // ==================== RECIPIENT: WELCOME + COLLABORATION BAR ====================
@@ -367,13 +377,18 @@ export const shareUiMethods = uiModule({
         const packet = this.pendingChangePacket;
         if (!packet) return;
         // Compute the applied counts BEFORE the tree changes (for the toast).
-        const { summarizeChangePacket } = await import('../share-diff.js');
-        const summary = summarizeChangePacket(DataManager.getData(), packet);
-        this.closeChangePacketPreview();
-
-        DataManager.applyChangePacketDirect(packet);
-        await TreeRenderer.renderAsync();
-        this.showToast(strings.shareDiff.applied(summary.newPersons.length, summary.modifiedPersons.length));
+        // §8: applied and drawn under Accept's working state, the preview open until then.
+        const el = activatedElement();
+        const n = Object.keys(DataManager.getData().persons).length;
+        await runHeavy(el, async () => {
+            const { summarizeChangePacket } = await import('../share-diff.js');
+            if (this.pendingChangePacket !== packet) return;
+            const summary = summarizeChangePacket(DataManager.getData(), packet);
+            DataManager.applyChangePacketDirect(packet);
+            await TreeRenderer.renderAsync();
+            this.closeChangePacketPreview();
+            this.showToast(strings.shareDiff.applied(summary.newPersons.length, summary.modifiedPersons.length));
+        }, { label: strings.busy.applyingChanges, atOnce: n >= MERGE_ANALYSIS_LONG_AT });
     },
 
     /** Review in detail: hand the reconstructed incoming tree to the merge engine. */
@@ -381,11 +396,15 @@ export const shareUiMethods = uiModule({
         const packet = this.pendingChangePacket;
         const base = this.pendingChangePacketBase;
         if (!packet || !base) return;
-        this.closeChangePacketPreview();
-
+        // §8: the matching under the working state of the choice, the preview open until the wizard comes.
+        const el = activatedElement();
         const { applyChangePacket } = await import('../share-diff.js');
+        if (this.pendingChangePacket !== packet) return;
         const incoming = applyChangePacket(base, packet);
-        MergerUI.startMerge(incoming, packet.senderName || strings.share.unknownSender);
+        await runHeavy(el?.isConnected ? el : null, () => {
+            this.closeChangePacketPreview();
+            MergerUI.startMerge(incoming, packet.senderName || strings.share.unknownSender);
+        }, { label: strings.merge.analyzing, atOnce: mergeAnalysisLong(DataManager.getData(), incoming) });
     },
 
     closeChangePacketPreview(): void {
@@ -461,14 +480,17 @@ export const shareUiMethods = uiModule({
 
         this.closeShareReplyDialog();
         this.pendingReplyEnvelope = null;
-        if (imported) {
-            if (DataManager.getCurrentTreeId() !== targetTreeId) {
-                await DataManager.switchTree(targetTreeId);
+        // The dialog is gone with the choice: the tree read as a progress toast past 120 ms (§1).
+        await busyToast(strings.busy.generic, async () => {
+            if (imported) {
+                if (DataManager.getCurrentTreeId() !== targetTreeId) {
+                    await DataManager.switchTree(targetTreeId);
+                }
+            } else {
+                await DataManager.leaveViewModeToTree(targetTreeId);
+                this.hideViewModeBanner();
             }
-        } else {
-            await DataManager.leaveViewModeToTree(targetTreeId);
-            this.hideViewModeBanner();
-        }
+        });
         this.updateTreeSwitcher();
         await TreeRenderer.renderAsync();
         MergerUI.startMerge(incoming, sender);
@@ -480,7 +502,8 @@ export const shareUiMethods = uiModule({
         this.closeShareReplyDialog();
         this.pendingReplyEnvelope = null;
         if (imported) {
-            await DataManager.importAsNewTree(structuredClone(imported.data as StromData), imported.treeName);
+            await busyToast(strings.busy.importing,
+                () => DataManager.importAsNewTree(structuredClone(imported.data as StromData), imported.treeName));
             this.updateTreeSwitcher();
             await TreeRenderer.renderAsync();
             return;

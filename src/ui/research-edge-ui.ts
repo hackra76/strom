@@ -5,6 +5,7 @@
  * tree's setting in Settings → Tree (research trees only).
  */
 
+import { canvasBusy } from './canvas-busy.js';
 import { researchActionLabel } from './research-open-mark.js';
 import { LiveDirection, researchLinkMark } from '../research-link.js';
 import { DataManager } from '../data.js';
@@ -24,6 +25,7 @@ import { uiModule } from './module.js';
 import { shownName } from '../person-name.js';
 import { liveSession } from './research-ui.js';
 import { directionProblemText } from './research-directions-ui.js';
+import { reserveBusySlot } from './busy.js';
 
 const BUBBLE_ID = 'research-edge-bubble';
 /** The view links' chain confirmation (src/ui/view-links-ui.ts): a pinned bubble lets it have the keyboard. */
@@ -194,7 +196,8 @@ export const researchEdgeUiMethods = uiModule({
             <button type="button" class="link-button reb-more">${esc(re.moreInResearch)}</button>`;
             bubble.querySelectorAll<HTMLButtonElement>('.reb-join').forEach(btn => btn.addEventListener('click', () => {
                 this.hideResearchEdgeBubble();
-                void TreeRenderer.setFocus(btn.dataset.person as PersonId);
+                // A194, 8a: the tree laid out anew under the canvas overlay (painted first).
+                void canvasBusy(() => TreeRenderer.setFocus(btn.dataset.person as PersonId));
             }));
         }
         document.body.appendChild(bubble);
@@ -353,9 +356,11 @@ export const researchEdgeUiMethods = uiModule({
                 setPendingHypothesis(rid, hypo, newPendingHypothesis(h, 'decide', url, this.researchSyncLink()?.link.head ?? '', Date.now(), variant));
                 return;
             }
-            if (t.closest('.reb-wait-again')) {
+            const again = t.closest<HTMLElement>('.reb-wait-again');
+            if (again) {
                 const url = rid ? pendingHypothesis(rid, hypo)?.url : undefined;
-                if (url) this.launchResearchLink(url, 'terminal');
+                // §5: the spinner after its words in its slot while the terminal opens.
+                if (url) this.launchResearchLink(url, 'terminal', reserveBusySlot(again));
                 return;
             }
             if (t.closest('.reb-wait-stop')) {
@@ -629,7 +634,8 @@ export const researchEdgeUiMethods = uiModule({
         root.querySelectorAll<HTMLButtonElement>('.rep-join').forEach(btn => {
             btn.onclick = () => {
                 this.closePersonResearchDialog();
-                TreeRenderer.setFocus(btn.dataset.person as PersonId);
+                // A104, 8a: the tree laid out anew under the canvas overlay (painted first).
+                void canvasBusy(() => TreeRenderer.setFocus(btn.dataset.person as PersonId));
             };
         });
         root.querySelectorAll<HTMLButtonElement>('.rep-hypo-go').forEach(btn => {
@@ -772,12 +778,13 @@ export const researchEdgeUiMethods = uiModule({
                 TreeManager.setResearchEdgeMode(treeId, value);
                 this.renderResearchEdgeSettings();
                 host.querySelector<HTMLInputElement>(`input[name="research-edge-mode"][value="${value}"]`)?.focus();
-                TreeRenderer.render();
+                // A151, 6.2 → §8: the choice at once, the tree drawn anew under the canvas overlay (painted first).
+                void canvasBusy(() => TreeRenderer.renderAsync());
             };
         });
         host.querySelector<HTMLInputElement>('#research-edge-motion-toggle')?.addEventListener('change', (e) => {
             TreeManager.setResearchEdgeMotion(treeId, (e.target as HTMLInputElement).checked);
-            TreeRenderer.render();
+            void canvasBusy(() => TreeRenderer.renderAsync());
         });
     },
 });

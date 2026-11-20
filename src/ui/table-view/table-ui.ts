@@ -23,6 +23,7 @@
 import { auditPersonName, DataManager } from '../../data.js';
 import { TreeManager } from '../../tree-manager.js';
 import { TreeRenderer } from '../../renderer.js';
+import { runBusy, nextPaint, busyButtonHtml } from '../busy.js';
 import { isPhoneBar, isTabletOrMobile } from '../../breakpoints.js';
 import { strings, getCurrentLanguage, type Language } from '../../strings.js';
 import { uiModule } from '../module.js';
@@ -34,11 +35,11 @@ import {
 import { onComputer, researchTableLive } from '../research-ui.js';
 import { researchBubble, researchConflictBubble, type ResearchBubble } from './table-research-bubble.js';
 import { AGENT_DONE_MS, materialsCountNow, researchConflictsNow } from '../../card-signals.js';
-import { directionPlacesKept, onDirectionPlaces } from '../../research-directions-write.js';
+import { onDirectionPlaces } from '../../research-directions-write.js';
 import { findCrossTreeMatches, getTreesDataForMatching, type CrossTreeMatch } from '../../cross-tree.js';
 import type { ChangeKind, PersonChange } from '../../research-changes.js';
 import {
-    CHECK_CHIPS, chipItem, chipLabel, clearFilter, columnItem, filterRows, filterSummary, isChipItem, newWindowOf, removeColumnFilter, searchQuery, setChip, setParticipantFilter,
+    addOnlyFilter, addWithoutFilter, researchFilterIdle, CHECK_CHIPS, chipItem, chipLabel, clearFilter, columnItem, filterRows, filterSummary, isChipItem, newWindowOf, removeColumnItemAt, searchQuery, setChip, setParticipantFilter,
     setColumnFilter, setEmptyFilter, sortRows, columnItemActive, type ChipId, type ColumnFilter, type FilterResult, type TableFilter,
 } from './table-filter.js';
 import {
@@ -55,10 +56,18 @@ import { TableGrid, type CellEditSpec, type GridCellRef, type RowAction } from '
 import { editChangeOf, editOptionsOf, editTargetOf, editValueOf, type EditTarget } from './table-edit.js';
 import { cellChoices, copyPlainText } from './table-cell.js';
 import { fanZoomModifier } from '../../fan-zoom.js';
-import { createBar, createStatus, createWindowButton, updateBar, updateResearchStatus, updateStatus } from './table-bar.js';
+import { createBar, createStatus, createWindowButton, fitBarRow, updateAgentNote, updateBar, updateNav, updateResearchStatus, updateScope, updateStatus } from './table-bar.js';
+import { JumpHistory, jumpTargetCell, type JumpStep } from './table-jump.js';
+import { PIN_MAX, TablePins, pinRanks, pinSvg } from './table-pins.js';
+import { createNotice, showNotice } from './table-notice.js';
+import { applyScopeCells, outsideScope, scopeCounts, scopeRows, tableScopeOf, type TableScope } from './table-scope.js';
+import { LEAD_COLUMNS } from './table-columns.js';
+import { listDisplayName, listKind } from '../../person-lists.js';
+import { listKindIcon } from '../list-kind-icon.js';
 import { applyTableWindowState, readTableWindowState, tableWindowStateOf, type TableWindowState } from './table-window-state.js';
 import { canOpenWindows, openInNewWindow } from '../../windows/window-open.js';
 import { getWindowRole } from '../../windows/window-role.js';
+import { windowAgentFollow } from '../../windows/agent-follow-state.js';
 import {
     canMoveColumn, canPinColumn, catalogColumns, displayColumns, hideColumn, lockedColumn, moveColumnBy, moveColumnRun, moveColumnTo,
     filterChanged, normalizeColumns, pinColumn, resetColumns, setColumnWidth, setGroupCollapsed, setGroupShown, showColumn, sortAdd, sortClick,
@@ -66,15 +75,16 @@ import {
 } from './table-state.js';
 import { ColumnPanel } from './table-colpanel.js';
 import {
-    anyExpanded, buildLines, coverageUnionsOf, hasMultiUnions, setAllExpanded, setExpanded, sortUnionOf, type UnionPredicate,
+    anyExpanded, buildLines, coverageUnionsOf, hasMultiUnions, isExpanded, setAllExpanded, setExpanded, sortUnionOf, type UnionPredicate,
 } from './table-subrows.js';
 import { columnCoverage, coverageCell, coverageLabel, type CoverageCell } from './table-coverage.js';
 import type { ColumnDef } from './table-columns.js';
 import { closeHeadMenu, headMenuItems, openHeadMenu, SEP, type HeadMenuItem, type MenuEntry } from './table-headmenu.js';
+import { listMenuEntries, listSheetPage } from '../person-list-add.js';
 import { issueCategory, translateValidationType, validateTreeData, type ValidationIssue } from '../../validation.js';
 import { dismissalFor, dismissalKey } from '../../quality-dismiss.js';
 import { QUALITY_CHANGED_EVENT } from '../quality-ui.js';
-import type { Partnership, PartnershipId, Person, PersonId, StromData, TableView, TreeId } from '../../types.js';
+import type { Partnership, PartnershipId, Person, PersonId, PersonList, StromData, TableGroupKey, TableView, TreeId } from '../../types.js';
 import {
     discardViewChanges, dropMissingViews, isBuiltinId, isResearchViewId, newViewId, openViewOf, readTableWork, restoreTableState, setResearchViews, switchView,
     tableWorkOf, takenViewNames, uniqueViewName, viewChanged, viewFromState, viewList, writeTableWork,
@@ -86,9 +96,10 @@ import {
     applyChecks, bandSeverity, CHECK_COLUMNS, CheckIndex, conflictCells, lineFindings, lineUnion, type CellFinding, type ConflictCell,
 } from './table-checks.js';
 import { conflictScope } from '../person-research-ui.js';
-import { lineCell, lineKey, type GridLine } from './table-subrows.js';
+import { lineCell, lineKey, plainLines, type DrawLine, type GridLine } from './table-subrows.js';
+import { groupedExportRows, groupedLines, groupingFits, groupKeysOfRow, groupRows, hasRepeats, multiValued, offeredGroupKeys, treeHasLines, type GroupOffer } from './table-group.js';
 import { cellDraft, type CellDraft } from '../../windows/window-drafts.js';
-import { cellText, isMouseLikePointer, markHtml, type CellConflictMark, type CellIssueMark } from './table-grid.js';
+import { cellText, isMouseLikePointer, markHtml, personLinks, type CellConflictMark, type CellIssueMark } from './table-grid.js';
 import { bubbleHeading, bubbleHtml, citesHtml, closeTableBubble, legendHtml, openBubblePanel, sheetElement, type BubbleCite } from './table-bubble.js';
 import { bridgeChanges, changedKeys, familyKeys, keepOrder, namesList, rowKeysFor, watchEdit } from './table-refresh.js';
 import type { DataChangedDetail } from '../../data.js';
@@ -101,6 +112,7 @@ import { tableEmptyState, type TableEmptyState } from './table-empty.js';
 import { sourcePlaceLine } from '../../source-location.js';
 import { shareDivergence } from '../../shared-events.js';
 import { divergenceSentence, divergentPersons } from '../../shared-divergence.js';
+import { TreeEditLock } from '../tree-edit-lock.js';
 
 interface Mounted {
     container: HTMLElement;
@@ -132,6 +144,19 @@ interface Mounted {
     emptyKey: string;
     /** What the phone's ⋯ offers for unions (§3.2): expand, collapse or nothing. */
     unionsButton: 'expand' | 'collapse' | null;
+    /** The strip for a person the filter hides (spec 103 2a). */
+    notice: HTMLElement;
+    /** The rows as last drawn, without a row shown for now: Save as list of people takes them (spec 084 §6). */
+    saveRows: readonly TableRow[];
+    /** The pinned rows outside the filter as last drawn (said, not saved, 6b). */
+    pinOutside: ReadonlySet<string>;
+    /** The groups of rows as last drawn (spec 084 §10): their keys, for Collapse / Expand all; null: not grouped. */
+    groupKeys: readonly string[] | null;
+}
+
+/** Save as list of people is offered (spec 084 §6): the People and Unions tables of a tree that takes changes. */
+function canSaveAsList(type: RowType): boolean {
+    return (type === 'persons' || type === 'unions') && !DataManager.listsReadOnly();
 }
 
 /** "New from research" in a window, or off (16zk): the window is the chip's value. */
@@ -189,6 +214,8 @@ let view: {
     tree: string; model: TableModel; type: RowType; key: string; checks: number;
     /** The research's environment the rows were filtered or sorted by (research chips or columns, §16.5), else null. */
     research: unknown; kept: boolean; result: ShownRows;
+    /** The scope the rows were narrowed by (spec 084 §9; a ticked box makes a new one). */
+    scope: TableScope | null;
 } | null = null;
 
 /** An edit opened from the table (§10.3): what it edits (the toast's name) and the records the edit may change, as stored before. */
@@ -221,7 +248,12 @@ export interface TableSelectionShare {
 }
 let selectionShare: TableSelectionShare | null = null;
 /** Another window's selection that came during a cell's edit: taken when the edit ends. */
-let pendingShared: { person: PersonId | null } | null = null;
+let pendingShared: { person: PersonId | null; scroll: boolean } | null = null;
+/**
+ * The agent's row this window last scrolled to (spec 097 §5, O4: once per
+ * person of the agent; null: none yet, or the window paused or detached since).
+ */
+let agentRevealed: string | null = null;
 
 /** The people a row is about, the main one first: a person; a union's partners; an event's people; a source none. */
 function rowPeople(row: TableRow): PersonId[] {
@@ -231,10 +263,123 @@ function rowPeople(row: TableRow): PersonId[] {
     return [];
 }
 
+/** Jumps by a person's name (spec 103 U3, decision D1): this window's history, of one tree (dropped when another one is drawn). */
+const jumps = new JumpHistory();
+let jumpsTree: string | null = null;
+/** A person shown for now outside the filter (spec 103 2b), while the People table's filter, search, sort and view stay. */
+let tempShown: { tree: string; person: PersonId; ctx: string } | null = null;
+/** The jump the strip waits on (spec 103 2a); gone with a change of the row type or the People table's filter. */
+let hiddenJump: { tree: string; step: JumpStep; ctx: string; outsideList?: boolean } | null = null;
+/** A view opened with a list that is gone (spec 084 §9): said under the bar until closed or the scope changes (the tree's key). */
+let scopeGone: string | null = null;
+/** A row a jump goes to (spec 084 §10): its group is opened when it is closed. */
+let openGroupFor: string | null = null;
+/** A Table filter rule being edited in the Table (spec 084 §7, §9): ⋯ offers Save to the list. */
+let ruleEdit: { tree: string; listId: string } | null = null;
+
+/** A menu row of Scope (spec 084 §9): the whole tree, a list, Manage lists…; null between the parts. */
+interface ScopeRow { id: string; label: string; iconHtml?: string; count?: number; current?: boolean; run: () => void }
+
+/** What a row shown for now depends on: the People table's filter, search, sort and open view. */
+function peopleCtx(state: TableState): string {
+    const st = state.types.persons;
+    return JSON.stringify([st.filter, searchQuery(st.search), st.sort, state.open.persons, st.scope]);
+}
+
+/** A row type's scope (spec 084 §9): its list, none for Sources or a list that is gone. */
+function scopeOfType(state: TableState, type: RowType): TableScope | null {
+    return type === 'sources' ? null : tableScopeOf(state.types[type].scope);
+}
+
+/** The sort a scope starts with (spec 084 §9): People in the list's order (# ↑). */
+const LIST_SORT: readonly SortSpec[] = [{ col: 'num', dir: 'asc' }];
+
+/**
+ * Set the Table's scope (spec 084 §9): the list, or the whole tree (null),
+ * for People, Unions and Events at once (Sources have none). The People
+ * table takes the list's order; back on the whole tree, the list's order
+ * gives way to the default view's sort. Returns whether anything changed.
+ */
+function setTableScope(state: TableState, listId: string | null): boolean {
+    let changed = false;
+    for (const type of ['persons', 'unions', 'events'] as const) {
+        const st = state.types[type];
+        if (st.scope === listId) continue;
+        st.scope = listId;
+        st.top = 0;
+        changed = true;
+        if (type !== 'persons') continue;
+        if (listId) st.sort = LIST_SORT.map(x => ({ ...x }));
+        else if (st.sort.some(x => x.col === 'num')) st.sort = st.sort.filter(x => x.col !== 'num');
+    }
+    if (changed) scopeGone = null;
+    return changed;
+}
+
+/** A list of a row type's scope that is gone (deleted, an undo): back to the whole tree. True when one was. */
+function dropGoneScopes(state: TableState): boolean {
+    let gone = false;
+    for (const type of ['persons', 'unions', 'events'] as const) {
+        const st = state.types[type];
+        if (!st.scope || DataManager.getPersonList(st.scope)) continue;
+        st.scope = null;
+        if (type === 'persons') st.sort = st.sort.filter(x => x.col !== 'num');
+        gone = true;
+    }
+    return gone;
+}
+
+/** The scope's lead columns (spec 084 §9, §13d): # and, for a work list, Done. */
+function leadColumnsOf(scope: TableScope): ColumnDef[] {
+    return LEAD_COLUMNS.filter(c => c.id === 'num' || !!scope.cells.done);
+}
+
+/**
+ * The columns drawn with a scope (spec 084 §9, §13d): # first and, for a
+ * work list, Done, both pinned before the state's own; the drawn positions
+ * of the others map to the state's as before.
+ */
+function withLeadColumns(d: DisplayColumns, scope: TableScope | null): DisplayColumns {
+    if (!scope) return d;
+    const leads = leadColumnsOf(scope);
+    return {
+        columns: [...leads, ...d.columns], widths: [...leads.map(c => c.width), ...d.widths], pinned: d.pinned + leads.length,
+        bands: [...leads.map(() => null), ...d.bands], starts: [...leads.map(() => 0), ...d.starts], ends: [...leads.map(() => 0), ...d.ends],
+    };
+}
+
+/**
+ * The rows with a person shown for now (spec 103 2b) where the sort (else
+ * the table's own order) puts them; the rows unchanged when they show the
+ * person already or there is no such person.
+ */
+function withTempRow(m: TableModel, rows: readonly TableRow[], person: PersonId, sort: readonly SortSpec[], pass: UnionPredicate | null): readonly TableRow[] {
+    const temp = m.personRows.get(person);
+    if (!temp || rows.includes(temp)) return rows;
+    const order = sort.length ? sortRows(m, 'persons', [...rows, temp], sort, pass ? sortUnionOf(pass) : undefined) : rowsOf(m, 'persons');
+    const shown = new Set<TableRow>(rows);
+    let before: TableRow | null = null;
+    for (const r of order) {
+        if (r === temp) break;
+        if (shown.has(r)) before = r;
+    }
+    const at = before ? rows.indexOf(before) + 1 : 0;
+    return [...rows.slice(0, at), temp, ...rows.slice(at)];
+}
+
+/**
+ * Rows pinned under the head (spec 103 §3): this window's, of one tree and
+ * one row type, never in a view (decisions D5, D7).
+ */
+const pins = new TablePins();
+
 /** Records changed (entity keys) whose rows light up at the next draw (§10.3). */
 let flashNext: { tree: string; keys: readonly string[] } | null = null;
 const BRIDGE_TOAST_MS = 8000;
 let mounted: Mounted | null = null;
+
+/** From this many cells the export says its state at once (building it takes longer than 120 ms). */
+export const TABLE_EXPORT_SHOWN_AT_ONCE = 30_000;
 /** The coverage row's cells (§6.1) for the rows last drawn; computed when a column is first drawn. */
 let coverage: { rows: readonly TableRow[]; cells: Map<string, CoverageCell> } | null = null;
 
@@ -462,27 +607,31 @@ function keepWork(tree: string, state: TableState): void {
  */
 function viewRows(
     tree: string, m: TableModel, type: RowType, filter: TableFilter, search: string, sort: readonly SortSpec[], columns: readonly ColumnDef[],
+    scope: TableScope | null = null,
 ): ShownRows {
     const q = searchQuery(search);
     const byChecks = sort.some(s => CHECK_COLUMNS.includes(s.col))
         || filter.items.some(i => isChipItem(i) && CHECK_CHIPS.includes(i.chip));
-    const key = JSON.stringify([filter, q, q ? columns.map(c => c.id) : 0, sort]);
+    const key = JSON.stringify([filter, q, q ? columns.map(c => c.id) : 0, sort, scope?.listId ?? null]);
     const checksVersion = byChecks ? m.ctx.checks?.version ?? 0 : 0;
     // A research chip or a research column's sort reads the research: a new environment filters and sorts again.
     const byResearch = filter.items.some(i => isChipItem(i) && isResearchChipId(i.chip))
         || sort.some(s => !!columnById(type, s.col)?.fromResearch);
     const researchNow = byResearch ? m.ctx.research ?? null : null;
     const last = view && view.tree === tree && view.type === type && view.key === key ? view : null;
-    if (last && last.model === m && last.checks === checksVersion && last.research === researchNow) return last.result;
-    const f = filterRows(m, type, rowsOf(m, type), filter, q ? { query: q, columns } : undefined);
+    if (last && last.model === m && last.checks === checksVersion && last.research === researchNow && last.scope === scope) return last.result;
+    // The scope (spec 084 §9) narrows the rows before the filter: People in the list's order.
+    const f = filterRows(m, type, scopeRows(m, type, scope), filter, q ? { query: q, columns } : undefined);
     const rows = sort.length ? sortRows(m, type, f.rows, sort, f.pass ? sortUnionOf(f.pass) : undefined) : f.rows;
     // §10.3: after a change of the data the rows stay in place, those that no longer
     // pass dimmed, until the sort, the filter or the view change. §16.6: so after a
     // change of the research's signals (the same model, a new environment) as well.
-    const signals = !!last && last.model === m && last.research !== researchNow;
-    const kept = last && (last.model.rev !== m.rev || last.kept || signals) ? keepOrder(m, last.result.rows, rows) : null;
+    const signals = !!last && last.model === m && (last.research !== researchNow || last.scope !== scope);
+    // A person out of the list (removed, the list's rule) leaves at once: the scope is not a filter to dim by.
+    const previous = last && scope ? last.result.rows.filter(r => !outsideScope(r, scope)) : last?.result.rows ?? [];
+    const kept = last && (last.model.rev !== m.rev || last.kept || signals) ? keepOrder(m, previous, rows) : null;
     const result: ShownRows = kept ? { rows: kept.rows, pass: f.pass, stale: kept.stale } : { rows, pass: f.pass, stale: NONE };
-    view = { tree, model: m, type, key, checks: checksVersion, research: researchNow, kept: !!kept, result };
+    view = { tree, model: m, type, key, checks: checksVersion, research: researchNow, scope, kept: !!kept, result };
     return result;
 }
 
@@ -543,6 +692,34 @@ function tableReadOnly(): boolean {
     return DataManager.isReadOnly() || DataManager.isTreeLocked();
 }
 
+/**
+ * Once the source opened from the table (its viewer, its editor, the editor
+ * from the viewer and back) is closed, the table's active cell has the focus
+ * again, unless something else took it meanwhile.
+ */
+function focusTableAfterSource(): void {
+    const viewer = document.getElementById('source-viewer-modal');
+    const editor = document.getElementById('source-editor-modal');
+    const open = (): boolean => !!viewer?.classList.contains('active') || !!editor?.classList.contains('active');
+    if (!open()) return;
+    const watch = new MutationObserver(() => {
+        if (open()) return;
+        watch.disconnect();
+        // After the table's redraw of a saved change (one frame).
+        requestAnimationFrame(() => {
+            const focused = document.activeElement;
+            // The dialog gives the focus back to the row's icon that opened it, which hides
+            // right after under the pointer (§10.1) and leaves the focus nowhere: not a taker.
+            const taken = focused instanceof Element && focused !== document.body
+                && !focused.closest('.tv-act') && focused.getClientRects().length > 0;
+            if (taken) return;
+            if (TreeRenderer.getViewMode() !== 'table') return;
+            mounted?.grid.activeCell()?.el?.focus({ preventScroll: true });
+        });
+    });
+    for (const el of [viewer, editor]) if (el) watch.observe(el, { attributes: true, attributeFilter: ['class'] });
+}
+
 export const tableMethods = uiModule({
     /**
      * The research's environment for the cells (§16; null: no research tree):
@@ -554,7 +731,7 @@ export const tableMethods = uiModule({
         const kind = this.activeResearchArchive() ? 'archive' : 'research';
         const readOnly = DataManager.isReadOnly();
         const now = researchTableLive();
-        const places = now.base ? directionPlacesKept(now.base) : null;
+        const places = now.places;
         const b = this.researchChangesBase();
         // §16.6: ✓ stands AGENT_DONE_MS after the agent left a person; the draw that drops it is asked for.
         const at = Date.now();
@@ -577,6 +754,22 @@ export const tableMethods = uiModule({
     },
 
     /**
+     * The research's environment of the open tree now, the Table shown or
+     * not (null: no research tree): another window's bubble action is checked
+     * against it (spec 097 §5).
+     */
+    tableResearchEnvNow(): ResearchTableEnv | null {
+        const data = DataManager.getData();
+        const lang = getCurrentLanguage();
+        const homeId = TreeRenderer.getFocusPersonId();
+        const rev = DataManager.getRevision();
+        if (!modelIsCurrent(model, data, rev, homeId, lang)) {
+            model = buildTableModel(data, { rev, homeId, lang, reliability: this.reliabilityOptionsNow() });
+        }
+        return this.tableResearchEnv(data, rev, model);
+    },
+
+    /**
      * What the research's bridge said changed (spec 057 §7.4): the table on
      * screen is drawn again when the agent's work or queue its cells read is
      * not the one drawn (following or not).
@@ -586,6 +779,61 @@ export const tableMethods = uiModule({
         const now = researchTableLive();
         const drawn = researchMemo.env.input;
         if (drawn.live === now.live && drawn.working === now.working && drawn.queue === now.queue) return;
+        redrawTable(el => this.renderTableView(el));
+    },
+
+    /**
+     * The agent's row in another window that follows the agent (spec 097 §5,
+     * O4): an attached window scrolls it into the middle of the body when the
+     * agent moves on to another person and the row is not all seen (the
+     * active cell, the selection and the focus stay); a paused or detached one
+     * does not scroll. While following (attached or paused), a row the filter
+     * hides is said in the status line with Show for now (not scrolled to);
+     * a pinned row is seen under the head.
+     */
+    tableAgentRow(follow: ReturnType<typeof windowAgentFollow>, agentKey: string | null, inRows: boolean, pinned: boolean): void {
+        if (!mounted) return;
+        if (follow !== 'attached') agentRevealed = null;
+        const hidden = (follow === 'attached' || follow === 'paused') && !!agentKey && !inRows && !pinned;
+        updateAgentNote(mounted.status, hidden ? agentKey : null);
+        if (follow !== 'attached' || !agentKey || agentKey === agentRevealed || hidden) return;
+        agentRevealed = agentKey;
+        if (inRows && !pinned) mounted.grid.revealKey(agentKey, 'center', { smooth: true, keepSelection: true });
+    },
+
+    /** "Show for now" of the agent's hidden row (spec 097 §5, spec 103 2b): the row shown for now, scrolled to as the agent's. */
+    tableShowAgentRow(): void {
+        const person = this.liveFollowTarget();
+        if (!person) return;
+        const tree = treeKey();
+        const state = stateOf(tree);
+        if (state.rowType !== 'persons') return;
+        tempShown = { tree, person, ctx: peopleCtx(state) };
+        const el = document.getElementById('table-container');
+        if (!el || TreeRenderer.getViewMode() !== 'table') return;
+        // The note's button goes: the focus stays in the table, not on the page.
+        const fromNote = !!document.activeElement?.closest('.tv-status-agent');
+        this.renderTableView(el);
+        // Asked for (paused too): the row in the middle when not seen, the selection kept.
+        mounted?.grid.revealKey(`p:${person}`, 'center', { smooth: true, keepSelection: true });
+        if (fromNote) mounted?.grid.el.focus({ preventScroll: true });
+    },
+
+    /** This window's following of the agent changed (attached, paused, detached; spec 097 §5): the Table looks again. */
+    tableAgentFollowChanged(): void {
+        redrawTable(el => this.renderTableView(el));
+    },
+
+    /**
+     * Another window's mirror of the agent's state changed (spec 097 K1.3):
+     * the research's link or status may make the tree a research tree here
+     * now (the model is built again), and the research's cells and views
+     * read the main window's work.
+     */
+    tableResearchMirrorChanged(): void {
+        if (TreeRenderer.getViewMode() !== 'table') return;
+        const opts = this.reliabilityOptionsNow();
+        if (model && (model.ctx.reliability.researchTree !== opts.researchTree || model.ctx.reliability.originFeature !== opts.originFeature)) model = null;
         redrawTable(el => this.renderTableView(el));
     },
 
@@ -656,8 +904,25 @@ export const tableMethods = uiModule({
         const state = stateOf(tree);
         // An undo or a delete took the open view away: back to the default one (§9.3).
         dropMissingViews(state, data.tableViews);
+        // A view's list that is gone (spec 084 §9): the whole tree, said under the bar.
+        if (dropGoneScopes(state)) scopeGone = tree;
         const type = state.rowType;
         const st = state.types[type];
+        const scope = scopeOfType(state, type);
+        // # and Done read the People table's scope; the work list's chips too.
+        applyScopeCells(m, scopeOfType(state, 'persons'));
+        // Jumps by a name (spec 103 U3): another tree drops the history, the row shown for now and the strip.
+        if (jumpsTree !== tree) {
+            jumps.clear();
+            jumpsTree = tree;
+            tempShown = null;
+            hiddenJump = null;
+        }
+        // Pinned rows (spec 103 §3): another tree or row type drops them.
+        pins.use(tree, type);
+        const pctx = peopleCtx(state);
+        if (tempShown && (tempShown.tree !== tree || type !== 'persons' || tempShown.ctx !== pctx)) tempShown = null;
+        if (hiddenJump && (hiddenJump.tree !== tree || hiddenJump.ctx !== `${type}|${pctx}`)) hiddenJump = null;
 
         if (!mounted || mounted.container !== container || mounted.lang !== lang || !container.contains(mounted.grid.el)) {
             this.closeTableColumns(false);
@@ -671,6 +936,33 @@ export const tableMethods = uiModule({
                 onRowType: (t) => this.setTableRowType(t),
                 onRowTypeSheet: () => this.showTableRowTypeSheet(),
                 onMoreMenu: () => this.showTableMoreMenu(),
+                onHistory: (d) => { this.tableHistory(d, false); },
+                onScopeMenu: (anchor) => this.showTableScopeMenu(anchor),
+            });
+            const notice = createNotice({
+                onShow: () => { if (hiddenJump) this.tableRunJump(hiddenJump.step, true, true); },
+                onClear: () => {
+                    const h = hiddenJump;
+                    if (!h) return;
+                    const pst = stateOf(treeKey()).types.persons;
+                    clearFilter(pst.filter);
+                    pst.search = '';
+                    filterChanged(pst);
+                    pst.top = 0;
+                    this.tableRunJump(h.step, false, true);
+                },
+                onWhole: () => {
+                    const h = hiddenJump;
+                    if (!h) return;
+                    setTableScope(stateOf(treeKey()), null);
+                    this.tableRunJump(h.step, false, true);
+                },
+                onClose: () => {
+                    hiddenJump = null;
+                    scopeGone = null;
+                    showNotice(notice, null);
+                    mounted?.grid.el.focus({ preventScroll: true });
+                },
             });
             const grid = new TableGrid({
                 onScroll: (top, left) => {
@@ -691,7 +983,7 @@ export const tableMethods = uiModule({
                     // After the editor's own steps (Tab opens the next one: the selection keeps waiting).
                     queueMicrotask(() => {
                         if (!pendingShared || mounted?.grid.isEditing()) return;
-                        this.tableSharedSelect(pendingShared.person);
+                        this.tableSharedSelect(pendingShared.person, pendingShared.scroll);
                     });
                 },
                 // A tap opens the row's sheet; a mouse or a pen only selects, on any device (its menu is the right button's).
@@ -706,7 +998,9 @@ export const tableMethods = uiModule({
                 },
                 onRowAction: (action, line) => this.tableRowAction(action, line),
                 onEditCell: (line, cell) => this.tableEditCell(line, cell.col),
-                onName: (line, _col, name, anchor) => this.tableNameAction(line, name, anchor),
+                onName: (line, col, name, anchor) => this.tableNameAction(line, name, anchor, col),
+                onPickName: (line, col, names, anchor) => this.tableLinkPick(line, col, names, anchor),
+                onHistory: (d) => this.tableHistory(d, true),
                 onMoreCites: (_line, _col, ids, anchor) => this.showTableCites(ids, anchor),
                 onSharedAges: (line, anchor) => { if (line.kind !== 'more' && line.row.kind === 'event') this.showTableSharedAges(line.row, anchor); },
                 onRowMenu: (line, anchor, cell) => this.showTableRowMenu(line, anchor, cell),
@@ -722,9 +1016,11 @@ export const tableMethods = uiModule({
                     return true;
                 }),
                 onToggleGroup: (group, collapse) => this.changeTableColumns(st => setGroupCollapsed(st, group, collapse)),
+                onToggleRowGroup: (key, open) => this.toggleTableRowGroup(key, open),
                 onHeadMenu: (colId, anchor) => this.showTableHeadMenu(colId, anchor),
                 onHeadSort: (colId, add) => this.changeTableColumns(st => (add ? sortShiftClick(st, colId) : sortClick(st, colId))),
                 onCoverageCell: (colId, anchor) => this.showTableCoverageMenu(colId, anchor),
+                onCoverageHelp: (anchor) => this.showTableCoverageHelp(anchor),
                 // §13c: the search counts among what applies, so it goes too.
                 onClearFilters: () => this.changeTableFilter((f, st) => {
                     const searched = st.search !== '';
@@ -733,6 +1029,8 @@ export const tableMethods = uiModule({
                 }, true),
                 onResize: (colId, width) => this.changeTableColumns(st => setColumnWidth(st, colId, width)),
                 onMoveColumn: (colId, offset) => this.changeTableColumns((st, t) => moveColumnBy(t, st, colId, offset)),
+                onCheck: (line) => this.toggleTableDone(line),
+                onThumb: (line) => { if (line.kind !== 'more' && line.row.kind === 'union') this.openUnionPhotoViewer(line.row.id); },
                 onMoveGroup: (start, end, before) => this.changeTableColumns((st, t) => {
                     const d = mounted?.display;
                     if (!d) return false;
@@ -761,6 +1059,7 @@ export const tableMethods = uiModule({
                 });
             }
             const status = createStatus();
+            status.querySelector('.tv-status-agent-show')!.addEventListener('click', () => this.tableShowAgentRow());
             const legendBtn = status.querySelector<HTMLButtonElement>('.tv-legend-btn')!;
             legendBtn.addEventListener('click', () => this.showTableLegend(legendBtn));
             const colsBtn = document.createElement('button');
@@ -781,9 +1080,11 @@ export const tableMethods = uiModule({
                 onChip: (chip, on) => this.changeTableFilter(f => setChip(f, chip, on)),
                 onResearchNew: (w) => this.changeTableFilter(f => setResearchNew(f, w)),
                 onChoiceChip: (chip, anchor) => this.showTableChipChoice(chip, anchor),
-                onEditColumn: (col, anchor) => this.showTableColumnFilter(col, anchor),
-                onRemoveColumn: (col) => this.changeTableFilter(f => removeColumnFilter(f, col)),
+                onEditColumn: (col, at, anchor) => this.showTableColumnFilter(col, anchor, at),
+                onRemoveColumn: (at) => this.changeTableFilter(f => removeColumnItemAt(f, at)),
                 onClear: () => this.changeTableFilter(f => clearFilter(f), true),
+                onUnpinAll: () => this.changeTablePins(() => pins.clear()),
+                onUngroup: () => this.setTableGroupBy(null),
                 onSheet: () => this.showTableFilters(),
             });
             const views = new ViewBar(bar.querySelector<HTMLElement>('.tv-slot-view')!, {
@@ -797,7 +1098,11 @@ export const tableMethods = uiModule({
             exportBtn.type = 'button';
             exportBtn.className = 'tv-export-btn';
             exportBtn.setAttribute('aria-haspopup', 'dialog');
-            exportBtn.innerHTML = `${strings.table.export}<span class="tv-export-caret" aria-hidden="true">▾</span>`;
+            // §1.2: the working state drawn with it; the toolbar has no room for the sentence, so the button keeps
+            // its own word with the spinner in front (its width the same), the sentence goes to a toast when hidden.
+            exportBtn.innerHTML = busyButtonHtml(`${escHtml(strings.table.export)}<span class="tv-export-caret" aria-hidden="true">▾</span>`,
+                strings.table.export, undefined, { own: true });
+            exportBtn.dataset.busy = 'idle';
             exportBtn.addEventListener('click', () => this.showTableExport());
             bar.querySelector('.tv-slot-export')!.appendChild(exportBtn);
             // ⧉ (spec 079 §1, 1c): the Table with its state in a new window; this window stays on the Table.
@@ -815,32 +1120,47 @@ export const tableMethods = uiModule({
             const bulk = document.createElement('div');
             bulk.className = 'table-bulk';
             bulk.hidden = true;
-            container.append(bar, bulk, grid.el, empty, status);
+            container.append(bar, notice, bulk, grid.el, empty, status);
             // A followed research's card stands below the bar: placed again when the bar's bottom moves
             // (the chips wrap, the research block opens, the window narrows).
             barWatch?.disconnect();
             let barBottom = -1;
+            let containerWidth = -1;
             barWatch = typeof ResizeObserver === 'function' ? new ResizeObserver(() => {
+                // A new width (the window, a side panel): row 1 fitted again before the card is placed.
+                // The container's width is watched (not the bar's), so the bar's new height comes deeper, in the same frame.
+                const width = Math.round(container.getBoundingClientRect().width);
+                if (width !== containerWidth) { containerWidth = width; fitBarRow(bar); }
                 const bottom = Math.round(bar.getBoundingClientRect().bottom);
                 if (bottom === barBottom) return;
                 barBottom = bottom;
                 this.placeLivePanel?.();
             }) : null;
             barWatch?.observe(bar);
+            barWatch?.observe(container);
+            // The fonts' final widths: fitted again once they are in.
+            void document.fonts?.ready.then(() => { if (mounted?.bar === bar) fitBarRow(bar); });
             mounted = {
                 container, lang, bar, bulk, grid, status, colsBtn, drawn: '', display: null, filters, filterState: null, views, exportBtn, windowBtn,
-                empty, emptyKey: '', unionsButton: null,
+                empty, emptyKey: '', unionsButton: null, notice, saveRows: [], pinOutside: new Set(), groupKeys: null,
             };
         }
 
-        const counts = rowCounts(m);
+        // The row types count what the scope has (spec 084 §9); Sources count the whole tree's.
+        const countScope = scope ?? (type === 'sources' ? scopeOfType(state, 'persons') : null);
+        const counts = countScope ? scopeCounts(m, countScope) : rowCounts(m);
         const phone = isPhoneBar();
         mounted.windowBtn.hidden = !canOpenWindows();
+        // ⋯ wider than a phone offers Group by (spec 084 §10) and Save as list of people (§6):
+        // with neither (no rows of the type, or Sources), no ⋯.
+        const groupOffer = this.tableGroupOffer(m, scope);
+        mounted.bar.querySelector('.tv-slot-more')?.classList.toggle('is-empty', !this.tableRuleList()
+            && (counts[type] === 0 || (!canSaveAsList(type) && !offeredGroupKeys(type, groupOffer).length)));
         normalizeColumns(type, st);
-        const display = displayColumns(type, st, phone);
+        const display = withLeadColumns(displayColumns(type, st, phone), type === 'persons' ? scope : null);
         mounted.display = display;
         this.tableCrossTrees(tree, m, type === 'persons' && display.columns.some(c => c.id === 'crossTree'));
-        const { rows, pass, stale } = viewRows(tree, m, type, st.filter, st.search, st.sort, display.columns);
+        const { rows, pass, stale } = viewRows(tree, m, type, st.filter, st.search, st.sort, display.columns, scope);
         // Entered from another view (U9): the person in focus is the active row (the active one kept if it is theirs).
         let revealFocus: string | null = null;
         if (focusOnEnter) {
@@ -860,11 +1180,42 @@ export const tableMethods = uiModule({
             if (!revealFocus && st.selected && rows.some(r => rowKey(r) === st.selected)) revealFocus = st.selected;
         }
         const persons = type === 'persons';
-        const lines = persons ? buildLines(rows, { collapse: st.unions, pass, revealed: new Set(st.revealedUnions) }) : undefined;
+        // A person shown for now outside the filter (spec 103 2b): in the rows, not in their count.
+        const shownRows = persons && tempShown ? withTempRow(m, rows, tempShown.person, st.sort, pass) : rows;
+        const temp = shownRows !== rows && tempShown ? new Set([`p:${tempShown.person}`]) : undefined;
+        // The rows under group headers (spec 084 §10): the jump's or the focus's row opens its group.
+        const grouping = groupingFits(type, st.group, groupOffer) ? st.group : null;
+        const groups = grouping ? groupRows(m, type, grouping.by, shownRows, scope?.cells.done ?? null) : null;
+        if (grouping && groups) {
+            for (const want of [openGroupFor, revealFocus]) {
+                const row = want ? shownRows.find(r => rowKey(r) === want) : undefined;
+                if (!row) continue;
+                const keys = groupKeysOfRow(m, type, grouping.by, row, scope?.cells.done ?? null);
+                if (keys.length && keys.every(k => grouping.collapsed.includes(k))) grouping.collapsed = grouping.collapsed.filter(k => k !== keys[0]);
+            }
+        }
+        openGroupFor = null;
+        const lineOpts = { collapse: st.unions, pass, revealed: new Set(st.revealedUnions) };
+        const lines: readonly DrawLine[] | undefined = groups && grouping
+            ? groupedLines(groups, new Set(grouping.collapsed), rows => (persons ? buildLines(rows, lineOpts) : plainLines(rows)))
+            : persons ? buildLines(shownRows, lineOpts) : undefined;
+        mounted.groupKeys = groups ? groups.map(g => g.key) : null;
+        const pinned = this.tablePinnedLines(m, type, st, state.open[type], shownRows, pass, phone);
+        mounted.saveRows = rows;
+        mounted.pinOutside = pinned?.outside ?? new Set();
+        // Pinned rows and a row shown for now outside the list (spec 084 §9): "outside the list".
+        const outsideList = scope ? new Set([...(pinned?.lines ?? []).map(l => l.row), ...shownRows.filter(r => temp?.has(rowKey(r)))]
+            .filter(r => outsideScope(r, scope)).map(rowKey)) : undefined;
         const unionsButton = persons && hasMultiUnions(rows) ? (anyExpanded(st.unions, rows) ? 'collapse' : 'expand') : null;
         const summary = filterSummary(m, type, st.filter, st.search);
+        // Another window following the agent (spec 097 §5): the agent's row tinted, scrolled to, or said hidden.
+        const follow = windowAgentFollow();
+        const agentPerson = follow && research?.input.live ? this.liveFollowTarget() : null;
+        const agentKey = agentPerson && persons && m.personRows.has(agentPerson) ? `p:${agentPerson}` : null;
         const filterState: FilterBarState = {
             model: m, type, filter: st.filter, search: st.search, shown: rows.length, checking: !index || !!checks?.running, phone,
+            pinned: phone ? 0 : pins.count(),
+            grouped: grouping ? strings.table.groupKey[grouping.by] : null,
             research: persons && research ? researchBarState(research, m, st.filter, display.columns, isResearchViewId(state.open[type])) : undefined,
         };
         mounted.filterState = filterState;
@@ -876,16 +1227,23 @@ export const tableMethods = uiModule({
         mounted.colsBtn.setAttribute('aria-label', `${strings.table.columns}, ${strings.table.columnsCount(st.columns.length, total)}`);
         container.dataset.rowtype = type;
         updateBar(mounted.bar, type, counts);
+        const scopeList = scopeOfType(state, type === 'sources' ? 'persons' : type)?.list ?? null;
+        updateScope(mounted.bar, {
+            list: type !== 'sources' && scopeList ? { name: listDisplayName(scopeList), kind: listKind(scopeList) } : null,
+            disabled: type === 'sources',
+        });
         this.renderTableSplitBar(mounted.bulk, type);
-        updateStatus(mounted.status, type, rows.length, counts[type], st.sort, !!checks?.running, tableReadOnly());
+        updateStatus(mounted.status, type, rows.length, counts[type], st.sort, !!checks?.running, tableReadOnly(),
+            groups && grouping ? { n: groups.length, distinct: persons && multiValued(grouping.by) && hasRepeats(groups, shownRows.length) ? shownRows.length : null } : null);
         const researchShown = !!research && display.columns.some(c => c.group === 'research');
         updateResearchStatus(mounted.status, !research || !researchShown ? null
             : research.input.live ? { live: true, followed: !!research.input.followed } : { live: false, when: this.tableResearchWhen(tree) });
         mounted.unionsButton = unionsButton;
         const openView = openViewOf(state, type, data.tableViews);
+        const treeCounts = rowCounts(m);
         this.drawTableEmpty(tableEmptyState({
-            persons: counts.persons, unions: counts.unions, events: counts.events, sources: counts.sources, type, viewId: openView.id, viewChanged: viewChanged(openView, st),
-            search: st.search, shown: rows.length, checksDone: !!index && !checks?.running,
+            persons: treeCounts.persons, unions: treeCounts.unions, events: treeCounts.events, sources: treeCounts.sources, type, viewId: openView.id, viewChanged: viewChanged(openView, st),
+            search: st.search, shown: shownRows.length, checksDone: !!index && !checks?.running,
             leads: index ? index.issues.filter(i => i.severity === 'info').length : 0,
             allComplete: () => {
                 const comp = columnById('persons', 'comp');
@@ -898,20 +1256,23 @@ export const tableMethods = uiModule({
         const restore = mounted.drawn !== drawn ? { top: st.top, left: st.left } : undefined;
         mounted.drawn = drawn;
         mounted.grid.setInput({
-            model: m, type, rows, columns: display.columns, widths: display.widths, pinned: display.pinned, sort: st.sort, homeId,
+            model: m, type, rows: shownRows, columns: display.columns, widths: display.widths, pinned: display.pinned, sort: st.sort, homeId,
+            links: type === 'persons' || type === 'unions', temp,
+            pinLines: pinned?.lines, pinnedKeys: pinned?.keys, pinOutside: pinned?.outside, outsideList,
+            listPeople: type === 'unions' && scope ? scope.cells.pos : undefined,
             bands: display.bands, coverageRow: st.coverageRow, editableHead: !phone,
             hit: searchQuery(st.search),
             filtered: new Set(st.filter.items.filter((i): i is Exclude<typeof i, { chip: ChipId }> => !isChipItem(i) && columnItemActive(i)).map(i => i.col)),
-            noMatch: !rows.length && summary
+            noMatch: !shownRows.length && summary
                 ? { title: strings.table.noMatch, text: strings.table.applies(summary), action: strings.table.clearFilters }
                 : null,
-            lines, subRows: persons, unionsButton, stale,
+            lines, subRows: persons, unionsButton, stale, stickyGroups: phone && !!groups,
             actions: phone ? null : { edit: !tableReadOnly(), tree: treeActionOffered() },
             editableAt: !phone && this.tableInlineEdit() ? (line, col) => !!this.tableEditTarget(line, col) : undefined,
             liveOff: research ? new Set(display.columns
                 .filter(c => c.group === 'research' && (c.id === 'rTasks' || c.id === 'rAgent') && researchColumnLiveOff(research, c.id as ResearchColumnId))
                 .map(c => c.id)) : undefined,
-            coverage: st.coverageRow ? (col) => coverageOf(m, rows, col, pass, display.columns[0]?.id) : undefined,
+            coverage: st.coverageRow ? (col) => (LEAD_COLUMNS.includes(col) ? null : coverageOf(m, rows, col, pass, display.columns.find(c => !LEAD_COLUMNS.includes(c))?.id)) : undefined,
             selected: st.selected,
             selectedShared: !!selectionShare?.active(),
             label: `${strings.viewModeSwitch.table} – ${strings.table.rows[type]}`,
@@ -920,6 +1281,7 @@ export const tableMethods = uiModule({
             agentAt: research?.input.live
                 ? (line) => (line.kind === 'row' && line.row.kind === 'person' ? researchAgentRow(research, line.row.person) : null)
                 : undefined,
+            agentKey,
             issueAt: index ? (line, col): CellIssueMark | null => {
                 const f = lineFindings(index, m, line, col)[0];
                 return f ? { severity: f.severity, label: translateValidationType(f.issue.type) } : null;
@@ -936,6 +1298,11 @@ export const tableMethods = uiModule({
             } : undefined,
         }, restore);
         if (revealFocus) mounted.grid.revealKey(revealFocus);
+        this.tableAgentRow(follow, agentKey, shownRows.some(r => rowKey(r) === agentKey), !!pinned?.keys.has(agentKey ?? ''));
+        if (scopeGone && scopeGone !== tree) scopeGone = null;
+        showNotice(mounted.notice, hiddenJump ? hiddenJump.step.to.label : scopeGone ? '' : null,
+            hiddenJump?.outsideList ? 'list' : !hiddenJump && scopeGone ? 'gone' : 'filter');
+        updateNav(mounted.bar, jumps.any(), jumps.canBack() ? jumps.backLabel() : null, jumps.canForward() ? jumps.forwardLabel() : null);
         if (flashNext) {
             const lit = flashNext.tree === tree ? rowKeysFor(data, type, flashNext.keys, type === 'events' ? m.events : undefined) : null;
             flashNext = null;
@@ -945,7 +1312,9 @@ export const tableMethods = uiModule({
         const open = openViewOf(state, type, data.tableViews);
         mounted.views.update({
             name: open.name, builtin: isBuiltinId(open.id), changed: viewChanged(open, st), readOnly: DataManager.isReadOnly(),
+            researchIdle: researchFilterIdle(m, type, st.filter),
         });
+        fitBarRow(mounted.bar);
         keepWork(tree, state);
     },
 
@@ -1049,8 +1418,7 @@ export const tableMethods = uiModule({
     tableCellFinder(line: GridLine, colPos: number): () => HTMLElement | null {
         const grid = mounted?.grid;
         const key = lineKey(line);
-        return () => (grid ? [...grid.el.querySelectorAll<HTMLElement>('.tv-row[data-key]')]
-            .find(r => r.dataset.key === key)?.querySelector<HTMLElement>(`[aria-colindex="${colPos + 1}"]`) ?? null : null);
+        return () => grid?.drawnCell(key, colPos) ?? null;
     },
 
     /** A finding's cell was clicked or Enter pressed on it (§7.4): the row selected, the bubble opened. */
@@ -1076,7 +1444,6 @@ export const tableMethods = uiModule({
     /** The bubble (a phone: the sheet) of these findings at a cell; `about`: each says whom or what it is about. */
     openTableFindings(line: GridLine, colPos: number, cell: HTMLElement, list: readonly CellFinding[], about: boolean): void {
         if (!list.length || !mounted) return;
-        const rect = cell.getBoundingClientRect();
         const treeId = treeKey();
         const readOnly = this.treeValidationReadOnly(treeId);
         const container = mounted.container;
@@ -1088,8 +1455,9 @@ export const tableMethods = uiModule({
         }
         const grid = mounted.grid;
         const cellKey = lineKey(line);
-        const findCell = (): HTMLElement | null => [...grid.el.querySelectorAll<HTMLElement>('.tv-row[data-key]')]
-            .find(r => r.dataset.key === cellKey)?.querySelector<HTMLElement>(`[aria-colindex="${colPos + 1}"]`) ?? null;
+        const findCell = (): HTMLElement | null => grid.drawnCell(cellKey, colPos);
+        // The cell as drawn now: a select draws the rows anew (T54 H8).
+        const rect = (findCell() ?? cell).getBoundingClientRect();
         const data = DataManager.getData();
         const shown = list.map(f => {
             const shared = sharedFinding(f.issue, data);
@@ -1288,7 +1656,10 @@ export const tableMethods = uiModule({
             hide: change((s, t) => hideColumn(t, s, colId)),
         });
         const title = columnLabel(col);
-        const note = columnNote(col);
+        // # and Done of a scope (spec 084 §9, §13d) only sort: they are not moved, pinned, filtered or hidden.
+        const lead = LEAD_COLUMNS.includes(col);
+        if (lead) entries.splice(3);
+        const note = lead ? '' : columnNote(col);
         if (!phone) {
             openHeadMenu(anchor, title, note, entries);
             return;
@@ -1320,15 +1691,23 @@ export const tableMethods = uiModule({
         if (el && TreeRenderer.getViewMode() === 'table') this.renderTableView(el);
     },
 
-    /** A column's filter (8d): a panel under the head or its chip; on a phone a sheet. */
-    showTableColumnFilter(colId: string, anchor: HTMLElement): void {
+    /**
+     * A column's filter (8d): a panel under the head or its chip; on a phone a
+     * sheet. A chip edits its own item (`at`, one of the column's exclusions
+     * too, spec 103 K1.2); the head the column's main filter.
+     */
+    showTableColumnFilter(colId: string, anchor: HTMLElement, at = -1): void {
         if (!model) return;
         const state = stateOf(treeKey());
         const type = state.rowType;
         const col = columnById(type, colId);
         if (!col) return;
-        const form = columnFilterForm(model, type, col, columnItem(state.types[type].filter, colId));
-        const apply = (): void => this.changeTableFilter(f => setColumnFilter(f, form.read()));
+        const filter = state.types[type].filter;
+        const own = filter.items[at];
+        const target = own && !isChipItem(own) && own.col === colId ? own : columnItem(filter, colId);
+        const form = columnFilterForm(model, type, col, target);
+        // The item stays the one edited, wherever it is in the items when the form applies.
+        const apply = (): void => this.changeTableFilter(f => setColumnFilter(f, form.read(), target ? f.items.indexOf(target) : -1));
         this.showTableFilterForm(anchor, columnLabel(col), form.el, apply);
     },
 
@@ -1419,7 +1798,7 @@ export const tableMethods = uiModule({
             onChip: (chip, on) => this.changeTableFilter(f => setChip(f, chip, on)),
             onResearchNew: (w) => this.changeTableFilter(f => setResearchNew(f, w)),
             onChoice: (chip, choice) => this.changeTableFilter(f => setChip(f, chip, !!choice, choice ?? {})),
-            onRemoveColumn: (col) => this.changeTableFilter(f => removeColumnFilter(f, col)),
+            onRemoveColumn: (at) => this.changeTableFilter(f => removeColumnItemAt(f, at)),
             onClear: () => this.changeTableFilter(f => clearFilter(f), true),
             onClose: () => this.closeTableFilters(),
         });
@@ -1487,7 +1866,9 @@ export const tableMethods = uiModule({
 
     /** ⧉ in the Table's bar follows whether windows are offered (a resize). */
     syncTableWindowButton(): void {
-        if (mounted) mounted.windowBtn.hidden = !canOpenWindows();
+        if (!mounted) return;
+        mounted.windowBtn.hidden = !canOpenWindows();
+        fitBarRow(mounted.bar);
     },
 
     /**
@@ -1520,14 +1901,31 @@ export const tableMethods = uiModule({
     },
 
     /**
+     * Whether the Table on screen leaves the person out (spec 110 §7): its
+     * filter, search or list shows no row of theirs (persons, unions, events),
+     * nor a pinned row or one shown for now. False when the Table is not shown
+     * or shows sources (about no one).
+     */
+    tableHidesPerson(personId: string): boolean {
+        const tree = treeKey();
+        if (TreeRenderer.getViewMode() !== 'table' || !document.getElementById('table-container')) return false;
+        if (!view || view.tree !== tree || view.type === 'sources') return false;
+        const pid = personId as PersonId;
+        if (tempShown && tempShown.tree === tree && tempShown.person === pid) return false;
+        if (mounted?.pinOutside.has(`p:${pid}`)) return false;
+        return !view.result.rows.some(r => rowPeople(r).includes(pid));
+    },
+
+    /**
      * A person selected in another window (spec 079 §2): their row here is
      * the selected one (the row kept if it is theirs), scrolled to only when
      * out of view. During a cell's edit it waits for the edit's end; a person
-     * the view leaves out: no row is selected, nothing said.
+     * the view leaves out: no row is selected, nothing said. `scroll` false:
+     * the row is selected where it is (the window follows the agent, spec 097 §4).
      */
-    tableSharedSelect(personId: string | null): void {
+    tableSharedSelect(personId: string | null, scroll = true): void {
         if (mounted?.grid.isEditing()) {
-            pendingShared = { person: personId as PersonId | null };
+            pendingShared = { person: personId as PersonId | null, scroll };
             return;
         }
         pendingShared = null;
@@ -1550,7 +1948,7 @@ export const tableMethods = uiModule({
         const row = current && rowPeople(current).includes(pid) ? current : rows.find(r => rowPeople(r).includes(pid));
         st.selected = row ? rowKey(row) : null;
         this.renderTableView(el!);
-        if (row) mounted?.grid.revealKeyNearest(rowKey(row));
+        if (row && scroll) mounted?.grid.revealKeyNearest(rowKey(row));
     },
 
     // -----------------------------------------------------------------------
@@ -1560,7 +1958,7 @@ export const tableMethods = uiModule({
     tableRowAction(action: RowAction, line: GridLine): void {
         if (line.row.kind === 'source') {
             closeHeadMenu();
-            if (action !== 'tree') this.openTableSource(line.row);
+            if (action !== 'tree') this.openTableSource(line.row, action === 'edit');
             return;
         }
         const personId = personOfRow(line.row);
@@ -1595,27 +1993,40 @@ export const tableMethods = uiModule({
         grid?.scrollIntoView({ block: 'nearest' });
     },
 
-    /**
-     * A source row's Open source and Edit (§14.2): the sources manager on that
-     * source; a locked tree, which has no manager, shows the source itself.
-     */
-    openTableSource(row: SourceRow): void {
-        this.openTableSourceId(row.id);
+    /** A source row's Open source (the source itself) and Edit (its editor) (§14.2). */
+    openTableSource(row: SourceRow, edit = false): void {
+        this.openTableSourceId(row.id, edit);
     },
 
-    /** A source by its id in the sources manager (§14.2, §14.3); a locked tree shows the source itself. */
-    openTableSourceId(id: string): void {
+    /**
+     * A source by its id (§14.2, §14.3): the source itself (its excerpts, Edit
+     * in it when the tree can be changed), or with `edit` straight its editor;
+     * a locked or read-only tree shows the source only. Closed, the table is
+     * where it was, its active cell focused again.
+     */
+    openTableSourceId(id: string, edit = false): void {
         const data = DataManager.getData();
         if (!data.sources?.[id]) return;
-        if (DataManager.isTreeLocked()) { this.showSourceViewer(id, null, { readOnly: true }); return; }
-        watching = { tree: treeKey(), name: () => DataManager.getData().sources?.[id]?.title ?? '', keys: watchEdit(data, [`s:${id}`]) };
+        // Nothing of the manager's stack stands between the table and the source.
         this.clearDialogStack();
-        this.showSourcesDialog(id);
+        if (tableReadOnly()) {
+            this.showSourceViewer(id, null, { readOnly: DataManager.isTreeLocked() });
+        } else {
+            watching = { tree: treeKey(), name: () => DataManager.getData().sources?.[id]?.title ?? '', keys: watchEdit(data, [`s:${id}`]) };
+            if (edit) {
+                this.sourceEditorContext = null;
+                this.reopenViewerAfterEditor = null;
+                this.showEditSourceModal(id);
+            } else {
+                this.showSourceViewer(id, null);
+            }
+        }
+        focusTableAfterSource();
     },
 
     /**
      * The pill "+N" of a citation cell (§14.3): the further cited sources, a
-     * click (a tap on a phone's sheet) opens one in the sources manager.
+     * click (a tap on a phone's sheet) opens that source.
      */
     showTableCites(ids: readonly string[], anchor: HTMLElement): void {
         closeHeadMenu();
@@ -1736,9 +2147,180 @@ export const tableMethods = uiModule({
      * participant's name offers "Filter: godparent {name}" (and, for a tree's
      * person, Open person), as a menu or on a phone and by touch as a sheet.
      */
-    tableNameAction(line: GridLine, name: CellName, anchor: HTMLElement): void {
+    // -----------------------------------------------------------------------
+    // Jumps by a person's name (spec 103 U3)
+
+    /**
+     * The step of a jump from a cell to a person's row in the People table
+     * (spec 103 §1, 3): where it starts, the line and cell it lands on (the
+     * Partner cell on the union's line through a partner, else Name; D2), the
+     * union opened for it (D3).
+     */
+    tableJumpStep(line: GridLine, col: ColumnDef, personId: PersonId): JumpStep | null {
+        const m = model;
+        const target = DataManager.getPerson(personId);
+        const prow = m?.personRows.get(personId);
+        if (!m || !target || !prow || line.kind === 'more') return null;
+        const state = stateOf(treeKey());
+        const people = rowPeople(line.row);
+        const origin = people.find(id => id !== personId) ?? null;
+        const from = [origin, ...people].map(id => (id ? DataManager.getPerson(id) : null)).find(Boolean);
+        let via = col.id;
+        let unionId: string | null = null;
+        if (line.row.kind === 'union' && (col.id === 'p1' || col.id === 'p2')) {
+            via = 'partner';
+            unionId = line.row.id;
+        } else if (line.row.kind === 'person' && col.id === 'partner' && line.union !== null) {
+            unionId = line.row.unions[line.union]?.id ?? null;
+        }
+        const pst = state.types.persons;
+        const shown = displayColumns('persons', pst, isPhoneBar()).columns.map(c => c.id);
+        const unionIndex = unionId ? prow.unions.findIndex(u => u.id === unionId) : -1;
+        const cell = jumpTargetCell(via, shown, unionIndex, prow.unions.length);
+        const grid = mounted?.grid.el;
+        return {
+            from: {
+                rowType: state.rowType, row: rowKey(line.row), key: lineKey(line), col: col.id,
+                scrollTop: grid?.scrollTop ?? 0, scrollLeft: grid?.scrollLeft ?? 0, label: from ? personName(from) : '',
+            },
+            to: {
+                personId, key: cell.sub ? `p:${personId}#u${cell.sub}` : `p:${personId}`, col: cell.col,
+                origin: cell.col === 'name' ? null : origin, label: personName(target),
+                expanded: cell.sub && !isExpanded(pst.unions, personId) ? personId : undefined,
+            },
+        };
+    },
+
+    /** Whether the People table shows a person now (its filter and search pass them). */
+    tablePersonShown(personId: PersonId): boolean {
+        const m = model;
+        if (!m) return false;
+        const tree = treeKey();
+        const pst = stateOf(tree).types.persons;
+        const state = stateOf(tree);
+        const scope = scopeOfType(state, 'persons');
+        const columns = withLeadColumns(displayColumns('persons', pst, isPhoneBar()), scope).columns;
+        return viewRows(tree, m, 'persons', pst.filter, pst.search, pst.sort, columns, scope).rows.some(r => r.kind === 'person' && r.id === personId);
+    },
+
+    /**
+     * Whether a person's row is pinned in the People table now (spec 103 §3):
+     * a jump to them while the filter hides them lands on their pinned row.
+     */
+    tablePersonPinned(personId: PersonId): boolean {
+        const tree = treeKey();
+        return stateOf(tree).rowType === 'persons' && !isPhoneBar() && pins.holds(tree, 'persons', `p:${personId}`);
+    },
+
+    /**
+     * A click (or Enter) on a person's name: the jump, or the strip when the
+     * filter hides them (spec 103 2a); a pinned person the filter hides is
+     * seen in the pinned rows, so the jump goes to that row, no strip.
+     */
+    tableJumpBy(line: GridLine, col: ColumnDef, personId: PersonId): void {
+        closeHeadMenu();
+        const step = this.tableJumpStep(line, col, personId);
+        if (!step) return;
+        if (this.tablePersonShown(personId) || this.tablePersonPinned(personId)) { this.tableRunJump(step, false, true); return; }
+        const tree = treeKey();
+        const state = stateOf(tree);
+        // Outside the People table's list (spec 084 §9): "Not in the list", with Whole tree.
+        const scope = scopeOfType(state, 'persons');
+        const row = model?.personRows.get(personId);
+        hiddenJump = { tree, step, ctx: `${state.rowType}|${peopleCtx(state)}`, outsideList: !!scope && !!row && outsideScope(row, scope) };
+        const el = document.getElementById('table-container');
+        if (el && TreeRenderer.getViewMode() === 'table') this.renderTableView(el);
+    },
+
+    /**
+     * A jump (spec 103 §1, 4): the People table, the person's row (shown for
+     * now outside the filter with `temp`), their union opened (D3), the cell
+     * in the middle and focused, the row lit; a new step when `record`.
+     */
+    tableRunJump(step: JumpStep, temp: boolean, record: boolean): void {
+        const tree = treeKey();
+        const state = stateOf(tree);
+        const pst = state.types.persons;
+        hiddenJump = null;
+        step.to.temp = temp;
+        if (record) {
+            if (jumpsTree !== tree) { jumps.clear(); jumpsTree = tree; }
+            jumps.push(step);
+        }
+        if (step.to.expanded) setExpanded(pst.unions, step.to.personId, true);
+        state.rowType = 'persons';
+        pst.selected = `p:${step.to.personId}`;
+        openGroupFor = pst.selected;
+        if (temp) tempShown = { tree, person: step.to.personId as PersonId, ctx: peopleCtx(state) };
+        const el = document.getElementById('table-container');
+        if (!el || TreeRenderer.getViewMode() !== 'table') return;
+        this.renderTableView(el);
+        const grid = mounted?.grid;
+        const cols = mounted?.display?.columns ?? [];
+        if (!grid) return;
+        const name = Math.max(0, cols.findIndex(c => c.id === 'name'));
+        const at = cols.findIndex(c => c.id === step.to.col);
+        grid.flash([`p:${step.to.personId}`]);
+        if (grid.jumpTo(step.to.key, at < 0 ? name : at, step.to.origin) || grid.jumpTo(`p:${step.to.personId}`, name, null)) return;
+        // Not in the body (the filter hides them) but pinned: their row in the pinned rows.
+        if (!grid.jumpToPin(step.to.key, at < 0 ? name : at, step.to.origin)) grid.jumpToPin(`p:${step.to.personId}`, name, null);
+    },
+
+    /**
+     * ‹ / › and Alt+← / Alt+→ (spec 103 §1, 6): back to where the last jump
+     * started (its row type, scroll and cell; the union it opened closed, the
+     * row it showed for now gone), or the jump again. False: no step.
+     */
+    tableHistory(dir: -1 | 1, focus: boolean): boolean {
+        const tree = treeKey();
+        if (jumpsTree !== tree) return false;
+        if (dir > 0) {
+            const step = jumps.forward();
+            if (!step) return false;
+            const pid = step.to.personId as PersonId;
+            this.tableRunJump(step, !this.tablePersonPinned(pid) && (step.to.temp || !this.tablePersonShown(pid)), false);
+            return true;
+        }
+        const step = jumps.back();
+        if (!step) return false;
+        const state = stateOf(tree);
+        hiddenJump = null;
+        if (step.to.expanded) setExpanded(state.types.persons.unions, step.to.personId, false);
+        if (step.to.temp && tempShown?.person === step.to.personId) tempShown = null;
+        const from = step.from;
+        state.rowType = from.rowType;
+        const fst = state.types[from.rowType];
+        fst.selected = from.row;
+        fst.top = from.scrollTop;
+        fst.left = from.scrollLeft;
+        const el = document.getElementById('table-container');
+        if (!el || TreeRenderer.getViewMode() !== 'table') return true;
+        this.renderTableView(el);
+        const grid = mounted?.grid;
+        if (!grid) return true;
+        const at = Math.max(0, (mounted?.display?.columns ?? []).findIndex(c => c.id === from.col));
+        grid.flash([from.row]);
+        grid.restoreCell(from.key, at, from.scrollTop, from.scrollLeft, focus);
+        return true;
+    },
+
+    /** Enter on a cell naming several of the tree's people (spec 103 1i): "Go to…" with each one. */
+    tableLinkPick(line: GridLine, col: ColumnDef, names: readonly CellName[], anchor: HTMLElement): void {
+        const entries: MenuEntry[] = names.filter(n => !!n.personId).map((n, i) => ({
+            id: `link${i}`, label: n.text, icon: '', run: () => this.tableJumpBy(line, col, n.personId as PersonId),
+        }));
+        if (entries.length) openHeadMenu(anchor, strings.table.link.pick, '', entries);
+    },
+
+    tableNameAction(line: GridLine, name: CellName, anchor: HTMLElement, col?: ColumnDef): void {
         closeHeadMenu();
         const role = name.role;
+        // A person's link in the People and Unions tables (spec 103 U3): a jump to their row.
+        const type = stateOf(treeKey()).rowType;
+        if (!role && name.personId && col && (type === 'persons' || type === 'unions')) {
+            this.tableJumpBy(line, col, name.personId as PersonId);
+            return;
+        }
         if (!role) {
             if (name.personId && DataManager.getPerson(name.personId)) this.showPersonPage(name.personId);
             return;
@@ -1751,15 +2333,19 @@ export const tableMethods = uiModule({
         }, true);
         const personId = name.personId && DataManager.getPerson(name.personId) ? name.personId : null;
         const open = (): void => { if (personId) this.showPersonPage(personId); };
+        // Go to {name} (spec 103, decision D6 c): first, the jump to their row in the People table.
+        const goTo = (): void => { if (personId && col) this.tableJumpBy(line, col, personId as PersonId); };
         if (isPhoneBar() || isCoarsePointer()) {
-            const rows = [{ label: t.filterParticipant[role](name.text), icon: '', run: filter }];
+            const rows = personId && col ? [{ label: t.link.goTo(name.text), icon: '→', run: goTo }] : [];
+            rows.push({ label: t.filterParticipant[role](name.text), icon: '', run: filter });
             if (personId) rows.push({ label: t.act.open, icon: '▤', run: open });
             this.noteBottomSheetTrigger();
             this.hideBottomSheet();
             this.presentMenuSheet(name.text, [{ rows }]);
             return;
         }
-        const entries: MenuEntry[] = [{ id: 'participant', label: t.filterParticipant[role](name.text), icon: '', run: filter }];
+        const entries: MenuEntry[] = personId && col ? [{ id: 'goTo', label: t.link.goTo(name.text), icon: '→', run: goTo }] : [];
+        entries.push({ id: 'participant', label: t.filterParticipant[role](name.text), icon: '', run: filter });
         if (personId) entries.push({ id: 'open', label: t.act.open, icon: '▤', run: open });
         const menu = openHeadMenu(anchor, '', '', entries);
         menu.setAttribute('aria-label', name.text);
@@ -1777,12 +2363,14 @@ export const tableMethods = uiModule({
         if (!choices) return [];
         const t = strings.table;
         const col = cell.col;
-        const set = (item: ColumnFilter) => (): void => this.changeTableFilter(f => setColumnFilter(f, item), true);
+        // Only adds its value to the column's, Without one more exclusion (spec 103 K1.1, K1.3).
+        const only = (item: ColumnFilter) => (): void => this.changeTableFilter(f => addOnlyFilter(f, item), true);
+        const without = (item: ColumnFilter) => (): void => this.changeTableFilter(f => addWithoutFilter(f, item), true);
         const out: HeadMenuItem[] = [];
         const copy = choices.copy;
         if (copy) out.push({ id: 'cellCopy', label: t.cell.copy, icon: '', hint: fanZoomModifier() === '⌘' ? '⌘C' : 'Ctrl+C', run: () => copyPlainText(copy) });
-        if (choices.only) out.push({ id: 'cellOnly', label: t.cell.only(choices.label), icon: '', run: set(choices.only) });
-        if (choices.without) out.push({ id: 'cellWithout', label: t.cell.without(choices.label), icon: '', run: set(choices.without) });
+        if (choices.only) out.push({ id: 'cellOnly', label: t.cell.only(choices.label), icon: '', run: only(choices.only) });
+        if (choices.without) out.push({ id: 'cellWithout', label: t.cell.without(choices.label), icon: '', run: without(choices.without) });
         if (choices.empty) {
             out.push(
                 { id: 'cellEmpty', label: t.onlyEmpty, icon: '', run: () => this.changeTableFilter(f => setEmptyFilter(f, col, 'empty'), true) },
@@ -1799,15 +2387,291 @@ export const tableMethods = uiModule({
     },
 
     /** The row's menu (§10.1): the cell's part (T54 F4) · Show in tree · Open person (Enter) · Edit… (double click) · Expand / Collapse unions. */
+    /**
+     * The pinned rows' lines for the grid (spec 103 §3): rows gone from the
+     * data drop out; in the table's order, kept until the sort, the filter,
+     * the search or the view change (D7 a); a person with their union
+     * sub-rows as the body draws them (D5 a); those the filter hides marked.
+     * Null with none, and on a phone (no pins there).
+     */
+    tablePinnedLines(
+        m: TableModel, type: RowType, st: RowTypeState, view: unknown, shown: readonly TableRow[], pass: UnionPredicate | null, phone: boolean,
+    ): { lines: readonly GridLine[]; keys: ReadonlySet<string>; outside: ReadonlySet<string> } | null {
+        if (!pins.count()) return null;
+        const byKey = new Map(rowsOf(m, type).map(r => [rowKey(r), r] as const));
+        pins.prune(k => byKey.has(k));
+        if (!pins.count() || phone) return null;
+        const shownKeys = shown.map(rowKey);
+        const shownSet = new Set(shownKeys);
+        const ctx = JSON.stringify([st.filter, searchQuery(st.search), st.sort, view]);
+        const order = pins.ordered(ctx, keys => pinRanks(keys, shownKeys, () => {
+            const hidden = keys.filter(k => !shownSet.has(k)).map(k => byKey.get(k)!);
+            const all = st.sort.length ? sortRows(m, type, [...shown, ...hidden], st.sort, pass ? sortUnionOf(pass) : undefined) : rowsOf(m, type);
+            return all.map(rowKey);
+        }));
+        const rows = order.map(k => byKey.get(k)).filter((r): r is TableRow => !!r);
+        const lines = type === 'persons' ? buildLines(rows, { collapse: st.unions, pass, revealed: new Set(st.revealedUnions) }) : plainLines(rows);
+        return { lines, keys: new Set(order), outside: new Set(order.filter(k => !shownSet.has(k))) };
+    },
+
+    /** Pin or unpin rows (spec 103 §3) and draw; the focus stays in its cell. */
+    changeTablePins(change: () => unknown): void {
+        change();
+        if (mounted) this.renderTableView(mounted.container);
+    },
+
+    /**
+     * The rows of a text selected across several rows of the grid (spec 103
+     * 3g: the grid selects cells one at a time, a range is the selected
+     * text), their row keys, each once; empty without one across rows.
+     */
+    tableAreaRowKeys(): string[] {
+        const grid = mounted?.grid.el;
+        const sel = typeof window.getSelection === 'function' ? window.getSelection() : null;
+        if (!grid || !sel || sel.isCollapsed || !sel.rangeCount) return [];
+        const range = sel.getRangeAt(0);
+        if (!grid.contains(range.commonAncestorContainer)) return [];
+        const keys = [...grid.querySelectorAll<HTMLElement>('.tv-body .tv-row[data-key]')]
+            .filter(r => range.intersectsNode(r)).map(r => r.dataset.key!.split('#')[0]);
+        const out = [...new Set(keys)];
+        return out.length > 1 ? out : [];
+    },
+
+    /**
+     * The row menu's pin item (spec 103 3b, 3g, 3h): Pin row, Pin rows (n)
+     * for a selected range the click is in, Unpin row on a pinned row;
+     * disabled with why when the pins would go over PIN_MAX. None on a phone.
+     */
+    tableRowPinEntry(line: GridLine, area: readonly string[]): HeadMenuItem | null {
+        if (isPhoneBar()) return null;
+        const t = strings.table.pinRow;
+        const key = rowKey(line.row);
+        const icon = pinSvg(14);
+        const many = area.length > 1 && area.includes(key) && pins.fresh(area).length ? area : null;
+        if (!many && pins.has(key)) return { id: 'unpin', label: t.unpin, icon: '', iconHtml: icon, run: () => this.changeTablePins(() => pins.unpin(key)) };
+        const keys = many ?? [key];
+        const can = pins.canPin(keys);
+        return {
+            id: 'pin', label: many ? t.many(many.length) : t.one, icon: '', iconHtml: icon,
+            ...(can ? {} : { disabled: true, title: t.limit }),
+            run: () => { if (pins.count() + pins.fresh(keys).length <= PIN_MAX) this.changeTablePins(() => pins.pin(keys)); },
+        };
+    },
+
+    /**
+     * "Add to list ›" of a row's menu (spec 084 §4): its own menu of the
+     * fixed lists. One person: ✓ where they are; a range selected across
+     * rows: "Add n people to a list", each person once, no ✓. A union
+     * brings both partners, an event its people; a source none.
+     */
+    tableRowListEntry(line: GridLine, area: readonly string[], anchor: HTMLElement): HeadMenuItem | null {
+        if (line.kind === 'more' || !model || DataManager.listsReadOnly()) return null;
+        const type = stateOf(treeKey()).rowType;
+        const many = area.length > 1 && area.includes(rowKey(line.row));
+        const byKey = many ? new Map(rowsOf(model, type).map(r => [rowKey(r), r] as const)) : null;
+        const rows = byKey ? area.map(k => byKey.get(k)).filter((r): r is TableRow => !!r) : [line.row];
+        const ids = [...new Set(rows.flatMap(rowPeople))];
+        if (!ids.length) return null;
+        const c = strings.contextMenu;
+        const label = many ? strings.table.act.toListN(ids.length) : c.toList;
+        return {
+            id: 'to-list', label, icon: '', hint: '›',
+            run: () => {
+                const menu = openHeadMenu(anchor, '', '', listMenuEntries(this, ids,
+                    () => this.showNewPersonList({ personIds: ids }), ids.length > 1 ? c.newListWithMany : c.newListWith));
+                menu.setAttribute('aria-label', label);
+            },
+        };
+    },
+
+    /**
+     * Save as list of people (spec 084 §6): the People or Unions table's
+     * people in the order of its rows (filter and sort, no row shown for
+     * now; a union's both partners, each person once), the filter and sort
+     * as a copy for an automatic list, the pinned rows outside the filter said.
+     */
+    saveTableAsList(): void {
+        if (!mounted || !model) return;
+        const state = stateOf(treeKey());
+        const type = state.rowType;
+        if (!canSaveAsList(type) || (type !== 'persons' && type !== 'unions')) return;
+        const st = state.types[type];
+        const ids = [...new Set(mounted.saveRows.flatMap(rowPeople))];
+        const byKey = new Map(rowsOf(model, type).map(r => [rowKey(r), r] as const));
+        const outside = [...mounted.pinOutside].map(k => byKey.get(k)).filter((r): r is TableRow => !!r)
+            .flatMap(rowPeople).map(id => DataManager.getPerson(id)).filter((p): p is Person => !!p).map(p => personName(p));
+        const open = viewList(state, storedViews(), DataManager.isReadOnly());
+        const name = [...open.builtin, ...open.research, ...open.custom].find(v => v.active)?.name;
+        this.showNewPersonList({
+            source: type === 'unions' ? 'unions' : 'table',
+            rule: (() => { const v = viewFromState(type, st, '', '', ''); return { kind: 'tableFilter' as const, rowType: type, filter: v.filter, sort: v.sort }; })(),
+            personIds: ids, pinOut: outside.join(', '), ...(name ? { name } : {}),
+        });
+    },
+
+    /** The rows of Scope ▾ and the phone's Scope › (spec 084 §9): Whole tree, the lists, Manage lists…. */
+    tableScopeRows(): ScopeRow[] {
+        const state = stateOf(treeKey());
+        const current = scopeOfType(state, state.rowType)?.listId ?? null;
+        const t = strings.table;
+        const rows: ScopeRow[] = [{ id: 'scope-whole', label: t.scopeWhole, current: !current, run: () => this.setTableScopeTo(null) }];
+        for (const l of DataManager.getPersonLists()) {
+            rows.push({
+                id: `scope-${l.id}`, label: listDisplayName(l), iconHtml: listKindIcon(listKind(l), 16), count: DataManager.getPersonListIds(l.id).length,
+                current: l.id === current, run: () => this.setTableScopeTo(l.id),
+            });
+        }
+        // A read-only export shows the scope without Manage lists… (spec 084 §9).
+        if (!DataManager.isReadOnly()) rows.push({ id: 'scope-manage', label: t.scopeManage, run: () => this.showPersonLists(current ? { listId: current } : {}) });
+        return rows;
+    },
+
+    /** Scope ▾ (spec 084 §9): Whole tree ✓, the lists with their kind and count (✓ on the chosen one), Manage lists…. */
+    showTableScopeMenu(anchor: HTMLElement): void {
+        const rows = this.tableScopeRows();
+        const item = (r: ScopeRow): MenuEntry => ({
+            id: r.id, label: r.label, icon: '', ...(r.iconHtml ? { iconHtml: r.iconHtml } : {}), checked: !!r.current,
+            ...(r.count !== undefined && !r.current ? { hint: String(r.count) } : {}), run: r.run,
+        });
+        const manage = rows.find(r => r.id === 'scope-manage');
+        const lists = rows.filter(r => r.id !== 'scope-whole' && r !== manage);
+        const entries: MenuEntry[] = [item(rows[0])];
+        if (lists.length) entries.push(SEP, { heading: strings.lists.title }, ...lists.map(item));
+        if (manage) entries.push(SEP, item(manage));
+        const menu = openHeadMenu(anchor, strings.table.scope, '', entries);
+        menu.classList.add('tv-scope-menu');
+    },
+
+    /** The phone's Scope › page rows (spec 084 §9). */
+    tableScopeSheetRows(): { id: string; label: string; icon: string; iconHtml?: string; value?: string; ariaLabel?: string; run: () => void }[] {
+        return this.tableScopeRows().map(r => ({
+            id: r.id, label: r.label, icon: '', ...(r.iconHtml ? { iconHtml: r.iconHtml } : {}),
+            value: r.current ? '✓' : r.count !== undefined ? String(r.count) : '',
+            ...(r.current ? { ariaLabel: `${r.label} ✓` } : {}), run: r.run,
+        }));
+    },
+
+    /** Choose the Table's scope (spec 084 §9): a list, or the whole tree (null); the pinned rows stay. */
+    setTableScopeTo(listId: string | null): void {
+        const state = stateOf(treeKey());
+        if (state.rowType === 'sources') return;
+        if (!setTableScope(state, listId)) return;
+        tempShown = null;
+        hiddenJump = null;
+        if (mounted) this.renderTableView(mounted.container);
+    },
+
+    /**
+     * Open in Table (spec 084 §9) from the lists: the People table in the
+     * list's scope; `noSource` (the "N without citation" tile) with the chip
+     * of people without a source.
+     */
+    openTableInScope(listId: string, opts: { noSource?: boolean } = {}): void {
+        if (!DataManager.getPersonList(listId)) return;
+        const state = stateOf(treeKey());
+        setTableScope(state, listId);
+        state.rowType = 'persons';
+        tempShown = null;
+        hiddenJump = null;
+        const st = state.types.persons;
+        if (opts.noSource && setChip(st.filter, 'noSource', true)) filterChanged(st);
+        this.showTableNow();
+    },
+
+    /**
+     * Edit rule… of a list made from a Table filter (spec 084 §7, §9): the
+     * Table with the rule's filter and sort on the whole tree; its ⋯ offers
+     * Save to the list.
+     */
+    openTableForRule(listId: string): void {
+        const list = DataManager.getPersonList(listId);
+        const rule = list?.rule;
+        if (!rule || rule.kind !== 'tableFilter') return;
+        const tree = treeKey();
+        const state = stateOf(tree);
+        setTableScope(state, null);
+        const st = state.types[rule.rowType];
+        st.filter = { op: 'and', items: structuredClone(rule.filter.items) as unknown as TableFilter['items'] };
+        st.sort = rule.sort.map(x => ({ col: x.col, dir: x.dir === -1 ? 'desc' : 'asc' }));
+        filterChanged(st);
+        st.top = 0;
+        state.rowType = rule.rowType;
+        tempShown = null;
+        hiddenJump = null;
+        ruleEdit = { tree, listId };
+        this.showTableNow();
+    },
+
+    /** The Table on screen, drawn anew. */
+    showTableNow(): void {
+        if (TreeRenderer.getViewMode() !== 'table') { this.setDisplayViewMode('table'); return; }
+        const el = document.getElementById('table-container');
+        if (el) this.renderTableView(el);
+    },
+
+    /** The list whose Table filter rule is being edited here (spec 084 §7), while the Table shows its row type. */
+    tableRuleList(): PersonList | null {
+        const tree = treeKey();
+        if (!ruleEdit || ruleEdit.tree !== tree || DataManager.listsReadOnly()) return null;
+        const list = DataManager.getPersonList(ruleEdit.listId);
+        if (!list?.rule || list.rule.kind !== 'tableFilter') { ruleEdit = null; return null; }
+        return stateOf(tree).rowType === list.rule.rowType ? list : null;
+    },
+
+    /** Save to the list {n} (spec 084 §7): the rule takes the Table's filter and sort as they are now. */
+    saveTableRule(): void {
+        const list = this.tableRuleList();
+        if (!list || list.rule?.kind !== 'tableFilter') return;
+        const type = list.rule.rowType;
+        const st = stateOf(treeKey()).types[type];
+        const v = viewFromState(type, st, '', '', '');
+        if (!DataManager.setPersonListRule(list.id, { kind: 'tableFilter', rowType: type, filter: v.filter, sort: v.sort }, list.dynamic)) return;
+        ruleEdit = null;
+        this.showToast(strings.lists.toast.saved(listDisplayName(list)));
+        if (mounted) this.renderTableView(mounted.container);
+    },
+
+    /** A work list's Done box (spec 084 §13d): the person ticked off or back, one undo step. */
+    toggleTableDone(line: GridLine): void {
+        if (line.kind !== 'row' || line.row.kind !== 'person' || DataManager.listsReadOnly()) return;
+        const scope = scopeOfType(stateOf(treeKey()), 'persons');
+        if (!scope?.cells.done || !scope.cells.pos.has(line.row.id)) return;
+        DataManager.togglePersonListDone(scope.listId, line.row.id);
+    },
+
+    /**
+     * Remove from the list (spec 084 §9d): in the scope of a fixed list, the
+     * row's person (or the people of a range selected across rows) out of it.
+     */
+    tableRowRemoveIds(line: GridLine, area: readonly string[]): PersonId[] {
+        if (line.kind === 'more' || DataManager.listsReadOnly() || !model) return [];
+        const state = stateOf(treeKey());
+        if (state.rowType !== 'persons') return [];
+        const scope = scopeOfType(state, 'persons');
+        if (!scope?.fixed) return [];
+        const keys = area.length && area.includes(rowKey(line.row)) ? area : [rowKey(line.row)];
+        return keys.filter(k => k.startsWith('p:')).map(k => k.slice(2) as PersonId).filter(id => scope.cells.pos.has(id));
+    },
+
+    removeTableRowsFromList(ids: PersonId[]): void {
+        const scope = scopeOfType(stateOf(treeKey()), 'persons');
+        if (scope?.fixed && ids.length) DataManager.removePersonsFromList(scope.listId, ids);
+    },
+
     showTableRowMenu(line: GridLine, anchor: HTMLElement, cell: GridCellRef | null = null): void {
         if (line.kind === 'more') return;
         if (isPhoneBar()) { this.showTableRowSheet(line, cell); return; }
         const t = strings.table;
         const run = (a: RowAction) => () => this.tableRowAction(a, line);
         const src = line.row.kind === 'source' ? line.row : null;
-        const cellPart: MenuEntry[] = this.tableCellChoices(line, cell);
+        // A text selected across rows (spec 103 3g): the cell's part is Copy only, its text.
+        const area = isPhoneBar() ? [] : this.tableAreaRowKeys();
+        const areaText = area.length ? window.getSelection()?.toString() ?? '' : '';
+        const cellPart: MenuEntry[] = area.length
+            ? [{ id: 'cellCopy', label: t.cell.copy, icon: '', hint: fanZoomModifier() === '⌘' ? '⌘C' : 'Ctrl+C', run: () => copyPlainText(areaText) }]
+            : this.tableCellChoices(line, cell);
         // T54 F8: the cell edited in place, as F2 does.
-        if (cell && this.tableEditTarget(line, cell.col)) {
+        if (!area.length && cell && this.tableEditTarget(line, cell.col)) {
             cellPart.push({ id: 'cell-edit', label: t.cell.edit, icon: '', hint: 'F2', run: () => { mounted?.grid.editActive(); } });
         }
         const entries: MenuEntry[] = cellPart.length ? [...cellPart, SEP] : [];
@@ -1817,6 +2681,15 @@ export const tableMethods = uiModule({
             entries.push({ id: 'open', label: t.act.open, icon: '▤', hint: 'Enter', run: run('open') });
         }
         if (!tableReadOnly()) entries.push({ id: 'edit', label: t.act.edit, icon: '✎', hint: t.dblClickHint, run: run('edit') });
+        // Pin or unpin the row (spec 103 3b), after Edit, before the unions.
+        const pin = this.tableRowPinEntry(line, area);
+        if (pin) entries.push(SEP, pin);
+        // Add to list › (spec 084 §4, 4c): the row's people, or those of a range selected across rows.
+        const toList = this.tableRowListEntry(line, area, anchor);
+        if (toList) entries.push(SEP, toList);
+        // Remove from the list (spec 084 §9d): in the scope of a fixed list.
+        const out = this.tableRowRemoveIds(line, area);
+        if (out.length) entries.push({ id: 'listRemove', label: strings.lists.remove, icon: '', run: () => this.removeTableRowsFromList(out) });
         if (line.kind === 'row' && line.expanded !== null) {
             const expand = !line.expanded;
             const id = line.row.id;
@@ -1850,8 +2723,35 @@ export const tableMethods = uiModule({
             { label: t.act.open, icon: '▤', run: run('open') },
         ];
         if (!ro) rows.push({ label: t.act.edit, icon: '✎', run: run('edit') });
+        // A tablet's sheet pins the row too (spec 103 §3; a phone has no pins).
+        const pin = this.tableRowPinEntry(line, []);
+        const pinRows = pin ? [{ label: pin.label, icon: '', iconHtml: pin.iconHtml, ...(pin.disabled ? { sub: pin.title } : {}), run: pin.disabled ? () => {} : pin.run }] : [];
         const cellBlocks = this.tableCellSheetBlocks(line, cell);
-        const blocks: { rows: typeof rows; divider?: boolean }[] = [...cellBlocks, cellBlocks.length ? { rows, divider: true } : { rows }];
+        // People in the cell (spec 103 §4): Go to {name} for each of the tree's people the cell names, first.
+        const type = stateOf(treeKey()).rowType;
+        const links = cell && cell.col.id !== 'name' && (type === 'persons' || type === 'unions') ? personLinks(cell.value) : [];
+        const linkBlocks = links.length ? [{
+            header: t.link.inCell,
+            rows: links.map(n => ({ label: t.link.goTo(n.text), icon: '→', value: '›', run: () => this.tableJumpBy(line, cell!.col, n.personId as PersonId) })),
+        }] : [];
+        const blocks: { rows: typeof rows; divider?: boolean }[] = [
+            ...cellBlocks.map((b, i) => (i === 0 && linkBlocks.length ? { ...b, divider: true } : b)),
+            cellBlocks.length || linkBlocks.length ? { rows, divider: true } : { rows },
+            ...(pinRows.length ? [{ rows: pinRows, divider: true }] : []),
+        ];
+        // Add to list › (spec 084 §4, 15e): a second page of the sheet; the row's people (no range by touch).
+        const people = rowPeople(line.row);
+        if (people.length && !DataManager.listsReadOnly()) {
+            const c = strings.contextMenu;
+            const page = listSheetPage(this, people, () => this.showNewPersonList({ personIds: people }),
+                people.length > 1 ? c.newListWithMany : c.newListWith);
+            const out = this.tableRowRemoveIds(line, []);
+            blocks.push({
+                rows: [{ label: c.toList, icon: '', run: () => {}, page } as typeof rows[number],
+                    ...(out.length ? [{ label: strings.lists.remove, icon: '', run: () => this.removeTableRowsFromList(out) }] : [])],
+                divider: true,
+            });
+        }
         if (!ro && line.row.kind === 'person') {
             const row = line.row;
             const n = row.unions.length;
@@ -1871,7 +2771,7 @@ export const tableMethods = uiModule({
         const sub = date ? [date.prefix, date.text].filter(Boolean).join(' ') : fanYears(person);
         this.noteBottomSheetTrigger();
         this.hideBottomSheet();
-        this.presentMenuSheet(title, blocks, sub ? { subtitle: sub } : {});
+        this.presentMenuSheet(title, [...linkBlocks, ...blocks], sub ? { subtitle: sub } : {});
     },
 
     /** A source row's sheet (§14.2): its title and archive on top, Open source and Edit. */
@@ -1955,6 +2855,8 @@ export const tableMethods = uiModule({
      * place, "Saved: {name}"). Null: saved or unchanged; else the error said under the field.
      */
     tableSaveCell(t: EditTarget, text: string): string | null {
+        // The tree is being replaced: the cell keeps its text, said under it and by a toast (§2.6).
+        if (TreeEditLock.refuse()) return TreeEditLock.text();
         const data = DataManager.getData();
         const res = editChangeOf(data, t, text);
         if (!res.ok) return res.error === 'date' ? strings.table.cell.badDate : strings.table.cell.nameNeeded;
@@ -2088,6 +2990,8 @@ export const tableMethods = uiModule({
                     { id: 'delete', label: t.deleteMenu, icon: '', disabled: !list.canEdit, run: () => { void this.deleteOpenTableView(); } });
                 if (list.builtinOpen) entries.push({ note: t.builtinLocked });
             }
+            // Save as list of people (spec 084 §6): after Delete, behind its own separator.
+            if (canSaveAsList(state.rowType)) entries.push(SEP, { id: 'saveList', label: strings.lists.saveAs, icon: '', run: () => this.saveTableAsList() });
             openHeadMenu(anchor, '', '', entries);
             return;
         }
@@ -2214,6 +3118,17 @@ export const tableMethods = uiModule({
         this.redrawTableNow();
     },
 
+    /** The coverage row's label "filled" (T54 H9, H12): what the row counts and why a share is bold; a phone: the sheet. */
+    showTableCoverageHelp(anchor: HTMLElement): void {
+        const t = strings.table;
+        const body = `<div class="tv-bub-note">${escHtml(t.coverageHelp)}</div>`;
+        if (isPhoneBar()) {
+            this.showTableSheet(sheetElement(t.coverageRow, body, 'legend', () => this.hideBottomSheet()));
+            return;
+        }
+        openBubblePanel({ rect: anchor.getBoundingClientRect(), label: t.coverageRow, kind: 'legend', focusBack: () => anchor, html: body });
+    },
+
     /** "● changed" of a built-in view: why there is no Save (9c). */
     showTableBuiltinNote(anchor: HTMLElement): void {
         const note = strings.table.builtinNote;
@@ -2234,20 +3149,27 @@ export const tableMethods = uiModule({
         const type = state.rowType;
         const st = state.types[type];
         const display = displayColumns(type, st, isPhoneBar());
-        const shown = viewRows(tree, model, type, st.filter, st.search, st.sort, display.columns);
+        // The scope's rows only (spec 084 §9), People with the scope's # and Done first as drawn (§12).
+        const scope = scopeOfType(state, type);
+        const shown = viewRows(tree, model, type, st.filter, st.search, st.sort, display.columns, scope);
         const filter = filterSummary(model, type, st.filter, st.search);
-        const every = rowsOf(model, type);
+        const every = scopeRows(model, type, scope);
         const whole = unfiltered && !!filter;
         // A row kept after an edit that no longer passes (§10.3) is not part of the export.
         const rows = whole
             ? (st.sort.length ? sortRows(model, type, every, st.sort) : [...every])
             : shown.stale.size ? shown.rows.filter(r => !shown.stale.has(rowKey(r))) : shown.rows;
-        const all = shownColumns(type, st, false);
+        const own = shownColumns(type, st, false);
+        const leads = type === 'persons' && scope ? leadColumnsOf(scope) : [];
+        if (leads.length) applyScopeCells(model, scope);
+        const all = leads.length
+            ? { columns: [...leads, ...own.columns], widths: [...leads.map(c => c.width), ...own.widths], pinned: own.pinned + leads.length }
+            : own;
         const treeName = (tree && TreeManager.getTreeMetadata(tree as TreeId)?.name) || '';
         const view = openViewOf(state, type, storedViews()).name;
         const now = new Date();
         return {
-            input: { model, type, rows, columns: all.columns, pass: whole ? null : shown.pass },
+            input: { model, type, rows, columns: all.columns, pass: whole ? null : shown.pass, groups: this.tableExportGroups(model, type, st, scope, rows) },
             pinned: all.pinned, widths: all.widths, view,
             checks: checks && checks.tree === tree ? checks.index : null,
             files: { csv: tableCsvFileName(treeName, view, now, 'csv'), xlsx: tableCsvFileName(treeName, view, now, 'xlsx') },
@@ -2274,15 +3196,30 @@ export const tableMethods = uiModule({
             const btn = form.closest('.tv-fpanel, .tv-fsheet')?.querySelector('.tv-fpanel-apply, .tv-fs-apply');
             if (btn) btn.textContent = exportDownloadLabel(f);
         }, (rows) => { exportUnfiltered = rows; });
-        this.showTableFilterForm(mounted.exportBtn, '', form, () => this.downloadTableExport(), {
+        this.showTableFilterForm(mounted.exportBtn, '', form, () => { void this.downloadTableExport(); }, {
             applyLabel: exportDownloadLabel(exportFormat), ariaLabel: t.export, cls: 'tv-xpanel', noCancel: true,
         });
     },
 
-    /** Download the CSV (§11.2) or the XLSX (§11.3) and say what went in (11b). */
-    downloadTableExport(format: ExportFormat = exportFormat, unfiltered: boolean = exportUnfiltered): void {
+    /**
+     * Download the CSV (§11.2) or the XLSX (§11.3) and say what went in (11b). The file is one computation over the
+     * rows (§8): the panel closed by Download, the toolbar's Export says "Saving the file…" first (at once for a large
+     * table: the page cannot paint while it builds), then the toast; resolves when the file is handed over.
+     */
+    async downloadTableExport(format: ExportFormat = exportFormat, unfiltered: boolean = exportUnfiltered): Promise<void> {
         const now = this.tableExportNow(unfiltered);
         if (!now) return;
+        const btn = mounted?.exportBtn;
+        const make = (): void => this.saveTableExport(now, format);
+        if (!btn?.isConnected) { make(); return; }
+        const cells = now.input.rows.length * Math.max(1, now.input.columns.length);
+        // A phone has Export in ⋯ (the toolbar's button hidden): the state goes to a progress toast (§4, §2).
+        await runBusy(btn, async () => { await nextPaint(); make(); },
+            { heavy: cells >= TABLE_EXPORT_SHOWN_AT_ONCE ? 'now' : true, label: strings.busy.savingFile, toastWhenGone: true });
+    },
+
+    /** The export built and handed to the browser, and its toast. */
+    saveTableExport(now: TableExportNow, format: ExportFormat): void {
         let blob: Blob;
         let made: { items: number; lines: number; columns: number };
         if (format === 'xlsx') {
@@ -2310,6 +3247,48 @@ export const tableMethods = uiModule({
             this.showToast(strings.table.res.exportNotLive, 6000, { title: done });
         } else {
             this.showToast(done, 5000);
+        }
+    },
+
+    /**
+     * ⋯ of a list › Export › CSV (spec 084 §12): downloaded at once — the
+     * People table's columns as the Table has them, # first (and Done of a
+     * work list), the list's people in its order, `{tree}_{list}_{day}.csv`.
+     */
+    exportPersonListCsv(listId: string): void {
+        const list = DataManager.getPersonList(listId);
+        const scope = tableScopeOf(listId);
+        if (!list || !scope) return;
+        const data = DataManager.getData();
+        const lang = getCurrentLanguage();
+        const homeId = TreeRenderer.getFocusPersonId();
+        const rev = DataManager.getRevision();
+        const tree = treeKey();
+        if (!modelIsCurrent(model, data, rev, homeId, lang)) {
+            model = buildTableModel(data, { rev, homeId, lang, reliability: this.reliabilityOptionsNow() });
+        }
+        const m = model!;
+        applyChecks(m, this.tableChecksFor(tree, data, rev));
+        applyResearch(m, this.tableResearchEnv(data, rev, m));
+        const before = m.ctx.scope;
+        applyScopeCells(m, scope);
+        try {
+            const st = stateOf(tree).types.persons;
+            const columns = [...leadColumnsOf(scope), ...shownColumns('persons', st, false).columns];
+            const csv = buildTableCsv({ model: m, type: 'persons', rows: scopeRows(m, 'persons', scope), columns, pass: null });
+            const treeName = (tree && TreeManager.getTreeMetadata(tree as TreeId)?.name) || '';
+            const file = tableCsvFileName(treeName, listDisplayName(list), new Date(), 'csv');
+            const url = URL.createObjectURL(new Blob([csv.csv], { type: 'text/csv;charset=utf-8' }));
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = file;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 0);
+            this.showToast(strings.table.exportedToast.p(file, csv.items, csv.lines, csv.columns), 5000);
+        } finally {
+            m.ctx.scope = before;
         }
     },
 
@@ -2356,11 +3335,104 @@ export const tableMethods = uiModule({
         }
     },
 
-    /** The phone's ⋯ (12a): Columns, Export, Coverage row and Expand or Collapse unions. */
+    /**
+     * ⋯ of the Table. Wider than a phone (spec 084 §6) a menu under it:
+     * Save as list of people (the People and Unions tables of a tree that
+     * takes changes); D4 puts Group by › and Collapse / Expand all groups
+     * above it, behind a separator. On a phone (12a) a sheet: Save as list
+     * of people, then Columns, Export, Coverage row and Expand or Collapse unions.
+     */
+    /** What Group by offers (spec 084 §10): Research line in a tree with research lines, Done in a work list's scope. */
+    tableGroupOffer(m: TableModel, scope: TableScope | null): GroupOffer {
+        return { lines: treeHasLines(m), work: !!scope?.cells.done };
+    },
+
+    /** The export's rows in their groups (spec 084 §10: flat, the group first); null: not grouped. */
+    tableExportGroups(m: TableModel, type: RowType, st: RowTypeState, scope: TableScope | null, rows: readonly TableRow[]): { group: string; row: TableRow }[] | null {
+        if (!groupingFits(type, st.group, this.tableGroupOffer(m, scope))) return null;
+        return groupedExportRows(groupRows(m, type, st.group.by, rows, scope?.cells.done ?? null));
+    },
+
+        /** Group the rows by a value (spec 084 §10), null: no grouping; the groups start open. */
+    setTableGroupBy(by: TableGroupKey | null): void {
+        this.changeTableColumns((st) => {
+            if ((st.group?.by ?? null) === by) return false;
+            st.group = by ? { by, collapsed: [] } : null;
+            return true;
+        });
+    },
+
+    /** One group opened (true) or closed (false) by its header. */
+    toggleTableRowGroup(key: string, open: boolean): void {
+        this.changeTableColumns((st) => {
+            if (!st.group) return false;
+            const shut = st.group.collapsed.includes(key);
+            if (shut !== open) return false;
+            st.group = { by: st.group.by, collapsed: open ? st.group.collapsed.filter(k => k !== key) : [...st.group.collapsed, key] };
+            return true;
+        });
+    },
+
+    /** Collapse all groups (true) or expand them all (false). */
+    setTableGroupsCollapsed(collapse: boolean): void {
+        const keys = mounted?.groupKeys;
+        this.changeTableColumns((st) => {
+            if (!st.group || !keys) return false;
+            st.group = { by: st.group.by, collapsed: collapse ? [...keys] : [] };
+            return true;
+        });
+    },
+
+    /** Group by's choices (spec 084 §10): No grouping, then the keys the row type offers, the chosen one ticked. */
+    tableGroupChoices(): { id: string; label: string; current: boolean; run: () => void }[] {
+        const state = stateOf(treeKey());
+        const type = state.rowType;
+        const st = state.types[type];
+        const scope = scopeOfType(state, type);
+        const offer = model ? this.tableGroupOffer(model, scope) : { lines: false, work: false };
+        const by = groupingFits(type, st.group, offer) ? st.group.by : null;
+        const t = strings.table;
+        return [
+            { id: 'group-none', label: t.groupNone, current: !by, run: () => this.setTableGroupBy(null) },
+            ...offeredGroupKeys(type, offer).map(k => ({ id: `group-${k}`, label: t.groupKey[k], current: by === k, run: () => this.setTableGroupBy(k) })),
+        ];
+    },
+
     showTableMoreMenu(): void {
         const state = stateOf(treeKey());
         const st = state.types[state.rowType];
         const t = strings.table;
+        const saveList = canSaveAsList(state.rowType);
+        const groupChoices = this.tableGroupChoices();
+        const groupedBy = groupChoices.find(c => c.current && c.id !== 'group-none')?.label ?? null;
+        // Editing a Table filter rule (spec 084 §7, §9): its list takes the filter as it is now.
+        const ruleList = this.tableRuleList();
+        const saveRule = ruleList ? { label: strings.lists.saveRule(listDisplayName(ruleList)), run: () => this.saveTableRule() } : null;
+        if (!isPhoneBar()) {
+            const anchor = mounted?.bar.querySelector<HTMLElement>('.tv-more-menu-btn');
+            const hasRows = !!rowCounts(model)[state.rowType];
+            const canGroup = hasRows && groupChoices.length > 1;
+            if (!anchor || (!saveRule && (!hasRows || (!saveList && !canGroup)))) return;
+            const entries: MenuEntry[] = [];
+            // Group by › and Collapse / Expand all groups (spec 084 §10), then the saves.
+            if (canGroup) {
+                entries.push({
+                    id: 'groupBy', label: t.groupBy, icon: '', hint: `${groupedBy ?? ''} ›`,
+                    run: () => {
+                        const sub: MenuEntry[] = groupChoices.map(c => ({ id: c.id, label: c.label, icon: '', checked: c.current, run: c.run }));
+                        sub.splice(1, 0, SEP);
+                        openHeadMenu(anchor, t.groupBy, '', sub);
+                    },
+                });
+                entries.push({ id: 'groupsCollapse', label: t.groupsCollapse, icon: '', disabled: !groupedBy, run: () => this.setTableGroupsCollapsed(true) });
+                entries.push({ id: 'groupsExpand', label: t.groupsExpand, icon: '', disabled: !groupedBy, run: () => this.setTableGroupsCollapsed(false) });
+            }
+            if ((saveRule || (saveList && hasRows)) && entries.length) entries.push(SEP);
+            if (saveRule) entries.push({ id: 'saveRule', label: saveRule.label, icon: '', run: saveRule.run });
+            if (saveList && hasRows) entries.push({ id: 'saveList', label: strings.lists.saveAs, icon: '', run: () => this.saveTableAsList() });
+            openHeadMenu(anchor, '', '', entries);
+            return;
+        }
         const rows: { label: string; run: () => void; value?: string; active?: boolean; ariaLabel?: string }[] = [
             { label: t.columns, value: String(st.columns.length), run: () => this.showTableColumns() },
             { label: t.export, run: () => this.showTableExport() },
@@ -2379,7 +3451,30 @@ export const tableMethods = uiModule({
         }
         this.noteBottomSheetTrigger();
         this.hideBottomSheet();
-        this.presentMenuSheet(t.moreActions, [{ rows }]);
+        // The phone's ⋯ starts with Scope › (spec 084 §9; not for Sources) and the saves.
+        const first: { label: string; run: () => void; value?: string; id?: string; page?: { title: string; rows: { label: string; run: () => void; value?: string; iconHtml?: string; icon?: string; id?: string; ariaLabel?: string }[] } }[] = [];
+        if (state.rowType !== 'sources') {
+            const scope = scopeOfType(state, state.rowType);
+            first.push({
+                id: 'tv-scope-row', label: t.scope, value: scope ? listDisplayName(scope.list) : t.scopeWhole,
+                run: () => {}, page: { title: t.scope, rows: this.tableScopeSheetRows() },
+            });
+        }
+        // Group by › (spec 084 §10): its page lists the choices, the chosen one ticked.
+        if (groupChoices.length > 1 && rowCounts(model)[state.rowType]) {
+            first.push({
+                id: 'tv-group-row', label: t.groupBy, value: groupedBy ?? t.groupNone, run: () => {},
+                page: {
+                    title: t.groupBy,
+                    rows: groupChoices.map(c => ({
+                        id: c.id, label: c.label, icon: '', value: c.current ? '✓' : '', ...(c.current ? { ariaLabel: `${c.label} ✓` } : {}), run: c.run,
+                    })),
+                },
+            });
+        }
+        if (saveRule) first.push({ label: saveRule.label, run: saveRule.run });
+        if (saveList) first.push({ label: strings.lists.saveAs, run: () => this.saveTableAsList() });
+        this.presentMenuSheet(t.moreActions, first.length ? [{ rows: first }, { rows, divider: true }] : [{ rows }]);
     },
 
     /** A completeness cell's bubble by touch (§6.2): the share, what is missing, what it counts. */

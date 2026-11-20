@@ -15,6 +15,7 @@ import { recordedAgeGap } from '../../recorded-age.js';
 import { shownNameOrEmpty } from '../../person-name.js';
 import { findRelationship } from '../../kinship.js';
 import { rodOf, siblingsOf, sortByBirth } from '../../lineage.js';
+import { branchesOf } from '../../branch-colors.js';
 import { sortLifeEvents, eventValueIsOnTag, coupleEventLabel } from '../../events.js';
 import { lifeEventLabel } from '../../person-sources.js';
 import { CARD_STATUS_CLASSES, cardStatus, factReliability, type ReliabilityStepName } from '../../reliability.js';
@@ -29,9 +30,10 @@ import { givenNameOf } from '../../shared-with-line.js';
 import {
     researchCell, sourceImageCell, sourceResearchIdCell, unionResearchCell, unionResearchIdCell, type ResearchColumnId, type UnionResearchColumnId,
 } from './table-research.js';
+import { addedTime } from '../../person-lists-data.js';
 import { dateNumber, type CellName, type CellValue, type EventRow, type PersonRow, type RowType, type SourceRow, type TableContext, type TableModel, type TableRow, type UnionRow } from './table-model.js';
 
-export type ColumnKind = 'text' | 'date' | 'age' | 'number' | 'percent' | 'pill' | 'link';
+export type ColumnKind = 'text' | 'date' | 'age' | 'number' | 'percent' | 'pill' | 'link' | 'thumb';
 
 /** Column groups in their order (People first, then the Unions table's own). */
 export const PERSON_GROUPS = ['person', 'birth', 'parents', 'union', 'divorce', 'death', 'events', 'sources', 'rel', 'research', 'checks'] as const;
@@ -72,6 +74,14 @@ export function emptyCell(computed = false): CellValue {
     return { ...EMPTY, computed };
 }
 
+/**
+ * A picture's cell (spec 107 §8): shown small, "yes" in a copy or an export;
+ * with a picture it sorts before the cells without one in both directions.
+ */
+export function thumbCell(dataUrl: string | undefined): CellValue {
+    return dataUrl ? { ...EMPTY, empty: false, text: strings.table.yes, sortKey: 0, thumb: dataUrl } : emptyCell();
+}
+
 /** A cell the column does not apply to (§6.1: left out of coverage). */
 export function naCell(text = '', computed = false): CellValue {
     return { ...EMPTY, na: true, text, computed, title: strings.table.na };
@@ -105,6 +115,23 @@ function textCell(value: string | null | undefined, computed = false): CellValue
 function numberCell(n: number | null | undefined, computed = true, text?: string): CellValue {
     if (n === null || n === undefined || !Number.isFinite(n)) return emptyCell(computed);
     return { ...EMPTY, text: text ?? String(n), sortKey: n, empty: false, computed };
+}
+
+/**
+ * The Added cell (spec 084 §8): the day the person came into the tree in the
+ * UI language, sorted by the moment (within a day by the time); without a
+ * recorded date "earlier" in italics, an empty cell (last in both directions,
+ * "Empty" in a filter).
+ */
+export function addedCell(ctx: TableContext, addedAt: string | undefined): CellValue {
+    const t = addedTime(addedAt);
+    if (!Number.isFinite(t)) return { ...emptyCell(), text: strings.table.earlier, word: true };
+    const d = new Date(t);
+    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const cell = dateCell(ctx, iso);
+    const midnight = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    // The time of day as a fraction below one: the year a date filter reads (sortKey / 10000) stays the same.
+    return typeof cell.sortKey === 'number' ? { ...cell, sortKey: cell.sortKey + Math.min(0.999, (t - midnight) / 86_400_000) } : cell;
 }
 
 /** A qualifier as the short word before a date (§5.3: "abt.", "bef.", "aft."). */
@@ -257,12 +284,12 @@ function otherPartner(ctx: TableContext, u: Partnership | null, self: PersonId):
     return ctx.person(u.person1Id === self ? u.person2Id : u.person1Id);
 }
 
+/** The wedding's witnesses, the tree's people as links to their rows (spec 103 U3). */
 function witnessNames(ctx: TableContext, u: Partnership): CellValue {
-    const names = (u.participants ?? []).filter(x => x.role === 'witness').map(x => {
-        const p = x.personId ? ctx.data.persons[x.personId] : undefined;
-        return p ? shownNameOrEmpty(p) : (x.name ?? '').trim();
-    }).filter(Boolean);
-    return textCell(names.join(', '));
+    return namesCell((u.participants ?? []).filter(x => x.role === 'witness').map(x => {
+        const n = participantCellName(ctx, x);
+        return n.personId ? { text: n.text, personId: n.personId } : { text: n.text };
+    }));
 }
 
 /** Length of a union (§5.1): from the wedding to the divorce, else to the first death; both alive: nothing. */
@@ -417,6 +444,29 @@ function crossTreeCell(ctx: TableContext, p: Person): CellValue {
     return { ...EMPTY, text: names.join(', '), sortKey: names.length, empty: false };
 }
 
+/**
+ * The Lineage cell (spec 112 §3): the person's line relative to the home
+ * (focused) person in words — paternal, maternal, both (R4), descendant; the
+ * first / second parent's line for two same-gender parents (R5) — with the
+ * lines for the grid's sign. Sorted paternal → both → maternal → descendant,
+ * the people without a line last.
+ */
+export function lineageCell(ctx: TableContext, id: PersonId): CellValue {
+    const res = ctx.branches();
+    const set = res?.map.get(id);
+    if (!res || !set) return emptyCell(true);
+    const s = strings.branchColors;
+    const n = res.numbered;
+    let text: string;
+    let key: number;
+    if (set.paternal && set.maternal) { text = n ? s.tableSlotBoth : s.tableBoth; key = 1; }
+    else if (set.paternal) { text = n ? s.legendSlot1 : s.legendPaternal; key = 0; }
+    else if (set.maternal) { text = n ? s.legendSlot2 : s.legendMaternal; key = 2; }
+    else if (set.descendant) { text = s.tableDescendant; key = 3; }
+    else return emptyCell(true);
+    return { ...textCell(text, true), sortKey: key, lineage: branchesOf(set), ...(n ? { lineageNumbered: true } : {}) };
+}
+
 /** Person status (§16.0): the card's one mark of sources and reliability in words; sorted strongest first. */
 function personStatusCell(ctx: TableContext, p: Person): CellValue {
     const st = cardStatus(ctx.data, p, { ...ctx.reliability, treeHasSources: ctx.hasSources(), unions: ctx.unionsOf() });
@@ -492,6 +542,10 @@ export const PERSON_COLUMNS: readonly ColumnDef[] = cols('persons', [
             return textCell(rod ? labels.get(rod) : '', true);
         },
     },
+    // The lineage relative to the home person (spec 112 §3); offered, not shown by default.
+    { id: 'lineage', group: 'person', label: 'lineage', width: 130, computed: true, get: (c, r) => lineageCell(c, r.id as PersonId) },
+    // When the person came into the tree (spec 084 §8); offered, not shown by default.
+    { id: 'added', group: 'person', label: 'added', width: 130, kind: 'date', get: (c, r) => addedCell(c, asPerson(r).addedAt) },
     // Birth and baptism
     {
         id: 'bDate', group: 'birth', label: 'bDate', width: 140, kind: 'date', get: (c, r) => {
@@ -723,6 +777,7 @@ export const UNION_COLUMNS: readonly ColumnDef[] = cols('unions', [
     { id: 'uLen', group: 'uextra', label: 'uLen', width: 96, kind: 'age', computed: true, get: (c, r) => unionLength(c, asUnion(r).union) },
     { id: 'srcCount', group: 'uextra', label: 'srcCount', width: 92, kind: 'number', computed: true, get: (_c, r) => numberCell(partnershipSourceIds(asUnion(r).union).length) },
     { id: 'uComp', group: 'uextra', label: 'uComp', width: 124, kind: 'percent', computed: true, get: (c, r) => unionComp(asUnion(r).union, unionPartners(c, asUnion(r)).p2) },
+    { id: 'uPhoto', group: 'uextra', label: 'uPhoto', width: 64, kind: 'thumb', get: (_c, r) => thumbCell(asUnion(r).union.photo) },
     // Research (16zg): only in a research tree
     ...UNION_RESEARCH_DEFS.map(([id, width]): Def => ({
         id, group: 'research', label: id, width, get: (c, r) => c.research ? unionResearchCell(c.research, asUnion(r).union, id) : emptyCell(),
@@ -935,7 +990,8 @@ export const EVENT_COLUMNS: readonly ColumnDef[] = cols('events', [
     { id: 'evAge', group: 'event', label: 'evAge', width: 110, kind: 'age', computed: true, get: (c, r) => eventAgeCell(c, r) },
     { id: 'evValue', group: 'event', label: 'evValue', width: 180, get: (_c, r) => eventValueCell(r) },
     { id: 'godparents', group: 'participants', label: 'godparents', width: 250, get: (c, r) => participantsCell(c, r, 'godparent') },
-    { id: 'witnesses', group: 'participants', label: 'witnesses', width: 200, get: (c, r) => participantsCell(c, r, 'witness') },
+    // Witnesses of any event (a baptism's, a burial's), not only a wedding's: the label says so (de Zeugen, not Trauzeugen).
+    { id: 'witnesses', group: 'participants', label: 'evWitnesses', width: 200, get: (c, r) => participantsCell(c, r, 'witness') },
     { id: 'officiants', group: 'participants', label: 'officiants', width: 170, get: (c, r) => participantsCell(c, r, 'officiant') },
     { id: 'others', group: 'participants', label: 'others', width: 200, get: (c, r) => participantsCell(c, r, 'other') },
     { id: 'evSource', group: 'source', label: 'evSource', width: 300, get: (c, r) => eventSourceCell(c, r) },
@@ -1006,8 +1062,37 @@ export const SOURCE_COLUMNS: readonly ColumnDef[] = cols('sources', [
     { id: 'srcImage', group: 'research', label: 'srcImage', width: 250, get: (c, r) => c.research ? sourceImageCell(asSource(r).source) : emptyCell() },
 ]);
 
+/**
+ * The columns a list's scope puts first in the People table (spec 084 §9,
+ * §13d): # (the place in the list's order, "–" outside the list) and, for a
+ * work list, Done with its box. Not in the catalog: shown only with the
+ * scope, never moved, hidden or stored in a view's columns; their cells are
+ * not cached (they follow the scope, not the model).
+ */
+export const LEAD_COLUMNS: readonly ColumnDef[] = cols('persons', [
+    {
+        id: 'num', group: 'person', label: 'num', kind: 'number', width: 46, computed: true, get: (c, r) => {
+            const n = c.scope?.pos.get(r.id);
+            return n ? numberCell(n, true) : { ...emptyCell(true), text: '–' };
+        },
+    },
+    {
+        id: 'done', group: 'person', label: 'done', width: 72, align: 'left', get: (c, r) => {
+            const done = c.scope?.done;
+            if (!done || !c.scope?.pos.has(r.id)) return naCell();
+            const on = done.has(r.id);
+            return { ...emptyCell(), empty: false, text: '', sortKey: on ? 1 : 0, check: on };
+        },
+    },
+]);
+
+/** Whether a column is one of the scope's lead columns (# and Done). */
+export function isLeadColumn(col: ColumnDef): boolean {
+    return LEAD_COLUMNS.includes(col);
+}
+
 const BY_TYPE: Record<RowType, ReadonlyMap<string, ColumnDef>> = {
-    persons: new Map(PERSON_COLUMNS.map(c => [c.id, c])),
+    persons: new Map([...PERSON_COLUMNS, ...LEAD_COLUMNS].map(c => [c.id, c])),
     unions: new Map(UNION_COLUMNS.map(c => [c.id, c])),
     events: new Map(EVENT_COLUMNS.map(c => [c.id, c])),
     sources: new Map(SOURCE_COLUMNS.map(c => [c.id, c])),
@@ -1159,6 +1244,7 @@ export function cellOf(model: TableModel, row: TableRow, col: ColumnDef, unionIn
     const scoped = row.kind === 'person' && col.unionScoped;
     const idx = scoped ? (unionIndex ?? 0) : 0;
     const key = scoped && idx > 0 ? `${col.id}#${idx}` : col.id;
+    if (LEAD_COLUMNS.includes(col)) return col.get(model.ctx, row, null);
     const hit = row.cache.get(key);
     if (hit) return hit;
     let value: CellValue;

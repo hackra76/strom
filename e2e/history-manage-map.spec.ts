@@ -126,9 +126,20 @@ test.describe('History of places: a place\'s region by hand', () => {
         await expect(t).toBeVisible();
         await expect(place(page, 'Čapkov').locator('[data-hm="mapAuto"]')).toHaveCount(0);
         // Undo puts the regions by hand back.
+        let release!: () => void;
+        const held = new Promise<void>(r => { release = r; });
+        const mapping = (u: URL) => /\/history\/map$/.test(u.pathname);
+        await page.route(mapping, async route => { await held; await route.fallback(); });
         await t.getByRole('button', { name: 'Undo' }).click();
+        // Undo works in the toast (§4): "Undoing…" with the place until the research answers.
+        const working = page.locator('.toast[aria-busy="true"]');
+        await expect(working).toContainText('Undoing…');
+        await expect(working).toContainText('Čapkov');
+        release();
         await expect.poll(() => history.writes.map.length).toBe(3);
         expect(history.writes.map[2]).toEqual({ place: 'Čapkov', regions: [{ id: 'cz-bohemia' }] });
+        await expect(toast(page, 'Undone.')).toBeVisible();
+        await page.unroute(mapping);
         await expect(place(page, 'Čapkov').locator('[data-hm="mapAuto"]')).toBeVisible();
     });
 
@@ -166,20 +177,32 @@ test.describe('History of places: a place\'s region by hand', () => {
         await expect(place(page, 'Lhotka').locator('[data-hm="mapAuto"]')).toHaveCount(0);
     });
 
-    test('refusals: busy says so in the picker and keeps it; gone closes nothing and reads again', async ({ page }) => {
+    test('refusals: busy says so above the footer with Try again and keeps the picker; gone closes nothing and reads again', async ({ page }) => {
         const { history } = await setup(page);
         await openPlaces(page);
         await place(page, 'Lhotka', 'unassigned').locator('[data-hm="assign"]').click();
         await option(page, 'cz-bohemia').locator('input').check();
         history.writeReply = { map: { status: 503, body: { error: 'busy', code: 'research.busy' } } };
+        let release!: () => void;
+        const held = new Promise<void>(r => { release = r; });
+        // B193: the write held, Assign shows its working state ("Saving…"), the other footer buttons wait.
+        await page.route('**/history/map*', async route => { await held; await route.fallback(); });
         await assignBtn(page).click();
-        await expect(picker(page).locator('.hmp-error')).toHaveText('The research is busy. It will work again shortly.');
+        await expect(assignBtn(page)).toHaveAttribute('data-busy', 'busy');
+        await expect(assignBtn(page).locator('.b-busy')).toContainText('Saving…');
+        await expect(picker(page).locator('[data-hmp="redo"]')).toBeDisabled();
+        release();
+        const msg = picker(page).locator('.busy-msg.is-err[role="alert"]');
+        await expect(msg).toContainText('The research is busy. It will work again shortly.');
+        await expect(picker(page).locator('.hmp-error')).toBeHidden();
         await expect(chosen(page, 'cz-bohemia')).toBeVisible();
         await expect(assignBtn(page)).toBeEnabled();
+        await expect(picker(page).locator('[data-hmp="redo"]')).toBeEnabled();
+        await page.unroute('**/history/map*');
         const reads = history.reads;
         history.writeReply = { map: { status: 404, body: { error: 'No such place in the facts of this tree.', code: 'history.place' } } };
-        await assignBtn(page).click();
-        await expect(picker(page).locator('.hmp-error')).toHaveText('No such place in the facts of this tree.');
+        await msg.getByRole('button', { name: 'Try again' }).click();
+        await expect(msg).toContainText('No such place in the facts of this tree.');
         await expect.poll(() => history.reads).toBeGreaterThan(reads);
         history.writeReply = undefined;
         await assignBtn(page).click();

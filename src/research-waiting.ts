@@ -7,8 +7,10 @@
  */
 
 import {
-    LiveWaiting, WAITING_SECTIONS, WaitingGroup, WaitingInbox, WaitingLinkAction, WaitingSection, imageNumber, researchTaskRef,
+    LiveBook, LiveBooks, LiveWaiting, WAITING_SECTIONS, WaitingGroup, WaitingInbox, WaitingLinkAction, WaitingSection, imageNumber, researchTaskRef,
 } from './research-link.js';
+import { bookTitle, bookWebUrl, bookWholeOnDisk, sortBooksMost } from './research-books.js';
+import type { strings } from './strings.js';
 import type { WaitingWrites } from './research-waiting-write.js';
 
 export type WaitingPhase = 'todo' | 'sent';
@@ -67,23 +69,92 @@ export function filterWaiting<T extends LiveWaiting>(items: readonly T[], filter
     return filter === 'all' ? [...items] : items.filter(w => waitingSection(w) === filter);
 }
 
+/** A book's group whose book is outside the research's list (spec 105, 5k): its id and the title its items say. */
+export interface WaitingBookStub {
+    id: string;
+    title: string;
+}
+
 export interface WaitingGroupRows<T extends LiveWaiting = LiveWaiting> {
     key: string;
-    /** The place (null: an item without one, in "Other"). */
+    /** The place (null: an item without one, in "Other"; a book's group). */
     group: WaitingGroup | null;
     items: T[];
+    /** Grouped by book (spec 105 §1): the book from the research's list, or only its id and title when outside it. */
+    book?: LiveBook | WaitingBookStub;
+    /** The first group without a book after its phase's books ("No book" stands before it). */
+    afterBooks?: true;
+    /**
+     * "Most tasks" (spec 105 U4 §4): the first book of its part — to download
+     * or whole on disk — with how many books the part has in the phase; only
+     * when the phase has books of both parts ("To download · N books" before it).
+     */
+    part?: { kind: BookPart; count: number };
+}
+
+/** A part of the books in "Most tasks": to download (images missing or not known), whole on disk. */
+export type BookPart = 'download' | 'disk';
+
+/** A book's group: what the research's list says of the book (null: a book outside the list, its title only). */
+export function listedBook(b: LiveBook | WaitingBookStub | undefined): LiveBook | null {
+    return b && 'tasks' in b ? b : null;
+}
+
+/** Groups by the place an item is done at (as before), or by its one book (spec 105 §1). */
+export type WaitingGroupBy = 'archive' | 'book';
+
+/** How the groups are made: by place or by book, and the research's books (`/status.books`). */
+export interface WaitingGroupOpts {
+    by?: WaitingGroupBy;
+    books?: LiveBooks | null;
+}
+
+/** The key of a book's group. */
+export const BOOK_GROUP_PREFIX = 'book:';
+
+/** The key of the group an item goes under: "Places" for a question about places, its place, else "other". */
+export function waitingGroupKey(w: LiveWaiting): string {
+    return w.kind === 'place' ? PLACES_GROUP : w.group?.key ?? OTHER_GROUP;
+}
+
+/** The book an item is grouped under (a question about places never: it stays under "Places"). */
+function itemBook(w: LiveWaiting): string | null {
+    return w.book && w.kind !== 'place' ? w.book : null;
+}
+
+/** The title of a book outside the research's list: as its item's inbox names it, else its id. */
+function stubTitle(w: LiveWaiting, id: string): string | null {
+    const inbox = w.inbox;
+    return inbox?.book && (!inbox.recordset || inbox.recordset === id) ? inbox.book : null;
 }
 
 /**
- * Items by their place, each group where its first item stands (in the
- * research's order); items without a place and the "other" group at the bottom.
+ * Items by their place in the order given, each group where its first item
+ * stands; with `byBook` an item of one book goes under its book instead.
  */
-export function groupWaiting<T extends LiveWaiting>(items: readonly T[]): WaitingGroupRows<T>[] {
+function groupInOrder<T extends LiveWaiting>(items: readonly T[], opts: WaitingGroupOpts = {}): WaitingGroupRows<T>[] {
+    const byBook = opts.by === 'book';
     const groups = new Map<string, WaitingGroupRows<T>>();
-    for (const w of orderWaiting(items)) {
+    for (const w of items) {
+        const book = byBook ? itemBook(w) : null;
+        if (book) {
+            const key = BOOK_GROUP_PREFIX + book;
+            let g = groups.get(key);
+            if (!g) {
+                const known = opts.books?.list.find(b => b.id === book) ?? null;
+                g = { key, group: null, items: [], book: known ?? { id: book, title: stubTitle(w, book) ?? book } };
+                groups.set(key, g);
+            } else if (!listedBook(g.book) && g.book!.title === book) {
+                // A later item names the title the first one did not.
+                const title = stubTitle(w, book);
+                if (title) g.book = { id: book, title };
+            }
+            g.items.push(w);
+            continue;
+        }
         // The research's questions about places go under one group "Places", whatever group they name.
         const place = w.kind === 'place';
-        const key = place ? PLACES_GROUP : w.group?.key ?? OTHER_GROUP;
+        const key = waitingGroupKey(w);
         let g = groups.get(key);
         if (!g) {
             g = { key, group: place ? null : w.group ?? null, items: [] };
@@ -93,16 +164,125 @@ export function groupWaiting<T extends LiveWaiting>(items: readonly T[]): Waitin
         if (!g.group && w.group && !place) g.group = w.group;
         g.items.push(w);
     }
-    const list = [...groups.values()];
-    return [...list.filter(g => g.key !== OTHER_GROUP), ...list.filter(g => g.key === OTHER_GROUP)];
+    return [...groups.values()];
 }
 
-/** Both phases (after the filter), each in groups. */
-export function waitingPhases<T extends LiveWaiting>(items: readonly T[], filter: WaitingFilter): Record<WaitingPhase, WaitingGroupRows<T>[]> {
+const listed = <T extends LiveWaiting>(g: WaitingGroupRows<T>): boolean => listedBook(g.book) !== null;
+
+/** The books' groups first (in the order given), then the rest, the first of them marked to stand after the books. */
+function booksFirst<T extends LiveWaiting>(books: WaitingGroupRows<T>[], rest: WaitingGroupRows<T>[]): WaitingGroupRows<T>[] {
+    if (books.length === 0 || rest.length === 0) return [...books, ...rest];
+    return [...books, { ...rest[0], afterBooks: true }, ...rest.slice(1)];
+}
+
+/**
+ * Items by their place, each group where its first item stands (in the
+ * research's order); items without a place and the "other" group at the bottom.
+ * By book (spec 105 §1): the books' groups first, each where its first item
+ * stands; in "Most tasks" (`most`) the books by their tasks (sortBooksMost),
+ * a book outside the research's list after them.
+ */
+export function groupWaiting<T extends LiveWaiting>(items: readonly T[], opts: WaitingGroupOpts = {}, most = false): WaitingGroupRows<T>[] {
+    const list = groupInOrder(orderWaiting(items), opts);
+    const books = list.filter(g => g.book);
+    const places = list.filter(g => !g.book);
+    const rest = [...places.filter(g => g.key !== OTHER_GROUP), ...places.filter(g => g.key === OTHER_GROUP)];
+    if (most) {
+        const known = books.filter(listed).sort((a, b) => sortBooksMost(a.book as LiveBook, b.book as LiveBook));
+        // A book outside the research's list: its images not known, so the last of the books to download.
+        const disk = known.filter(g => bookWholeOnDisk(g.book as LiveBook));
+        const download = [...known.filter(g => !disk.includes(g)), ...books.filter(g => !listed(g))];
+        return booksFirst(markPart(download, 'download', disk.length > 0).concat(markPart(disk, 'disk', download.length > 0)), rest);
+    }
+    return booksFirst(books, rest);
+}
+
+/** A part's first book marked with the part and its count (`both`: the phase has books of the other part too). */
+function markPart<T extends LiveWaiting>(groups: WaitingGroupRows<T>[], kind: BookPart, both: boolean): WaitingGroupRows<T>[] {
+    if (!both || groups.length === 0) return groups;
+    return [{ ...groups[0], part: { kind, count: groups.length } }, ...groups.slice(1)];
+}
+
+/**
+ * A phase's lines for the guessed height of the section in the own window's
+ * columns: its rows without groups, else each group's band (`bandRows`),
+ * "No book" and the subheadings of "Most tasks" (spec 105 U4 §4).
+ */
+export function waitingPhaseLines<T extends LiveWaiting>(groups: readonly WaitingGroupRows<T>[], bandRows: (g: WaitingGroupRows<T>) => number): number {
+    return groups.reduce((n, g) => n + (g.key === FLAT_GROUP ? g.items.length : bandRows(g)) + (g.afterBooks ? 1 : 0) + (g.part ? 1 : 0), 0);
+}
+
+/**
+ * The order of Awaiting action (spec 083 K5.1): the research's (phases,
+ * places, lines), or by when an item has waited since (`at`); with the
+ * research's books (spec 105 §2) also "Most tasks" — the books by their tasks.
+ */
+export type WaitingOrder = 'recommended' | 'newest' | 'oldest' | 'most';
+/** The orders of every research (without its books). */
+export const WAITING_ORDERS: readonly WaitingOrder[] = ['recommended', 'newest', 'oldest'];
+/** Every order there is (a kept one is checked against it). */
+export const ALL_WAITING_ORDERS: readonly WaitingOrder[] = [...WAITING_ORDERS, 'most'];
+
+/** The orders offered: "Most tasks" only when the research says its books (booksOn). */
+export function waitingOrdersFor(books: boolean): readonly WaitingOrder[] {
+    return books ? ALL_WAITING_ORDERS : WAITING_ORDERS;
+}
+
+/** An order by when the items have waited since (its time beside the rows and after the groups' names). */
+export function isTimeOrder(order: WaitingOrder): order is 'newest' | 'oldest' {
+    return order === 'newest' || order === 'oldest';
+}
+/** The key of a phase's one list without groups (it has no heading). */
+export const FLAT_GROUP = '*';
+
+/** When an item has waited since (`at`); null when the research did not say (or said nothing readable). */
+export function waitingSince(w: LiveWaiting): number | null {
+    if (!w.at) return null;
+    const ts = Date.parse(w.at);
+    return Number.isFinite(ts) ? ts : null;
+}
+
+/**
+ * Items by when they have waited since, newest or oldest first; equal times
+ * keep the research's order, items without a time come last either way, in
+ * the research's order (spec 083 H2 a).
+ */
+export function sortWaitingByTime<T extends LiveWaiting>(items: readonly T[], order: 'newest' | 'oldest'): T[] {
+    const sign = order === 'newest' ? -1 : 1;
+    return orderWaiting(items).map((w, i) => ({ w, i, t: waitingSince(w) }))
+        .sort((a, b) => {
+            if (a.t === null || b.t === null) return a.t === b.t ? a.i - b.i : a.t === null ? 1 : -1;
+            return sign * (a.t - b.t) || a.i - b.i;
+        })
+        .map(x => x.w);
+}
+
+/** One phase's rows in an order: in groups, or (a time order only) one list without them. */
+function phaseRows<T extends LiveWaiting>(items: readonly T[], order: WaitingOrder, groups: boolean, opts: WaitingGroupOpts): WaitingGroupRows<T>[] {
+    // "Most tasks" is always by book: the books by their tasks, the rest by place, all within in the research's order.
+    if (order === 'most') return groupWaiting(items, { ...opts, by: 'book' }, true);
+    if (order === 'recommended') return groupWaiting(items, opts);
+    const sorted = sortWaitingByTime(items, order);
+    if (!groups) return sorted.length > 0 ? [{ key: FLAT_GROUP, group: null, items: sorted }] : [];
+    // Each group where its newest (oldest) item stands; "Other" and "Places" too, not kept at the bottom.
+    const list = groupInOrder(sorted, opts);
+    return booksFirst(list.filter(g => g.book), list.filter(g => !g.book));
+}
+
+/**
+ * Both phases (after the filter), each in groups: in the research's order
+ * (recommended), or by time (spec 083 K5.1, K5.2) — within each group and
+ * the groups by their first item, or (`groups` off) one list per phase.
+ * By book (`opts.by`, spec 105 §1; always in "Most tasks"): an item of one
+ * book under its book, the books first in each phase (a book in both phases
+ * when its items are), the rest by place after them.
+ */
+export function waitingPhases<T extends LiveWaiting>(items: readonly T[], filter: WaitingFilter,
+    order: WaitingOrder = 'recommended', groups = true, opts: WaitingGroupOpts = {}): Record<WaitingPhase, WaitingGroupRows<T>[]> {
     const shown = filterWaiting(items, filter);
     return {
-        todo: groupWaiting(shown.filter(w => waitingPhase(w) === 'todo')),
-        sent: groupWaiting(shown.filter(w => waitingPhase(w) === 'sent')),
+        todo: phaseRows(shown.filter(w => waitingPhase(w) === 'todo'), order, groups, opts),
+        sent: phaseRows(shown.filter(w => waitingPhase(w) === 'sent'), order, groups, opts),
     };
 }
 
@@ -126,6 +306,45 @@ export function panelWaiting<T extends LiveWaiting>(items: readonly T[], n = PAN
     const first = todo.filter(w => focus.has(w.id));
     const shown = [...first, ...todo.filter(w => !focus.has(w.id))].slice(0, Math.max(n, first.length));
     return { shown, more: todo.length - shown.length };
+}
+
+/** A group of the small panel: its items shown (cut to the panel's rows) and how many it has to do in all. */
+export interface PanelWaitingGroup<T extends LiveWaiting = LiveWaiting> {
+    rows: WaitingGroupRows<T>;
+    total: number;
+}
+
+/**
+ * The small panel with the research's books (spec 105 §5, 5g): the items to
+ * do in the order and groups chosen (by book, by archive, or one list), cut
+ * to the panel's `n` rows as they stand in that order; the items in `focus`
+ * all shown, however many. Each group keeps how many it has in all; a group
+ * left without a row goes, "No book" stands before the first place after a
+ * book. `more`: the items to do not shown (as panelWaiting counts them).
+ */
+export function panelWaitingGroups<T extends LiveWaiting>(items: readonly T[], order: WaitingOrder, groups: boolean, opts: WaitingGroupOpts = {},
+    n = PANEL_WAITING, focus: ReadonlySet<string> = new Set()): { groups: PanelWaitingGroup<T>[]; shown: number; more: number } {
+    const todo = todoWaiting(items);
+    const all = waitingPhases(todo, 'all', order, groups, opts).todo;
+    const drawn = all.flatMap(g => g.items);
+    const first = drawn.filter(w => focus.has(w.id));
+    const keep = new Set<T>([...first, ...drawn.filter(w => !focus.has(w.id)).slice(0, Math.max(0, n - first.length))]);
+    const out: PanelWaitingGroup<T>[] = [];
+    let afterBook = false;
+    let noBookSaid = false;
+    for (const g of all) {
+        const rows = g.items.filter(w => keep.has(w));
+        if (rows.length === 0) continue;
+        const { afterBooks: _drop, ...rest } = g;
+        const next: WaitingGroupRows<T> = { ...rest, items: rows };
+        if (g.book) afterBook = true;
+        else if (afterBook && !noBookSaid && g.key !== FLAT_GROUP) {
+            next.afterBooks = true;
+            noBookSaid = true;
+        }
+        out.push({ rows: next, total: g.items.length });
+    }
+    return { groups: out, shown: keep.size, more: todo.length - keep.size };
 }
 
 /**
@@ -389,6 +608,62 @@ export function imagesState(w: LiveWaiting): ImagesState | null {
     };
 }
 
+// ==================== DELIVERING IMAGES (spec 105 U4 §5) ====================
+
+/** The texts of an item's actions (`strings.live.waitingTask` of a language). */
+export type WaitingTaskTexts = typeof strings.live.waitingTask;
+
+/**
+ * What an item waiting for images asks to be delivered: the numbers still
+ * missing (null: not known — an older research, a count not known, none
+ * left) and the title of the book whose folder they go into (null: the
+ * task's own folder).
+ */
+export interface WaitingDeliver {
+    missing: number[] | null;
+    book: string | null;
+}
+
+/**
+ * `bookFolder`: the book's folder can be opened from here (the research's
+ * link to it). The sentence names the folder the folder step opens: the
+ * book's only for a book in the research's list with its folder, the task's
+ * otherwise (a book outside the list, without a folder, or no such link).
+ */
+export function waitingDeliver(w: LiveWaiting, books?: LiveBooks | null, bookFolder = true): WaitingDeliver {
+    const img = imagesState(w);
+    const missing = img?.detail === 'full' && img.missing && img.missing.length > 0 ? [...img.missing] : null;
+    const id = itemBook(w);
+    const listed = id && bookFolder ? books?.list.find(b => b.id === id) : undefined;
+    return { missing, book: listed?.folder ? bookTitle(listed) : null };
+}
+
+/** The sentence of the Deliver block: which images, as files, into which folder. */
+export function deliverSentence(d: WaitingDeliver, T: WaitingTaskTexts): string {
+    if (d.missing) {
+        const list = imageRanges(d.missing);
+        return d.book !== null ? T.deliverBook(list, d.missing.length, d.book) : T.deliverTask(list, d.missing.length);
+    }
+    return d.book !== null ? T.deliverBookAny(d.book) : T.deliverTaskAny;
+}
+
+/** A step of delivering images, in their order: the archive's website, the folder, "Add images". */
+export type DeliverStep = 'web' | 'folder' | 'images';
+
+/** The website of step ①: the item's own, else its book's (or the book's archive's); null: no such step. */
+export function deliverWebUrl(w: LiveWaiting, book: Pick<LiveBook, 'url' | 'archive'> | null): string | null {
+    return w.url ?? (book ? bookWebUrl(book) : null);
+}
+
+/** The steps an item shows, in their order: each only when it can go from here (the next takes its number). */
+export function deliverSteps(o: { web: string | null; folder: boolean; images: boolean }): DeliverStep[] {
+    const out: DeliverStep[] = [];
+    if (o.web) out.push('web');
+    if (o.folder) out.push('folder');
+    if (o.images) out.push('images');
+    return out;
+}
+
 /** The numbers that arrived between two states of one item (missing before, not now). */
 export function imagesArrived(before: ImagesState | null, now: ImagesState | null): number[] {
     if (!before?.missing || !now?.missing) return [];
@@ -400,6 +675,24 @@ export function waitingGroupMissing(items: readonly LiveWaiting[]): number | nul
     let sum = 0;
     for (const w of items) sum += waitingForImages(w) ? w.inbox?.missing?.length ?? 0 : 0;
     return sum > 0 ? sum : null;
+}
+
+/** About how many characters of a group's title one line of a column holds (the guessed height only). */
+export const GROUP_TITLE_LINE_CHARS = 70;
+/** The lines a group's title takes at most before "…" and "more" (spec 105 U4 §1; a phone and the panel 4). */
+export const GROUP_TITLE_LINES = 3;
+
+/**
+ * How many lines a group's band adds to the guessed height of Awaiting
+ * action (spec 105 U4 §1, §2): its title, one more line for every ~70
+ * characters up to the cap; a book of the research's list its archive, its
+ * facts and its actions; a place its actions under the title and the images
+ * its items miss. Guessed by the text's length, never measured.
+ */
+export function waitingGroupBandLines(title: string, head: { book?: boolean; listed?: boolean; missing?: boolean }): number {
+    const titleLines = Math.min(GROUP_TITLE_LINES, Math.max(1, Math.ceil(title.trim().length / GROUP_TITLE_LINE_CHARS)));
+    if (head.book) return titleLines + (head.listed ? 3 : 0);
+    return titleLines + 1 + (head.missing ? 1 : 0);
 }
 
 /** Files a task takes as images of its book (`<input accept>`; the research reads PDF page by page). */
@@ -431,9 +724,13 @@ export function imageNumberOfName(name: string): number | null {
  * How a file got its number: by its name, in order to the missing ones (the
  * counts match), by hand; 'pdf' — a lone PDF the research spreads over the
  * missing numbers itself; 'unknown' — the task does not know which images it
- * wants (sent without a number).
+ * wants (sent without a number). At a task that does not know how many it
+ * wants (K044, `next` known): 'next' — the book's next free number as
+ * foreseen; 'pdf' — a PDF, its pages from the next free on; 'unknown' — the
+ * next free, not foreseen (after a PDF): each goes with the next free number
+ * the research said last.
  */
-export type ImageAssignHow = 'name' | 'order' | 'hand' | 'pdf' | 'unknown';
+export type ImageAssignHow = 'name' | 'order' | 'hand' | 'pdf' | 'unknown' | 'next';
 
 export interface ImageAssignment {
     /** The file's place in the list given. */
@@ -450,6 +747,8 @@ export interface ImageAssignment {
     replace: 'no' | 'ask' | 'yes';
     /** It is not sent at all (checked before): not a kind the task takes, too large. */
     problem?: 'format' | 'size';
+    /** A number chosen by hand that another file has by hand too (it needs another before anything goes). */
+    twice?: number;
 }
 
 export interface ImagesAssigned {
@@ -472,7 +771,7 @@ export interface ImagesAssigned {
  * number (the research spreads its pages); the rest stay without one.
  */
 export function assignImages(files: readonly { name: string; size?: number }[], want: readonly number[] | null, have: readonly number[],
-    opts: { chosen?: readonly (number | null | undefined)[]; maxBytes?: number } = {}): ImagesAssigned {
+    opts: { chosen?: readonly (number | null | undefined)[]; maxBytes?: number; next?: number } = {}): ImagesAssigned {
     const wanted = want ? new Set(want) : null;
     const saved = new Set(have);
     const out: ImageAssignment[] = files.map((f, index) => {
@@ -485,7 +784,7 @@ export function assignImages(files: readonly { name: string; size?: number }[], 
     });
     const valid = out.filter(a => !a.problem);
     if (!wanted) {
-        for (const a of valid) a.how = 'unknown';
+        assignFree(valid, files, opts.chosen ?? [], opts.next);
         return summary(out);
     }
     const taken = new Set<number>();
@@ -511,6 +810,53 @@ export function assignImages(files: readonly { name: string; size?: number }[], 
         left[0].how = 'pdf';
     }
     return summary(out);
+}
+
+/**
+ * Numbers at a task that does not know which images it wants (K044), in the
+ * files' order: a number chosen by hand (another file with the same one by
+ * hand needs another); every other file the book's next free number as
+ * foreseen from `next` on (each past every number before it, as the
+ * research counts: highest + 1) — never the number of its name, which may
+ * be anything ("IMG_4821.JPG") and would leave a gap in the book. A PDF
+ * starts at the next free (its pages after it) and nothing after it is
+ * foreseen ('unknown': the next free the research says when it goes).
+ * `next` not known (an older research): only the hand; the rest goes
+ * without a number.
+ */
+function assignFree(valid: ImageAssignment[], files: readonly { name: string }[], chosen: readonly (number | null | undefined)[], next: number | undefined): void {
+    const taken = new Set<number>();
+    for (const a of valid) {
+        const n = chosen[a.index];
+        if (typeof n !== 'number') continue;
+        if (taken.has(n)) a.twice = n;
+        else taken.add(n);
+    }
+    let counter = next ?? null;
+    for (const a of valid) {
+        const n = chosen[a.index];
+        if (a.twice !== undefined) {
+            a.how = null;
+            continue;
+        }
+        if (typeof n === 'number') {
+            a.num = n;
+            a.how = 'hand';
+            if (counter !== null) counter = Math.max(counter, n + 1);
+            continue;
+        }
+        const pdf = fileExt(files[a.index].name) === 'pdf';
+        if (counter === null) {
+            a.how = 'unknown';
+            continue;
+        }
+        while (taken.has(counter)) counter++;
+        a.num = counter;
+        a.how = pdf ? 'pdf' : 'next';
+        taken.add(counter);
+        // A PDF's pages are not known here: nothing after it is foreseen.
+        counter = pdf ? null : counter + 1;
+    }
 }
 
 function summary(files: ImageAssignment[]): ImagesAssigned {

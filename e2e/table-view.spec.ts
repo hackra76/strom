@@ -152,6 +152,87 @@ test.describe('desktop (1440)', () => {
         expect(await clippedTexts(page)).toEqual([]);
     });
 
+    test('a slanted text keeps its last letter: room on the right of its clipping box (T54 H14)', async ({ page }) => {
+        await page.clock.setFixedTime(new Date('2026-06-15T10:00:00Z'));
+        await openApp(page);
+        // One living person: "living" in Death completeness and "–" in the death cells.
+        await seedTree(page, { ...INKY, e: { firstName: 'Fylip', lastName: 'Pýchrož', birthDate: '1990-03-03', parents: ['a', 'b'] } }, 'Pýchrož', 'a');
+        await openTable(page);
+        await page.locator('#table-container .tv-cols-btn').click();
+        const panel = page.getByRole('dialog', { name: 'Columns' });
+        await panel.locator('.tv-cp-q').fill('Death completeness');
+        await panel.getByRole('checkbox', { name: 'Death completeness' }).check();
+        await panel.getByRole('button', { name: 'Done' }).click();
+        await expect(page.locator('#table-container .tv-body .tv-row[data-key="p:a#u2"]')).toBeVisible();
+        const room = await page.locator('#table-container .tv-body').evaluate((body) => {
+            const out: { text: string; room: number }[] = [];
+            for (const el of body.querySelectorAll<HTMLElement>('.tv-cell-text')) {
+                if (getComputedStyle(el).fontStyle !== 'italic' || !el.textContent?.trim()) continue;
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                const t = range.getBoundingClientRect();
+                // The clipping edge is the padding box's right; the text ends at its own right.
+                const r = el.getBoundingClientRect();
+                const clipRight = r.right - parseFloat(getComputedStyle(el).borderRightWidth);
+                out.push({ text: el.textContent.trim(), room: clipRight - t.right });
+            }
+            return out;
+        });
+        const texts = room.map(r => r.text);
+        expect(texts).toContain('living');
+        expect(texts).toContain('2 unions');
+        for (const r of room) expect(r.room, r.text).toBeGreaterThanOrEqual(2);
+    });
+
+    test('what is chosen is drawn one hairline thick; the bar\'s corners are its search field\'s (T54 H3, H11)', async ({ page }) => {
+        await openApp(page);
+        await seedTree(page, INKY, 'Pýchrož', 'a');
+        await openTable(page);
+        // No source: every row stays (none of them has one).
+        await page.locator('#table-container .tv-chip[data-chip="noSource"]').click();
+        await expect(page.locator('#table-container .tv-chip[aria-pressed="true"]')).toHaveCount(1);
+        await page.locator('#table-container .tv-body .tv-row').nth(1).locator('.tv-cell').nth(2).click();
+        await expect(page.locator('#table-container .tv-body .tv-cell.is-active-cell')).toHaveCount(1);
+        const look = await page.locator('#table-container').evaluate((root) => {
+            const cs = (sel: string) => getComputedStyle(root.querySelector(sel)!);
+            const on = cs('.tv-rowtype > [aria-checked="true"]');
+            const first = cs('.tv-rowtype > .sel-opt:first-child');
+            const chip = cs('.tv-chip[aria-pressed="true"]');
+            const cell = cs('.tv-body .tv-cell.is-active-cell');
+            const row = cs('.tv-body .tv-row[aria-selected="true"] > .tv-cell:not(.is-active-cell)');
+            return {
+                segOn: [on.borderTopWidth, on.borderLeftWidth, on.boxShadow],
+                chip: [chip.borderTopWidth, chip.boxShadow],
+                cell: cell.outlineWidth,
+                row: row.boxShadow,
+                corners: {
+                    segment: first.borderTopLeftRadius,
+                    view: cs('.tv-view-btn').borderTopLeftRadius,
+                    columns: cs('.tv-cols-btn').borderTopLeftRadius,
+                    export: cs('.tv-export-btn').borderTopLeftRadius,
+                    search: cs('.tv-search-q').borderTopLeftRadius,
+                },
+            };
+        });
+        expect(look.segOn).toEqual(['1px', '1px', 'none']);
+        expect(look.chip).toEqual(['1px', 'none']);
+        expect(look.cell).toBe('1px');
+        expect(look.row).toMatch(/0px -1px 0px 0px inset$/);
+        const r = look.corners.search;
+        expect(look.corners).toEqual({ segment: r, view: r, columns: r, export: r, search: r });
+
+        // The person dialog: Gender's corners are those of its text fields.
+        await page.locator('#view-mode-family').click();
+        const id = await page.evaluate(() => window.Strom.DataManager.getAllPersons()[0].id);
+        await page.evaluate((id) => window.Strom.UI.showEditPersonModal(id), id);
+        await expect(page.locator('#person-modal')).toBeVisible();
+        const dlg = await page.evaluate(() => ({
+            gender: getComputedStyle(document.getElementById('gender-segment')!).borderTopLeftRadius,
+            field: getComputedStyle(document.getElementById('input-firstname')!).borderTopLeftRadius,
+        }));
+        expect(dlg.gender).toBe(dlg.field);
+    });
+
     test('the person in focus goes along between the table and the other views (U9)', async ({ page }) => {
         await openApp(page);
         await seedTree(page, longTree(120), 'Kvelden', 'p0');

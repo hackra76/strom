@@ -18,7 +18,13 @@ import { PersonId, TreeId, StromData } from '../types.js';
 import { findComponents, componentName, TreeComponent } from '../components.js';
 import { extractSubtree } from '../subtree.js';
 import { uiModule } from './module.js';
+import { runBusy, nextPaint, activatedElement, type BusyCtl } from './busy.js';
+import { computeUnder } from './canvas-busy.js';
+import { busyProg } from './busy-prog.js';
 
+
+/** From this many people splitting a tree says its state at once (finding its parts takes longer than 120 ms). */
+export const SPLIT_SHOWN_AT_ONCE = 3000;
 export const splitMethods = uiModule({
     /** The active tree is in memory; any other has to be read from storage. */
     async splitDataFor(id: TreeId): Promise<StromData | null> {
@@ -34,11 +40,17 @@ export const splitMethods = uiModule({
     async showSplitDialog(treeId?: string, parentDialogId?: string): Promise<void> {
         const id = (treeId as TreeId) || DataManager.getCurrentTreeId();
         if (!id) return;
-        const data = await this.splitDataFor(id);
-        if (!data) return;
+        // §8: the tree read and its parts found under the working state of the choice (the canvas overlay
+        // when its menu closed), at once for a large tree.
+        const people = TreeManager.getTreeMetadata(id)?.personCount ?? 0;
+        const found = await computeUnder(activatedElement(), async () => {
+            const data = await this.splitDataFor(id);
+            return data ? findComponents(data) : null;
+        }, { label: strings.busy.findingParts, atOnce: people >= SPLIT_SHOWN_AT_ONCE });
+        if (!found) return;
 
         this.splitTreeId = id;
-        this.splitComponents = findComponents(data);
+        this.splitComponents = found;
         this.splitParentDialog = parentDialogId ?? null;
 
         document.getElementById('split-modal')?.remove();
@@ -73,8 +85,11 @@ export const splitMethods = uiModule({
         overlay.querySelectorAll('.split-check').forEach(box => {
             (box as HTMLInputElement).onchange = () => this.updateSplitButton();
         });
-        (overlay.querySelector('#split-go') as HTMLButtonElement | null)?.addEventListener(
-            'click', () => void this.performSplit());
+        const go = overlay.querySelector<HTMLButtonElement>('#split-go');
+        // One working state from the click (§8): a second click splits nothing more.
+        // 8b: the steps above the footer, the end ✓ "Created" and the sentence in the dialog.
+        go?.addEventListener('click', () => void runBusy(go, ctl => this.performSplit(ctl),
+            { label: strings.busy.creating, heavy: 'now', stepsInToast: true, done: strings.busy.done.created }));
 
         this.clearDialogStack();
         if (this.splitParentDialog) {
@@ -125,24 +140,45 @@ export const splitMethods = uiModule({
      * touched — no data is moved, only duplicated, so a wrong pick costs a
      * delete rather than a family.
      */
-    async performSplit(): Promise<void> {
+    async performSplit(ctl?: BusyCtl): Promise<void> {
         const chosen = this.selectedSplitIndexes();
         if (chosen.length === 0 || !this.splitTreeId) return;
 
         const data = await this.splitDataFor(this.splitTreeId);
         if (!data) return;
 
-        for (const index of chosen) {
+        const modal = document.querySelector<HTMLElement>('#split-modal .split-modal');
+        const footer = modal?.querySelector('.buttons') ?? null;
+        modal?.querySelector('.busy-prog, .busy-prog-done')?.remove();
+        const prog = ctl && modal ? busyProg(modal, footer) : null;
+        for (const [k, index] of chosen.entries()) {
             const component = this.splitComponents[index];
-            const subtree = extractSubtree(data, new Set<PersonId>(component.personIds));
             const name = componentName(component, strings.split.familyName, strings.split.noSurname);
+            // Several trees: each one's step painted before its work (§8), above the footer (8b).
+            if (ctl && chosen.length > 1) {
+                const words = strings.busy.creatingTreeK(k + 1, chosen.length, name);
+                ctl.step(words, k + 1, chosen.length);
+                prog?.set(words, k + 1, chosen.length);
+                await nextPaint();
+            }
+            const subtree = extractSubtree(data, new Set<PersonId>(component.personIds));
             TreeManager.createTreeFromImport(subtree, name, false);
         }
 
-        this.closeSplitDialog();
         this.updateTreeSwitcher();
         this.updateTreeManagerList();
         TreeRenderer.render();
+        if (prog && modal?.isConnected) {
+            // 8b: the dialog stays with the sentence; Split off locked, Cancel becomes Close.
+            prog.done(strings.split.done(chosen.length));
+            const go = modal.querySelector<HTMLButtonElement>('#split-go');
+            if (go) go.disabled = true;
+            modal.querySelectorAll<HTMLInputElement>('.split-check').forEach(x => { x.disabled = true; });
+            const cancel = modal.querySelector<HTMLButtonElement>('#split-close');
+            if (cancel) cancel.textContent = strings.buttons.close;
+            return;
+        }
+        this.closeSplitDialog();
         this.showToast(strings.split.done(chosen.length));
     },
 

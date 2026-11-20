@@ -44,7 +44,9 @@ async function openMain(page: Page): Promise<string> {
 async function openSatellite(context: BrowserContext, treeId: string): Promise<Page> {
     const sat = await context.newPage();
     await sat.clock.setFixedTime(new Date('2026-06-15T10:00:00Z'));
-    await sat.goto(`/strom.html?okno=table&tree=${encodeURIComponent(treeId)}&w=t1`);
+    // These tests share a choice by marking (a Table window's default, Focus: windows-send-focus.spec.ts).
+    await sat.addInitScript(() => { if (sessionStorage.getItem('strom.win.send.st01aa') === null) sessionStorage.setItem('strom.win.send.st01aa', 'mark'); });
+    await sat.goto(`/strom.html?okno=table&tree=${encodeURIComponent(treeId)}&w=st01aa`);
     await expect(tv(sat, '.tv-status-count')).toHaveText(`${EXTRA + 3} of ${EXTRA + 3} people`);
     // Connected to the main window (editable).
     await expect(tv(sat, '.tv-status-ro')).toBeHidden();
@@ -89,7 +91,7 @@ test.describe('desktop (1440)', () => {
         // The Table only marks another window's choice (K2.1).
         await expect(sat.locator('.sat-follow')).toHaveAttribute('aria-haspopup', 'menu');
         await expect(sat.locator('.sat-follow')).toHaveAttribute('data-mode', 'mark');
-        await expect(sat.locator('.sat-follow')).toHaveAttribute('aria-label', 'Follow selection: mark only');
+        await expect(sat.locator('.sat-follow')).toHaveAttribute('aria-label', 'Person selection between windows. From other windows: mark only. To the main window: mark only.');
         // Not mounted at all (not only hidden).
         for (const sel of ['.toolbar', '#bottom-bar', '.tree-switcher', '#research-menu-row', '#actions-settings-row', '#research-sync-pill']) {
             await expect(sat.locator(sel), sel).toHaveCount(0);

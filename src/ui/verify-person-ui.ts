@@ -29,7 +29,7 @@ import {
     VerifyBulkDone, VerifyBulkOrder, VerifyBulkResult, VerifyFact, VerifyTarget, postVerify, postVerifyBulk, postVerifyStop,
 } from '../research-verify.js';
 import {
-    BulkScopeOption, FactOffer, VERIFY_TRY_PEOPLE, bulkScopeOptions, factOffer, personVerifyAskCount, personVerifyCounts, queuedToastDue,
+    BulkScopeOption, FactOffer, PERSON_VERIFY_KINDS, VERIFY_TRY_PEOPLE, bulkScopeOptions, factOffer, personVerifyAskCount, personVerifyCounts, queuedToastDue,
     verifyCostSplit, verifyFactKind, verifyRecordText,
 } from '../verify-ui-model.js';
 import { VerifyResearch, researchVerifies } from '../verify-offer.js';
@@ -41,6 +41,7 @@ import { onBridgeStatus } from './research-sync-ui.js';
 import { liveSession } from './research-ui.js';
 import { rodIndex } from './rod-view.js';
 import { uiModule } from './module.js';
+import { runBusy } from './busy.js';
 import { factVerifyStartedHere, factWaitsForVerify, markVerifyPending, verifyKindName } from './verify-ui.js';
 import { verifyRefusalText } from '../verify-refusal.js';
 
@@ -138,6 +139,8 @@ interface PersonPreviewState {
     opener: HTMLElement | null;
     /** "Verify first": the facts waiting further down the research's queue, moved to its head. */
     prioritize?: boolean;
+    /** The research's /verify {person} would take facts the dialog leaves out (a residence): a start names each fact. */
+    others?: boolean;
 }
 
 let preview: PersonPreviewState | null = null;
@@ -423,7 +426,10 @@ export const verifyPersonMethods = uiModule({
             const state = this.personVerifyState(st.personId);
             const byEid = new Map<string, PersonFact>();
             for (const f of state?.facts ?? []) if (f.offer.eid) byEid.set(f.offer.eid, f);
-            st.rows = r.facts.map(f => {
+            // Only the five main events (PERSON_VERIFY_KINDS); a residence goes by "Verify" at the fact.
+            const asked = r.facts.filter(f => PERSON_VERIFY_KINDS.has(f.kind));
+            st.others = asked.length < r.facts.length;
+            st.rows = asked.map(f => {
                 const local = byEid.get(f.fact);
                 const title = local ? factTitle(f.kind, local.holder, local.fact) : verifyKindName(f.kind);
                 const record = verifyRecordText(f.record);
@@ -506,7 +512,10 @@ export const verifyPersonMethods = uiModule({
         }
     },
 
-    /** Start: the whole person when every fact is checked, else each checked fact by its id. */
+    /**
+     * Start: the whole person when every fact is checked and the research's /verify {person} takes no
+     * other (a residence), else each checked fact by its id (the research joins them into the person's task).
+     */
     async verifyPersonStart(): Promise<void> {
         const st = preview;
         if (!st || st.busy) return;
@@ -516,7 +525,7 @@ export const verifyPersonMethods = uiModule({
         if (!ref || checked.length === 0) return;
         st.busy = true;
         this.renderVerifyPerson();
-        const all = checked.length === st.rows.length;
+        const all = checked.length === st.rows.length && !st.others;
         const targets: VerifyTarget[] = all ? [{ person: ref }] : checked.map(r => ({ fact: r.eid }));
         const started: StartedFact[] = [];
         /** The facts the research queued, by its answers (each target's checked rows when one names none). */
@@ -548,7 +557,7 @@ export const verifyPersonMethods = uiModule({
             return;
         }
         this.closeVerifyPersonDialog();
-        // What the research says it queued: a residence it verifies too, though the tree holds no such fact to mark.
+        // What the research says it queued: a fact it holds that the tree does not show counts too.
         this.showToast(failure || strings.verify.bulkStarted(queued.size || started.length || checked.length), 5000, failure ? { alert: true } : {});
         this.afterVerifyStarted();
     },
@@ -580,9 +589,10 @@ export const verifyPersonMethods = uiModule({
         const v = strings.verify;
         const rows: string[] = [];
         if (pending > 0) {
+            // Stop's `data-action` is its identity: its "Stopping…" follows it when the section is drawn anew.
             rows.push(`<div class="vfy-sec-row vfy-sec-pending"><span class="vfy-sec-main"><span class="vfy-sec-title">${esc(v.pendingRow(pending))}</span>`
                 + `<span class="vfy-sec-sub">${esc(v.pendingRowSub)}</span></span>`
-                + (opts.stop ? `<button type="button" class="link-button vfy-sec-stop" data-verify-act="stop">${researchBridgeActionLabel(v.stop, 'verify-stop')}</button>` : '')
+                + (opts.stop ? `<button type="button" class="link-button vfy-sec-stop" data-verify-act="stop" data-action="verify-stop">${researchBridgeActionLabel(v.stop, 'verify-stop')}</button>` : '')
                 + '</div>');
         }
         if (opts.bulk) {
@@ -629,18 +639,38 @@ export const verifyPersonMethods = uiModule({
         });
     },
 
-    /** Stop: the research drops what it has not begun to verify. */
+    /**
+     * Stop: the research drops what it has not begun to verify. The button says "Stopping…" until the research's
+     * answer (a second click asks nothing more), its refusal under it with "Try again" (B119); without the button
+     * the outcome is a toast.
+     */
     async verifyStop(btn: HTMLButtonElement | null): Promise<void> {
-        if (!this.verifyBridgeNow()) return;
-        if (btn) btn.disabled = true;
-        const r = await this.postResearchBridgeWrite((base, features) => postVerifyStop(base, { features }));
-        if (btn) btn.disabled = false;
-        if (!r || !r.ok) {
-            this.showToast(r ? verifyRefusalText(r.code) : strings.verify.failed, 5000, { alert: true });
+        if (!this.treeVerifyNow()?.stop) return;
+        if (!btn?.isConnected) {
+            const r = await this.writeVerifyStop();
+            if (r.ok) this.showToast(strings.verify.stopped, 4000);
+            else this.showToast(r.text, 5000, { alert: true });
             return;
         }
-        this.showToast(strings.verify.stopped, 4000);
+        await runBusy(btn, async ctl => {
+            const r = await this.writeVerifyStop();
+            if (!r.ok) {
+                ctl.end({ ok: false, kind: 'error', text: r.text, retry: () => { void this.verifyStop(btn.isConnected ? btn : null); } });
+                return;
+            }
+            this.showToast(strings.verify.stopped, 4000);
+        }, { label: strings.busy.stopping, kind: 'write' });
+    },
+
+    /**
+     * Stop written through the bridge, the marks and the research's version following it; the refusal's sentence.
+     * The overview's own window asks its main window (its silence said as such).
+     */
+    async writeVerifyStop(): Promise<{ ok: true } | { ok: false; text: string }> {
+        const r = await this.postResearchBridgeWrite((base, features) => postVerifyStop(base, { features }));
+        if (!r || !r.ok) return { ok: false, text: r ? verifyRefusalText(r.code) : strings.verify.failed };
         this.afterVerifyStarted();
+        return { ok: true };
     },
 
     /** The open places that show the verification, drawn again (a start, a stop, a new status). */

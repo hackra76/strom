@@ -204,6 +204,8 @@ test.describe('questions about places in Awaiting action', () => {
     });
 
     test('a conflict: Keep; a written place: Yes; a suggestion: Don\'t know — each with its toast', async ({ page }) => {
+        // The 3 s each toast with its Undo stands to be read run on Playwright's clock (it ticks as ever).
+        await page.clock.install();
         const b = await research(page);
         await openWin(page);
 
@@ -229,10 +231,12 @@ test.describe('questions about places in Awaiting action', () => {
         await expect(f.locator('.waiting-place-choice')).toHaveText(['Yes', 'No', 'Don’t know']);
         await f.getByRole('button', { name: 'Yes' }).click();
         await expect.poll(() => b.places!.answers.at(-1)).toEqual({ place: 'L0030', take: 'yes' });
+        await page.clock.runFor(3000);   // the toast before it stands its 3 s
         await expect(toast(page)).toContainText('Entry changed to “Lhota, house 16” (1 fact).');
 
         await cardOf(page, 'L0013').getByRole('button', { name: 'Don’t know' }).click();
         await expect.poll(() => b.places!.answers.at(-1)).toEqual({ place: 'L0013', take: 'unknown' });
+        await page.clock.runFor(3000);
         await expect(toast(page)).toContainText('Noted: not known. The place stays off the map.');
         await expect.poll(() => cards(page)).toEqual(['L0012', 'L0020']);
         expect(b.places!.answers).toHaveLength(3);
@@ -275,6 +279,38 @@ test.describe('questions about places in Awaiting action', () => {
         await expect.poll(() => b.places!.undos).toEqual([{ undo: 'U1' }]);
         await expect.poll(() => cards(page)).toHaveLength(5);
         await expect(win(page).locator('.waiting-places-accept')).toHaveText('Accept all suggested (3)');
+    });
+
+    test('It is A and Accept n say Sending… on the button clicked until the research answers; the others stay locked, a second click sends nothing', async ({ page }) => {
+        const b = await research(page);
+        await openWin(page);
+        let release!: () => void;
+        let held = new Promise<void>(r => { release = r; });
+        await page.route(url => url.pathname.endsWith('/places/answer'), async route => {
+            const body = route.request().postDataJSON() as { dry?: boolean } | null;
+            if (route.request().method() === 'POST' && !body?.dry) await held;
+            await route.fallback();
+        });
+        const pick = cardOf(page, 'L0012').locator('.waiting-place-pick').first();
+        await pick.click();
+        await expect(pick).toHaveAttribute('data-busy', 'busy');
+        await expect(pick).toContainText('Sending…');
+        await expect(cardOf(page, 'L0013').locator('.waiting-place-pick').first()).toBeDisabled();
+        await pick.click({ force: true });
+        release();
+        await expect.poll(() => cards(page)).toEqual(['L0013', 'L0020', 'L0021', 'L0030']);
+        expect(b.places!.answers.filter(a => !(a as { dry?: boolean }).dry)).toHaveLength(1);
+
+        held = new Promise<void>(r => { release = r; });
+        await win(page).locator('.waiting-places-keep').click();
+        const go = win(page).locator('.waiting-places-go');
+        await go.click();
+        await expect(go).toHaveAttribute('data-busy', 'busy');
+        await expect(go).toContainText('Sending…');
+        await go.click({ force: true });
+        release();
+        await expect(win(page).locator('.waiting-places-preview')).toHaveCount(0);
+        expect(b.places!.answers.filter(a => !(a as { dry?: boolean }).dry)).toHaveLength(2);
     });
 
     test('By area: the chip previews only its area\'s suggestions and accepts only them; Escape closes the preview first', async ({ page }) => {

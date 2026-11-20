@@ -761,3 +761,73 @@ test.describe('the sample tree\'s toolbar with the line picker and ⧉', () => {
         });
     });
 });
+
+test.describe('the tree switcher and the search field are equally high (T54 H4)', () => {
+    test.use({ locale: 'de-DE' });
+
+    const heights = (page: Page) => page.evaluate(() => {
+        const box = (sel: string) => {
+            const r = document.querySelector(sel)!.getBoundingClientRect();
+            return { h: Math.round(r.height * 10) / 10, mid: Math.round((r.top + r.height / 2) * 10) / 10 };
+        };
+        // The search already folded to the magnifier (de at 800 px, touch, with ⌂ of spec 111): that is the search.
+        const folded = document.querySelector('.toolbar')!.classList.contains('toolbar-squeeze-3');
+        return { switcher: box('.toolbar .tree-switcher-btn'), search: box(folded ? '.toolbar .search-open-btn' : '.toolbar .search-row') };
+    });
+
+    for (const [width, height, touch] of [[1440, 900, false], [1280, 800, false], [1024, 768, false], [1024, 768, true], [800, 1100, true]] as const) {
+        test.describe(`${width} px${touch ? ', touch' : ''}`, () => {
+            test.use({ viewport: { width, height }, hasTouch: touch });
+
+            test('the same height and middle; folded to the magnifier, that is as high too', async ({ page }) => {
+                await openApp(page);
+                await page.getByRole('button', { name: 'Beispiel-Stammbaum ausprobieren' }).click();
+                await expect(page.locator('#toolbar-focus-name')).not.toHaveText('');
+                await settleLayout(page);
+                const h = await heights(page);
+                expect(h.switcher).toEqual(h.search);
+                // The search folded to the magnifier (fit step 5) keeps the height. Measured in the same task
+                // as the class is set: the bar's own fit may take a forced step back right after.
+                const mag = await page.evaluate(() => {
+                    document.querySelector('.toolbar')!.classList.add('toolbar-squeeze-3');
+                    return Math.round(document.querySelector('.toolbar .search-open-btn')!.getBoundingClientRect().height * 10) / 10;
+                });
+                expect(mag).toBe(h.switcher.h);
+            });
+        });
+    }
+});
+
+test.describe('Esc folds the search opened from the magnifier back to it', () => {
+    test.use({ locale: 'de-DE' });
+
+    // Widths where the de bar folds the search on its own: a computer at 1100, a tablet at 700.
+    for (const [width, height, touch] of [[1100, 800, false], [700, 1000, true]] as const) {
+        test.describe(`${width} px${touch ? ', touch' : ''}`, () => {
+            test.use({ viewport: { width, height }, hasTouch: touch });
+
+            test('the field closes, the magnifier has the focus, the query stays', async ({ page }) => {
+                await openApp(page);
+                await page.getByRole('button', { name: 'Beispiel-Stammbaum ausprobieren' }).click();
+                await expect(page.locator('#toolbar-focus-name')).not.toHaveText('');
+                await settleLayout(page);
+                // The search folded to the magnifier (fit step toolbar-squeeze-3).
+                await expect(page.locator('.toolbar')).toHaveClass(/\btoolbar-squeeze-3\b/);
+                const mag = page.locator('#search-open-btn');
+                const field = page.locator('#toolbar-search-picker .person-picker-input');
+                await mag.click();
+                await expect(field).toBeVisible();
+                await expect(field).toBeFocused();
+                await field.pressSequentially('an');
+                await page.keyboard.press('Escape');
+                await expect(page.locator('body')).not.toHaveClass(/\bsearch-open\b/);
+                await expect(field).toBeHidden();
+                await expect(mag).toBeFocused();
+                // The query holds: the magnifier shows it, and opens the field with it again.
+                await expect(page.locator('body')).toHaveClass(/\bsearch-active\b/);
+                await mag.click();
+                await expect(field).toHaveValue('an');
+            });
+        });
+    }
+});

@@ -52,6 +52,8 @@ import { isLivingPerson, inferBirthUpperBounds } from '../privacy.js';
 import * as CrossTree from '../cross-tree.js';
 import { AuditLogManager } from '../audit-log.js';
 import { uiModule } from './module.js';
+import { runBusy, activatedElement, nextPaint } from './busy.js';
+import { shownCount } from './file-pick.js';
 import { yearOf, parseFlexDate, formatFlexDate } from '../dates.js';
 import { computeFamilyStats, computeCompleteness } from '../stats.js';
 import { findComponents, componentName } from '../components.js';
@@ -152,6 +154,9 @@ function personLabel(data: StromData, id: string): string {
     return p ? (shownNameOrEmpty(p) || id) : id;
 }
 
+/** From this many people the tree check says its state at once (it computes for longer than 120 ms). */
+export const CHECK_SHOWN_AT_ONCE = 5000;
+
 export const treeStatsMethods = uiModule({
     /**
      * Show tree validation dialog (checks for genealogical inconsistencies).
@@ -163,8 +168,22 @@ export const treeStatsMethods = uiModule({
     async showTreeValidationDialog(treeId: string, parentDialogId?: string,
         opts: { leads?: boolean; focus?: { type: string; category: IssueCategory; dismissed: boolean } } = {}): Promise<void> {
         const tree = TreeManager.getTreeMetadata(treeId as TreeId);
-        const treeData = await this.treeValidationData(treeId);
-        if (!tree || !treeData) return;
+        if (!tree) return;
+        // §8: the check is one computation over the whole tree; the element of the click says it first
+        // ("Checking 2,400 people…"), at once for a large tree (timers do not run while it computes).
+        const el = activatedElement();
+        const check = async (): Promise<{ treeData: StromData; result: TreeValidationResult } | null> => {
+            const treeData = await this.treeValidationData(treeId);
+            if (!treeData) return null;
+            if (el) await nextPaint();
+            return { treeData, result: validateTreeData(treeData) };
+        };
+        const n = tree.personCount;
+        const checked = el
+            ? await runBusy(el, check, { heavy: n >= CHECK_SHOWN_AT_ONCE ? 'now' : true, label: strings.busy.checkingPeople(n, shownCount(n)) })
+            : await check();
+        if (!checked) return;
+        const { treeData, result } = checked;
 
         const modal = document.getElementById('tree-validation-modal');
         const title = document.getElementById('tree-validation-title');
@@ -187,7 +206,6 @@ export const treeStatsMethods = uiModule({
             view.groups.set(opts.focus.type, true);
         }
 
-        const result = validateTreeData(treeData);
         if (content) {
             content.innerHTML = this.generateTreeValidationHtml(result, treeData, treeId);
             this.bindTreeValidationActions(content, result, treeId);
@@ -355,6 +373,9 @@ export const treeStatsMethods = uiModule({
                     redraw();
                     return;
                 }
+                case 'verdictsRetry':
+                    this.retryDuplicateVerdicts(treeId);
+                    return;
                 case 'aside': {
                     const type = el.dataset.type ?? '';
                     if (view.asideOpen.has(type)) view.asideOpen.delete(type); else view.asideOpen.add(type);
@@ -585,6 +606,11 @@ export const treeStatsMethods = uiModule({
         };
     },
 
+    /** A sentence under a group's head, as trusted HTML (the research's verdicts not come in time, with Try again). */
+    validationGroupMsgHtml(type: string, treeId: string): string {
+        return this.duplicateVerdictMsgHtml(type, treeId);
+    },
+
     /** A line under a group's title (§3: "Assessed by the research"). */
     validationGroupNote(type: string, treeId: string): string {
         return this.duplicateVerdictNote(type, treeId);
@@ -736,7 +762,7 @@ export const treeStatsMethods = uiModule({
                     ${note ? `<span class="vq-group-note">${esc(note)}</span>` : ''}
                 </span>
                 <span class="vq-group-count">${group.issues.length}</span>
-            </button>`;
+            </button>${this.validationGroupMsgHtml(group.type, treeId)}`;
         if (open) {
             const limit = rows.length >= LONG_GROUP ? Math.min(rows.length, v.shown.get(group.type) ?? GROUP_STEP) : rows.length;
             html += '<div class="vq-rows">';

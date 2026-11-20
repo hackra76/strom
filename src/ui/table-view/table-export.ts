@@ -36,6 +36,8 @@ export function tableCsvField(raw: string): string {
 export function exportText(value: CellValue): string {
     const r = value.research;
     if (r) return r.liveOff ? '' : r.export;
+    // A ticked box (Done of a work list, spec 084 §13d) as the mark it shows.
+    if (value.check) return '✓';
     return cellPlainText(value);
 }
 
@@ -55,6 +57,12 @@ export interface TableCsvInput {
     columns: readonly ColumnDef[];
     /** The union filters' predicate (§3.3): only passing unions are written; null: all. */
     pass?: UnionPredicate | null;
+    /**
+     * The rows in their groups (spec 084 §10): written in the groups' order
+     * with the group in a first "Group" column, a row in several groups once
+     * in each; absent: not grouped.
+     */
+    groups?: readonly { group: string; row: TableRow }[] | null;
 }
 
 export interface TableCsv {
@@ -87,6 +95,8 @@ export interface ExportTable {
     columns: (ColumnDef | null)[];
     /** Where the "Union" column is (−1: none). */
     unionAt: number;
+    /** The first column is the rows' group (spec 084 §10). */
+    grouped: boolean;
     lines: ExportLine[];
     /** People or unions written. */
     items: number;
@@ -116,16 +126,28 @@ export function buildExportTable(input: TableCsvInput): ExportTable {
         head.splice(unionAt, 0, strings.table.csvUnionCol);
         cols.splice(unionAt, 0, null);
     }
+    const grouped = !!input.groups;
+    if (grouped) {
+        head.unshift(strings.table.groupCol);
+        cols.unshift(null);
+    }
     const lines: ExportLine[] = [];
+    let group = '';
     const push = (row: TableRow, union: number | null, continuation: boolean, cells: (CellValue | null)[], unionText: string): void => {
         const texts = cells.map(v => (v ? exportText(v) : ''));
         if (unionCol) {
             cells.splice(unionAt, 0, null);
             texts.splice(unionAt, 0, unionText);
         }
+        if (grouped) {
+            cells.unshift(null);
+            texts.unshift(group);
+        }
         lines.push({ row, union, continuation, cells, texts });
     };
-    for (const row of rows) {
+    const entries = input.groups ?? rows.map(row => ({ group: '', row }));
+    for (const { group: g, row } of entries) {
+        group = g;
         const unions = unionsOf(row);
         const multi = row.kind === 'person' && row.unions.length > 1;
         const first = unions[0] ?? 0;
@@ -138,7 +160,7 @@ export function buildExportTable(input: TableCsvInput): ExportTable {
             push(row, u, true, columns.map(c => (c.unionScoped ? cellOf(model, row, c, u) : null)), strings.table.csvUnionOf(u + 1, n));
         }
     }
-    return { head, columns: cols, unionAt, lines, items: rows.length };
+    return { head, columns: cols, unionAt: unionCol && grouped ? unionAt + 1 : unionAt, grouped, lines, items: rows.length };
 }
 
 /** The CSV of the table as shown (§11.2). */

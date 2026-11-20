@@ -171,7 +171,22 @@ test('the map offers to look up places after consent, plots them, never scrolls 
     // Consent is asked for before anything is sent.
     await expect(page.getByText(/place names.*will be sent/i)).toBeVisible();
     expect(asked).toEqual([]);
+    // The second place waits until the progress is seen (a route added later is asked first).
+    let release!: () => void;
+    const held = new Promise<void>(r => { release = r; });
+    await page.route('**://nominatim.openstreetmap.org/**', async route => {
+        if (asked.length > 0) await held;
+        await route.fallback();
+    });
     await page.getByRole('button', { name: 'Look them up' }).click();
+    // While it looks up (2h): what runs with "k of n" at the right, the one 4 px bar, Cancel at the right.
+    const geo = page.locator('#map-status .map-geo-prog');
+    await expect(geo.locator('.prog-t')).toHaveText('Looking up places…');
+    await expect(geo.locator('.prog-k')).toHaveText(/^[01] of 2$/);
+    // The bar is drawn anew with each step: read on the bar as it is now, not on a copy just replaced.
+    await expect(geo.locator('.bar')).toHaveCSS('height', '4px');
+    await expect(geo.locator('.prog-acts').getByRole('button', { name: 'Cancel' })).toBeVisible();
+    release();
     // Markers appear for both places.
     await expect(page.locator('.map-marker')).toHaveCount(2, { timeout: 15000 });
     expect([...asked].sort()).toEqual(['Greenwich', 'Pembroke']);
@@ -205,6 +220,62 @@ test('the map offers to look up places after consent, plots them, never scrolls 
     await expect(page.locator('.map-marker')).toHaveCount(2);
     expect(asked.length).toBe(firstRound);
     await expect(page.getByRole('button', { name: /Look up \d+ places?/ })).toBeHidden();
+});
+
+test('a lookup without an answer (§10.3): the network down stops the run with its sentence and Try again, nothing counted as not found', async ({ page }) => {
+    await stubTiles(page);
+    let down = true;
+    const asked: string[] = [];
+    await page.route('**://nominatim.openstreetmap.org/**', route => {
+        const q = new URL(route.request().url()).searchParams.get('q') ?? '';
+        asked.push(q);
+        if (down) return route.abort('internetdisconnected');
+        return route.fulfill({ status: 200, contentType: 'application/json',
+            body: JSON.stringify([{ lat: q === 'Greenwich' ? '51.48' : '51.67', lon: q === 'Greenwich' ? '0.0' : '-4.91', display_name: `${q}, Test` }]) });
+    });
+    await openApp(page);
+    await page.getByRole('button', { name: 'Try a sample tree' }).click();
+    await expect(card(page, 'Johan')).toBeVisible();
+    await seedPlaces(page);
+    await page.getByRole('button', { name: 'Map', exact: true }).click();
+    await clearToasts(page);
+    await page.getByRole('button', { name: /Look up \d+ places?/ }).click();
+    await page.getByRole('button', { name: 'Look them up' }).click();
+    const failed = page.locator('#map-status .busy-msg.is-err[role="alert"]');
+    await expect(failed.locator('.busy-msg__text')).toHaveText('The service is not available (network error).');
+    // The run stopped at the first place; no "not found" toast.
+    expect(asked).toHaveLength(1);
+    await expect(page.locator('.toast', { hasText: 'not found' })).toHaveCount(0);
+    await expect(page.locator('#map-status')).not.toContainText('not found by the map');
+    down = false;
+    await failed.getByRole('button', { name: 'Try again' }).click();
+    await expect(page.locator('.map-marker')).toHaveCount(2, { timeout: 15000 });
+    await expect(failed).toHaveCount(0);
+});
+
+test('the service\'s request limit (429) and no answer in 10 s are said as such', async ({ page }) => {
+    await page.clock.install({ time: new Date('2026-11-18T10:00:00Z') });
+    await stubTiles(page);
+    let reply: 'limit' | 'silent' = 'limit';
+    await page.route('**://nominatim.openstreetmap.org/**', route => {
+        if (reply === 'limit') return route.fulfill({ status: 429, contentType: 'application/json', body: '[]' });
+        return undefined;   // never answers
+    });
+    await openApp(page);
+    await page.getByRole('button', { name: 'Try a sample tree' }).click();
+    await expect(card(page, 'Johan')).toBeVisible();
+    await seedPlaces(page);
+    await page.getByRole('button', { name: 'Map', exact: true }).click();
+    await clearToasts(page);
+    await page.getByRole('button', { name: /Look up \d+ places?/ }).click();
+    await page.getByRole('button', { name: 'Look them up' }).click();
+    const failed = page.locator('#map-status .busy-msg.is-err');
+    await expect(failed.locator('.busy-msg__text')).toHaveText('The service refuses more requests right now (request limit). Another attempt is possible later.');
+    reply = 'silent';
+    await failed.getByRole('button', { name: 'Try again' }).click();
+    await expect(page.locator('#map-status .map-geo-prog')).toBeVisible();
+    await page.clock.runFor(11_000);
+    await expect(failed.locator('.busy-msg__text')).toHaveText('The service did not answer within 10 s.');
 });
 
 test('of several towns of the same name the lookup takes the one nearest the tree\'s other places, in one request; a location placed by hand stays', async ({ page }) => {
@@ -493,6 +564,85 @@ test('tiles refused even with the app id: one note instead of the blocked pictur
     await page.getByRole('button', { name: 'Zoom in' }).click();
     await expect(note).toBeVisible();
     expect(asked.length).toBe(before);
+});
+
+/** §10.3: tiles that do not come (the network down, no answer in 15 s) are said once in the map's corner, with Try again. */
+test('tiles that do not come over the network: one sentence in the map\'s corner, Try again draws them, the points stay', async ({ page }) => {
+    const png = Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+        'base64',
+    );
+    let down = true;
+    await page.route('**://tile.openstreetmap.org/**', route =>
+        down ? route.abort('internetdisconnected') : route.fulfill({ status: 200, contentType: 'image/png', body: png }));
+    await page.addInitScript(() => {
+        const raw = localStorage.getItem('strom-settings');
+        const settings = raw ? JSON.parse(raw) : {};
+        settings.mapTiles = true;
+        localStorage.setItem('strom-settings', JSON.stringify(settings));
+    });
+    await stubGeocoder(page, {});
+    await openMapWithTwoPlaces(page);
+
+    const note = page.locator('#map-container .map-tiles-failed');
+    await expect(note).toBeVisible();
+    await expect(note).toHaveCount(1);
+    await expect(note).toHaveAttribute('role', 'alert');
+    await expect(note).toContainText('The map tiles did not load.');
+    // In the top left corner, under the scope (not over the zoom buttons or the bar).
+    await expect(page.locator('#map-container .map-topleft > .map-tiles-failed')).toHaveCount(1);
+    await expect(page.locator('.map-marker')).toHaveCount(2);
+    await expect(page.locator('.map-tiles-blocked')).toHaveCount(0);
+    // The tiles that did not come draw no broken-image frames: the one sentence says it.
+    expect(await page.locator('.map-tiles .map-tile[data-tile-state="failed"]').evaluateAll(els =>
+        els.length > 0 && els.every(el => getComputedStyle(el).visibility === 'hidden'))).toBe(true);
+
+    down = false;
+    await note.getByRole('button', { name: 'Try again' }).click();
+    await expect(note).toHaveCount(0);
+    const tiles = page.locator('.map-tiles .map-tile');
+    await expect.poll(() => tiles.evaluateAll(els =>
+        els.length > 0 && els.every(el => (el as HTMLImageElement).complete && (el as HTMLImageElement).naturalWidth > 0))).toBe(true);
+    await expect(page.locator('.map-marker')).toHaveCount(2);
+});
+
+test('a tile without an answer for 15 s is said in the corner; when it comes after all, the sentence goes', async ({ page }) => {
+    const png = Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+        'base64',
+    );
+    const held: (() => Promise<void>)[] = [];
+    await page.route('**://tile.openstreetmap.org/**', route => {
+        held.push(() => route.fulfill({ status: 200, contentType: 'image/png', body: png }).catch(() => undefined));
+    });
+    await page.addInitScript(() => {
+        const raw = localStorage.getItem('strom-settings');
+        const settings = raw ? JSON.parse(raw) : {};
+        settings.mapTiles = true;
+        localStorage.setItem('strom-settings', JSON.stringify(settings));
+    });
+    await stubGeocoder(page, {});
+    await openApp(page);
+    await page.clock.install({ time: new Date('2026-11-18T10:00:00Z') });
+    await page.getByRole('button', { name: 'Try a sample tree' }).click();
+    await expect(card(page, 'Johan')).toBeVisible();
+    await seedPlaces(page);
+    await seedCoords(page, { greenwich: [51.48, 0.0], pembroke: [51.67, -4.91] });
+    await page.getByRole('button', { name: 'Map', exact: true }).click();
+    await clearToasts(page);
+    await expect(page.locator('.map-marker')).toHaveCount(2);
+    await expect.poll(() => held.length).toBeGreaterThan(0);
+
+    const note = page.locator('#map-container .map-tiles-failed');
+    await page.clock.runFor(14_000);
+    await expect(note).toHaveCount(0);
+    await page.clock.runFor(1_500);
+    await expect(note).toBeVisible();
+    await expect(note).toHaveCount(1);
+
+    // The answers come late: the tiles show and the sentence goes by itself.
+    for (const go of held.splice(0)) await go();
+    await expect(note).toHaveCount(0);
 });
 
 test('the map controls say what they do', async ({ page }) => {

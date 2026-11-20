@@ -30,7 +30,7 @@ function list(files: MaterialFile[], extra: Partial<MaterialList> = {}): Materia
 }
 
 function att(id: string, init: Partial<Attachment> = {}): Attachment {
-    return { id, name: `${id}.jpg`, mimeType: 'image/jpeg', dataUrl: 'data:image/jpeg;base64,AA==', sizeBytes: 10, ...init };
+    return { id, name: `${id}.jpg`, mimeType: 'image/jpeg', dataUrl: 'data:image/jpeg;base64,AA==', sizeBytes: 10, places: [], ...init };
 }
 
 function memoryStorage(): Storage {
@@ -135,7 +135,7 @@ describe('rows', () => {
 
     it("a sender's note is quoted with the UI language's own marks (no Czech „…“ in English)", () => {
         const item: MaterialItem = {
-            key: 'm:I0001', origin: 'archive', title: 'Letter from an aunt', persons: ['P0001'], viaBatch: [],
+            key: 'm:I0001', origin: 'archive', title: 'Letter from an aunt', name: 'Letter from an aunt', titled: false, persons: ['P0001'], viaBatch: [],
             noteUser: 'From the attic box', here: true,
         };
         const ctx = { treeId: 't1', researchId: 'r1', base: null, agent: true } as unknown as MaterialsContext;

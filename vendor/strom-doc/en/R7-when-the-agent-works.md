@@ -279,14 +279,29 @@ An agent that is not logged in to its subscription does not do a session. The ru
 in — run … once and log in**.
 
 - **Limits:**
-  - before the first session strom checks this only for Claude Code with a separate folder
-    (`agent.claudeConfigDir` or `CLAUDE_CONFIG_DIR`, other than `~/.claude`). The run then ends without a session and
-    without asking the condition;
+  - before the first session strom checks this for Claude Code: up to research 1.33.0 only with a separate folder
+    (`agent.claudeConfigDir` or `CLAUDE_CONFIG_DIR`, other than `~/.claude`), from 1.34.0 with the default one too.
+    The run then ends without a session and without asking the condition;
   - otherwise the `claude-usage` condition finds it (it stops; for a run by hand **Start anyway?** comes up,
     [R7.4.1](#R7.4.1)), or a session that ends with a login error.
 - **Since:** research 1.25.2; stopping after a session with a login error from 1.0.0
+- **From research 1.34.0:** Claude Code in the terminal, which strom starts by itself (working alone, the readers of
+  scans and documents, [R8.3](R8-reading-scans.md#R8.3)), has a login of its own, not the Claude app's. When
+  `claude auth status` says it is not logged in:
+  - `strom read` and the other reading by readers (clips, transcripts, a document from the app) start no reader and
+    end at once: **Claude Code in the terminal is not logged in — … starts it itself (not the Claude app, which has
+    its own login)**, with the hint **logging in once in a terminal: …, then /login**;
+  - a reader that ends with a login error says so with how to log in, as it goes and in the summary, never only
+    “auth”;
+  - `strom doctor` has a line of its own **Claude Code login**: **Claude Code in the terminal logged in**, or the
+    warning **Claude Code in the terminal is not logged in — …** with the fix **… in a terminal, then /login**. In
+    a Strom archive the login is neither checked nor said.
 
-<!-- zdroj: research:src/commands/session.ts:916 loggedOut, :1260-1264 auth · src/core/claudedir.ts claudeConfigSet :33, forClaude, claudeLoggedIn :91 · gate.ts:253-258 loggedIn · CHANGELOG.cs.md 1.25.2 -->
+  An answer that does not tell the login decides nothing. Terminal: `claude`, then `/login`; `strom doctor`.
+- **From research 1.35.0:** a login check that does not answer within 5 s decides nothing and ends everything it
+  started, on Windows too, where the agent's program could go on running before.
+
+<!-- zdroj: research:src/commands/session.ts:916 loggedOut, :1260-1264 auth · src/core/claudedir.ts claudeConfigSet :33, forClaude, claudeLoggedIn :91 · gate.ts:253-258 loggedIn · CHANGELOG.cs.md 1.25.2 · 1.34.0 (K040): src/core/agentcli.ts requireClaudeLogin, agentLoggedOut (agent.logged-out) · src/commands/readers.ts refuseReadersLoggedOut, readerAuthSaid · src/commands/read.ts · src/commands/session.ts loggedOut bez claudeConfigSet · src/commands/setup.ts doctor login (ne v archivu) · assets/lang/*.json ui.read.auth, ui.doc.login*, ui.error.agent.logged-out* · CHANGELOG 1.34.0 · 1.35.0: research:bb79ee54 src/core/claudedir.ts AUTH_STATUS_MS 5000, claudeLoggedIn přes src/core/runsync.ts runSync (win32 taskkill /T /F, jinde skupina procesů) · CHANGELOG.cs.md 1.35.0 „Windows: po kontrole přihlášení nic neběží dál“ -->
 
 <a id="R7.8"></a>
 ## R7.8 Strom archive: a research the agent does not work on
@@ -325,16 +340,19 @@ A research whose agent is not on this computer (not installed, or the research w
 for it. Until then it behaves as a Strom archive.
 
 - **Enforced by the code:**
-  - what the app sends is entered as in an archive; nothing is made for the agent, and the agent's work is refused
+  - what the app sends is entered as in an archive; the agent gets nothing, and the agent's work is refused
     with a sentence saying that the research waits for an agent and where to install it or choose another;
-  - the saved mode does not change and the tasks are not parked. Once the agent is installed, the research goes on by
+  - the saved mode does not change and the tasks the research had are not parked. Once the agent is installed, the research goes on by
     itself with the tasks it had;
   - an agent that is working in the research right now (even one other than the one set) makes it a research.
 - **Why:** an archive is the person's choice and strom does not record it for them. A research without an agent only
-  behaves as an archive, so once the agent is installed it goes on by itself with the tasks it had; none is parked.
+  behaves as an archive, so once the agent is installed it goes on by itself with the tasks it had.
 - **Controls:** terminal: the menu, the first item (**Keep it only as a Strom archive: keeping the data from the Strom
   app**, or installing the agent); `strom mode` shows the state. The app shows such a research as **Archive**
   ([S1.3](S1-connecting-app-and-research.md#S1.3)).
-- **Since:** research 1.15.0
+- **Since:** research 1.15.0; 1.35.0: new tasks put aside
+- **From research 1.35.0:** a task that comes meanwhile (for material sent, a scan to read) is made put aside, as in
+  an archive. It comes back to the queue as soon as an agent starts working on the research (session start,
+  `strom run`, chat; even another than the one set), or when the agent set is on the computer again.
 
-<!-- zdroj: research:src/core/state.ts (hlavička, stateOf, actsAsArchive, kindOf, refuseInArchive agent.missing) · cs.json ui.mode.is.waiting, ui.waiting.refuse, ui.menu.keeparchive · CHANGELOG 1.15.0 -->
+<!-- zdroj: research:src/core/state.ts (hlavička, stateOf, actsAsArchive, kindOf, refuseInArchive agent.missing) · cs.json ui.mode.is.waiting, ui.waiting.refuse, ui.menu.keeparchive · CHANGELOG 1.15.0 · 1.35.0: research:31def74a src/core/state.ts heldWhereNobody (parked, heldBy archive, waiting.held), settleWaiting (atWork: session start, run, chat; jinak stateOf research) · src/core/records.ts create · CHANGELOG.cs.md 1.35.0 „Rodinný materiál … odložený, dokud tu agent není“ -->

@@ -68,6 +68,62 @@ test.describe('History in the life timeline: Settings', () => {
         expect(view).toBeNull();
     });
 
+    test('6.1 (B170): switched on, the toggle stays dashed with "Loading…" until the history is read; a click meanwhile is ignored', async ({ page }) => {
+        const { history } = await setup(page, { layerOn: false });
+        // A new history in the research meanwhile: switching on reads it.
+        history.rev = 'h-new';
+        await poll(page);
+        await openSettings(page);
+        let answer: () => void = () => {};
+        const gate = new Promise<void>(r => { answer = r; });
+        await page.route(/\/history(\?|$)/, async (route) => { await gate; await route.fallback(); });
+        const reads = history.reads;
+        await toggle(page).check();
+        await expect(toggle(page)).toBeChecked();
+        await expect(toggle(page)).toHaveAttribute('data-pend', '1');
+        await expect(toggle(page)).toHaveAttribute('aria-busy', 'true');
+        // Dashed though clicked (focused): the dialog's focus rule does not take the dash away.
+        await expect(toggle(page)).toBeFocused();
+        expect(await toggle(page).evaluate(el => getComputedStyle(el).outlineStyle)).toBe('dashed');
+        const label = page.locator('label.settings-checkbox', { has: toggle(page) });
+        await expect(label.locator('.busy-st')).toHaveText('Loading…');
+        await toggle(page).click({ force: true });
+        await expect(toggle(page)).toBeChecked();
+        answer();
+        await expect(toggle(page)).not.toHaveAttribute('data-pend', '1');
+        await expect(label.locator('.busy-st')).toHaveCount(0);
+        await expect(toggle(page)).not.toHaveAttribute('aria-disabled', 'true');
+        expect(history.reads).toBe(reads + 1);
+        await expect(toggle(page)).toBeChecked();
+    });
+
+    test('a read without an answer in 15 s: the status row says so with Try again, then the research not running, then the status (§10.3)', async ({ page }) => {
+        await page.clock.install({ time: new Date('2026-11-18T10:00:00Z') });
+        const isRead = (url: URL) => url.pathname.endsWith('/history');
+        const ged = historyGed();
+        await fakeBridge(page, { features: HISTORY_FEATURES, history: fakeHistory(), treeGed: ged, links: LINKS });
+        // The research's bridge answers its status but not the read (a route added later is asked first).
+        await page.route(isRead, () => { /* never answers */ });
+        await openResearch(page, { ged });
+        await poll(page);
+        await openSettings(page);
+        await page.clock.runFor(16_000);
+        const msg = status(page).locator('.busy-msg.is-err[role="alert"]');
+        await expect(msg).toHaveText(/The research did not answer within 15 s\./);
+        // Nothing read yet: the sentence alone, no guessed status beside it.
+        await expect(status(page)).not.toContainText('The research looks for events.');
+        await page.unroute(isRead);
+        // Not reached at all: the research is not running.
+        await page.route(isRead, route => route.abort());
+        await msg.getByRole('button', { name: 'Try again' }).click();
+        await expect(msg).toContainText('The research is not running. Strom Research needs to be started.');
+        await page.unroute(isRead);
+        await msg.getByRole('button', { name: 'Try again' }).click();
+        await expect(msg).toHaveCount(0);
+        await expect(status(page)).toContainText('The research looks for events.');
+        await expect(status(page).locator('.busy-st')).toHaveCount(0);
+    });
+
     test('on for a tree without a research: says so', async ({ page }) => {
         await openApp(page);
         await openSettings(page);
@@ -153,6 +209,25 @@ test.describe('History in the life timeline: Settings', () => {
         await expect(status(page)).toBeHidden();
         await poll(page);
         await expect(status(page)).toBeHidden();
+    });
+
+    test('Turn off the search says Turning off… on its link until the research answers; one write however often clicked', async ({ page }) => {
+        const { history } = await setup(page, { layerOn: true });
+        await openSettings(page);
+        await toggle(page).uncheck();
+        let release!: () => void;
+        const held = new Promise<void>(r => { release = r; });
+        await page.route(url => url.pathname.endsWith('/experiments'), async route => {
+            if (route.request().method() === 'POST') await held;
+            await route.fallback();
+        });
+        const off = status(page).getByRole('button', { name: 'Turn off the search for this tree' });
+        await off.click();
+        await expect(status(page).locator('[data-history-action="off"]')).toHaveAttribute('data-busy', 'busy');
+        await status(page).locator('[data-history-action="off"]').click({ force: true });
+        release();
+        await expect(page.locator('.toast').filter({ hasText: 'The search for events is off for this tree.' })).toBeVisible();
+        expect(history.offs).toEqual([{ history: false }]);
     });
 
     test('the research not searching: the search is switched on by its terminal (the experiment link)', async ({ page }) => {

@@ -3,12 +3,15 @@
  * see src/ui/module.ts for the composition pattern.
  */
 
+import { canvasBusy } from './canvas-busy.js';
+import { busyButtonHtml } from './busy.js';
 import { refreshWindowControls } from '../windows/window-open.js';
 import { initDialogFocus } from './dialog-focus.js';
 import { initClosedPopups } from './closed-popups.js';
 import { initSheetSlide } from './sheet-slide.js';
 import { initKeyboardAccess } from './keyboard-access.js';
 import { syncTreeLegendLift } from './legend-lift.js';
+import { syncBranchLegend, syncBranchMarkerSetting } from './branch-marker-ui.js';
 import { DataManager, auditPersonName } from '../data.js';
 import { announcedResearchLinks, researchLinksEnabled, setResearchLinksEnabled } from '../research-device.js';
 import { TreeManager } from '../tree-manager.js';
@@ -56,32 +59,15 @@ import { yearOf } from '../dates.js';
 import { twoFiguresSvg } from '../icons.js';
 import { shownNameOrEmpty, nameHtml } from '../person-name.js';
 import { forgetCardTypeCopy } from './card-fields-ui.js';
-import { setResearchOpenLabel } from './research-open-mark.js';
+import { showToast as showToastNow, putToast as putToastNow, showProgressToast as showProgressToastNow, type ToastOptions, type ToastHandle, type LongOpts, type ProgressStep, type ProgressToastHandle } from './toast.js';
 import { helpMark, setHelpMarkTopic } from './help-mark.js';
 import { HELP_TOPICS, type HelpTopic } from '../help/topics.js';
 import { openHelp } from './help-ui.js';
 import { syncControlBlock } from './minimap.js';
 import { addLender, cancelWaiting, removeLender, watchToasts, whenFree } from '../toast-slot.js';
+import { defaultFocusKey, focusDefaultPerson, isDefaultFocusContext, updateDefaultFocusButtons } from './default-focus.js';
 
 
-/** How a message shows (UI.showToast). */
-interface ToastOptions {
-    title?: string;
-    spinner?: boolean;
-    closable?: boolean;
-    kind?: string;
-    /** `research`: it opens the research (its mark at the end, §6). */
-    /** `research`: the action opens the research's terminal (its mark); `ai`: an agent works there too. */
-    action?: { label: string; run: () => void; research?: boolean; ai?: boolean };
-    hold?: boolean;
-    /** A notice to be read: it stands 3 s at least before a newer toast takes its place (round 7 §53). */
-    notice?: boolean;
-    /** Said as an alert (`role="alert"`): something asked for did not happen. */
-    alert?: boolean;
-    /** A dialog's footer (selector) the toast stands above while it is on the screen: shown over a
-     *  dialog, the toast must not cover the dialog's action buttons. */
-    clearOf?: string;
-}
 
 /** The sample name under Settings > Surname display (no titles shown). */
 const SURNAME_SAMPLE = { firstName: 'Marie', lastName: 'Dvořáková', marriedSurname: 'Nováková' };
@@ -402,8 +388,9 @@ export const miscMethods = uiModule({
         if (relCardToggle) relCardToggle.checked = SettingsManager.isReliabilityCardEnabled();
         this.syncSurnameDisplaySetting();
         this.syncTreeSpacingSetting();
-        const branchColorsToggle = document.getElementById('branch-colors-toggle') as HTMLInputElement | null;
-        if (branchColorsToggle) branchColorsToggle.checked = SettingsManager.isBranchColorsEnabled();
+        // The previews draw with the tag's letters of the language (also before a tree is drawn).
+        this.applyBranchMarkerAttrs();
+        syncBranchMarkerSetting(SettingsManager.getBranchMarker(), SettingsManager.isBranchTintOn());
         const descFamiliesToggle = document.getElementById('descendants-families-default-toggle') as HTMLInputElement | null;
         if (descFamiliesToggle) descFamiliesToggle.checked = SettingsManager.isDescendantsFullFamiliesDefault();
 
@@ -518,8 +505,21 @@ export const miscMethods = uiModule({
 
     setDisplayViewMode(mode: ViewMode): void {
         // The Research overview open without following closes with a switch, as by its ⤡.
-        if (mode !== TreeRenderer.getViewMode()) this.researchOverviewViewSwitched();
-        TreeRenderer.setViewMode(mode); // re-renders + calls updateViewModeUI
+        const from = TreeRenderer.getViewMode();
+        if (mode === from) return;
+        this.researchOverviewViewSwitched();
+        // C5, §8: the view laid out anew under the canvas overlay ("Calculating the layout…" past 120 ms).
+        // The mode is the new one at once; the overlay painted before the layout.
+        void canvasBusy(ready => TreeRenderer.setViewMode(mode, ready), {
+            stateFirst: true, label: mode === 'map' ? strings.busy.mapCalc : strings.busy.layout,
+        }); // re-renders + calls updateViewModeUI
+        // The bars, the classes of the view and what is fitted to them in the first frame, before the layout (1101).
+        this.updateViewModeUI();
+        if (from === 'fan' || from === 'table') {
+            // The chrome of the view now; the followed research's card placed again for it (1101).
+            document.body.dataset.viewMode = mode;
+            this.placeLivePanel?.();
+        }
     },
 
     exitDescendantsView(): void {
@@ -617,21 +617,24 @@ export const miscMethods = uiModule({
         // shown (family/descendants — not timeline, not fan).
         const cardsShown = mode === 'family' || mode === 'descendants';
         const treeLegend = document.getElementById('tree-legend');
+        // The lineage part (spec 112 §3): the signs in the cards' shape, the lines'
+        // names (numbered under R5, read from the canvas the cards were drawn on).
+        const legend = document.getElementById('branch-legend');
+        const branchShown = !!legend && cardsShown && SettingsManager.isBranchLegendEnabled()
+            && syncBranchLegend(legend, SettingsManager.getBranchMarker(),
+                !!document.getElementById('tree-canvas')?.classList.contains('branch-numbered'), SettingsManager.isBranchTintOn());
+        if (legend) legend.style.display = branchShown ? 'flex' : 'none';
         if (treeLegend) {
             const hasPersons = DataManager.getAllPersons().length > 0;
             const shown = cardsShown && hasPersons && SettingsManager.isBranchLegendEnabled();
             treeLegend.style.display = shown ? 'flex' : 'none';
+            treeLegend.classList.toggle('has-branch', branchShown);
             syncTreeLegendLift(treeLegend, shown);
         }
         // The ring of an unknown sex is explained only when such a person is in view.
         const unknownItem = document.getElementById('legend-unknown');
         if (unknownItem) {
             unknownItem.style.display = document.querySelector('#tree-canvas .person-card.unknown') ? '' : 'none';
-        }
-        const legend = document.getElementById('branch-legend');
-        if (legend) {
-            legend.style.display = (cardsShown && SettingsManager.isBranchColorsEnabled()
-                && SettingsManager.isBranchLegendEnabled()) ? 'flex' : 'none';
         }
         if (treeLegend) {
             this.updateLegendMarks(treeLegend);
@@ -859,6 +862,21 @@ export const miscMethods = uiModule({
                 }
                 // The Places dialog's menu, preview and selection close one at a time first.
                 if (this.topActiveOverlay()?.id === 'places-modal' && this.placesEscape()) return;
+                // New list / Save as list: its person choice, then the dialog (over Lists of people).
+                if (this.isNewPersonListOpen() && ['person-list-new', 'person-list-save'].includes(this.topActiveOverlay()?.id ?? '')) {
+                    this.newPersonListEscape();
+                    return;
+                }
+                // Add person (to a fixed list, over Lists of people).
+                if (this.topActiveOverlay()?.id === 'person-list-add') {
+                    this.closeAddPersonsToList();
+                    return;
+                }
+                // Lists of people: an open menu, then the name being edited, then the dialog.
+                if (this.topActiveOverlay()?.id === 'person-lists-modal') {
+                    this.personListsEscape();
+                    return;
+                }
                 // The questions about places: a bulk preview closes first, then the window.
                 if (this.topActiveOverlay()?.id === 'waiting-places-modal') {
                     this.waitingPlacesEscape();
@@ -1399,9 +1417,22 @@ export const miscMethods = uiModule({
                 return;
             }
 
-            // Skip shortcuts when focus is in input/textarea/select
-            const activeEl = document.activeElement;
-            if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'SELECT')) return;
+            // Focus the tree's default person (spec 111 §6): ⌘1 (Mac) / Ctrl+1 (elsewhere) by the
+            // key's place, also from a text field; H / h outside one. Not while held down, not over a
+            // menu or a sheet; in the map, the timeline, the table and other windows the key goes on
+            // untouched (the browser keeps ⌘1 / Ctrl+1 for its tabs there).
+            const activeEl = document.activeElement as HTMLElement | null;
+            const typing = !!activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'SELECT' || activeEl.isContentEditable);
+            if (defaultFocusKey(e, this.isMacPlatform(), typing)) {
+                if (isDefaultFocusContext() && !this.defaultFocusKeyHeld()) {
+                    e.preventDefault();
+                    if (!e.repeat) focusDefaultPerson('shortcut');
+                }
+                return;
+            }
+
+            // Skip shortcuts when focus is in a text field (also an editable element)
+            if (typing) return;
 
             // "/" focuses the toolbar search (only when not typing — the guard
             // above already returned for inputs/textareas/selects).
@@ -1456,6 +1487,18 @@ export const miscMethods = uiModule({
                 return;
             }
         });
+    },
+
+    /**
+     * A menu, a sheet or another floating layer is open over the tree (the
+     * dialogs return earlier): the default person's shortcut waits (spec 111 §6).
+     */
+    defaultFocusKeyHeld(): boolean {
+        if (this.contextMenu || this.bottomSheet || this.crossTreeChooser || this.tourActive) return true;
+        if (TreePreview.isOpen() || TreeCompare.isOpen() || this.isResearchMenuOpen()) return true;
+        if (TreeRenderer.getFanView()?.menuOpen()) return true;
+        if (document.body.classList.contains('focus-steppers-open')) return true;
+        return !!document.querySelector('#actions-menu-dropdown.active, #tree-switcher-dropdown.active, .tree-row-menu.open, #fan-sheet:not([hidden])');
     },
 
     /**
@@ -1668,6 +1711,12 @@ export const miscMethods = uiModule({
                 el.textContent = getString(key);
                 // A tab's label holds the width of its bold cut (src/ui/sel-css.ts).
                 if (el.classList.contains('sel-l')) el.setAttribute('data-label', el.textContent);
+                // A button whose working words are drawn with it (§1.2: its width the same at rest and working).
+                const busyKey = el.getAttribute('data-i18n-busy');
+                if (busyKey && el instanceof HTMLElement) {
+                    el.innerHTML = busyButtonHtml(this.escapeHtml(getString(key)), getString(busyKey), undefined, { own: true });
+                    if (!el.dataset.busy) el.dataset.busy = 'idle';
+                }
             }
         });
 
@@ -1710,6 +1759,8 @@ export const miscMethods = uiModule({
         const isSk = cur === 'cs';
         document.getElementById('lang-btn-sk')?.classList.toggle('active', isSk);
         document.getElementById('lang-btn-en')?.classList.toggle('active', !isSk);
+        // ⌂'s tooltip and name are composed, not data-i18n (spec 111).
+        updateDefaultFocusButtons();
     },
 
     /**
@@ -1769,100 +1820,18 @@ export const miscMethods = uiModule({
      * §53): a message coming sooner waits and shows then, with its full time.
      * `notice`: this message is such a toast as well (a warning to be read).
      */
-    showToast(message: string, duration = 3000, opts: ToastOptions = {}): void {
-        watchToasts();
-        whenFree('message', () => this.putToast(message, duration, opts));
+    showToast(message: string, duration = 3000, opts: ToastOptions = {}): ToastHandle {
+        return showToastNow(message, duration, opts);
     },
 
     /** Put the message on the screen now (showToast, its turn come). */
     putToast(message: string, duration: number, opts: ToastOptions): void {
-        // Remove existing toast
-        const existing = document.querySelector('.toast');
-        if (existing) existing.remove();
+        putToastNow(message, duration, opts);
+    },
 
-        const toast = document.createElement('div');
-        toast.className = opts.title || opts.spinner ? 'toast toast--rich' : 'toast';
-        toast.setAttribute('role', opts.alert ? 'alert' : 'status');
-        if (opts.kind) toast.dataset.kind = opts.kind;
-        if (opts.notice) toast.dataset.notice = '';
-        if (opts.spinner) {
-            const spin = document.createElement('span');
-            spin.className = 'toast-spinner';
-            spin.setAttribute('aria-hidden', 'true');
-            toast.appendChild(spin);
-        }
-        if (opts.title) {
-            const body = document.createElement('span');
-            body.className = 'toast-body';
-            const title = document.createElement('strong');
-            title.className = 'toast-title';
-            title.textContent = opts.title;
-            body.append(title, document.createTextNode(message));
-            toast.appendChild(body);
-        } else {
-            toast.appendChild(document.createTextNode(message));
-        }
-        if (opts.action) {
-            const { label, run, research, ai } = opts.action;
-            const act = document.createElement('button');
-            act.type = 'button';
-            act.className = 'toast-action';
-            if (research) setResearchOpenLabel(act, label, { ai });
-            else act.textContent = label;
-            act.onclick = () => {
-                toast.classList.remove('show');
-                setTimeout(() => toast.remove(), 300);
-                run();
-            };
-            // In the group of actions: an "Undo" or "↩ Back" riding along joins it, the group wraps whole
-            const actions = document.createElement('span');
-            actions.className = 'toast-actions';
-            actions.appendChild(act);
-            toast.appendChild(actions);
-        }
-        if (opts.closable) {
-            const close = document.createElement('button');
-            close.type = 'button';
-            close.className = 'toast-close';
-            close.setAttribute('aria-label', strings.buttons.close);
-            close.innerHTML = '&times;';
-            close.onclick = () => {
-                toast.classList.remove('show');
-                setTimeout(() => toast.remove(), 300);
-            };
-            toast.classList.add('toast--closable');
-            toast.appendChild(close);
-        }
-        document.body.appendChild(toast);
-        if (opts.clearOf) {
-            const foot = document.querySelector<HTMLElement>(opts.clearOf);
-            const top = foot?.offsetParent ? foot.getBoundingClientRect().top : 0;
-            if (top > 0) toast.style.bottom = `${Math.max(0, window.innerHeight - top) + 8}px`;
-        }
-
-        // Trigger animation
-        requestAnimationFrame(() => {
-            toast.classList.add('show');
-        });
-
-        // Auto-hide; a toast with a button (its action, or "Undo" / "↩ Back" riding
-        // in it) stays while the keyboard is on it (reached with Tab) and goes
-        // once focus leaves (`hold`: also under the pointer).
-        if (!Number.isFinite(duration)) return;
-        const hide = (): void => {
-            if (toast.isConnected && toast.contains(document.activeElement)) {
-                toast.addEventListener('focusout', () => setTimeout(hide, 0), { once: true });
-                return;
-            }
-            // `hold`: it also stays while the pointer is on it.
-            if (opts.hold && toast.isConnected && toast.matches(':hover')) {
-                toast.addEventListener('mouseleave', () => setTimeout(hide, 1000), { once: true });
-                return;
-            }
-            toast.classList.remove('show');
-            setTimeout(() => toast.remove(), 300);
-        };
-        setTimeout(hide, duration);
+    /** The progress toast of a long action (waiting buttons §2.1). */
+    showProgressToast(opts: LongOpts, first?: ProgressStep): ProgressToastHandle {
+        return showProgressToastNow(opts, first);
     },
 
     // ---- UNDO TOAST ----
@@ -1904,21 +1873,25 @@ export const miscMethods = uiModule({
         this.dismissUndoToast();
         // A toast of its own made in a dialog (a citation's chip, the source viewer's citation bar):
         // it stands over the dialog (any other pill waits for the dialogs to close, as before).
+        // Made in the materials viewer or a materials dialog (spec 102 §3's "×"): over them too.
         const overDialog = ownToast && document.querySelector('.modal-overlay.active') !== null;
-        whenFree('undo', () => this.putUndoToast(description, note, overDialog));
+        const overViewer = ownToast && document.querySelector('#attachment-overlay.active, .mdlg-overlay') !== null;
+        whenFree('undo', () => this.putUndoToast(description, note, overDialog, overViewer));
     },
 
     /**
      * Put the undo pill on the screen now (showUndoToast, its turn come).
      * `note`: a second sentence under it (the pill wraps, stands 10 s);
      * `overDialog`: the change was made in a dialog, the pill stands over it
-     * so its "Undo" can be clicked there (spec 095 §2, §3).
+     * so its "Undo" can be clicked there (spec 095 §2, §3); `overViewer`: the
+     * same over the image viewer and the materials dialogs (spec 102 §3).
      */
-    putUndoToast(description: string, note?: string, overDialog = false): void {
+    putUndoToast(description: string, note?: string, overDialog = false, overViewer = false): void {
         const el = document.createElement('div');
         el.className = 'undo-toast';
         if (note) el.classList.add('undo-toast-roomy');
         if (overDialog) el.classList.add('undo-toast-over-dialog');
+        if (overViewer) el.classList.add('undo-toast-over-viewer');
         el.setAttribute('role', 'status');
         el.setAttribute('aria-live', 'polite');
 

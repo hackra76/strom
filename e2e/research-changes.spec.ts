@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { card } from './helpers.js';
+import { card, reloadApp } from './helpers.js';
 import { fakeBridge, openResearch, openResearchMenu, poll, block, editJan, researchGed, NEW_HEAD } from './research-bridge.js';
 
 /**
@@ -38,8 +38,18 @@ test.describe('changes per person', () => {
         // The block in ⋯ → Research: how many people; the same panel from "Other actions" (Send sends at once here).
         await openResearchMenu(page, { expandMore: true });
         await expect(block(page)).toContainText('1 person changed');
+        // The menu closes on the choice: the list is computed under the canvas overlay (A93, waiting buttons §8).
+        await page.evaluate(() => {
+            const w = window as unknown as { __said: string[] };
+            w.__said = [];
+            new MutationObserver(() => {
+                const o = document.querySelector('#tree-container > .canvas-busy');
+                if (o && !document.getElementById('research-changes-panel')) w.__said.push(o.textContent ?? '');
+            }).observe(document.getElementById('tree-container')!, { childList: true, subtree: true, characterData: true });
+        });
         await page.locator('#research-item-changes').click();
         await expect(panel).toBeVisible();
+        expect(await page.evaluate(() => (window as unknown as { __said: string[] }).__said)).toContain('Finding the changes…');
         // A name selects the person and closes the panel.
         await panel.locator('.research-changes-name').click();
         await expect(panel).toHaveCount(0);
@@ -83,7 +93,7 @@ test.describe('changes per person', () => {
             st.lastWritten = { ...st.lastWritten, at: '2026-10-24T08:52:00.000Z' };
             localStorage.setItem(key, JSON.stringify(st));
         });
-        await page.reload();
+        await reloadApp(page);
         await poll(page);
         await openResearchMenu(page);
         await expect(block(page)).toHaveAttribute('data-state', 'inSync');
@@ -123,7 +133,7 @@ test.describe('changes per person', () => {
 
         // No news after every restart: no dot on the Research button, the block quiet until the next send.
         for (let i = 0; i < 2; i++) {
-            await page.reload();
+            await reloadApp(page);
             await poll(page);
             await openResearchMenu(page);
             await expect(block(page)).toHaveAttribute('data-state', 'notWritten');
@@ -148,13 +158,13 @@ test.describe('changes per person', () => {
             delete st.writtenSeen;
             localStorage.setItem(key, JSON.stringify(st));
         });
-        await page.reload();
+        await reloadApp(page);
         await poll(page);
         await openResearchMenu(page);
         await expect(block(page)).toHaveAttribute('data-state', 'written');
         await expect(block(page).getByRole('menuitem', { name: 'What was written ›' })).toBeVisible();
         await page.evaluate(() => window.Strom.UI.closeResearchMenu());
-        await page.reload();
+        await reloadApp(page);
         await poll(page);
         await openResearchMenu(page);
         await expect(block(page)).toHaveAttribute('data-state', 'inSync');
@@ -253,7 +263,7 @@ test.describe('changes per person', () => {
         const before = await shown();
         expect(before.sub).toMatch(/^0 people · changed since /);
         expect(before.inexact).toBe(0);
-        await page.reload();
+        await reloadApp(page);
         await expect(card(page, 'Jan')).toBeVisible();
         expect(await shown()).toEqual(before);
     });
@@ -297,7 +307,7 @@ test.describe('changes per person after a send the research took nothing from', 
         await listed();
 
         // After a reload: the same.
-        await page.reload();
+        await reloadApp(page);
         await expect(card(page, 'Jan')).toBeVisible();
         await poll(page);
         await listed();

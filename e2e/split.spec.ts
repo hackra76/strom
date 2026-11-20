@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { openApp, createFirstPerson, addRelation, card, openTreeStructure } from './helpers.js';
+import { syntheticTree } from '../src/__tests__/helpers/synthetic-tree';
 
 /**
  * Splitting a tree into the families it holds (N3). Only families that nothing
@@ -41,6 +42,10 @@ test('a tree with two unrelated families can be split into two trees, the origin
 
     await rows.nth(1).locator('.split-check').check();
     await page.getByRole('button', { name: 'Split off 1' }).click();
+    // 8b: the dialog says what was made; Close takes it away.
+    await expect(page.locator('#split-modal .busy-prog-done')).toHaveText('1 tree created. The original is untouched.');
+    await expect(page.locator('#split-go')).toBeDisabled();
+    await page.locator('#split-close', { hasText: 'Close' }).click();
     await expect(page.locator('#split-modal')).toHaveCount(0);
 
     // The split copies, it does not move: the open tree still shows everyone.
@@ -135,4 +140,56 @@ test('a tree with one family and a few strays is not offered a split', async ({ 
     await expect(card(page, 'Josef')).toBeVisible();
     await expect(page.locator('#confirmation-modal')).not.toHaveClass(/active/);
     await expect(page.getByText(/families that nothing connects/i)).toHaveCount(0);
+});
+
+test('Split off works at once: the button says it is creating, a double click creates the tree once', async ({ page }) => {
+    await openApp(page);
+    await twoUnrelatedFamilies(page);
+    await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
+    await page.locator('.tree-row-menu-btn').first().click();
+    const structure = await openTreeStructure(page, page.locator('.tree-row-menu.open'));
+    await structure.locator('.tree-row-menu-item', { hasText: 'Separate disconnected parts' }).click();
+    const rows = page.locator('.split-row');
+    await expect(rows).toHaveCount(2);
+    const before = await page.evaluate(() => window.Strom.TreeManager.getTrees().length);
+    await rows.nth(1).locator('.split-check').check();
+    // Heavy work: its state is seen at once (no 120 ms grace), and the second click does nothing.
+    const busy = await page.locator('#split-go').evaluate((b: HTMLButtonElement) => {
+        b.click();
+        const at = b.getAttribute('aria-busy');
+        b.click();
+        return at;
+    });
+    expect(busy).toBe('true');
+    await expect(page.locator('#split-modal .busy-prog-done')).toBeVisible();
+    await page.locator('#split-close').click();
+    await expect(page.locator('#split-modal')).toHaveCount(0);
+    const trees = await page.evaluate(() => window.Strom.TreeManager.getTrees().map((t: { name: string }) => t.name));
+    expect(trees.length).toBe(before + 1);
+    expect(trees.filter((n: string) => n === 'Svoboda family')).toHaveLength(1);
+});
+
+test('splitting a tree from its menu finds the parts under the canvas overlay, "Finding the parts…" (B208, waiting buttons §8)', async ({ page }) => {
+    test.setTimeout(90_000);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await openApp(page);
+    const { data, rootId } = syntheticTree({ persons: 3200, seed: 5 });
+    await page.evaluate(async ({ data, rootId }) => {
+        const S = window.Strom;
+        await S.DataManager.importAsNewTree(data, 'Synthetic');
+        S.TreeRenderer.setFocus(rootId);
+        await S.TreeRenderer.renderAsync();
+    }, { data, rootId });
+    await page.evaluate(() => {
+        const w = window as unknown as { __said: string[] };
+        w.__said = [];
+        new MutationObserver(() => {
+            const o = document.querySelector('#tree-container > .canvas-busy');
+            if (o && !document.getElementById('split-modal')) w.__said.push(o.textContent ?? '');
+        }).observe(document.getElementById('tree-container')!, { childList: true, subtree: true, characterData: true });
+    });
+    await page.evaluate(() => window.Strom.UI.showSplitDialog());
+    await expect(page.locator('#split-modal')).toBeVisible({ timeout: 60_000 });
+    const said = await page.evaluate(() => (window as unknown as { __said: string[] }).__said);
+    expect(said.some(t => t.includes('Finding the parts…'))).toBe(true);
 });

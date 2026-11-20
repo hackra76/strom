@@ -23,10 +23,10 @@ import { TreeRenderer } from '../renderer.js';
 import { strings, getCurrentLanguage, getStringsForLang } from '../strings.js';
 import { PrivacyMode } from '../privacy.js';
 import { PersonId, StromData } from '../types.js';
-import { buildFamilyBook } from '../book.js';
-import { bookFileName } from '../book-window.js';
+import { buildFamilyBook, buildFamilyBookAsync, type BookBuildEnv } from '../book.js';
+import { bookFileName, bookPreparingHtml } from '../book-window.js';
 import {
-    BOOK_PART_KEYS, BookDetail, BookLang, BookOptions, BookPartKey, BookSelectionSpec,
+    BOOK_PART_KEYS, BookDetail, BookEnv, BookEstimate, BookLang, BookOptions, BookPartKey, BookSelectionSpec,
     autoBookTitle, bookPartAvailability, bookPeriod, bookRodCounts, estimateBook,
 } from '../book-options.js';
 import {
@@ -52,6 +52,8 @@ import { displayYear } from '../dates.js';
 import { openPersonPopover } from './person-popover.js';
 import { readRecent } from './tree-overview.js';
 import { uiModule } from './module.js';
+import { activatedElement, BUSY_MIN_MS, BUSY_SHOW_MS, busySpinHtml, nextPaint } from './busy.js';
+import { showProgressToast, type ProgressToastHandle } from './toast.js';
 import type { HistoryPayload, PersonHistoryEnv } from '../history.js';
 
 type Kind = 'tree' | 'rods' | 'ancestors' | 'descendants' | 'persons';
@@ -146,6 +148,12 @@ interface DialogState {
     phase: Phase;
     est: PagesEstimate | null;
     estTimer: number | null;
+    /**
+     * The book's estimates by their options (a large tree's is counted after a painted frame, §8): the
+     * last few kept, so a choice and back shows the one counted before at once.
+     */
+    bookEsts?: Map<string, BookEstimate | null>;
+    bookEstPending?: string | null;
     job: PagesJob | null;
     prog: { done: number; total: number; text: string };
     file: PagesFile | null;
@@ -168,6 +176,9 @@ function savesZip(s: DialogState): boolean {
 }
 
 let st: DialogState | null = null;
+
+/** The book's building stopped: Cancel in the progress toast, or its window closed meanwhile. */
+class BookBuildStopped extends Error {}
 /** The build going on with the dialog closed ("Continue in background", 1102 §7.2); its chip in the toolbar. */
 let running: DialogState | null = null;
 let closePicker: (() => void) | null = null;
@@ -525,10 +536,14 @@ function syncBook(s: DialogState, modal: HTMLElement): string {
         : esc(D.titleAuto(period));
 
     // The estimate, the outline and the title page
-    const est = ready ? estimateBook(s.data, opts, env) : null;
+    const counted = ready ? bookEstimateOf(s, opts, env) : null;
+    const pending = counted === 'pending';
+    const est = pending ? null : counted;
     const estEl = modal.querySelector<HTMLElement>('.book-estimate')!;
-    estEl.textContent = est ? T.estimate(est.pages, est.persons, est.chapters) : s.kind === 'rods' ? T.noRodSelected : D.noPerson;
+    if (pending) estEl.innerHTML = `${busySpinHtml()}${esc(T.estimating)}`;
+    else estEl.textContent = est ? T.estimate(est.pages, est.persons, est.chapters) : s.kind === 'rods' ? T.noRodSelected : D.noPerson;
     estEl.classList.toggle('is-empty', !est);
+    if (pending) estEl.setAttribute('aria-busy', 'true'); else estEl.removeAttribute('aria-busy');
     const open = modal.querySelector<HTMLButtonElement>('#book-open');
     if (open) open.disabled = !est;
     const outline = modal.querySelector<HTMLElement>('.book-outline')!;
@@ -807,6 +822,45 @@ function computeEstimate(s: DialogState): PagesEstimate | null {
         minimal, minimalShown, minimalSave: set.minimalIds.size, phone,
     };
 }
+
+/** From this many people the book's estimate is counted after the dialog is painted (it takes longer than 120 ms). */
+export const BOOK_ESTIMATE_DEFERRED_AT = 5000;
+
+/**
+ * The book's estimate for `opts`, kept while they stay the same. A large tree's is counted after a painted frame
+ * (§8): 'pending' meanwhile (the line says "Counting the pages…", Open waits), then the dialog is synced again.
+ */
+function bookEstimateOf(s: DialogState, opts: BookOptions, env: BookEnv): BookEstimate | null | 'pending' {
+    const key = JSON.stringify(opts);
+    const kept = s.bookEsts ??= new Map();
+    if (kept.has(key)) {
+        const est = kept.get(key)!;
+        // The newest last: the oldest goes first.
+        kept.delete(key);
+        kept.set(key, est);
+        return est;
+    }
+    const keep = (est: BookEstimate | null): BookEstimate | null => {
+        kept.set(key, est);
+        while (kept.size > BOOK_ESTIMATES_KEPT) kept.delete(kept.keys().next().value!);
+        return est;
+    };
+    const count = (): BookEstimate | null => { try { return estimateBook(s.data, opts, env); } catch { return null; } };
+    if (Object.keys(s.data.persons).length < BOOK_ESTIMATE_DEFERRED_AT) return keep(count());
+    if (s.bookEstPending !== key) {
+        s.bookEstPending = key;
+        void nextPaint().then(() => {
+            if (st !== s || s.bookEstPending !== key) return;
+            s.bookEstPending = null;
+            keep(count());
+            sync(s);
+        });
+    }
+    return 'pending';
+}
+
+/** How many of the book's estimates a dialog keeps (each a few kB: its outline). */
+const BOOK_ESTIMATES_KEPT = 8;
 
 /** Recompute the pages' estimate 150 ms after the last change (at once when asked). */
 function scheduleEstimate(s: DialogState, now = false): void {
@@ -1439,7 +1493,8 @@ export const bookUiMethods = uiModule({
     savePagesResult(): void {
         const file = st?.file;
         if (!file) return;
-        savePagesFile(file).then((saved) => {
+        // The button carries the writing after the system's "Save as" (§9).
+        savePagesFile(file, activatedElement()).then((saved) => {
             if (saved) this.showToast(strings.familyPages.saved(file.name));
         }, () => {
             this.showAlert(strings.familyPages.saveFailed, 'warning');
@@ -1465,11 +1520,16 @@ export const bookUiMethods = uiModule({
 
     /** The book's HTML for these options: for the window, or for a saved file. */
     familyBookHtml(options: BookOptions, forSave: boolean): string {
+        return buildFamilyBook(DataManager.getData(), options, this.familyBookEnv(options, forSave));
+    },
+
+    /** What the book is built with besides the data and the options (window or saved file). */
+    familyBookEnv(options: BookOptions, forSave: boolean): BookBuildEnv {
         const data = DataManager.getData();
         const firstId = Object.keys(data.persons)[0];
         const lang = options.lang;
         const locale = lang === 'cs' ? 'sk-SK' : lang === 'de' ? 'de-DE' : lang === 'pl' ? 'pl-PL' : 'en-GB';
-        return buildFamilyBook(data, options, {
+        return {
             treeName: TreeManager.getActiveTreeMetadata()?.name,
             dateLabel: getStringsForLang(lang).book.compiled(new Date().toLocaleDateString(locale)),
             fontCss: appFontFaceCss(POSTER_SERIF_FACES) + bookItalicFontCss(),
@@ -1480,7 +1540,74 @@ export const bookUiMethods = uiModule({
                 storyDraftUrls: (owner) => this.storyCompareUrls('person' in owner
                     ? { personId: owner.person.id } : { partnershipId: owner.couple.id }),
             }),
+        };
+    },
+
+    /**
+     * 8c / 3f: the book's window says "Preparing the book…" at once (in the click), the chapters are built in
+     * parts with "chapter k of n" between them; past 120 ms the main window shows the progress toast with Cancel.
+     * Cancel (or the window closed) stops the building; the window opened for it closes.
+     */
+    async fillBookWindow(win: Window, options: BookOptions, openedNow: boolean): Promise<void> {
+        const started = Date.now();
+        const doc = win.document;
+        doc.open();
+        doc.write(bookPreparingHtml(options.lang));
+        doc.close();
+        const W = getStringsForLang(options.lang).busy;
+        let cancelled = false;
+        let toast: ProgressToastHandle | null = null;
+        let lastYield = started;
+        // The book's window paints (it is the one in front); the opener may be hidden behind it.
+        const yieldToWindow = (): Promise<void> => new Promise(resolve => {
+            let done = false;
+            const go = (): void => { if (!done) { done = true; resolve(); } };
+            try { win.requestAnimationFrame(() => win.setTimeout(go, 0)); } catch { /* closed */ }
+            setTimeout(go, 100);
         });
+        try {
+            const html = await buildFamilyBookAsync(DataManager.getData(), options, this.familyBookEnv(options, false), async ({ k, n }) => {
+                if (cancelled || win.closed) throw new BookBuildStopped();
+                const k$ = doc.querySelector('.bp-k');
+                if (k$) k$.textContent = W.chapterK(k, n);
+                const bar = doc.querySelector<HTMLElement>('.bp-bar > i');
+                if (bar) bar.style.width = `${Math.round(((k - 1) / n) * 100)}%`;
+                const now = Date.now();
+                if (!toast && now - started >= BUSY_SHOW_MS) {
+                    toast = showProgressToast({
+                        title: strings.busy.preparingBook,
+                        startedAt: started,
+                        cancel: () => { cancelled = true; },
+                        show: () => { try { win.focus(); } catch { /* the browser decides */ } },
+                    });
+                }
+                toast?.update({ step: strings.busy.chapterK(k, n), percent: Math.round(((k - 1) / n) * 100) });
+                // The first chapter's step painted, then a pause for the window every 40 ms of work.
+                if (k === 1 || now - lastYield >= 40) {
+                    await yieldToWindow();
+                    lastYield = Date.now();
+                    if (cancelled || win.closed) throw new BookBuildStopped();
+                }
+            });
+            if (win.closed) throw new BookBuildStopped();
+            doc.open();
+            doc.write(html);
+            doc.close();
+            this.wireBookWindow(win, options);
+            if (toast) {
+                const t: ProgressToastHandle = toast;
+                setTimeout(() => t.close(), Math.max(0, started + BUSY_SHOW_MS + BUSY_MIN_MS - Date.now()));
+            }
+            try { win.focus(); } catch { /* the browser decides */ }
+        } catch (e) {
+            (toast as ProgressToastHandle | null)?.close();
+            if (e instanceof BookBuildStopped) {
+                if (openedNow && !win.closed) win.close();
+                return;
+            }
+            if (!win.closed) win.close();
+            this.showAlert(strings.export.failed, 'warning');
+        }
     },
 
     /** The book's window straight away for a selection (from the pages' window): the remembered options. */
@@ -1490,11 +1617,7 @@ export const bookUiMethods = uiModule({
         const options = bookOptionsFromMemory(appBookLang(), loadBookMemory(storage(), TreeManager.getActiveTreeId()), spec);
         const win = window.open('', '_blank');
         if (!win) { this.showAlert(strings.export.failed, 'warning'); return; }
-        win.document.open();
-        win.document.write(this.familyBookHtml(options, false));
-        win.document.close();
-        this.wireBookWindow(win, options);
-        try { win.focus(); } catch { /* the browser decides */ }
+        void this.fillBookWindow(win, options, true);
     },
 
     /** "Open book": the window opens (or the one being changed is rewritten); for the pages, the file is built. */
@@ -1523,15 +1646,11 @@ export const bookUiMethods = uiModule({
         const options = currentOptions(s);
         saveBookMemory(storage(), s.treeId, options, memoryExtra(s));
         // The window first (a popup must open in the click), then the book.
-        const win = s.win && !s.win.closed ? s.win : window.open('', '_blank');
+        const reused = s.win && !s.win.closed ? s.win : null;
+        const win = reused ?? window.open('', '_blank');
         this.closeBookDialog();
         if (!win) { this.showAlert(strings.export.failed, 'warning'); return; }
-        const html = this.familyBookHtml(options, false);
-        win.document.open();
-        win.document.write(html);
-        win.document.close();
-        this.wireBookWindow(win, options);
-        try { win.focus(); } catch { /* the browser decides */ }
+        void this.fillBookWindow(win, options, !reused);
     },
 
     /** The book window's app actions: Change options, Save as HTML, Share; the story comparison. */
@@ -1558,26 +1677,53 @@ export const bookUiMethods = uiModule({
                 this.openFamilyPages(options.selection);
                 return;
             }
-            try {
-                const html = this.familyBookHtml(options, true);
-                const name = bookFileName(title());
-                if (act === 'save') {
-                    const W = win as Window & typeof globalThis;
-                    const url = W.URL.createObjectURL(new W.Blob([html], { type: 'text/html;charset=utf-8' }));
-                    const a = doc.createElement('a');
-                    a.href = url;
-                    a.download = name;
-                    doc.body.appendChild(a);
-                    a.click();
-                    a.remove();
-                    setTimeout(() => W.URL.revokeObjectURL(url), 2000);
-                } else if (act === 'share') {
-                    const file = new File([html], name, { type: 'text/html' });
-                    void win.navigator.share({ files: [file], title: title() }).catch(() => { /* cancelled */ });
-                }
-            } catch {
-                win.alert(getStringsForLang(options.lang).book.win.saveFailed);
-            }
+            // C46, §8: the saved book is built anew; its button says "Saving…" first (painted), locked meanwhile.
+            const btn = el as HTMLElement;
+            if (btn.getAttribute('aria-busy') === 'true') return;
+            const label = btn.textContent ?? '';
+            btn.setAttribute('aria-busy', 'true');
+            btn.setAttribute('aria-disabled', 'true');
+            btn.style.minWidth = `${btn.offsetWidth}px`;
+            btn.textContent = getStringsForLang(options.lang).busy.saving;
+            const rest = (): void => {
+                btn.textContent = label;
+                btn.style.minWidth = '';
+                btn.removeAttribute('aria-busy');
+                btn.removeAttribute('aria-disabled');
+            };
+            let painted = false;
+            const run = (): void => {
+                if (painted) return;
+                painted = true;
+                try { this.saveOrShareBook(win, options, act, title()); } finally { rest(); }
+            };
+            try { win.requestAnimationFrame(() => win.setTimeout(run, 0)); } catch { /* closed */ }
+            setTimeout(run, 100);
         });
+    },
+
+    /** Save as HTML / Share from the book's window: the book built for a file. */
+    saveOrShareBook(win: Window, options: BookOptions, act: string | null, bookTitle: string): void {
+        const doc = win.document;
+        try {
+            const html = this.familyBookHtml(options, true);
+            const name = bookFileName(bookTitle);
+            if (act === 'save') {
+                const W = win as Window & typeof globalThis;
+                const url = W.URL.createObjectURL(new W.Blob([html], { type: 'text/html;charset=utf-8' }));
+                const a = doc.createElement('a');
+                a.href = url;
+                a.download = name;
+                doc.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => W.URL.revokeObjectURL(url), 2000);
+            } else if (act === 'share') {
+                const file = new File([html], name, { type: 'text/html' });
+                void win.navigator.share({ files: [file], title: bookTitle }).catch(() => { /* cancelled */ });
+            }
+        } catch {
+            win.alert(getStringsForLang(options.lang).book.win.saveFailed);
+        }
     },
 });

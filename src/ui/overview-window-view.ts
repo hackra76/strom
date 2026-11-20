@@ -23,11 +23,20 @@ import { replacePendingHypotheses, type PendingHypothesis } from '../research-hy
 import { setAcceptBatch, type AcceptBatch } from '../research-hypothesis-waiting.js';
 import { moveQueueItemFirst, noteQueueRev, placeQueueItemInLists, onQueueListsChange, readQueuePage, resetQueueLists, setQueueRemote } from '../research-queue-pages.js';
 import { BRIDGE_ANSWER_MS } from '../bridge-ask.js';
+import { VERIFY_TIMEOUT_MS } from '../research-verify.js';
 import { strings } from '../strings.js';
 import type { UIClass } from './index.js';
 import { el, setOverviewWindowDrawn, type LiveSession, type OverviewViewing } from './research-ui.js';
 import { applyDirectionsWindowState, setQueueDirectionFilter } from './research-directions-ui.js';
 import { setOverviewOwnWindow } from './research-overview-ui.js';
+import { openResearchBusy, type OpenBusyResult } from './research-open-busy.js';
+import { askMainWindow, followLiveFromWindow } from './overview-window-follow.js';
+import { activatedElement } from './busy.js';
+import type { ResearchLinkKind } from './research-ui.js';
+import { auditRefusalOf, auditResearchUnavailable, setWaitingAuditState } from './waiting-task-ui.js';
+import { asAuditPreview } from '../research-audit.js';
+import type { WaitingAuditPreviewResult, WaitingAuditResult, WaitingFileResult } from '../research-waiting-write.js';
+import { itemKey } from './waiting-images-ui.js';
 import { SECTION_PREFS_EVENT, sectionPrefs, watchSectionPrefsStorage } from './live-section-prefs.js';
 import {
     overviewClosedStrip, overviewWindowScreen, renderOverviewWindowState,
@@ -35,6 +44,8 @@ import {
 } from './overview-window-states.js';
 import type { DirectionFormOptions } from './direction-form-ui.js';
 import type { WaitingAnswerOutcome } from './waiting-answer-form.js';
+import type { RowNote } from './waiting-row-notes.js';
+import type { RowBusyView } from './row-busy.js';
 import { taskOrderOutcomeOf, type TaskOrderOutcome, type TaskOrderWrite } from './research-offline-ui.js';
 import {
     OVERVIEW_ACTIONS_TO_MAIN, emptyOverviewExtras, overviewSessionFromData, readOverviewState,
@@ -42,6 +53,9 @@ import {
 } from '../windows/overview-window.js';
 
 /** How the window reaches the main window (the satellite client, or a test's double). */
+/** Longest a file written by the main window is waited for (at least; a big file longer, as its write). */
+const FILE_RELAY_MIN_MS = 60_000;
+
 export interface OverviewWindowPort {
     /** Ask the main window for an action. */
     send(action: OverviewActionId, args?: unknown): void;
@@ -186,10 +200,28 @@ export function overviewWindowOverrides(port: OverviewWindowPort, read: () => Ov
         },
         // The tree's "Verifying" as the main window's snapshot says it: Stop asked there, the bulk dialog opened there.
         treeVerifyNow() { return extras().verify ?? null; },
-        async verifyStop(): Promise<void> { run('verify-stop'); },
+        /**
+         * Stop written by the main window (its bridge): the button here says the work until its outcome (§11.2);
+         * nothing heard of the main window for 10 s: "The main Strom window does not respond."
+         */
+        async writeVerifyStop(): Promise<{ ok: true } | { ok: false; text: string }> {
+            const got = await askMainWindow({
+                ask: (waitMs) => port.ask('verify-stop', undefined, waitMs),
+                waitMs: VERIFY_TIMEOUT_MS + BRIDGE_ANSWER_MS,
+                working: () => extras().verifyStopping === true,
+                signal: new AbortController().signal,
+            });
+            const a = got.answer;
+            if (a && typeof a === 'object' && 'ok' in a) return a as { ok: true } | { ok: false; text: string };
+            if (got.silent) return { ok: false, text: strings.busy.mainWindowSilent };
+            // The main window offers no Stop now (the verification ended there meanwhile).
+            return { ok: false, text: strings.verify.failed };
+        },
         showVerifyBulkDialog(): void { run('verify-bulk'); },
         // Research for this tree at the work outside the directions: a dialog of the main window.
         openOffLineSettings(): void { run('offline-settings'); },
+        // Research for this tree at Books (Faster by downloading › Settings…): a dialog of the main window.
+        openBooksSettings(): void { run('books-settings'); },
         offLineSettingsOffered(): boolean { return extras().offLineSettings === true; },
         // Its own overview (no small panel here); none opened or closed here.
         renderLivePanel(this: UIClass): void { this.renderResearchOverview(); },
@@ -216,7 +248,13 @@ export function overviewWindowOverrides(port: OverviewWindowPort, read: () => Ov
 
         // ---- the actions: asked of the main window ----
         stopLiveFollow(): void { run('stop-follow'); },
-        startFollowLive(): void { run('follow-live'); },
+        // The state on the element clicked here until the main window says how the start ended (§11.2).
+        startFollowLive(_origin?: unknown, _forResearch?: string, el?: HTMLElement | null) {
+            return followLiveFromWindow(el ?? activatedElement(), {
+                ask: (waitMs) => port.ask('follow-live', undefined, waitMs),
+                followStart: () => extras().followStart ?? null,
+            }) as ReturnType<UIClass['startFollowLive']>;
+        },
         setLiveFollow(on: boolean): void { run('follow-tree', { on }); },
         setLiveFollowView(view: FollowView): void { run('follow-view', { view }); },
         async toggleResearchLive(): Promise<void> { run('turn-on'); },
@@ -239,8 +277,21 @@ export function overviewWindowOverrides(port: OverviewWindowPort, read: () => Ov
         },
         async showTreeOverview(): Promise<void> { run('tree-overview'); },
         showWaitingPlaces(focus?: string): void { run('waiting-places', focus ? { focus } : {}); },
-        async showWaitingGroupNote(_s: LiveSession, key: string, name: string): Promise<void> {
-            run('waiting-group-note', { group: key, name });
+        /**
+         * The queries' text read by the main window and shown there (it comes forward): the button here says the
+         * work until its outcome, a failure under it (§11.2); nothing heard of the main window for 10 s: its silence.
+         */
+        async readWaitingGroupNote(_s: LiveSession, key: string, name: string): Promise<string | null> {
+            port.focusMain();
+            const got = await askMainWindow({
+                ask: (waitMs) => port.ask('waiting-group-note', { group: key, name }, waitMs),
+                waitMs: OVERVIEW_ANSWER_WAIT_MS + BRIDGE_ANSWER_MS,
+                working: () => extras().noteReading?.includes(key) ?? false,
+                signal: new AbortController().signal,
+            });
+            const a = got.answer;
+            if (a && typeof a === 'object' && 'failed' in a) return typeof a.failed === 'string' ? a.failed : null;
+            return got.silent ? strings.busy.mainWindowSilent : null;
         },
         openWaitingImages(_s: LiveSession, w: LiveWaiting, files?: readonly File[]): void {
             run('waiting-images', { itemId: w.id, ...(files?.length ? { files: [...files] } : {}) });
@@ -282,17 +333,93 @@ export function overviewWindowOverrides(port: OverviewWindowPort, read: () => Ov
             return out;
         },
         taskOrderBusy(id: string): boolean { return extras().taskOrder.busy.includes(id); },
+        // The row's state as the main window has it (§4: the spinner past 120 ms there).
+        taskOrderView(id: string): RowBusyView | null {
+            const t = extras().taskOrder;
+            if (!t.busy.includes(id)) return null;
+            const m = t.shown?.find(x => x.id === id);
+            return { shown: m?.shown ?? false, label: m?.label ?? '' };
+        },
+        taskOrderRetry(): (() => void) | null { return null; },
         taskOrderProblem(id: string): string { return extras().taskOrder.problems[id] ?? ''; },
         async sendWaitingAnswer(_s: LiveSession, w: LiveWaiting, text: string): Promise<WaitingAnswerOutcome> {
             const r = await port.ask('waiting-answer', { itemId: w.id, text }, OVERVIEW_ANSWER_WAIT_MS);
             return (typeof r === 'string' ? r : 'fail') as WaitingAnswerOutcome;
         },
         async markWaitingSent(_s: LiveSession, w: LiveWaiting): Promise<void> { run('waiting-sent', { itemId: w.id }); },
-        async markWaitingUnsent(_s: LiveSession, id: string): Promise<void> { run('waiting-unsent', { itemId: id }); },
+        async markWaitingUnsent(_s: LiveSession, id: string): Promise<undefined> { run('waiting-unsent', { itemId: id }); return undefined; },
         async markWaitingGroupSent(_s: LiveSession, key: string): Promise<void> { run('waiting-group-sent', { group: key }); },
-        async sendWaitingFile(s: LiveSession, task: string, file: File): Promise<void> {
+        // A row's own write (§7) as the main window has it: "saving", or refused with its sentence; Try again asks it.
+        waitingRowNote(_s: LiveSession, id: string): RowNote | null {
+            const ww = extras().waitingWrite;
+            if (!ww) return null;
+            if (ww.saving.includes(id)) return { kind: 'saving' };
+            const r = ww.refused.find(x => x.id === id);
+            if (!r) return null;
+            const said = refusalsSaid.get(id) === r.text;
+            refusalsSaid.set(id, r.text);
+            return {
+                kind: 'refused', tint: r.tint,
+                refusal: { text: r.text, phase: 'todo', at: 0, untinted: !r.tint, said, ...(r.retry ? { retry: () => run('waiting-retry', { itemId: id }) } : {}) },
+            };
+        },
+        touchWaitingRow(): boolean { return false; },
+        retryWaitingRow(_s: LiveSession, id: string): boolean {
+            run('waiting-retry', { itemId: id });
+            return true;
+        },
+        // Leave as is at a finding (spec 109 §4): written by the main window (its toast with Undo); the row goes here at once.
+        async keepWaitingAudit(this: UIClass, s: LiveSession, w: LiveWaiting): Promise<void> {
+            if (!w.audit || auditResearchUnavailable(s)) return;
+            setWaitingAuditState(itemKey(s, w.id), { phase: 'kept', stamp: w.audit.stamp });
+            run('waiting-audit', { itemId: w.id, do: 'keep' });
+            this.renderResearchOverview();
+        },
+        async unkeepWaitingAudit(this: UIClass, s: LiveSession, id: string): Promise<undefined> {
+            setWaitingAuditState(itemKey(s, id), null);
+            run('waiting-audit', { itemId: id, do: 'unkeep' });
+            this.renderResearchOverview();
+            return undefined;
+        },
+        // The fix (spec 109 §2): its preview read and the fix written by the main window (its toast with Undo there);
+        // the preview, its refusals and the focus are this window's.
+        async readWaitingAuditPreview(_s: LiveSession, w: LiveWaiting): Promise<WaitingAuditPreviewResult> {
+            const r = await port.ask('waiting-audit', { itemId: w.id, do: 'preview' }, OVERVIEW_ANSWER_WAIT_MS);
+            const o = r && typeof r === 'object' ? r as Record<string, unknown> : null;
+            const preview = o?.ok === true ? asAuditPreview(o.preview) : null;
+            return preview ? { ok: true, preview } : auditRefusalOf(o?.ok === false ? o : { code: 'network' });
+        },
+        async writeWaitingAuditFix(_s: LiveSession, w: LiveWaiting, expect: string): Promise<WaitingAuditResult> {
+            const r = await port.ask('waiting-audit', { itemId: w.id, do: 'fix', expect }, OVERVIEW_ANSWER_WAIT_MS);
+            const o = r && typeof r === 'object' ? r as Record<string, unknown> : null;
+            if (o?.ok === true) {
+                const ids = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof researchTaskRef(x) === 'string') : []);
+                return { ok: true, task: researchTaskRef(o.task) ?? '', tasks: ids(o.tasks), woke: ids(o.woke), head: '' };
+            }
+            return auditRefusalOf(o?.ok === false ? o : { code: 'network' });
+        },
+        async undoWaitingAuditFix(this: UIClass, _s: LiveSession, id: string): Promise<undefined> {
+            run('waiting-audit', { itemId: id, do: 'unfix' });
+            return undefined;
+        },
+        /**
+         * The file written by the main window (its write, its version): the button here says the work until its
+         * outcome; nothing heard of the main window for 10 s, null ("The main Strom window does not respond.").
+         */
+        async writeWaitingFile(s: LiveSession, task: string, file: File): Promise<WaitingFileResult | null> {
             const w = s.waiting.find(x => researchTaskRef(x.id) === task);
-            if (w) run('waiting-file', { itemId: w.id, file });
+            if (!w) return { ok: false, code: 'none', status: 0, retryAfter: null, reason: '' };
+            const got = await askMainWindow({
+                ask: (waitMs) => port.ask('waiting-file', { itemId: w.id, file }, waitMs),
+                waitMs: Math.max(FILE_RELAY_MIN_MS, file.size / 2000) + BRIDGE_ANSWER_MS,
+                working: () => extras().fileSending?.includes(w.id) ?? false,
+                signal: new AbortController().signal,
+            });
+            const answer = got.answer;
+            if (answer && typeof answer === 'object' && 'ok' in answer) return answer as WaitingFileResult;
+            // The main window cannot write it (the row gone, writes off there): as a row gone.
+            if (answer === false) return { ok: false, code: 'none', status: 0, retryAfter: null, reason: '' };
+            return null;
         },
         askWaitingHypothesis(h: ResearchHypothesis, what: 'decide' | 'abandon' | 'keep-open', variant?: string): void {
             if (!h.id) return;
@@ -315,8 +442,36 @@ export function overviewWindowOverrides(port: OverviewWindowPort, read: () => Ov
             // "Work on the queue…" starts the agent there: the main window says so as for its own link.
             port.send('research-link', { link: l.link, params: l.params, ...(l.link === 'work' ? { kind: 'agent' } : {}) });
         },
+        /** "Work on the queue…" started from here: the main window hands it over and keeps its state (3a). */
+        beginQueueWork(this: UIClass, url: string): void {
+            lastWorkUrl = url;
+            this.handOverResearchLink(url);
+        },
+        /** The start of the queue's work as the main window has it. */
+        queueStartNow(): { phase: 'starting' | 'silent'; startedAt: number } | null {
+            return extras().queueStart ?? null;
+        },
+        /** Try again: the same link once more through the main window. */
+        retryQueueWork(this: UIClass): void {
+            if (lastWorkUrl) this.handOverResearchLink(lastWorkUrl);
+        },
+        /** A link from here: the element's state a moment; the main window hands it over and waits for its proof. */
+        launchResearchLink(this: UIClass, url: string, kind: ResearchLinkKind = 'terminal', el?: HTMLElement | null): Promise<OpenBusyResult> {
+            if (kind === 'version') { this.handOverResearchLink(url); return Promise.resolve('opened'); }
+            return openResearchBusy(el ?? null, url, { agent: kind === 'agent', relayed: true }, {
+                handOver: (link) => this.handOverResearchLink(link),
+                ask: async () => null,
+                statusNow: () => null,
+                bridgeDown: () => false,
+            });
+        },
     };
 }
+
+/** The last "Work on the queue…" link started from this window (its Try again). */
+let lastWorkUrl: string | null = null;
+/** A refused row's sentence drawn here already (its text): `role=alert` only on its first drawing. */
+const refusalsSaid = new Map<string, string>();
 
 /** The drawn sessions now (the overrides read the session of the last snapshot). */
 let drawnNow: OverviewWindowDrawn | null = null;

@@ -39,11 +39,17 @@ import {
 } from '../history.js';
 import { manageSummaries } from '../history-manage.js';
 import {
-    fetchBridgeHistory, hideRequestBody, postBridgeHide, postBridgeExperimentsOff, experimentOfSwitch, type ExperimentSwitch,
+    fetchBridgeHistory, hideRequestBody, postBridgeHide, postBridgeExperimentsOff, experimentOfSwitch, HISTORY_READ_TIMEOUT_MS,
+    type ExperimentSwitch,
 } from '../history-bridge.js';
+import { busySpinHtml, runBusy, activatedElement } from './busy.js';
 import { loadHistoryCache, saveHistoryCache, loadHideQueue, saveHideQueue } from '../history-store.js';
 import { onBridgeStatus } from './research-sync-ui.js';
 import { uiModule } from './module.js';
+import { applyPend, endPend, isPend, pendStatusEl, startPend } from './switch-pend.js';
+
+/** The layer's switch in Settings while switching it on reads the history (6.1, B170). */
+const HISTORY_LAYER_PEND = 'history-layer';
 
 /** The manager "History of places" (history-manage-ui.ts). */
 export const HISTORY_MANAGE_DIALOG_ID = 'history-modal';
@@ -82,6 +88,10 @@ const readHere = new Set<string>();
 /** A read running; the rev asked meanwhile waits for it. */
 const reading = new Set<string>();
 const readAgain = new Map<string, string | undefined>();
+/** The last read of a research failed (no answer within its limit, or the bridge not reached); a read that works clears it. */
+const readFailed = new Map<string, 'timeout' | 'network'>();
+/** Try again in Settings' status row: its read runs ("Loading…" in the row until it ends). */
+const readRetrying = new Set<string>();
 /** Sending the queue now. */
 const flushing = new Set<string>();
 /** The search was switched off from here (until the status agrees or says otherwise): when. */
@@ -171,7 +181,7 @@ export const historyMethods = uiModule({
         }
         await this.ensureHistoryCache(rid);
         const status = this.researchBridgeUp(rid) ? this.researchStatusOf(rid) : null;
-        if (status) this.noteHistoryStatus(rid, status);
+        if (status) await this.noteHistoryStatus(rid, status);
         else this.historyChanged();
     },
 
@@ -224,7 +234,7 @@ export const historyMethods = uiModule({
      * the tree is open, `history.events` is said and its `history.rev` is not
      * the one read; send the waiting hidings; redraw the Settings row.
      */
-    noteHistoryStatus(researchId: string, status: LiveStatus): void {
+    noteHistoryStatus(researchId: string, status: LiveStatus): Promise<void> {
         const rid = researchId.toLowerCase();
         lastFeatures.set(rid, status.features ?? []);
         this.noteHistoryKindsStatus(rid, status);
@@ -241,21 +251,23 @@ export const historyMethods = uiModule({
         }
         if (!SettingsManager.isHistoryLayer() || rid !== activeResearchId()) {
             this.renderHistorySettingsIfOpen();
-            return;
+            return Promise.resolve();
         }
-        void this.ensureHistoryCache(rid).then(() => {
+        // Resolves once the research's history (when it was stale) is read.
+        let read: Promise<void> = Promise.resolve();
+        return this.ensureHistoryCache(rid).then(() => {
             const features = status.features ?? [];
             if (features.includes(HISTORY_EVENTS_FEATURE)) {
                 const rev = status.historyRev;
                 const stale = !cache.get(rid) || (rev ? loadedRev.get(rid) !== rev : !readHere.has(rid));
-                if (stale) void this.readBridgeHistory(rid, rev);
+                if (stale) read = this.readBridgeHistory(rid, rev).catch(() => { /* the read's own end */ });
             }
             if (features.includes(HISTORY_HIDE_FEATURE)) void this.flushHistoryQueue(rid);
             this.syncHistoryStrip();
             this.renderHistorySettingsIfOpen();
             // The manager's header and actions follow the status (search on/off, pace, features).
             if (document.getElementById(HISTORY_MANAGE_DIALOG_ID)?.classList.contains('active')) this.renderHistoryManage();
-        });
+        }).then(() => read);
     },
 
     /** The stream's `history {rev}` event: a change without a new commit (spec 020 A3). */
@@ -267,6 +279,18 @@ export const historyMethods = uiModule({
         const features = this.researchStatusOf(rid)?.features ?? [];
         if (!features.includes(HISTORY_EVENTS_FEATURE)) return;
         void this.readBridgeHistory(rid, rev);
+    },
+
+    /** Whether the last read of the research failed: `timeout` (no answer in 15 s) or `network` (not reached). */
+    historyReadFailure(researchId: string): 'timeout' | 'network' | undefined {
+        // Kept while the status's own reads try again (each lasts up to the limit), until one comes back.
+        return readFailed.get(researchId.toLowerCase());
+    },
+
+    /** Try again after a failed read: "Loading…" again until this read ends. */
+    historyReadRetry(researchId: string): Promise<void> {
+        readFailed.delete(researchId.toLowerCase());
+        return this.readBridgeHistory(researchId);
     },
 
     /** `GET /history`: the new payload in use and on the device; a refused or too big one leaves the old. */
@@ -281,6 +305,12 @@ export const historyMethods = uiModule({
         reading.add(rid);
         try {
             const r = await fetchBridgeHistory(base, rev ? { rev } : {});
+            if (!r.ok && (r.code === 'timeout' || r.code === 'network')) {
+                readFailed.set(rid, r.code);
+                // §10.3: the manager waiting for its first read says so instead of "Loading…" for ever.
+                if (document.getElementById(HISTORY_MANAGE_DIALOG_ID)?.classList.contains('active')) this.renderHistoryManage();
+                this.renderHistorySettingsIfOpen();
+            } else readFailed.delete(rid);
             if (r.ok) {
                 await this.ensureHistoryCache(rid);
                 cache.set(rid, r.payload);
@@ -634,9 +664,25 @@ export const historyMethods = uiModule({
 
     /** The layer switched on or off in Settings. Switching it on reads; it never writes to the research. */
     toggleHistoryLayer(on: boolean): void {
+        // Still reading after it was switched on (6.1, B170): a click meanwhile is ignored, visibly.
+        if (isPend(HISTORY_LAYER_PEND)) {
+            const toggle = document.getElementById('history-setting-toggle') as HTMLInputElement | null;
+            if (toggle) toggle.checked = true;
+            return;
+        }
         SettingsManager.setHistoryLayer(on);
-        if (on) void this.refreshHistoryForActiveTree();
-        else this.historyChanged();
+        if (!on) {
+            this.historyChanged();
+            return;
+        }
+        // On: the device's copy and the research's history are read; the switch stays dashed with "Loading…"
+        // (after 120 ms) until they are in.
+        startPend(HISTORY_LAYER_PEND, { label: strings.busy.generic, redraw: () => this.renderHistorySettingsIfOpen() });
+        this.renderHistorySettingsIfOpen();
+        void this.refreshHistoryForActiveTree().finally(async () => {
+            await endPend(HISTORY_LAYER_PEND);
+            this.renderHistorySettingsIfOpen();
+        });
     },
 
     /** The `experiment` link may be offered for the research (§1.3 canLinkOn / canLinkOff). */
@@ -661,7 +707,15 @@ export const historyMethods = uiModule({
         const row = document.getElementById('history-setting-status');
         const link = document.getElementById('history-manage-link');
         const layerOn = SettingsManager.isHistoryLayer();
-        if (toggle) toggle.checked = layerOn;
+        if (toggle) {
+            toggle.checked = layerOn;
+            applyPend(toggle, HISTORY_LAYER_PEND);
+            if (!isPend(HISTORY_LAYER_PEND)) toggle.removeAttribute('aria-disabled');
+            const name = document.getElementById('history-setting-name');
+            name?.parentElement?.querySelector(':scope > .pend-st')?.remove();
+            const st = pendStatusEl(HISTORY_LAYER_PEND);
+            if (st && name) name.after(st);
+        }
         if (!row || !link) return;
         const rid = activeResearchId();
         if (rid && layerOn && !cache.has(rid)) {
@@ -688,9 +742,28 @@ export const historyMethods = uiModule({
             formatDate,
             formatTime,
         }, lang());
-        if (!said) {
+        // §10.3: the research's read did not come back (no answer in 15 s, or not reached): the row says so with
+        // Try again; with nothing read yet the status alone would guess ("done"), so the sentence stands alone.
+        const failure = rid && layerOn && status ? this.historyReadFailure(rid) : undefined;
+        const retrying = !!rid && layerOn && readRetrying.has(rid);
+        const end = retrying
+            ? `<span class="busy-st history-read-busy">${busySpinHtml(12)}${esc(strings.busy.generic)}</span>`
+            : failure
+                ? `<div class="busy-msg is-err history-read-failed" role="alert"><span class="busy-msg__text">${esc(failure === 'timeout'
+                    ? strings.busy.errTimeout(Math.round(HISTORY_READ_TIMEOUT_MS / 1000)) : strings.busy.errOffline)}</span>`
+                    + `<button type="button" class="link busy-msg__retry" data-history-action="readAgain" onclick="window.Strom.UI.historySettingsReadAgain()">${esc(strings.busy.retry)}</button></div>`
+                : '';
+        if (end && !payload) {
+            // Drawn again only when it changed: a status poll does not say the alert again.
+            if (row.dataset.drawn !== end) {
+                row.innerHTML = end;
+                row.dataset.drawn = end;
+            }
+            row.hidden = false;
+        } else if (!said) {
             row.hidden = true;
             row.innerHTML = '';
+            delete row.dataset.drawn;
         } else {
             const h = strings.history;
             // Switching the search on asks in the research's terminal (its mark); off goes through the bridge, or
@@ -705,7 +778,11 @@ export const historyMethods = uiModule({
             if (said.action === 'linkOn') html += `${button('linkOn', h.enableSearch)} ${esc(h.enableSearchAlso)}`;
             else if (said.action) html += button(said.action, h.disableSearch);
             else if (err?.link) html += button('errLink', h.disableSearch);
-            row.innerHTML = html;
+            html += end;
+            if (row.dataset.drawn !== html) {
+                row.innerHTML = html;
+                row.dataset.drawn = html;
+            }
             row.hidden = false;
         }
         this.renderHistoryKinds();
@@ -769,9 +846,33 @@ export const historyMethods = uiModule({
     },
 
     /** A link or button of the status row. */
+    /** Try again under Settings' status row after a failed read: "Loading…" there until the read ends. */
+    historySettingsReadAgain(): void {
+        const rid = activeResearchId();
+        if (!rid || readRetrying.has(rid)) return;
+        readRetrying.add(rid);
+        const row = document.getElementById('history-setting-status');
+        const hadFocus = !!row && !!document.activeElement && row.contains(document.activeElement);
+        this.renderHistorySettingsIfOpen();
+        // The focus stays in the row (its button goes with the sentence).
+        if (row && hadFocus) {
+            row.tabIndex = -1;
+            row.focus({ preventScroll: true });
+        }
+        void this.historyReadRetry(rid).finally(() => {
+            readRetrying.delete(rid);
+            this.renderHistorySettingsIfOpen();
+        });
+    },
+
     historySettingsAction(action: HistorySettingsAction | 'errLink'): void {
         if (action === 'linkOn') this.historyEnableSearch();
-        else if (action === 'off') void this.historyDisableSearch();
+        else if (action === 'off') {
+            // Through the bridge: the link working from the click until the research answers (B172), one write.
+            const el = activatedElement() ?? document.querySelector<HTMLElement>('[data-history-action="off"]');
+            if (el) void runBusy(el, () => this.historyDisableSearch(), { label: strings.busy.turningOff, kind: 'write' });
+            else void this.historyDisableSearch();
+        }
         else if (action === 'linkOff') this.historyLaunchExperiment('off');
         else if (action === 'errLink' && offError?.link) this.launchResearchLink(offError.link, 'terminal');
     },
@@ -823,9 +924,13 @@ export const historyMethods = uiModule({
      * `experiments.split` the history of regions or of places alone): through
      * the bridge at once when it says `experiments.off`, else its link. A
      * refusal of one switch (the manager) is a toast; of both, Settings' row.
-     * `quiet`: no toast when it went (Settings' Search column says it in its own sentence).
+     * `quiet`: no toast when it went (Settings' Search column says it in its own sentence); `onRefused`: a
+     * refusal of one switch said at that switch instead of a toast (6.1), with the terminal's way where it has one.
      */
-    async historyDisableSearch(which: ExperimentSwitch = 'history', opts: { quiet?: boolean } = {}): Promise<boolean> {
+    async historyDisableSearch(which: ExperimentSwitch = 'history', opts: {
+        quiet?: boolean;
+        onRefused?: (text: string, alt?: { label: string; run: () => void; mark: ResearchActionMark }) => void;
+    } = {}): Promise<boolean> {
         const rid = activeResearchId();
         if (!rid) return false;
         const status = this.researchBridgeUp(rid) ? this.researchStatusOf(rid) : null;
@@ -854,7 +959,11 @@ export const historyMethods = uiModule({
         } else {
             const text = r.reason || (r.held ? this.researchWriteHeldText(r.held, false).toast : strings.live.waitingWrite.writeFailed);
             if (which === 'history') offError = { researchId: rid, text, ...(r.link ? { link: r.link } : {}) };
-            else {
+            else if (opts.onRefused) {
+                const link = r.link;
+                opts.onRefused(r.reason ? strings.busy.notChanged(r.reason) : text, link
+                    ? { label: h.switchOff, run: () => this.launchResearchLink(link, 'terminal'), mark: researchUrlMark(link) ?? 'terminal' } : undefined);
+            } else {
                 const link = r.link;
                 this.showToast(text, 6000, link ? { action: { label: h.switchOff, run: () => this.launchResearchLink(link, 'terminal'), ...researchLinkFlags(link) } } : {});
             }

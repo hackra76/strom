@@ -51,6 +51,8 @@ import { contextMenuMethods } from './context-menu.js';
 import { bottomSheetMethods } from './bottom-sheet.js';
 
 import { personModalMethods } from './person-modal.js';
+import { portraitActionsMethods, PendingPortrait } from './portrait-actions-ui.js';
+import { unionPhotoMethods } from './union-photo-ui.js';
 import { personEventsMethods } from './person-events.js';
 import { sharedEventMethods } from './shared-event-ui.js';
 import { sharedLineMethods } from './shared-line-ui.js';
@@ -94,6 +96,13 @@ import { materialsMethods } from './materials-ui.js';
 import { materialsWindowMethods } from './materials-window.js';
 import { materialViewerMethods } from './material-viewer-ui.js';
 import { materialActionsMethods } from './material-actions-ui.js';
+import { materialSortMethods } from './material-sort-ui.js';
+import { materialDetailsMethods } from './material-details-ui.js';
+import { materialUsesMethods } from './material-uses-ui.js';
+import { materialAttachMethods } from './material-attach-ui.js';
+import { materialDeleteMethods } from './material-delete-ui.js';
+import { materialBulkMethods } from './material-bulk-ui.js';
+import { sourceDocsMethods } from './source-docs-ui.js';
 import { researchUpdateMethods } from './research-update-ui.js';
 import { researchChangesMethods } from './research-changes-ui.js';
 import { batchMethods } from './batch-ui.js';
@@ -107,6 +116,9 @@ import { readHistoryMethods } from './read-history-ui.js';
 import { evidenceUiMethods } from './evidence-ui.js';
 import { rodViewMethods } from './rod-view.js';
 import { treeOverviewMethods } from './tree-overview.js';
+import { personListsMethods } from './person-lists-ui.js';
+import { personListNewMethods } from './person-list-new-ui.js';
+import { personListAddMethods } from './person-list-add.js';
 import { cardSignalsUiMethods } from './card-signals-ui.js';
 import { researchOverviewMethods } from './research-overview-ui.js';
 import { liveSectionEditMethods } from './live-section-edit-ui.js';
@@ -116,6 +128,7 @@ import { researchBrowserMethods } from './research-browser-ui.js';
 import { researchRemovedMethods } from './research-removed-ui.js';
 import { researchDirectionsMethods } from './research-directions-ui.js';
 import { overviewWindowMethods } from './overview-window-ui.js';
+import { agentWindowMethods } from './agent-window-ui.js';
 import { directionFormMethods } from './direction-form-ui.js';
 import { researchOffLineMethods } from './research-offline-ui.js';
 import { queueWorkMethods } from './queue-work-dialog.js';
@@ -214,6 +227,8 @@ export class UIClass {
     gedcomRawBuffer: ArrayBuffer | null = null;
     /** How the GEDCOM file in the result dialog was decoded. */
     gedcomDecoding: GedcomDecoding | null = null;
+    /** The encoding being read again (C53), while its select is locked. */
+    gedcomEncodingReading: string | null = null;
     /** The GEDCOM file of the result dialog as picked: its name, sha256 and the day it was loaded (spec 066). */
     gedcomFileInfo: { name: string; sha: string; at: string } | null = null;
     /** A new tree from a GEDCOM file waits for the import dialog's OK: the file's import record. */
@@ -253,7 +268,7 @@ export class UIClass {
     onLocalDataUnlocked: (() => Promise<void>) | null = null;  // Set by main.ts: reload + first render after unlock
     lockedDataReopen: (() => void) | null = null;          // The prompt the Unlock action reopens (null = default)
     newerNoticeTreeId: TreeId | null = null;               // The newer app's tree the read-only bar was raised for
-    exportPasswordCallback: ((password: string | null) => void) | null = null;
+    exportPasswordCallback: ((password: string | null) => unknown) | null = null;
     // Per-category byte sizes of the tree in the open export dialog, measured
     // once when the dialog opens so toggling a content checkbox never
     // re-stringifies the whole tree (see readExportContentSizes).
@@ -314,6 +329,12 @@ export class UIClass {
      */
     primaryNameDraft: PrimaryName | undefined = undefined;
     primaryNameInitial: PrimaryName | undefined = undefined;
+    /**
+     * Person modal: the portrait from the editor in the preview, with the
+     * whole photo or the attachment it was cut from and its crop — the
+     * portrait's source on Save (spec 107 §1, §2, §4); dropped on the next open.
+     */
+    pendingPortrait: PendingPortrait | null = null;
 
     // Debounce timer for the live search filter/highlight.
     searchFilterTimer: ReturnType<typeof setTimeout> | null = null;
@@ -608,6 +629,14 @@ type PersonModalMethods = typeof personModalMethods;
 export interface UIClass extends PersonModalMethods {}
 Object.assign(UIClass.prototype, personModalMethods);
 
+type PortraitActionsMethods = typeof portraitActionsMethods;
+export interface UIClass extends PortraitActionsMethods {}
+Object.assign(UIClass.prototype, portraitActionsMethods);
+
+type UnionPhotoMethods = typeof unionPhotoMethods;
+export interface UIClass extends UnionPhotoMethods {}
+Object.assign(UIClass.prototype, unionPhotoMethods);
+
 type PersonEventsMethods = typeof personEventsMethods;
 type SharedEventMethods = typeof sharedEventMethods;
 export interface UIClass extends PersonEventsMethods {}
@@ -769,6 +798,34 @@ type MaterialActionsMethods = typeof materialActionsMethods;
 export interface UIClass extends MaterialActionsMethods {}
 Object.assign(UIClass.prototype, materialActionsMethods);
 
+type MaterialSortMethods = typeof materialSortMethods;
+export interface UIClass extends MaterialSortMethods {}
+Object.assign(UIClass.prototype, materialSortMethods);
+
+type MaterialDetailsMethods = typeof materialDetailsMethods;
+export interface UIClass extends MaterialDetailsMethods {}
+Object.assign(UIClass.prototype, materialDetailsMethods);
+
+type MaterialUsesMethods = typeof materialUsesMethods;
+export interface UIClass extends MaterialUsesMethods {}
+Object.assign(UIClass.prototype, materialUsesMethods);
+
+type MaterialAttachMethods = typeof materialAttachMethods;
+export interface UIClass extends MaterialAttachMethods {}
+Object.assign(UIClass.prototype, materialAttachMethods);
+
+type MaterialDeleteMethods = typeof materialDeleteMethods;
+export interface UIClass extends MaterialDeleteMethods {}
+Object.assign(UIClass.prototype, materialDeleteMethods);
+
+type MaterialBulkMethods = typeof materialBulkMethods;
+export interface UIClass extends MaterialBulkMethods {}
+Object.assign(UIClass.prototype, materialBulkMethods);
+
+type SourceDocsMethods = typeof sourceDocsMethods;
+export interface UIClass extends SourceDocsMethods {}
+Object.assign(UIClass.prototype, sourceDocsMethods);
+
 type ResearchUpdateMethods = typeof researchUpdateMethods;
 export interface UIClass extends ResearchUpdateMethods {}
 Object.assign(UIClass.prototype, researchUpdateMethods);
@@ -867,6 +924,15 @@ Object.assign(UIClass.prototype, rodViewMethods);
 type TreeOverviewMethods = typeof treeOverviewMethods;
 export interface UIClass extends TreeOverviewMethods {}
 Object.assign(UIClass.prototype, treeOverviewMethods);
+type PersonListsMethods = typeof personListsMethods;
+export interface UIClass extends PersonListsMethods {}
+Object.assign(UIClass.prototype, personListsMethods);
+type PersonListNewMethods = typeof personListNewMethods;
+export interface UIClass extends PersonListNewMethods {}
+Object.assign(UIClass.prototype, personListNewMethods);
+type PersonListAddMethods = typeof personListAddMethods;
+export interface UIClass extends PersonListAddMethods {}
+Object.assign(UIClass.prototype, personListAddMethods);
 
 type CardSignalsUiMethods = typeof cardSignalsUiMethods;
 export interface UIClass extends CardSignalsUiMethods {}
@@ -903,6 +969,10 @@ Object.assign(UIClass.prototype, researchDirectionsMethods);
 type OverviewWindowMethods = typeof overviewWindowMethods;
 export interface UIClass extends OverviewWindowMethods {}
 Object.assign(UIClass.prototype, overviewWindowMethods);
+
+type AgentWindowMethods = typeof agentWindowMethods;
+export interface UIClass extends AgentWindowMethods {}
+Object.assign(UIClass.prototype, agentWindowMethods);
 
 type DirectionFormMethods = typeof directionFormMethods;
 export interface UIClass extends DirectionFormMethods {}

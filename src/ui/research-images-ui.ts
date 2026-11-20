@@ -13,12 +13,14 @@ import { TreeManager } from '../tree-manager.js';
 import { Source, SourceExcerpt, StromData, TreeId } from '../types.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { uiModule } from './module.js';
+import { runBusy } from './busy.js';
 import { onComputer } from './research-ui.js';
 import { heldReasonKey } from './sources.js';
 import { storedResearchBridge } from '../research-device.js';
 import { parseLiveBridge } from '../research-link.js';
 import { helpMark } from './help-mark.js';
 import { SourceImagesChoice } from '../privacy.js';
+import { barHtml } from './prog-bar.js';
 import {
     RESEARCH_IMAGE_EVENT, HeldImageMode, LoadError, LoadErrorKind, MissingList, QueueSnapshot, ResearchImageQueue,
     fetchMissingList, formatImageBytes, hasResearchImages, heldImageMode, knownImageError, loadErrorKind,
@@ -251,7 +253,7 @@ export const researchImagesMethods = uiModule({
             run.clips.forEach((clip, i) => {
                 if (i < run.index || stored.has(clip) || viewerErrors.has(clip)) return;
                 chunks.push(i === run.index
-                    ? `<div class="viewer-excerpt-slot is-active" role="status"><span class="viewer-excerpt-slot-text">${esc(r.loading(i + 1, run.clips.length))}</span><span class="viewer-excerpt-slot-bar" aria-hidden="true"></span></div>`
+                    ? `<div class="viewer-excerpt-slot is-active" role="status"><span class="viewer-excerpt-slot-text">${esc(r.loading(i + 1, run.clips.length))}</span>${barHtml(null)}</div>`
                     : '<div class="viewer-excerpt-slot" aria-hidden="true"></div>');
             });
         } else if (open.length > 0) {
@@ -461,16 +463,20 @@ export const researchImagesMethods = uiModule({
         if (bulkView === 'progress' && mine) {
             const s = mine.snapshot;
             const paused = s.phase === 'paused';
-            const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
             box.hidden = false;
-            box.innerHTML = `<div class="sources-bulk-panel${paused ? ' is-paused' : ''}" role="status">
-                <p class="sources-bulk-progress">${esc(paused ? r.bulkPaused(s.done, s.total, size(s.bytes)) : r.bulkProgress(s.done, s.total, size(s.bytes)))}</p>
-                <div class="sources-bulk-bar" aria-hidden="true"><span style="width:${pct}%"></span></div>
-                <p class="sources-bulk-note">${esc(r.bulkCanClose)}</p>
-                <div class="sources-bulk-buttons">
-                    <button type="button" class="secondary" id="sources-bulk-pause">${esc(paused ? r.resume : r.pause)}</button>
-                    <button type="button" class="secondary" id="sources-bulk-stop">${esc(r.stop)}</button>
-                </div></div>`;
+            // 2h: what runs with "k of n" at the right, the bar, the size so far with Pause / Stop at the right.
+            box.innerHTML = `<div class="sources-bulk-panel${paused ? ' is-paused' : ''}">
+                <div class="prog sources-bulk-prog">
+                    <div class="prog-line" role="status"><span class="prog-t sources-bulk-progress">${esc(paused ? r.bulkHeadPaused : r.bulkHead)}</span>
+                        <span class="prog-k">${esc(strings.busy.kOfN(s.done, s.total))}</span></div>
+                    ${barHtml(s.total ? s.done / s.total : 0, { paused })}
+                    <div class="prog-line"><span>${esc(size(s.bytes))}</span>
+                        <span class="prog-acts sources-bulk-buttons">
+                            <button type="button" class="secondary" id="sources-bulk-pause">${esc(paused ? r.resume : r.pause)}</button>
+                            <button type="button" class="secondary" id="sources-bulk-stop">${esc(r.stop)}</button>
+                        </span></div>
+                </div>
+                <p class="sources-bulk-note">${esc(r.bulkCanClose)}</p></div>`;
             box.querySelector('#sources-bulk-pause')?.addEventListener('click', () => (paused ? mine.resume() : mine.pause()));
             box.querySelector('#sources-bulk-stop')?.addEventListener('click', () => mine.stop());
             return;
@@ -533,18 +539,22 @@ export const researchImagesMethods = uiModule({
         box.hidden = false;
         box.innerHTML = `<div class="sources-bulk-line"><span>${esc(r.bulkLine(images, held.length))}</span>
             <button type="button" class="link-button" id="sources-bulk-open">${esc(r.bulkLoad)}</button></div>`;
-        box.querySelector('#sources-bulk-open')?.addEventListener('click', () => void this.openBulkImageWarning());
+        // A202: the list of what is missing comes from the research (15 s at most): the link waits meanwhile.
+        const open = box.querySelector<HTMLElement>('#sources-bulk-open');
+        open?.addEventListener('click', () => void runBusy(open, ctl => this.openBulkImageWarning(ctl.signal), { kind: 'bridge' }));
         box.querySelector('.sources-bulk-line')?.append(helpMark('imagesHeld'));
     },
 
     /** "Load all from the research…": the warning with counts, size and free space. */
-    async openBulkImageWarning(): Promise<void> {
+    async openBulkImageWarning(signal?: AbortSignal): Promise<void> {
         const env = this.researchImagesEnv();
         if (env.mode !== 'fetch') return;
         const held = this.heldSources();
         const images = held.reduce((n, h) => n + h.clips.length, 0);
         let list: MissingList | null = null;
-        try { list = await fetchMissingList(env.base); } catch { list = null; }
+        try { list = await fetchMissingList(env.base, signal); } catch { list = null; }
+        // The time ran out: the link says so, no warning comes later.
+        if (signal?.aborted) return;
         const known = new Map((list?.sources ?? []).map(s => [s.source, s]));
         // Sizes the research knows; the rest at their average.
         const withSize = held.filter(h => (known.get(sourceRefOf(h.src) ?? '')?.bytes ?? 0) > 0);
@@ -557,6 +567,7 @@ export const researchImagesMethods = uiModule({
             const est = await navigator.storage?.estimate?.();
             if (est && typeof est.quota === 'number' && typeof est.usage === 'number') free = Math.max(0, est.quota - est.usage);
         } catch { free = null; }
+        if (signal?.aborted) return;
         bulkPlan = { list, free, images, sources: held.length, bytes, ready };
         bulkView = 'warn';
         this.renderResearchImagesBulk();
@@ -644,7 +655,10 @@ export const researchImagesMethods = uiModule({
         this.closeTreeManagerDialog();
         this.sourcesFilter = 'imageHeld';
         this.showSourcesDialog();
-        await this.openBulkImageWarning();
+        // A153: the list of what is missing comes from the research (15 s at most): the window's own link waits
+        // meanwhile, as when clicked there (A202); a progress toast without it.
+        const open = document.querySelector<HTMLElement>('#sources-bulk-open') ?? document.createElement('button');
+        await runBusy(open, ctl => this.openBulkImageWarning(ctl.signal), { kind: 'bridge', toastWhenGone: true });
     },
 
     // ==================== RESEARCH TREE SETTINGS ====================
@@ -831,10 +845,9 @@ export const researchImagesMethods = uiModule({
         if (!q) return true;
         const draw = (s: QueueSnapshot): void => {
             if (!progress) return;
-            const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
             progress.hidden = false;
             progress.innerHTML = `<p class="export-images-progress-text">${esc(x.loadingBefore(s.done, s.total))}</p>
-                <div class="sources-bulk-bar" aria-hidden="true"><span style="width:${pct}%"></span></div>
+                ${barHtml(s.total ? s.done / s.total : 0)}
                 <button type="button" class="secondary" id="export-images-stop">${esc(strings.researchImages.stop)}</button>`;
             progress.querySelector('#export-images-stop')?.addEventListener('click', () => q.stop());
         };

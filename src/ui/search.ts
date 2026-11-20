@@ -44,10 +44,17 @@ import { AuditLogManager } from '../audit-log.js';
 import { uiModule } from './module.js';
 import { isPhoneBar } from '../breakpoints.js';
 import { shownName } from '../person-name.js';
+import { openHeadMenu } from './table-view/table-headmenu.js';
+import { listMenuEntries } from './person-list-add.js';
 
 /** The phone top bar (≤640px, or a phone sideways): the search folds to a magnifier there. */
 export function isPhoneToolbar(): boolean {
     return isPhoneBar();
+}
+
+/** A desktop or tablet bar too tight for the field: the search folds to the magnifier (fit step toolbar-squeeze-3). */
+function isSearchFolded(): boolean {
+    return !!document.querySelector('.toolbar.toolbar-squeeze-3');
 }
 
 /** Filters set in the filter panel (the years count as one). */
@@ -102,10 +109,15 @@ export const searchMethods = uiModule({
                 setTimeout(() => this.settleSearchAfterBlur(), 150);
             });
             input.addEventListener('keydown', (e) => {
-                if (e.key === 'Escape' && isPhoneToolbar() && document.body.classList.contains('search-open')) {
+                if (e.key !== 'Escape' || !document.body.classList.contains('search-open')) return;
+                if (isPhoneToolbar()) {
                     e.preventDefault();
                     e.stopPropagation();
                     this.cancelSearch();
+                } else if (isSearchFolded()) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.foldSearch();
                 }
             });
         }
@@ -116,6 +128,21 @@ export const searchMethods = uiModule({
         document.body.classList.add('search-open');
         const input = document.querySelector<HTMLInputElement>('#toolbar-search-picker .person-picker-input');
         input?.focus();
+    },
+
+    /**
+     * Esc in the field opened from the magnifier (a tight desktop or tablet
+     * bar): the field folds back and the magnifier takes the focus. The
+     * query and the filters stay (the magnifier then shows they hold).
+     */
+    foldSearch(): void {
+        if (document.getElementById('search-filters')?.style.display !== 'none') this.toggleSearchFilters();
+        this.toolbarSearchPicker?.hide();
+        document.body.classList.remove('search-open');
+        const mag = document.getElementById('search-open-btn');
+        if (mag) mag.focus();
+        else document.querySelector<HTMLInputElement>('#toolbar-search-picker .person-picker-input')?.blur();
+        this.syncSearchState();
     },
 
     /** Phone "Cancel" (and Esc / Back): the query AND the filters go, the bar is at rest. */
@@ -320,7 +347,7 @@ export const searchMethods = uiModule({
         }
     },
 
-    showSearchResultsModal(results: import('../types.js').Person[], _query: string): void {
+    showSearchResultsModal(results: import('../types.js').Person[], query: string): void {
         // Use confirmation modal for search results
         // Fresh Cancel / OK pair — not whatever the last confirm left there.
         this.resetConfirmButtons();
@@ -382,6 +409,25 @@ export const searchMethods = uiModule({
         modal.onclick = (e) => {
             if (e.target === modal) close();
         };
+
+        // Results to a list › (spec 084 §4, §6): ALL the results, not only the ten shown; only where lists can change.
+        const buttons = document.getElementById('confirm-buttons');
+        if (buttons && !DataManager.listsReadOnly()) {
+            const ids = results.map(p => p.id);
+            const link = document.createElement('button');
+            link.type = 'button';
+            link.className = 'link-button search-to-list';
+            link.setAttribute('aria-haspopup', 'menu');
+            link.textContent = `${strings.search.toList} ›`;
+            link.onclick = () => {
+                const menu = openHeadMenu(link, '', '', listMenuEntries(this, ids, () => {
+                    close();
+                    this.showNewPersonList({ source: 'search', personIds: ids, name: strings.lists.save.searchName(query.trim()) });
+                }, strings.search.newFromResults(ids.length), true));
+                menu.setAttribute('aria-label', strings.search.toList);
+            };
+            buttons.prepend(link);
+        }
 
         modal.classList.add('active');
     },

@@ -1,7 +1,7 @@
 {
   "name": "strom-rodokmen",
-  "version": "3.29.0",
-  "stromDoc": "ff310a74995cebf3b16c5c8bf56adfe635bc2e1b",
+  "version": "3.30.0",
+  "stromDoc": "eddd7e946752f146eeb8767c5d13ce3b8ab0e488",
   "description": "Dvorský Family Tree - Web Viewer",
   "main": "dist/bundle.js",
   "scripts": {

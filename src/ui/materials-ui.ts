@@ -18,14 +18,17 @@
 import { researchActionLabel, researchMarkFlags } from './research-open-mark.js';
 import { DataManager } from '../data.js';
 import { TreeRenderer } from '../renderer.js';
-import { Person, PersonId } from '../types.js';
+import { Attachment, Person, PersonId, TreeId } from '../types.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { setMaterialsCountProvider } from '../card-signals.js';
+import { personMediaIndex, treeMedia, placeKey, personMediaCount } from '../media.js';
 import { researchPersonRef, parseLiveBridge, researchLinkMark } from '../research-link.js';
 import { storedResearchBridge, announcedResearchScheme, researchLinksEnabled } from '../research-device.js';
 import {
-    MATERIAL_LIST_FEATURE, MATERIAL_ASSIGN_FEATURE, MATERIAL_THUMB_FEATURE, MATERIALS_EVENT,
+    MATERIAL_LIST_FEATURE, MATERIAL_ASSIGN_FEATURE, MATERIAL_THUMB_FEATURE, MATERIAL_USES_FEATURE, MATERIAL_EDIT_FEATURE,
+    MATERIAL_SORT_FEATURE, MATERIALS_EVENT,
     MaterialCaps, MaterialEnv, MaterialItem, MaterialList, MaterialAction, MaterialActionId, MaterialFile, MaterialBatch,
+    MaterialPerson, materialPerson,
     materialCaps, materialActions, personMaterials, materialCounter, materialKindLabel, batchFolderLabel,
     materialType, fileExt, primeMaterials, cachedMaterials, cachedMaterialList, saveMaterialList,
     fetchMaterial, getCachedThumb, fileUrl, materialSystemLink,
@@ -35,7 +38,10 @@ import { materialThumbs } from '../material-thumbs.js';
 import { formatBytesShort } from './originals-ui.js';
 import { onComputer } from './research-ui.js';
 import { openImageViewer } from './image-viewer.js';
+import { materialDetailsEdit } from './material-details-ui.js';
 import { uiModule } from './module.js';
+import { canEditPortrait } from './portrait-actions-ui.js';
+import { windowAddOffered } from '../materials-overview.js';
 
 const MODAL_ID = 'materials-modal';
 const SECTION_ID = 'materials-section';
@@ -46,15 +52,17 @@ export const PERSON_SECTION_ROWS = 6;
 const THUMB_PX = 128;
 /** The research's material capabilities, remembered per research (`/status` is gone while it is not running). */
 const FEATURES_KEY = 'strom-material-features:';
-const MATERIAL_FEATURE_NAMES = [MATERIAL_LIST_FEATURE, MATERIAL_ASSIGN_FEATURE, MATERIAL_THUMB_FEATURE];
+const MATERIAL_FEATURE_NAMES = [MATERIAL_LIST_FEATURE, MATERIAL_ASSIGN_FEATURE, MATERIAL_THUMB_FEATURE,
+    MATERIAL_USES_FEATURE, MATERIAL_EDIT_FEATURE, MATERIAL_SORT_FEATURE];
 /** Images the browser shows itself (others open in the system or as a file). */
 const VIEWABLE_IMAGES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
 const BATCH_ID = /^[A-Za-z0-9_.-]{1,120}$/;
 
 export interface MaterialsOpenOptions {
+    /** A person: their REFN with an archive, their PersonId (or REFN of a tree person) without one. */
     person?: string;
     batch?: string;
-    group?: 'batch' | 'date';
+    group?: 'batch' | 'date' | 'added' | 'person';
 }
 
 /** Where a research write on items was asked from (the dialogs' context). */
@@ -72,13 +80,37 @@ export interface MaterialActionCtx {
     anchor?: HTMLElement;
     /** Called once a write started without a dialog has its answer (the element that asked for it stops waiting). */
     settled?: () => void;
+    /**
+     * Hide… asked from another dialog (the agent's proposal): called once its own dialog ended — written (after the
+     * write), cancelled or closed — so the dialog it came from comes back.
+     */
+    back?: () => void;
+    /**
+     * A refused write said at the element that asked for it (§5: the sentence under the viewer's chip) instead of a
+     * toast: the text, "Try again" when it may help, one more way (Reload, the research's own way).
+     */
+    refused?: (end: MaterialRefusal) => void;
+    /** Hide…: the reason chosen first (the sorting's copies: Duplicate, spec 102 §2). */
+    hideReason?: 'unrelated' | 'duplicate';
+}
+
+/** A refused write's end at its element (`retry`: "Try again"; `alt`: one more action with its research mark). */
+export interface MaterialRefusal {
+    text: string;
+    retry?: () => void;
+    alt?: { label: string; run: () => void; research?: boolean; ai?: boolean };
 }
 
 /** Where an item was opened from, for the viewer (its ‹ › go through `items`). */
 export interface MaterialOpenCtx {
-    where: 'section' | 'window';
-    /** What the items are ("Jan Novák", a batch's name) for the viewer's header. */
+    /** `review`: Go through (spec 102 §8c) – the panel's fields from the first file, saved on the way. */
+    where: 'section' | 'window' | 'review';
+    /** What the items are ("Jan Novák", a batch's name) for the viewer's header; in review the filter's name. */
     label?: string;
+    /** Review under "Without source": Create a source is the main action. */
+    noSource?: boolean;
+    /** Review ended (the viewer closed): how many files were saved. */
+    done?: (saved: number) => void;
 }
 
 /** What the materials need to know about the active tree (null: not linked to a research). */
@@ -222,36 +254,47 @@ const ACTION_LABEL: Record<MaterialActionId, () => string> = {
     openSystem: () => strings.materials.openSystem,
     showInBatch: () => strings.materials.showInBatch,
     download: () => strings.materials.download,
-    deleteFromTree: () => strings.materials.deleteFromTree,
+    useAsPortrait: () => strings.materials.useAsPortrait,
+    removeFromTree: () => strings.materials.removeFromTree,
+    edit: () => strings.materials.titleAndData,
+    attach: () => strings.materials.attach,
+    makeSource: () => strings.materials.makeSource,
 };
 
 /** Where the item's ⋯ menu draws a line above (the research's writes, then the rest). */
-const DIVIDER_BEFORE: MaterialActionId[] = ['openSystem', 'deleteFromTree'];
+const DIVIDER_BEFORE: MaterialActionId[] = ['openSystem', 'removeFromTree'];
 
 // ==================== MODULE STATE ====================
 
 /** The person's items as drawn in the section (by key), for the ⋯ menu and opening. */
 let sectionItems = new Map<string, MaterialItem>();
-/** Which attachments the tree holds and on whom: a change redraws what shows them (window, section, viewer). */
+/** An attachment with what the rows show of it (its title, kind, date and note; spec 102 §2). */
+const attachmentKey = (a: Attachment): string => [a.id, a.title ?? '', a.kind ?? '', a.date ?? '', a.note ?? ''].join('\u0001');
+
+/** Which files the tree holds and where: a change redraws what shows them (window, section, viewer). */
 export function treeAttachmentsKey(): string {
     const parts: string[] = [];
+    const index = personMediaIndex(DataManager.getData());
     for (const p of DataManager.getAllPersons()) {
-        if (!p.attachments?.length) continue;
-        parts.push(`${p.id}|${p.refn ?? ''}|${p.attachments.map(a => a.id).join(',')}`);
+        const atts = index.get(p.id);
+        if (!atts?.length) continue;
+        parts.push(`${p.id}|${p.refn ?? ''}|${atts.map(attachmentKey).join(',')}`);
     }
+    // Every file with its places (a file only at a source or a union counts too; spec 102 §1).
+    for (const att of treeMedia(DataManager.getData())) parts.push(`${att.id}@${att.places.map(placeKey).join(',')}`);
     return parts.join(';');
 }
 
 /** The attachments the open person's section and list were drawn with (ids). */
 let sectionAttachments = '';
-const personAttachmentIds = (p: Person): string => (p.attachments ?? []).map(a => a.id).join(',');
+const personAttachmentIds = (p: Person): string => DataManager.personMedia(p.id).map(attachmentKey).join(',');
 /** People whose `?person=` is being asked now (REFN). */
 const personLoading = new Set<string>();
 /** Trees whose whole list was asked in this page (once per page; later answers come per person). */
 const fullAsked = new Set<string>();
 /** What the cards and the gates showed last (a change redraws the cards). */
 let drawnSignature = '';
-let providerState: { on: boolean; count: ((p: Person) => number) | null } = { on: false, count: null };
+let providerState: { on: boolean; count: ((p: MaterialPerson) => number) | null } = { on: false, count: null };
 /** The last state of the gates and the bridge the section was drawn with. */
 let lastBridgeKey = '';
 
@@ -280,7 +323,7 @@ export const materialsMethods = uiModule({
             researchId,
             base: parseLiveBridge(storedResearchBridge(researchId)?.base)?.base ?? null,
             env,
-            caps: materialCaps({ ...env, ...(links ? {} : { links: false }) }),
+            caps: materialCaps({ ...env, ...(links ? {} : { openLinks: false }) }),
             agent: !this.researchAgentlessFor(researchId, ctx.link),
         };
     },
@@ -288,6 +331,42 @@ export const materialsMethods = uiModule({
     /** Materials from the research are shown in this tree (on a computer, a research that lists them). */
     materialsListOn(): boolean {
         return !!this.materialsContext()?.caps.list;
+    },
+
+    /**
+     * "Add materials…" in the window's header (spec 102 §8): the research
+     * menu's own batch wizard, beside a research archive, the tree writable.
+     */
+    materialsAddOffered(): boolean {
+        return windowAddOffered({ model: this.materialsListOn() ? 'archive' : 'app', batches: this.batchAvailable(), readOnly: DataManager.isReadOnly() });
+    },
+
+    /**
+     * The Materials window is offered (spec 102 §1): every tree but the
+     * read-only page of an exported HTML file. Without a research that lists
+     * materials it shows the tree's own files (the `app` model).
+     */
+    materialsWindowOn(): boolean {
+        return !DataManager.isViewMode() && !!DataManager.getCurrentTreeId();
+    },
+
+    /**
+     * What the window works with: the research's context where it lists
+     * materials, else the tree alone (no research, no bridge: every research
+     * gate closed).
+     */
+    materialsWindowContext(): MaterialsContext | null {
+        const ctx = this.materialsContext();
+        if (ctx?.caps.list) return ctx;
+        const treeId = DataManager.getCurrentTreeId();
+        if (!treeId || !this.materialsWindowOn()) return null;
+        const env: MaterialEnv = { features: null, linked: false, onComputer: onComputer(), bridgeUp: false };
+        return { treeId, researchId: '', base: null, env, caps: materialCaps(env), agent: !!ctx?.agent };
+    },
+
+    /** The Actions menu's "Materials N" (a tree without a listing research): the tree's files. */
+    materialsAppCount(): number {
+        return treeMedia(DataManager.getData()).length;
     },
 
     /** A tree linked to a research, on a touch device: attachments under "Materials" with a sentence (8.3). */
@@ -301,7 +380,7 @@ export const materialsMethods = uiModule({
         const person = DataManager.getPerson(personId);
         if (!person) return [];
         const ctx = this.materialsContext();
-        return personMaterials(person, ctx?.caps.list ? cachedMaterialList(ctx.treeId) : null);
+        return personMaterials(materialPerson(DataManager.getData(), person), ctx?.caps.list ? cachedMaterialList(ctx.treeId) : null);
     },
 
     /** The person menu's "Materials N" (0: no row; only where materials are shown). */
@@ -325,7 +404,8 @@ export const materialsMethods = uiModule({
      * come from `opts`, are shown as active and are not kept after closing.
      */
     openMaterials(opts: MaterialsOpenOptions = {}): void {
-        if (!this.materialsListOn()) return;
+        if (!this.materialsWindowOn()) return;
+        const archive = this.materialsListOn();
         this.closeMaterialsItemMenu();
         this.closeActionsMenu();
         this.hideContextMenu?.();
@@ -334,24 +414,38 @@ export const materialsMethods = uiModule({
         const overlay = document.createElement('div');
         overlay.id = MODAL_ID;
         overlay.className = 'modal-overlay active';
-        const person = opts.person ? researchPersonRef(opts.person) : null;
-        const batch = typeof opts.batch === 'string' && BATCH_ID.test(opts.batch) ? opts.batch : null;
+        // The person filter's key: a REFN with an archive, a PersonId without one.
+        const appPerson = (key: string): string | null => {
+            if (DataManager.getPerson(key as PersonId)) return key;
+            const refn = researchPersonRef(key);
+            return refn ? DataManager.getAllPersons().find(p => researchPersonRef(p.refn) === refn)?.id ?? null : null;
+        };
+        const person = opts.person ? (archive ? researchPersonRef(opts.person) : appPerson(opts.person)) : null;
+        const batch = archive && typeof opts.batch === 'string' && BATCH_ID.test(opts.batch) ? opts.batch : null;
         if (person) overlay.dataset.person = person;
         if (batch) overlay.dataset.batch = batch;
-        const group = opts.group === 'date' || opts.group === 'batch' ? opts.group : undefined;
-        overlay.dataset.group = group ?? 'batch';
+        const group = archive
+            ? (opts.group === 'date' || opts.group === 'batch' ? opts.group : undefined)
+            : (opts.group === 'added' || opts.group === 'person' ? opts.group : undefined);
+        overlay.dataset.group = group ?? (archive ? 'batch' : 'added');
+        overlay.dataset.model = archive ? 'archive' : 'app';
         const m = strings.materials;
+        // Add materials… (spec 102 §8): no symbol, the bridge's own wizard; on a phone in the header's ⋯.
+        const add = this.materialsAddOffered();
         overlay.innerHTML = `
             <div class="modal modal--lg materials-window" role="dialog" aria-modal="true" aria-labelledby="materials-title">
                 <div class="modal-header mw-head">
                     <div class="mw-titles">
                         <h2 id="materials-title">${esc(m.title)}</h2>
                         <span class="mw-summary" role="status" aria-live="polite"></span>
+                        <button type="button" class="mw-where" data-mw="where" aria-haspopup="dialog" aria-expanded="false" aria-label="${esc(m.whereTitle)}" title="${esc(m.whereTitle)}">ⓘ</button>
                     </div>
                     <div class="mw-selhead">
                         <span class="mw-selhead-count" role="status"></span>
                         <button type="button" class="link-button mw-selhead-done">${esc(m.done)}</button>
                     </div>
+                    <button type="button" class="secondary mw-add" data-mw="add"${add ? '' : ' hidden'}>${esc(m.addMaterials)}</button>
+                    <button type="button" class="mw-more mw-head-more" data-mw="head-menu" aria-haspopup="menu" aria-expanded="false" aria-label="${esc(m.moreActions)}" title="${esc(m.moreActions)}">⋯</button>
                     <div class="mw-toolbar">
                         <input type="search" id="materials-search" class="mw-search" placeholder="${esc(m.search)}" aria-label="${esc(m.search)}" autocomplete="off" spellcheck="false">
                         <div class="mw-tools"></div>
@@ -364,7 +458,7 @@ export const materialsMethods = uiModule({
         overlay.addEventListener('click', (e) => { if (e.target === overlay) this.closeMaterials(); });
         overlay.querySelector('.close-btn')?.addEventListener('click', () => this.closeMaterials());
         this.pushDialog(MODAL_ID);
-        if (batch) {
+        if (batch && archive) {
             const ctx = this.materialsContext();
             if (ctx) void markBatchOpened(ctx.treeId, batch);
         }
@@ -476,7 +570,7 @@ export const materialsMethods = uiModule({
             ? `<div class="material-row is-skeleton" aria-hidden="true"><span class="material-thumb"></span><span class="material-skel-lines"><span></span><span></span></span></div>`.repeat(2)
             : '';
         const empty = items.length === 0 && !loading
-            ? `<div class="materials-empty"><p>${esc(ctx.agent ? m.emptyTextResearch : m.emptyText)}</p>${locked ? '' : `<button type="button" class="primary btn-sm materials-add" data-act="add">${esc(addLabel)}</button>`}</div>`
+            ? `<div class="materials-empty"><p>${esc(this.researchArchiveHoldsMedia(ctx.treeId as TreeId) ? (ctx.agent ? m.emptyTextHeldResearch : m.emptyTextHeld) : ctx.agent ? m.emptyTextResearch : m.emptyText)}</p>${locked ? '' : `<button type="button" class="primary btn-sm materials-add" data-act="add">${esc(addLabel)}</button>`}</div>`
             : '';
         const more = items.length > PERSON_SECTION_ROWS
             ? `<button type="button" class="link-button materials-all" data-act="all-person">${esc(m.allForPerson(items.length))}</button>`
@@ -505,7 +599,11 @@ export const materialsMethods = uiModule({
         const thumb = imgPreview
             ? `<span class="material-thumb"><img src="${esc(att.dataUrl)}" alt=""></span>`
             : `<span class="material-thumb"${lazy ? ` data-sha="${esc(sha)}"` : ''}><span class="material-row-tile">${esc(materialTileLetters(item))}</span></span>`;
-        const where = `<span class="material-line3"><span class="material-where">${esc(batchFolderLabel(item))}</span>${refn && item.viaBatch.includes(refn) ? `<span class="material-via">${esc(m.viaBatch)}</span>` : ''}</span>`;
+        // The attachment the person's portrait is cut from (spec 107 §4).
+        const owner = this.currentId ? DataManager.getPerson(this.currentId) : null;
+        const isSource = !!att && !!owner && this.portraitSourceAttachmentShown(owner) === att.id;
+        const portraitTag = isSource ? `<span class="material-via material-portrait-tag" title="${esc(strings.attachments.portraitTagTitle)}">${esc(strings.attachments.portraitTag)}</span>` : '';
+        const where = `<span class="material-line3"><span class="material-where">${esc(batchFolderLabel(item))}</span>${refn && item.viaBatch.includes(refn) ? `<span class="material-via">${esc(m.viaBatch)}</span>` : ''}${portraitTag}</span>`;
         // A tree attachment keeps its own note field (editable as before); the research's note is shown.
         let note = '';
         if (item.origin === 'tree' && att && !locked) {
@@ -609,6 +707,18 @@ export const materialsMethods = uiModule({
     },
 
     /** The person's editor, scrolled to their materials (menu "Materials N", the toast's "Show"). */
+    /**
+     * A person's materials from a menu: the Materials window filtered to them
+     * (by their REFN beside an archive, else in every tree's window, spec 102
+     * §1); a tree in view mode keeps their card's section.
+     */
+    openPersonMaterialsFromMenu(personId: PersonId): void {
+        const refn = DataManager.getPerson(personId)?.refn;
+        if (refn && this.materialsListOn()) this.openMaterials({ person: refn });
+        else if (!this.materialsListOn() && this.materialsWindowOn()) this.openMaterials({ person: personId, group: 'added' });
+        else this.showPersonMaterials(personId);
+    },
+
     showPersonMaterials(personId: PersonId): void {
         if (this.currentId !== personId || !document.getElementById('person-modal')?.classList.contains('active')) {
             this.clearDialogStack();
@@ -676,7 +786,7 @@ export const materialsMethods = uiModule({
             return;
         }
         // Anything the browser does not show: the system's program, through the research.
-        const link = ctx.caps.links !== false ? materialSystemLink(ctx.researchId, file.sha, announcedResearchScheme()) : null;
+        const link = ctx.caps.openLinks !== false ? materialSystemLink(ctx.researchId, file.sha, announcedResearchScheme()) : null;
         if (link) this.launchResearchLink(link);
         else window.open(fileUrl(ctx.base, file.sha), '_blank', 'noopener');
     },
@@ -687,14 +797,29 @@ export const materialsMethods = uiModule({
         const item = sectionItems.get(key);
         const ctx = this.materialsContext();
         if (!item || !ctx) return;
+        this.showMaterialItemMenu(item, anchor, ctx.caps);
+    },
+
+    /**
+     * An item's ⋯ menu (the section's rows, the person card's attachment rows,
+     * spec 102 §2). `caps`: the research's (none without one); `open`: how the
+     * row opens its item (else the section's way).
+     */
+    showMaterialItemMenu(item: MaterialItem, anchor: HTMLElement, caps: MaterialCaps, opts: { open?: () => void } = {}): void {
+        const ctx = this.materialsContext();
         this.closeMaterialsItemMenu();
         const person = this.currentId ? DataManager.getPerson(this.currentId) : null;
         const refn = researchPersonRef(person?.refn);
         const locked = !!this.currentId && DataManager.isPersonLocked(this.currentId);
-        const actions = materialActions(item, ctx.caps, { person: refn, where: 'menu' })
+        const actions = materialActions(item, caps, { person: refn, where: 'menu' })
             // Nothing to download from an attachment that is only its original; a locked person keeps its files.
             .filter(a => !(a.id === 'download' && (!item.attachment?.dataUrl || item.attachment.originalOnly)))
-            .filter(a => !(a.id === 'deleteFromTree' && locked));
+            .filter(a => !((a.id === 'removeFromTree' || a.id === 'attach' || a.id === 'makeSource') && (locked || DataManager.isReadOnly())))
+            // Title and details: where they can change here (spec 102 §2).
+            .filter(a => !(a.id === 'edit' && !['on', 'off'].includes(materialDetailsEdit(item, ctx) ?? '')))
+            // Use as portrait: a person who can change, and not the portrait's source already (spec 107 §4).
+            .filter(a => !(a.id === 'useAsPortrait' && (!this.currentId || !canEditPortrait(this.currentId)
+                || (!!person && this.portraitSourceAttachmentShown(person) === item.attachment?.id))));
         const menu = document.createElement('div');
         menu.id = MENU_ID;
         menu.className = 'materials-item-menu';
@@ -702,7 +827,7 @@ export const materialsMethods = uiModule({
         menu.innerHTML = actions.map((a, i) => {
             const divider = i > 0 && DIVIDER_BEFORE.includes(a.id) ? '<div class="materials-item-menu-divider" role="separator"></div>' : '';
             const off = a.disabled ? ` aria-disabled="true" title="${esc(strings.materials.actionsWhenRunning)}"` : '';
-            const danger = a.id === 'deleteFromTree' ? ' is-danger' : '';
+            const danger = a.id === 'removeFromTree' ? ' is-danger' : '';
             return `${divider}<button type="button" role="menuitem" class="materials-item-menu-row${danger}" data-action="${a.id}"${off}>${researchActionLabel(ACTION_LABEL[a.id](), a.id === 'openSystem' ? researchLinkMark('media') : 'none')}</button>`;
         }).join('');
         document.body.appendChild(menu);
@@ -721,7 +846,8 @@ export const materialsMethods = uiModule({
             const action = actions.find(a => a.id === btn.dataset.action);
             this.closeMaterialsItemMenu();
             anchor.focus();
-            if (action) this.runMaterialItemAction(item, action, refn);
+            if (action?.id === 'open' && opts.open) opts.open();
+            else if (action) this.runMaterialItemAction(item, action, refn);
         }));
         menuKeyHandler = (e: KeyboardEvent) => {
             if (e.key === 'Escape') {
@@ -779,7 +905,12 @@ export const materialsMethods = uiModule({
                 a.remove();
                 break;
             }
-            case 'deleteFromTree': if (item.attachment) void this.deleteAttachment(item.attachment.id); break;
+            case 'useAsPortrait': if (item.attachment && this.currentId) void this.useAttachmentAsPortrait(this.currentId, item.attachment.id); break;
+            case 'removeFromTree': void this.openRemoveFromTreeDialog(item); break;
+            case 'attach': this.openAttachDialog([item], { personId: this.currentId }); break;
+            case 'makeSource': void this.makeSourceFromMaterial(item, { personId: this.currentId }); break;
+            case 'restore': if (item.removedId) { this.restoreRemovedMaterials([item]); break; } this.materialAction(action.id, [item], { person: refn, where: 'section' }); break;
+            case 'edit': this.openMaterialDetailsDialog(item); break;
             default: this.materialAction(action.id, [item], { person: refn, where: 'section' });
         }
     },
@@ -914,7 +1045,7 @@ export const materialsMethods = uiModule({
     },
 
     initMaterials(): void {
-        setMaterialsCountProvider((p: Person) => (providerState.on && providerState.count ? providerState.count(p) : null));
+        setMaterialsCountProvider((p: Person) => (providerState.on && providerState.count ? providerState.count(materialPerson(DataManager.getData(), p)) : null));
         window.addEventListener(MATERIALS_EVENT, (e) => {
             const treeId = (e as CustomEvent<{ treeId?: string }>).detail?.treeId;
             if (treeId) this.materialsListChanged(treeId);

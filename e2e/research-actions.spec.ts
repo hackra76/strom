@@ -115,11 +115,11 @@ test.describe('the Research menu', () => {
         await expect(page.locator('#research-item-open')).toHaveAttribute('aria-description', /^Continues in the research on this computer/);
 
         await page.locator('#research-item-open').click();
-        await expect(page.locator('.toast')).toContainText('Opening the research…');
-        await expect(page.locator('.toast')).toContainText('Continue in the terminal window.');
+        // The menu closed: the state of the link in a toast until the research says it took the link.
+        await expect(page.locator('.toast--progress').last()).toContainText('Opening the research…');
         await openResearchMenu(page);
         await page.locator('#research-item-chat').click();
-        await expect(page.locator('.toast')).toContainText('Opening the agent…');
+        await expect(page.locator('.toast--progress').last()).toContainText('Opening the agent…');
         await openResearchMenu(page);
         await page.locator('#research-item-send').click();
         expect(await launched(page)).toEqual([
@@ -142,30 +142,35 @@ test.describe('the Research menu', () => {
         await openResearchMenu(page, { expandMore: true });
         await page.locator('#research-item-version').click();
         expect(await launched(page)).toEqual([`strom-research://app?tree=${UUID}`]);
-        await expect(page.locator('.toast .toast-spinner')).toBeVisible();
-        await expect(page.locator('.toast')).toContainText('Waiting for the new version from the research…');
+        // The wait in its progress toast (waiting buttons §2.8): the one spinner, then the failure with Try again.
+        const wait = page.locator('.toast--progress');
+        await expect(wait.locator('.busy-spin')).toBeVisible();
+        await expect(wait).toContainText('Waiting for the new version from the research…');
         await page.clock.fastForward(20_500);
-        await expect(page.locator('.toast')).toHaveText('The research did not answer. Start it and try again.');
+        await expect(wait).toHaveAttribute('role', 'alert');
+        await expect(wait).toContainText('The research did not answer. Start it and try again.');
+        await expect(wait.getByRole('button', { name: 'Try again' })).toBeVisible();
 
-        // It came in time: the spinner goes, the import takes over.
+        // It came in time: the spinner goes (the failure before with it), the import takes over.
         await openResearchMenu(page, { expandMore: true });
         await page.locator('#research-item-version').click();
-        await expect(page.locator('.toast .toast-spinner')).toBeVisible();
+        await expect(wait.locator('.busy-spin')).toBeVisible();
+        await expect(page.locator('.toast', { hasText: 'did not answer' })).toHaveCount(0);
         await page.evaluate(() => window.Strom.UI.openExternalRequest(new URLSearchParams('import-url=https://example.com/x.ged')));
-        await expect(page.locator('.toast .toast-spinner')).toHaveCount(0);
+        await expect(wait.locator('.busy-spin')).toHaveCount(0);
         await page.clock.fastForward(25_000);
-        await expect(page.locator('.toast')).not.toContainText('did not answer');
+        await expect(page.locator('.toast', { hasText: 'did not answer' })).toHaveCount(0);
     });
 
     test('"Load new version": the version opening in another tab (app in a browser) ends the wait here', async ({ page, context }) => {
         await setup(page);
         await openResearchMenu(page, { expandMore: true });
         await page.locator('#research-item-version').click();
-        await expect(page.locator('.toast .toast-spinner')).toBeVisible();
+        await expect(page.locator('.toast--progress .busy-spin')).toBeVisible();
         const other = await context.newPage();
         await asWindowlessTab(other);
         await other.goto(`/strom.html?import-url=${encodeURIComponent('http://127.0.0.1:5995/tree.ged')}`);
-        await expect(page.locator('.toast .toast-spinner')).toHaveCount(0);
+        await expect(page.locator('.toast--progress .busy-spin')).toHaveCount(0);
         await other.close();
     });
 
@@ -306,7 +311,7 @@ test.describe('live research: Awaiting action', () => {
         // The first level: the overview and Stop following first (spec 057 §7.1), then design 2d — the tree is the
         // research's own, nothing of it to send (menu 1020 §2.7).
         await expect(page.locator('#research-menu > .research-menu-group > .tree-switcher-action .research-item-label'))
-            .toHaveText(['Research overview', 'Stop following', 'Awaiting action', 'Continue with the agent', 'Open research', 'Other actions']);
+            .toHaveText(['Research overview', 'End following', 'Awaiting action', 'Continue with the agent', 'Open research', 'Other actions']);
         await expect(page.locator('#research-item-send')).toHaveCount(0);
         await page.locator('#research-item-waiting').click();
         await expect(panel).not.toHaveClass(/collapsed/);
@@ -344,7 +349,7 @@ test.describe('person menu: Research ›', () => {
         await personMenu(page, 'Jan');
         await openPersonSubmenu(page, 'research');
         await page.locator('.context-submenu [data-action="research-ask"]').click();
-        await expect(page.locator('.toast')).toContainText('Opening the agent…');
+        await expect(page.locator('.toast--progress').last()).toContainText('Opening the agent…');
         expect(await launched(page)).toEqual([
             `strom-research://research?tree=${UUID}&person=P0012&direction=ancestors`,
             `strom-research://chat?tree=${UUID}&person=P0012`,
@@ -370,7 +375,7 @@ test.describe('person menu: Research ›', () => {
         await dialog.getByText('With family').click();
         await dialog.getByRole('button', { name: 'Add in the research, opens in the research' }).click();
         await expect(dialog).toHaveCount(0);
-        await expect(page.locator('.toast')).toContainText('Opening the research…');
+        await expect(page.locator('.toast--progress').last()).toContainText('Opening the research…');
 
         await personMenu(page, 'Jan');
         await openPersonSubmenu(page, 'research');

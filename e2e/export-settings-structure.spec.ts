@@ -38,8 +38,9 @@ test('export menu: groups in order with result-named rows (EN, CS, DE)', async (
     expect(descs.length).toBeGreaterThanOrEqual(7);
     for (const d of descs) expect(d.trim().length).toBeGreaterThan(0);
 
-    // The whole tree / current view switch, singular for one person.
-    await expect(page.locator('#export-scope .segment-btn')).toHaveText(['Whole tree', 'Current view only (1 person)']);
+    // The whole tree / current view / list switch, singular for one person (the person just made
+    // is in the ready-made list Added in the last 30 days, spec 084 §12).
+    await expect(page.locator('#export-scope .segment-btn')).toHaveText(['Whole tree', 'Current view only (1 person)', 'List of people']);
 
     // Rows have no fill and no frame.
     const row = page.locator('#export-modal .menu-option').first();
@@ -54,7 +55,7 @@ test('export menu: groups in order with result-named rows (EN, CS, DE)', async (
         'sdílet', 'uložit a zálohovat', 'tisk a obraz', 'pro jiné programy',
     ]);
     expect(cs[2].rows).toEqual(['Plakát', 'Kniha rodu', 'Propojené stránky']);
-    await expect(page.locator('#export-scope .segment-btn')).toHaveText(['Celý strom', 'Jen aktuální pohled (1 osoba)']);
+    await expect(page.locator('#export-scope .segment-btn')).toHaveText(['Celý strom', 'Jen aktuální pohled (1 osoba)', 'Seznam osob']);
     await page.evaluate(() => window.Strom.UI.closeExportDialog());
 
     await page.evaluate(() => window.Strom.UI.setLanguage('de'));
@@ -133,7 +134,7 @@ test('export menu for a non-active tree hides whole view-scoped groups', async (
 test.describe('grouped settings', () => {
     test.use({ viewport: { width: 1440, height: 900 } });
 
-    test('shows at least two whole groups without scrolling; rows carry no frame', async ({ page }) => {
+    test('the first screen shows the tree view\'s head and its lineage marker choice whole; rows carry no frame', async ({ page }) => {
         await openApp(page);
         await page.evaluate(() => window.Strom.UI.showSettingsDialog());
         const settings = page.locator('#settings-modal');
@@ -148,17 +149,24 @@ test.describe('grouped settings', () => {
         // No per-option heading repeating the row text any more.
         await expect(settings.locator('.settings-label')).toHaveCount(0);
 
-        const fullyVisible = await settings.evaluate((modal) => {
+        // Since the lineage markers' five shapes (spec 112, R1) the Tree view group is taller than
+        // the dialog at 900px (it used to show two whole groups): its head and the whole choice of
+        // the shapes stand on the first screen, without scrolling.
+        const firstScreen = await settings.evaluate((modal) => {
             const box = modal.querySelector('.modal') as HTMLElement;
             const scroller = (box.querySelector(':scope > .modal-content') as HTMLElement | null) ?? box;
             const view = scroller.getBoundingClientRect();
-            return Array.from(modal.querySelectorAll('.settings-group')).filter((g) => {
-                const r = g.getBoundingClientRect();
-                return r.top >= view.top - 0.5 && r.bottom <= view.bottom + 0.5
-                    && r.bottom <= window.innerHeight;
-            }).length;
+            const inView = (el: Element | null) => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                return r.top >= view.top - 0.5 && r.bottom <= view.bottom + 0.5 && r.bottom <= window.innerHeight;
+            };
+            return {
+                head: inView(modal.querySelector('#settings-group-tree')),
+                markers: inView(modal.querySelector('#branch-marker-setting')),
+            };
         });
-        expect(fullyVisible).toBeGreaterThanOrEqual(2);
+        expect(firstScreen).toEqual({ head: true, markers: true });
 
         // No .settings-checkbox anywhere has its own frame.
         const framed = await page.locator('.settings-checkbox').evaluateAll((els) =>

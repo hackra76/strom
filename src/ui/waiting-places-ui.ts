@@ -41,11 +41,15 @@ import { drawTiles, dotsHtml, mapSize, type SmallMapView } from './places-find-u
 import { fetchStatus, liveSession } from './research-ui.js';
 import { normalizeModal } from './modal-skeleton.js';
 import { uiModule } from './module.js';
+import { runBusy } from './busy.js';
 import { helpMark } from './help-mark.js';
+import type { ToastWorkEnd } from './toast.js';
 
 const MODAL_ID = 'waiting-places-modal';
 /** How long the toasts with Undo stand. */
 const TOAST_MS = 8000;
+/** An answer's Undo working in its toast: the bridge's 15 s and a little more. */
+const PLACES_UNDO_MS = 20_000;
 /** An answered question stays hidden this long while the research's status still lists it. */
 const ANSWERED_HIDE_MS = 30_000;
 /** The small map beside the candidates (CSS px; on a phone it takes the card's width). */
@@ -55,6 +59,8 @@ const MAP_H = 260;
 const STATUS_TIMEOUT_MS = 4000;
 /** "Keep all" names the places up to this many. */
 const KEEP_NAMES = 3;
+/** The identity (`data-action`) of the button whose write runs: its state follows it through a redraw. */
+const WORKING = 'waiting-place-working';
 
 interface Preview {
     kind: 'accept' | 'keep';
@@ -73,6 +79,8 @@ const view = {
     answered: new Map<string, number>(),
     /** A write runs (one at a time). */
     busy: false,
+    /** The button whose write runs (its question, its `data-wait-act`): it says the work, the rest wait locked (B30, B31). */
+    busyOn: null as { place: string; act: string } | null,
     /** Questions whose map is shown (a phone held sideways). */
     mapOpen: new Set<string>(),
     /** The question the window was opened at (its card stays marked through redraws). */
@@ -314,7 +322,8 @@ export const waitingPlacesMethods = uiModule({
             <strong class="waiting-places-preview-title">${esc(title)}</strong>
             <ul>${lines.map(l => `<li>${esc(l)}</li>`).join('')}</ul>
             <div class="waiting-places-preview-buttons">
-                <button type="button" class="primary waiting-places-go" data-wait-act="bulk-go"${view.busy || (p.kind === 'accept' && p.dry === null) ? ' disabled' : ''}>${esc(go)}</button>
+                <button type="button" class="primary waiting-places-go" data-wait-act="bulk-go"${view.busy && view.busyOn?.act === 'bulk-go' ? ` data-action="${WORKING}"`
+                    : view.busy || (p.kind === 'accept' && p.dry === null) ? ' disabled' : ''}>${esc(go)}</button>
                 <button type="button" class="secondary waiting-places-cancel" data-wait-act="bulk-cancel">${esc(W.cancel)}</button>
             </div>
         </div>`;
@@ -401,10 +410,10 @@ export const waitingPlacesMethods = uiModule({
             });
         });
         card.querySelectorAll<HTMLButtonElement>('.waiting-place-pick').forEach(btn => {
-            btn.onclick = () => void this.answerWaitingPlace(w, btn.dataset.cand as PlaceAnswerTake);
+            btn.onclick = () => void this.answerWaitingPlace(w, btn.dataset.cand as PlaceAnswerTake, btn.dataset.waitAct ?? '');
         });
         card.querySelectorAll<HTMLButtonElement>('.waiting-place-choice').forEach(btn => {
-            btn.onclick = () => void this.answerWaitingPlace(w, btn.dataset.take as PlaceAnswerTake);
+            btn.onclick = () => void this.answerWaitingPlace(w, btn.dataset.take as PlaceAnswerTake, btn.dataset.waitAct ?? '');
         });
         const toggle = card.querySelector<HTMLButtonElement>('.waiting-place-maptoggle');
         if (toggle) toggle.onclick = () => {
@@ -412,7 +421,11 @@ export const waitingPlacesMethods = uiModule({
             else view.mapOpen.add(w.place);
             this.renderWaitingPlaces();
         };
-        if (view.busy) card.querySelectorAll<HTMLButtonElement>('.waiting-place-pick, .waiting-place-choice').forEach(b => { b.disabled = true; });
+        if (view.busy) card.querySelectorAll<HTMLButtonElement>('.waiting-place-pick, .waiting-place-choice').forEach(b => {
+            // The one working keeps its state through a redraw (its identity), the others are locked.
+            if (view.busyOn?.place === w.place && view.busyOn.act === b.dataset.waitAct) b.dataset.action = WORKING;
+            else b.disabled = true;
+        });
         return card;
     },
 
@@ -594,13 +607,12 @@ export const waitingPlacesMethods = uiModule({
      * Refused: why, and nothing changes (a question changed meanwhile:
      * "Awaiting action" is read again).
      */
-    async answerWaitingPlace(w: PlaceQuestion, take: PlaceAnswerTake): Promise<void> {
+    async answerWaitingPlace(w: PlaceQuestion, take: PlaceAnswerTake, act = ''): Promise<void> {
         const access = this.waitingPlacesAccess();
         if (view.busy || !access.canAnswer || !access.base || !take) return;
-        view.busy = true;
-        this.renderWaitingPlaces();
-        const res = await postPlacesAnswer(access.base, { place: w.place, take }, access.features);
-        view.busy = false;
+        const base = access.base;
+        const res = await this.waitingPlacesWrite({ place: w.place, act }, () => postPlacesAnswer(base, { place: w.place, take }, access.features));
+        if (!res) { this.renderWaitingPlaces(); return; }
         if (!res.ok) {
             this.showWaitingPlacesRefusal(res);
             this.renderWaitingPlaces();
@@ -613,10 +625,28 @@ export const waitingPlacesMethods = uiModule({
         if (view.preview) view.preview.places = view.preview.places.filter(p => p !== w.place);
         const undo = res.kind === 'one' && res.undo && access.canUndo ? res.undo : '';
         this.showToast(this.waitingAnswerText(w, take), TOAST_MS, undo ? {
-            action: { label: strings.places.waiting.undo, run: () => void this.undoWaitingPlaces(undo, [w.place]) },
+            action: { label: strings.places.waiting.undo, run: () => this.undoWaitingPlaces(undo, [w.place]),
+                work: { label: strings.busy.reverting, sub: w.place, timeoutMs: PLACES_UNDO_MS } },
         } : {});
         this.renderWaitingPlaces();
         await this.waitingPlacesWritten();
+    },
+
+    /**
+     * One write of the questions (one at a time): the others locked, the clicked button says "Sending…" from the
+     * click until the research answers (B30, B31). Undefined: it failed on its way (said at the button).
+     */
+    async waitingPlacesWrite<T>(on: { place: string; act: string }, write: () => Promise<T>): Promise<T | undefined> {
+        view.busy = true;
+        view.busyOn = on;
+        this.renderWaitingPlaces();
+        const el = document.querySelector<HTMLElement>(`#${MODAL_ID} [data-action="${WORKING}"]`);
+        try {
+            return el ? await runBusy(el, write, { label: strings.busy.sending, kind: 'local' }) : await write();
+        } finally {
+            view.busy = false;
+            view.busyOn = null;
+        }
     },
 
     /** What a toast says after an answer. */
@@ -643,10 +673,10 @@ export const waitingPlacesMethods = uiModule({
         const access = this.waitingPlacesAccess();
         if (!p || view.busy || !access.canAnswer || !access.base) return;
         const W = strings.places.waiting;
-        view.busy = true;
-        this.renderWaitingPlaces();
-        const res = await postPlacesAnswer(access.base, { places: p.places, take: p.kind === 'accept' ? 'first' : 'keep' }, access.features);
-        view.busy = false;
+        const base = access.base;
+        const res = await this.waitingPlacesWrite({ place: '', act: 'bulk-go' },
+            () => postPlacesAnswer(base, { places: p.places, take: p.kind === 'accept' ? 'first' : 'keep' }, access.features));
+        if (!res) { this.renderWaitingPlaces(); return; }
         if (!res.ok || res.kind !== 'bulk') {
             if (!res.ok) this.showWaitingPlacesRefusal(res);
             this.renderWaitingPlaces();
@@ -660,25 +690,23 @@ export const waitingPlacesMethods = uiModule({
         const undo = res.undo && access.canUndo && res.done.length ? res.undo : '';
         this.showToast(sub || main, TOAST_MS, {
             ...(sub ? { title: main } : {}),
-            ...(undo ? { action: { label: W.undo, run: () => void this.undoWaitingPlaces(undo, res.done) } } : {}),
+            ...(undo ? { action: { label: W.undo, run: () => this.undoWaitingPlaces(undo, res.done),
+                work: { label: strings.busy.reverting, timeoutMs: PLACES_UNDO_MS } } } : {}),
         });
         this.renderWaitingPlaces();
         await this.waitingPlacesWritten();
     },
 
-    /** Undo an answer step (one question or a bulk step) at the research. */
-    async undoWaitingPlaces(undo: string, places: readonly string[]): Promise<void> {
+    /** Undo an answer step (one question or a bulk step) at the research: it works in its toast (B32), its end said there. */
+    async undoWaitingPlaces(undo: string, places: readonly string[]): Promise<ToastWorkEnd | undefined> {
         const access = this.waitingPlacesAccess();
-        if (!access.canUndo || !access.base) return;
+        if (!access.canUndo || !access.base) return undefined;
         const res = await postPlacesUndo(access.base, { undo }, access.features);
-        if (!res.ok) {
-            this.showWaitingPlacesRefusal(res);
-            return;
-        }
+        if (!res.ok) return { ok: false, text: this.waitingPlacesRefusalText(res), retry: res.code !== 'later' && res.code !== 'archive' };
         for (const id of places) view.answered.delete(id);
-        this.showToast(strings.places.waiting.undone, 4000);
         this.renderWaitingPlaces();
-        await this.waitingPlacesWritten();
+        void this.waitingPlacesWritten();
+        return { ok: true, text: strings.places.waiting.undone };
     },
 
     /** After a write: the research's status (its waiting list) and its places are read again. */
@@ -716,6 +744,11 @@ export const waitingPlacesMethods = uiModule({
 
     /** A refused answer or undo, said; a question changed meanwhile reads "Awaiting action" again. */
     showWaitingPlacesRefusal(res: PlacesWriteRefusal): void {
+        this.showToast(this.waitingPlacesRefusalText(res), 6000, { kind: 'waiting-failed' });
+    },
+
+    /** The words of a refused answer or undo (a question changed meanwhile reads "Awaiting action" again). */
+    waitingPlacesRefusalText(res: PlacesWriteRefusal): string {
         const W = strings.places.waiting;
         const r = strings.places.research;
         let text: string;
@@ -728,6 +761,6 @@ export const waitingPlacesMethods = uiModule({
             case 'archive': text = res.reason || r.errArchive; break;
             default: text = res.reason || W.errFailed;
         }
-        this.showToast(text, 6000, { kind: 'waiting-failed' });
+        return text;
     },
 });

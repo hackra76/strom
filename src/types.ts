@@ -77,6 +77,10 @@ export function generateAttachmentId(): string {
  */
 export type Gender = 'male' | 'female' | 'unknown';
 
+/** Shape of the lineage marker on cards (spec 112, R1); 'none' draws none. */
+export type BranchMarker = 'arc' | 'tag' | 'stripe' | 'corner' | 'none';
+export const BRANCH_MARKERS: readonly BranchMarker[] = ['arc', 'tag', 'stripe', 'corner', 'none'];
+
 /** Every value of Gender, in the order the person dialog offers them. */
 export const GENDERS: readonly Gender[] = ['male', 'female', 'unknown'];
 
@@ -295,6 +299,38 @@ export interface LifeEvent {
      * GEDCOM `2 _STROM_ROLE` + `3 _STROM_AT` + `4 TYPE`.
      */
     roleAt?: EventRoleAt;
+}
+
+/**
+ * The edits of a portrait over its original (spec 107), applied in this
+ * order: mirror, quarter turns, straighten, crop. The math lives in
+ * src/photo.ts (portraitRect, clampPortraitCrop…).
+ */
+export interface PortraitCrop {
+    /**
+     * The frame (a square in pixels) in fractions 0–1 of the image after the
+     * mirror and the quarter turns, from the top left: w × width = h × height.
+     */
+    region: { x: number; y: number; w: number; h: number };
+    /** Clockwise turn in quarter turns (none = upright). */
+    quarterTurns?: 1 | 2 | 3;
+    /** Straightening in degrees, −45…45 in steps of 0.5; positive = clockwise, about the frame's centre. */
+    angle?: number;
+    /** Mirrored horizontally (before the turns). */
+    mirror?: true;
+}
+
+/**
+ * Where a portrait was cut from (Person.photoSource): exactly one of an image
+ * attachment of the same person or a union's photo (Partnership.photo), with
+ * the crop. JSON and backups only, never GEDCOM; patterned on
+ * SourceExcerpt.fromAttachmentId + region.
+ */
+export interface PortraitSource extends PortraitCrop {
+    /** An image file of the same person (StromData.media, a place of the person)… */
+    attachmentId?: string;
+    /** …or the photo of one of the person's unions (Partnership.photo). */
+    partnershipId?: PartnershipId;
 }
 
 /** Whose event a person's own godparent / witness event belongs to (LifeEvent.roleAt). */
@@ -552,8 +588,6 @@ export interface Attachment {
     dataUrl: string;
     sizeBytes: number;
     note?: string;
-    /** Optional link to a Source (StromData.sources). */
-    sourceId?: string;
     /** The original file behind the preview (a tree linked to Strom Research). */
     original?: MediaOriginal;
     /**
@@ -568,7 +602,44 @@ export interface Attachment {
      * written back by "Back to {prog}" only.
      */
     date?: string;
+    /** The file's title (spec 102 K1.1); missing or empty = none, the file's name stands for it. */
+    title?: string;
+    /** What the file is (spec 102), as the research's materials say it. */
+    kind?: MaterialKind;
+    /** Who gave the title, the date and the kind (spec 102 §13: an agent never overwrites a person's); missing = 'user'. */
+    titleBy?: MediaBy;
+    dateBy?: MediaBy;
+    kindBy?: MediaBy;
+    /**
+     * Where the file is in the tree, in the order it was put there (data v24):
+     * a person, a person's fact or event, a couple, a couple's event or a
+     * source. Empty only on a record taken out of the tree (`removed`).
+     */
+    places: MediaPlace[];
+    /** Taken out of a tree linked to an archive (spec 102 §9): the places it had, for "Restore". */
+    removed?: { at: string; reason?: 'unrelated' | 'duplicate'; places: MediaPlace[] };
+    /** When the file came into the tree (ISO); missing = earlier. */
+    addedAt?: string;
 }
+
+/** What a file of the tree is (spec 102): the same words as the research's materials. */
+export type MaterialKind = 'photo' | 'document' | 'record' | 'other';
+
+/** Who gave a file's detail: a person or the research's agent (spec 102 §13). */
+export type MediaBy = 'user' | 'agent';
+
+/**
+ * One place of a file in the tree (data v24, StromData.media): shaped as a
+ * citation's context, plus a source. Each may say who put it there (`by`,
+ * spec 102 §13; missing = 'user').
+ */
+export type MediaPlace = (
+    /** The person, their birth or death (`fact`) or one of their events (`eventId`, LifeEvent.id); at most one of the two. */
+    | { personId: PersonId; fact?: 'birth' | 'death'; eventId?: string }
+    /** The couple or one of its events (CoupleEvent.id). */
+    | { partnershipId: PartnershipId; eventId?: string }
+    | { sourceId: string }
+) & { by?: MediaBy };
 
 export interface Person {
     id: PersonId;
@@ -683,6 +754,14 @@ export interface Person {
     nameVariants?: string[];
     isLocked?: boolean;
     /**
+     * When the person came into the tree (ISO; spec 084 §8, data version
+     * 22): written when a person is added, a GEDCOM file imported, another
+     * tree merged in or the research brings a new person. Never edited by
+     * hand, never guessed for older people (absent = "earlier"), never
+     * written to GEDCOM.
+     */
+    addedAt?: string;
+    /**
      * Explicit override of the "is this person alive?" heuristic used by the
      * living-privacy export filter. true = deceased, false = definitely alive,
      * undefined = fall back to the age heuristic.
@@ -703,6 +782,14 @@ export interface Person {
     photoOriginalName?: string;
     /** The portrait's date as the file it came from wrote it (see Attachment.date); goes with the photo. */
     photoDate?: string;
+    /**
+     * Where the portrait was cut from (spec 107, data v23): an image attachment
+     * of this person or the couple's photo of one of their unions, with the
+     * crop. Only when the portrait was made in the crop editor from that
+     * original; goes with the photo (a new or removed photo drops it). JSON
+     * and backups only, never GEDCOM.
+     */
+    photoSource?: PortraitSource;
     /** Life events other than birth/death (see LifeEvent). */
     events?: LifeEvent[];
     /** This person's chapter in the family book (GEDCOM _STORY on INDI). */
@@ -721,8 +808,6 @@ export interface Person {
      * citations are no fact (an entry there is dropped when the tree is read).
      */
     citationMain?: CitationMain<PersonCitationField>;
-    /** Attached documents (scans, certificates, letters…). */
-    attachments?: Attachment[];
     /**
      * Per-parent relationship type, keyed by parent PersonId. A missing entry
      * (or 'biological') is the default, so existing data needs no migration.
@@ -1458,6 +1543,24 @@ export interface Partnership {
      * (which stay fields above): banns, a contract, a census of the household…
      */
     events?: CoupleEvent[];
+    /**
+     * The couple's photo (a wedding or joint picture, spec 107, data v23): a
+     * JPEG data URL, longer side ≤ ATTACHMENT_MAX_SIDE, not a square. The
+     * original the partners' portraits can be cut from (Person.photoSource).
+     * GEDCOM: `1 OBJE` under the FAM.
+     */
+    photo?: string;
+    /** Original file name of the couple's photo (UX only). */
+    photoOriginalName?: string;
+    /** The photo's date as the file it came from wrote it (GEDCOM `_DATE`, see Person.photoDate); not shown. */
+    photoDate?: string;
+    /**
+     * The original file behind the couple's photo (spec 108 K2.4): chosen in a
+     * tree whose research takes a couple's original (`accepts.media.family`),
+     * the file goes there (`PUT /media` with `X-Strom-Family`) and the photo
+     * names it (`2 _STROM_SHA` under the FAM's OBJE). Goes with the photo.
+     */
+    photoOriginal?: MediaOriginal;
     /** The import (StromData.imports id) the partner link came from. */
     importId?: string;
     /**
@@ -1546,9 +1649,13 @@ export interface CoupleEvent {
     gedcomType?: string;
 }
 
-/** The partnership fields the relationships panel edits (DataManager.updatePartnership). */
+/**
+ * The partnership fields the relationships panel edits (DataManager.updatePartnership).
+ * The couple's photo (spec 107): an empty `photo` removes it.
+ */
 export type PartnershipUpdates = Partial<Pick<Partnership,
-    'status' | 'startDate' | 'startPlace' | 'endDate' | 'endPlace' | 'address' | 'ages' | 'note' | 'isPrimary'>>;
+    'status' | 'startDate' | 'startPlace' | 'endDate' | 'endPlace' | 'address' | 'ages' | 'note' | 'isPrimary'
+    | 'photo' | 'photoOriginalName' | 'photoDate' | 'photoOriginal'>>;
 
 // ==================== LAST FOCUSED MARKER ====================
 
@@ -1724,6 +1831,14 @@ export function partnershipParticipants(u: Pick<Partnership, 'participants' | 'e
  *   when the tree is read, a backup is taken first. An older app (v19) would
  *   edit one copy alone and the copies would go apart, so the bump makes it
  *   open the tree read-only.
+ * v22 (2026-11, spec 084): StromData.personLists (named lists of people,
+ *   fixed or automatic by a rule) and StromData.personListsDropped (the
+ *   ready-made "Added in the last 30 days" deleted), Person.addedAt (when a
+ *   person came into the tree), TableView.scope and TableView.group.
+ *   Additive: nothing is computed for older trees (people without addedAt
+ *   are "earlier"; the ready-made list exists without being stored, see
+ *   src/person-lists.ts). An older app (v21) would drop the lists on a
+ *   re-save, so the bump makes it warn first.
  * v21 (2026-11, spec 095): the main citation of a fact
  *   (Person/Partnership/LifeEvent/CoupleEvent.citationMain), chosen by hand,
  *   and the events a source records (Source.events, GEDCOM EVENTS_RECORDED
@@ -1732,8 +1847,23 @@ export function partnershipParticipants(u: Pick<Partnership, 'participants' | 'e
  *   reordered). Additive: nothing is changed when a tree is read. An older
  *   app (v20) would show the automatic first citation and drop the choice on
  *   a re-save, so the bump makes it warn first.
+ * v23 (2026-11, spec 107): Person.photoSource (the original a portrait was
+ *   cut from — an image attachment of the person or a union's photo — with the
+ *   crop, JSON only) and Partnership.photo / photoOriginalName / photoDate
+ *   (the couple's photo, GEDCOM `FAM > OBJE`). Additive: a tree of v22 reads
+ *   unchanged, nothing is made. An older app (v22) would drop the couple's
+ *   photo and the portraits' originals on a re-save, so the bump makes it
+ *   warn first.
+ * v24 (2026-11, spec 102): the tree's files are records of their own
+ *   (StromData.media, one record per file) with the places where each is in
+ *   the tree (a person, a fact or event, a couple, a source), a title, a
+ *   kind and who gave them; Person.attachments and Attachment.sourceId go:
+ *   a tree of v23 is moved over when read (each attachment a record at its
+ *   person and its source; the same file at several people one record).
+ *   An older app (v23) would find no attachments and drop them on a
+ *   re-save, so the bump makes it warn first.
  */
-export const STROM_DATA_VERSION = 21;
+export const STROM_DATA_VERSION = 24;
 
 /** The rows of a saved Table view (spec 073 §2; events and sources come later). */
 export type TableViewRowType = 'persons' | 'unions' | 'events' | 'sources';
@@ -1754,7 +1884,58 @@ export interface TableView {
     filter: { op: 'and'; items: Record<string, unknown>[] };
     sort: { col: string; dir: 1 | -1 }[];
     unions?: { collapsed: boolean; except: string[] };
+    /** The rows of one list of people only (spec 084 §9; not for sources). */
+    scope?: { listId: string };
+    /** Group headers by one value (spec 084 §10); `collapsed` holds the closed groups' keys. */
+    group?: { by: TableGroupKey; collapsed: string[] };
     /** ISO time of the last save. */
+    updated: string;
+}
+
+/** What the Table groups its rows by (spec 084 §10, §11). */
+export type TableGroupKey =
+    | 'lines' | 'rod' | 'surname' | 'bPlace' | 'bCentury' | 'bDecade' | 'gen' | 'sex' | 'occ'
+    | 'addedDay' | 'addedMonth' | 'addedYear' | 'done'
+    | 'wDecade' | 'wPlace' | 'uRods' | 'kids'
+    | 'evType' | 'evDecade' | 'evPlace';
+
+/**
+ * The rule of a list of people (spec 084): what an automatic list is worked
+ * out from each time, what a fixed list was made from ("Created from", "Add
+ * from the rule"). `personName` keeps the name of the rule's person for when
+ * that person is gone.
+ */
+export type PersonListRule =
+    | { kind: 'rods'; rodIds: string[] }
+    | { kind: 'ancestors'; personId: PersonId; generations?: number; personName?: string }
+    | { kind: 'descendants'; personId: PersonId; generations?: number; personName?: string }
+    | { kind: 'line'; directionId: string; lineName?: string }
+    | { kind: 'tableFilter'; rowType: 'persons' | 'unions'; filter: TableView['filter']; sort: TableView['sort'] }
+    | { kind: 'added'; days: number };
+
+/** How the people of a list are ordered (spec 084 §5). */
+export type PersonListSort = 'old' | 'gen' | 'name' | 'added' | 'manual';
+
+/** A named list of people (spec 084, data version 22). */
+export interface PersonList {
+    id: string;
+    /** Unique in the tree (compared without diacritics and case). Empty only for the ready-made list: its name follows its period. */
+    name: string;
+    /** true = automatic: the people come from the rule each time. */
+    dynamic: boolean;
+    rule?: PersonListRule;
+    /** A fixed list's people in their manual order (kept under any other sort). */
+    personIds?: PersonId[];
+    /** People taken out of a fixed list by hand: "Add from the rule" does not bring them back. */
+    removed?: PersonId[];
+    sort: PersonListSort;
+    /** A fixed list ticked off person by person (§13). */
+    checklist?: boolean;
+    /** The ticked-off people of this list. */
+    done?: PersonId[];
+    /** The ready-made "Added in the last 30 days" (§8). */
+    builtin?: 'added30';
+    /** ISO time of the last change. */
     updated: string;
 }
 
@@ -1919,6 +2100,15 @@ export interface StromData {
     /** Per-tree catalog of sources/citations, keyed by Source id. */
     sources?: Record<string, Source>;
 
+    /**
+     * The tree's files (data v24, spec 102): scans, photos, letters and
+     * documents, one record per file keyed by its id, each with the places
+     * where it is in the tree (Attachment.places). The order is the order
+     * they were added; a person's attachments are the records with a place
+     * of that person (src/media.ts).
+     */
+    media?: Record<string, Attachment>;
+
     // Default person settings (exports with tree)
     defaultPersonId?: PersonId | LastFocusedMarker;  // undefined = first person, LAST_FOCUSED = where user left off, PersonId = specific
     /**
@@ -1982,6 +2172,15 @@ export interface StromData {
      * empty = none saved.
      */
     tableViews?: TableView[];
+
+    /**
+     * Named lists of people (spec 084, data version 22), fixed or automatic.
+     * The ready-made "Added in the last 30 days" is stored only once changed
+     * (src/person-lists.ts). Absent or empty = none.
+     */
+    personLists?: PersonList[];
+    /** Ready-made lists deleted here: never made again (spec 084 Q3). */
+    personListsDropped?: 'added30'[];
 
     /**
      * When Strom Research wrote what the people's `research` says (GEDCOM
@@ -2160,13 +2359,14 @@ export type CardPhotoShape = 'circle' | 'rounded';
 
 /**
  * The Normal card's box per photo size of the view (spec 096 §2): the card's
- * width and base height, the photo's size and the card's side padding on a
- * card with a photo. A view takes the medium or large box only when someone
- * drawn in it has a photo (renderer.ts viewHasPhoto), else the small one,
- * which is CARD_SIZE.normal. The text column beside the photo is 126px in
- * every size (src/card-width.ts normalCardTextWidth). A large card with a
- * photo is 96px tall through LayoutConfig.personHeights (the view's
- * cardHeight stays 64). MUST match index.html body[data-card-photo].
+ * width and base height, the avatar's size and the card's side padding on a
+ * card with an avatar, a photo or the initials alike (spec 103 K2.1). A view
+ * takes the medium or large box only when someone drawn in it has an avatar
+ * (renderer.ts viewHasAvatar), else the small one, which is CARD_SIZE.normal.
+ * The text column beside the avatar is 126px in every size (src/card-width.ts
+ * normalCardTextWidth). A large card with an avatar is 96px tall through
+ * LayoutConfig.personHeights (the view's cardHeight stays 64; a placeholder
+ * 64). MUST match index.html body[data-card-photo].
  */
 export const NORMAL_PHOTO_BOX: Record<CardPhotoSize, { cardWidth: number; cardHeight: number; avatar: number; padX: number }> = {
     small: { cardWidth: 188, cardHeight: 64, avatar: 34, padX: 9 },
@@ -2259,6 +2459,8 @@ export type AuditAction =
     | 'tableView.save'
     | 'tableView.rename'
     | 'tableView.delete'
+    | 'personList.save'
+    | 'personList.delete'
     | 'undo'
     | 'redo'
     /** An edit made in a satellite window, saved by the main window (spec 079). */
@@ -2289,7 +2491,7 @@ export interface AuditLog {
  * should be kept in sync with package.json.
  */
 declare const __APP_VERSION__: string | undefined;
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '3.29.0';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '3.30.0';
 
 /** Envelope wrapping embedded data in exported HTML files */
 export interface EmbeddedDataEnvelope {
@@ -2391,7 +2593,10 @@ export interface AppSettings {
     genLabels?: boolean;  // default: true - sticky generation labels over the canvas
     zoomControls?: boolean;  // default: true - floating zoom buttons over the tree
     onThisDay?: boolean;  // default: true - daily "on this day" reminder
-    branchColors?: boolean;  // default: true - colour cards by branch vs focus
+    /** @deprecated Before lineage markers (spec 112): read only to migrate to `branchMarker` (true → 'arc', false → 'none'). */
+    branchColors?: boolean;
+    branchMarker?: BranchMarker;  // default: 'arc' - shape of the lineage marker on cards ('none' = no shape; the tint is its own switch)
+    branchTint?: boolean;  // default: false - tint cards in the lineage colour (only while a marker is on)
     branchLegend?: boolean;  // default: false - show the branch-colour legend box
     deathAnniversaries?: boolean;  // default: false - include yearly death anniversaries
     onThisDayAllTrees?: boolean;   // default: false - "on this day" also from the other visible trees
@@ -2418,7 +2623,8 @@ export interface AppSettings {
     cardDensity?: CardDensity;  // default: 'normal' - how much detail a card shows
     /** Settings → Person card → Photo on the card (spec 096); absent = small + circle (the card as before). This device only. */
     cardPhoto?: { size?: CardPhotoSize; shape?: CardPhotoShape };
-    exportScope?: 'tree' | 'view';  // default: 'tree' - the export dialog's whole tree / current view switch
+    exportScope?: 'tree' | 'view' | 'list';  // default: 'tree' - the export dialog's whole tree / current view / list of people switch
+    exportListId?: string;  // the list of the export dialog's list scope (spec 084 §12)
     treeSpacing?: TreeSpacing;  // default: 'normal' - gaps between cards and generations in the tree view
     posterSpacing?: TreeSpacing;  // default: 'normal' - the same for an exported image, poster or PDF
     /** The custom density's lines (src/card-fields.ts); set the first time "Custom" is chosen. */
@@ -2536,6 +2742,14 @@ export interface TreeMetadata {
     fileCopyAt?: string;
     /** The "changes only in the browser" notice was closed for this tree (ISO); it returns after the next file copy. */
     fileCopyNoticeClosedAt?: string;
+    /**
+     * Fingerprint of the portraits, couples' photos and attachments only the
+     * browser keeps ('' = none; src/browser-media.ts), as last saved or read.
+     * Missing: not known yet.
+     */
+    mediaFp?: string;
+    /** The same fingerprint of what the last file copy carried (missing: not known). */
+    fileCopyMediaFp?: string;
     /** The last choice of "Save as HTML" on a person page (spec 025): content groups and privacy. */
     personPageExport?: {
         groups: import('./person-page.js').PersonPageGroups;
@@ -2657,6 +2871,8 @@ export interface ResearchTreeEtag {
     images: boolean;
     /** The file's variant: `ref` its images by their hash (`ged.imagesByHash`); absent: with them in it. */
     variant?: 'ref';
+    /** The file came with the tree's own files (`media=app`, spec 108); absent: without them. */
+    media?: true;
 }
 
 /** A research's file with its images by their hash (`ref`) or in it (`data`). */

@@ -182,7 +182,8 @@ test.describe('⧉ Open another window', () => {
         await expect(another(sat)).toBeVisible();
         await expect(another(sat)).toBeEnabled();
         await expect(another(sat)).toHaveAccessibleName('Open another window');
-        expect((await another(sat).boundingBox())!.width).toBe(32);
+        // As large as the main window's ⧉ (T54 H15).
+        expect((await another(sat).boundingBox())!.width).toBe(30);
 
         // This window's person, not the main window's.
         await sat.evaluate(() => window.Strom.TreeRenderer.setFocus('e' as never));
@@ -247,21 +248,20 @@ test.describe('the header fits (de)', () => {
             await page.setViewportSize({ width: 1440, height: 900 });
             const treeId = await openMain(page, context, LONG_NAME);
             const sat = await openSatellite(context, treeId, 'descendants', `sv1${width}`, { width, height: 700 });
-            await expect(sat.locator('.sat-follow')).toHaveAttribute('aria-label', 'Auswahl folgen: wechseln');
+            await expect(sat.locator('.sat-follow')).toHaveAttribute('aria-label', 'Personenauswahl zwischen Fenstern. Aus anderen Fenstern: wechseln.');
             await expect(another(sat)).toHaveAccessibleName('Weiteres Fenster öffnen');
             if (width >= 960) await expect(segment(sat)).toBeVisible();
             else await expect(viewBtn(sat)).toBeVisible();
-            // The name beside the mode wherever the mode is written, beside the view tabs too (960–1199 px:
-            // the verb alone, "wechseln ▾", says nothing); a phone width keeps the mark alone.
-            await expect(sat.locator('.sat-follow-label')).toBeVisible({ visible: width > 640 });
+            // "Auswahl:" from 1280 px (spec 110 §1), the mode in words beside its icon; a phone width keeps the icon alone.
+            await expect(sat.locator('.sat-follow-label')).toBeVisible({ visible: width >= 1280 });
             await expect(sat.locator('.sat-follow-state')).toBeVisible({ visible: width > 640 });
             await headerFits(sat);
-            // "Follow selection" (K2.1): its longest mode fits too; its menu stays inside the window, nothing in it cut.
+            // "Selection" (K2.1): its longest mode fits too; its menu stays inside the window, nothing in it cut.
             await setFollowMode(sat, 'mark');
             await headerFits(sat);
             if (width >= 960) {
                 const titleWidth = await sat.locator('.sat-header-title').evaluate(el => el.getBoundingClientRect().width);
-                expect(titleWidth, 'beside the tabs and the whole "Follow selection:" the name still reads').toBeGreaterThan(60);
+                expect(titleWidth, 'beside the tabs and "Selection" the name still reads').toBeGreaterThan(60);
             }
             await sat.locator('.sat-follow').click();
             const m = await sat.locator('.sat-follow-menu').evaluate((menu) => {
@@ -280,6 +280,40 @@ test.describe('the header fits (de)', () => {
                 expect(await sat.locator('.sat-header-title').evaluate(el => el.scrollWidth > el.clientWidth && getComputedStyle(el).textOverflow === 'ellipsis'), 'the long name is cut with an ellipsis').toBe(true);
             }
             await expect(sat).toHaveTitle(`Nachkommen – ${LONG_NAME} – Strom`);
+            await sat.close();
+        });
+    }
+});
+
+test.describe('Undo, Redo and ⧉ as in the main window (T54 H15)', () => {
+    for (const kind of ['table', 'descendants']) {
+        test(`${kind}: the same sizes, the same spaces between them and to the window's edge`, async ({ page, context }) => {
+            await page.setViewportSize({ width: 1440, height: 900 });
+            const treeId = await openMain(page, context);
+            await page.evaluate((k) => window.Strom.UI.setDisplayViewMode(k as never), kind);
+            const rect = (p: Page, sel: string) => p.locator(sel).evaluate(el => {
+                const r = el.getBoundingClientRect();
+                return { left: Math.round(r.left), right: Math.round(r.right), w: Math.round(r.width), h: Math.round(r.height), mid: Math.round(r.top + r.height / 2) };
+            });
+            const main = {
+                undo: await rect(page, '#toolbar-undo-btn'), redo: await rect(page, '#toolbar-redo-btn'),
+                win: await rect(page, '#view-window-btn'), bar: await rect(page, '.toolbar'),
+                pad: await page.locator('.toolbar').evaluate(el => getComputedStyle(el).paddingRight),
+            };
+            const sat = await openSatellite(context, treeId, kind, `h15${kind}`, { width: 1440, height: 900 });
+            const s = {
+                undo: await rect(sat, '.sat-header #toolbar-undo-btn'), redo: await rect(sat, '.sat-header #toolbar-redo-btn'),
+                win: await rect(sat, '.sat-header .sat-another'), bar: await rect(sat, '.sat-header'),
+            };
+            // The buttons as large as the main window's (its ⧉ measured before a window is open: no count beside it).
+            for (const k of ['undo', 'redo', 'win'] as const) expect([s[k].w, s[k].h], k).toEqual([main[k].w, main[k].h]);
+            // Undo and Redo as close as in the main window; ⧉ as far from them as the main window's ⧉ is.
+            expect(s.redo.left - s.undo.right).toBe(main.redo.left - main.undo.right);
+            expect(s.win.left - s.redo.right).toBe(main.undo.left - main.win.right);
+            // One middle line, and ⧉ as far from the window's edge as the toolbar's padding.
+            expect(new Set([s.undo.mid, s.redo.mid, s.win.mid]).size).toBe(1);
+            expect(`${s.bar.right - s.win.right}px`).toBe(main.pad);
+            await headerFits(sat);
             await sat.close();
         });
     }

@@ -9,7 +9,7 @@ import { researchOpenMark, setResearchOpenLabel } from './research-open-mark.js'
 import { iconSvg } from '../icons.js';
 import { PersonId } from '../types.js';
 import { uiModule } from './module.js';
-import { strings } from '../strings.js';
+import { strings, getCurrentLanguage } from '../strings.js';
 import { SettingsManager } from '../settings.js';
 import { TreeRenderer } from '../renderer.js';
 import { TreeManager } from '../tree-manager.js';
@@ -50,11 +50,13 @@ interface MenuRow {
     /** A shortcut chip (shown only with a mouse): Ctrl+Z, Ctrl+⇧+Z, Ctrl+S. */
     kbd?: 'undo' | 'redo' | 'save';
     /** A second level in the same sheet ("For the family ›"): its title and rows, ‹ Back returns. */
-    page?: { title: string; rows: MenuRow[] };
+    page?: { title: string; rows: MenuRow[]; note?: string };
     /** A stable id for the row (tests, focus). */
     id?: string;
     /** A small sign before the label (the Table view's row actions: ⌖ ▤ ✎); '' keeps its place empty. */
     icon?: string;
+    /** A drawn sign (an SVG, trusted markup) in place of `icon`'s text (the Table's pin). */
+    iconHtml?: string;
     /** A second line of the row's own (the tree's research marks). */
     extra?: HTMLElement;
 }
@@ -135,6 +137,7 @@ export const bottomSheetMethods = uiModule({
             const divider = a.divider ? '<div class="bottom-sheet-divider" role="separator"></div>' : '';
             const header = (a.section ? `<div class="bottom-sheet-section win-research-head" role="presentation">${esc(a.section)}</div>` : '')
                 + (a.header ? `<div class="bottom-sheet-section" role="presentation">${esc(a.header)}</div>` : '');
+            if (a.hint) return `${divider}${header}<p class="bottom-sheet-hint" role="note">${esc(a.label)}</p>`;
             if (a.caption) {
                 return `${divider}${header}<div class="bottom-sheet-caption" role="menuitem" aria-disabled="true"><span class="view-link-icon" aria-hidden="true"></span><span>${esc(a.label)}</span></div>`;
             }
@@ -415,6 +418,8 @@ export const bottomSheetMethods = uiModule({
         const lastExport = viewMode ? undefined : this.exportReminderLast();
         const reminder = lastExport === undefined ? undefined
             : { id: 'sheet-export-reminder', text: this.exportReminderText(lastExport), link: s.snapshots.exportAll, run: () => this.researchActionExportAll() };
+        // Lists of people (spec 084 §2, 15a): after Sources, an exported page reads them too.
+        const listsRow: MenuRow = { label: s.lists.title, id: 'sheet-lists', run: () => this.showPersonLists() };
         // "For the family ›": the book and the family pages (an exported page has them too), the poster, the fly-through.
         const familyRow: MenuRow = { label: s.menu.forFamily, id: 'sheet-family', run: () => {}, page: { title: s.menu.forFamily, rows: [
             ...(active || viewMode ? [bookRow, pagesRow, treePagesRow] : []),
@@ -424,13 +429,17 @@ export const bottomSheetMethods = uiModule({
         if (viewMode) {
             // An exported page (menu 1020 §10, D1): the overview takes the place of Tree ›.
             blocks.push({ divider: blocks.length > 0, rows: [
-                annRow, familyRow,
+                annRow, listsRow, familyRow,
                 { label: s.treeOverview.menu, id: 'sheet-overview', run: () => this.showActiveTreeOverview() },
             ] });
         } else {
             blocks.push({ divider: blocks.length > 0, rows: [
                 ...(active ? [annRow] : []),
                 ...(active && this.isSourcesMenuOffered() ? [{ label: s.sources.menu, run: () => this.showSourcesDialog() }] : []),
+                // Materials N (spec 102 §1) on a tablet; a phone's sheet keeps its first level without scrolling.
+                ...(active && this.isMaterialsMenuOffered() && !isPhoneBar()
+                    ? [{ label: s.materials.menu, id: 'sheet-materials', value: this.materialsAppCount().toLocaleString(getCurrentLanguage()), run: () => this.openMaterials() }] : []),
+                ...(active ? [listsRow] : []),
                 // One Export…: the whole tree or the current view, chosen in its dialog
                 // (locked data exports what it shows).
                 active
@@ -534,11 +543,13 @@ export const bottomSheetMethods = uiModule({
         title.className = 'bottom-sheet-menu-title';
         title.textContent = titleText;
         sheet.appendChild(title);
+        // The quiet line under the title goes with it on a second page.
+        let subLine: HTMLElement | null = null;
         if (opts.subtitle) {
-            const sub = document.createElement('div');
-            sub.className = 'bottom-sheet-menu-sub';
-            sub.textContent = opts.subtitle;
-            sheet.appendChild(sub);
+            subLine = document.createElement('div');
+            subLine.className = 'bottom-sheet-menu-sub';
+            subLine.textContent = opts.subtitle;
+            sheet.appendChild(subLine);
         }
 
         const list = document.createElement('div');
@@ -559,7 +570,8 @@ export const bottomSheetMethods = uiModule({
                 const icon = document.createElement('span');
                 icon.className = 'bottom-sheet-icon';
                 icon.setAttribute('aria-hidden', 'true');
-                icon.textContent = row.icon;
+                if (row.iconHtml) icon.innerHTML = row.iconHtml;
+                else icon.textContent = row.icon;
                 btn.appendChild(icon);
             }
             const label = document.createElement('span');
@@ -654,9 +666,18 @@ export const bottomSheetMethods = uiModule({
             const items = document.createElement('div');
             items.className = 'bottom-sheet-items';
             for (const row of page.rows) items.appendChild(makeButton(row));
+            // A quiet note under the rows, not an action (Add to list: automatic lists fill themselves).
+            if (page.note) {
+                const note = document.createElement('p');
+                note.className = 'bottom-sheet-hint';
+                note.setAttribute('role', 'note');
+                note.textContent = page.note;
+                items.appendChild(note);
+            }
             subPage.append(head, items);
             sheet.appendChild(subPage);
             title.hidden = true;
+            if (subLine) subLine.hidden = true;
             list.hidden = true;
             items.querySelector<HTMLElement>('.bottom-sheet-item')?.focus({ preventScroll: true });
         };
@@ -665,6 +686,7 @@ export const bottomSheetMethods = uiModule({
             subPage.remove();
             subPage = null;
             title.hidden = false;
+            if (subLine) subLine.hidden = false;
             list.hidden = false;
             subOpener?.focus({ preventScroll: true });
         };
@@ -780,6 +802,7 @@ export const bottomSheetMethods = uiModule({
         const showResearchPage = (): void => {
             if (!researchPage) return;
             title.hidden = true;
+            if (subLine) subLine.hidden = true;
             list.hidden = true;
             researchPage.hidden = false;
             // The second level is the whole research menu, "Other actions" open.
@@ -794,6 +817,7 @@ export const bottomSheetMethods = uiModule({
             researchPage.hidden = true;
             this.setResearchMoreOpen(false);
             title.hidden = false;
+            if (subLine) subLine.hidden = false;
             list.hidden = false;
             const body = researchPage.querySelector<HTMLElement>('#research-sheet-menu');
             if (body) {

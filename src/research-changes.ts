@@ -7,6 +7,7 @@
 
 import { StromData, Person, Partnership, PartnershipId, Source, EventParticipant, PersonId, LifeEvent, Attachment, PlaceGeo, isPrimaryName, personSourceIds } from './types.js';
 import { isPurePlaceholder } from './single-parent.js';
+import { mediaPersonIds, mediaSourceId, mediaSourceIds, personMediaIndex, placePersonId, placeSourceId, samePlace } from './media.js';
 import { collectPlaces } from './places.js';
 import { factValueSignature, handedConfirmations } from './verify.js';
 import type { FactHolder } from './import-origin.js';
@@ -15,11 +16,18 @@ import { sourcePlaceDiffers, sourcePlaceKey } from './source-location.js';
 
 export type ChangeKind =
     | 'added' | 'deleted' | 'name' | 'gender' | 'birth' | 'death' | 'marriage' | 'event'
-    | 'godparent' | 'witness' | 'citation' | 'source' | 'attachment' | 'attachmentRemoved' | 'note' | 'parents' | 'other';
+    | 'godparent' | 'witness' | 'citation' | 'source' | 'photo' | 'photoRemoved' | 'attachment' | 'attachmentRemoved' | 'attachmentEdited'
+    /** A file's title, kind or date (spec 102 §10); a file put at one of the person's facts or events; a file taken off a source. */
+    | 'attachmentTitle' | 'attachmentAt' | 'attachmentFrom'
+    | 'note' | 'parents' | 'other';
 
-/** The order kinds are told in (the most telling first). */
-const KIND_ORDER: ChangeKind[] = ['added', 'deleted', 'name', 'gender', 'birth', 'death', 'marriage', 'event', 'godparent', 'witness',
-    'citation', 'source', 'attachment', 'attachmentRemoved', 'note', 'parents', 'other'];
+/** The order kinds are told in (the most telling first; the portrait right after the name, spec 102 §10). */
+const KIND_ORDER: ChangeKind[] = ['added', 'deleted', 'name', 'photo', 'photoRemoved', 'gender', 'birth', 'death', 'marriage', 'event', 'godparent', 'witness',
+    'citation', 'source', 'attachment', 'attachmentRemoved', 'attachmentTitle', 'attachmentAt', 'attachmentFrom', 'attachmentEdited', 'note', 'parents', 'other'];
+
+/** The kinds that are the tree's own files (a portrait, attachments): a write with `media.app` names them itself. */
+const PERSON_MEDIA_KINDS: ReadonlySet<ChangeKind> = new Set<ChangeKind>(['photo', 'photoRemoved', 'attachment', 'attachmentRemoved', 'attachmentEdited',
+    'attachmentTitle', 'attachmentAt', 'attachmentFrom']);
 
 export interface PersonChange {
     personId: PersonId;
@@ -29,6 +37,10 @@ export interface PersonChange {
     deleted?: boolean;
     /** A removed person's number in the research (its REFN in the base), to pair what the research did not write. */
     refn?: string;
+    /** `attachmentAt`: the fact or event a file was put at (the first one). */
+    mediaAt?: { fact?: 'birth' | 'death'; eventId?: string };
+    /** `attachmentFrom`: the title of the source a file was taken off (the first one). */
+    mediaFrom?: string;
 }
 
 const NAME_FIELDS: (keyof Person)[] = ['firstName', 'lastName', 'titleBefore', 'titleAfter', 'marriedSurname', 'marriedFirstName', 'primaryName', 'nameVariants'];
@@ -36,7 +48,7 @@ const BIRTH_FIELDS: (keyof Person)[] = ['birthDate', 'birthPlace', 'birthAddress
 const DEATH_FIELDS: (keyof Person)[] = ['deathDate', 'deathPlace', 'deathCause', 'deathAge', 'deathAddress', 'isDeceased'];
 const CITATION_FIELDS: (keyof Person)[] = ['sourceIds', 'birthSourceIds', 'deathSourceIds'];
 /** Not the user's: the research's own knowledge and statuses, and what the app keeps for itself. */
-const IGNORED_FIELDS = new Set<string>(['research', 'birthStatus', 'deathStatus', 'photoOriginalName', 'photoDate', 'partnerships', 'childIds', 'isLocked',
+const IGNORED_FIELDS = new Set<string>(['research', 'birthStatus', 'deathStatus', 'photoOriginalName', 'photoDate', 'photoOriginal', 'partnerships', 'childIds', 'isLocked',
     'dismissedMarriedSuggestion', 'importId', 'importedValues', 'importedParents', 'researchOrigins', 'originalIds', 'gedcomExtra', 'alsoChildOf',
     'confirmed', 'researchVerify']);
 const MARRIAGE_FIELDS: (keyof Partnership)[] = ['status', 'startDate', 'startPlace', 'endDate', 'endPlace', 'address', 'ages', 'note'];
@@ -79,8 +91,9 @@ export function baseCopy(data: StromData): StromData {
     // when it is kept again (retagged, taken back): an empty list there would read as all of them changed.
     const older = (data as BaseCopy).olderCopy === true;
     const kept = older
-        ? { persons: data.persons, partnerships: data.partnerships, sources: data.sources ?? {}, olderCopy: true }
+        ? { persons: data.persons, partnerships: data.partnerships, sources: data.sources ?? {}, ...(data.media ? { media: data.media } : {}), olderCopy: true }
         : { persons: data.persons, partnerships: data.partnerships, sources: data.sources ?? {},
+            ...(data.media ? { media: data.media } : {}),
             places: data.places ?? {}, surnameVariants: data.surnameVariants ?? [],
             // The rejected spelling suggestions: what the research holds of them (its "not sent yet").
             surnameRejections: data.surnameRejections ?? [] };
@@ -115,7 +128,13 @@ function participantKinds(before: EventParticipant[] | undefined, after: EventPa
     return [...out];
 }
 
-function personKinds(before: Person, after: Person): Set<ChangeKind> {
+/** A person's files in two versions (data v24: StromData.media, by person); a source's title by its id. */
+interface PersonFiles { before: readonly Attachment[]; after: readonly Attachment[]; sourceTitle?: (id: string) => string }
+
+/** Where a person's file went or which source it left (the row's `mediaAt` / `mediaFrom`). */
+type PersonFileDetail = Pick<PersonChange, 'mediaAt' | 'mediaFrom'>;
+
+function personKinds(before: Person, after: Person, files: PersonFiles, detail: PersonFileDetail = {}): Set<ChangeKind> {
     const kinds = new Set<ChangeKind>();
     if (NAME_FIELDS.some(f => differs(before[f], after[f]))) kinds.add('name');
     if (before.gender !== after.gender) kinds.add('gender');
@@ -123,6 +142,8 @@ function personKinds(before: Person, after: Person): Set<ChangeKind> {
     if (DEATH_FIELDS.some(f => differs(before[f], after[f]))) kinds.add('death');
     if (CITATION_FIELDS.some(f => differs(before[f] ?? [], after[f] ?? []))) kinds.add('citation');
     if (differs(before.notes ?? '', after.notes ?? '')) kinds.add('note');
+    // The portrait: a new or other one (or another crop of its original), or taken off.
+    if (differs(before.photo, after.photo) || differs(before.photoSource, after.photoSource)) kinds.add(after.photo ? 'photo' : 'photoRemoved');
     // Events: the event itself, its people, its citations.
     const evBefore = new Map((before.events ?? []).map(e => [e.id, e]));
     const evAfter = new Map((after.events ?? []).map(e => [e.id, e]));
@@ -139,15 +160,35 @@ function personKinds(before: Person, after: Person): Set<ChangeKind> {
     }
     // Attachments: added, removed (by id); a changed note or crop is "other". One that belongs to a
     // source (here or in the research's version) is the source's change, told there (diffOther).
-    const ofSource = new Set([...(before.attachments ?? []), ...(after.attachments ?? [])].filter(a => a.sourceId).map(a => a.id));
-    const ownAtts = (p: Person): Attachment[] => (p.attachments ?? []).filter(a => !ofSource.has(a.id));
-    const attBefore = new Set(ownAtts(before).map(a => a.id));
-    const attAfter = new Set(ownAtts(after).map(a => a.id));
+    const ofSource = new Set([...files.before, ...files.after].filter(a => mediaSourceId(a)).map(a => a.id));
+    const ownBefore = files.before.filter(a => !ofSource.has(a.id));
+    const ownAfter = files.after.filter(a => !ofSource.has(a.id));
+    const attBefore = new Set(ownBefore.map(a => a.id));
+    const attAfter = new Set(ownAfter.map(a => a.id));
     if ([...attAfter].some(id => !attBefore.has(id))) kinds.add('attachment');
     if ([...attBefore].some(id => !attAfter.has(id))) kinds.add('attachmentRemoved');
+    // A file in both versions (spec 102 §10): its title, kind or date; a new place at one of the person's facts
+    // or events; a source it was taken off. A file of a source keeps its title change at the source (diffOther).
+    const wasHere = new Map(files.before.map(a => [a.id, a]));
+    for (const b of files.after) {
+        const a = wasHere.get(b.id);
+        if (!a) continue;
+        if (!ofSource.has(b.id) && ((a.title ?? '') !== (b.title ?? '') || (a.kind ?? '') !== (b.kind ?? '') || (a.date ?? '') !== (b.date ?? ''))) kinds.add('attachmentTitle');
+        for (const pl of b.places) {
+            if (placePersonId(pl) !== after.id || !('personId' in pl) || (!pl.fact && !pl.eventId) || a.places.some(x => samePlace(x, pl))) continue;
+            kinds.add('attachmentAt');
+            detail.mediaAt ??= pl.fact ? { fact: pl.fact } : { eventId: pl.eventId };
+        }
+        for (const pl of a.places) {
+            const sid = placeSourceId(pl);
+            if (!sid || b.places.some(x => samePlace(x, pl))) continue;
+            kinds.add('attachmentFrom');
+            detail.mediaFrom ??= files.sourceTitle?.(sid) ?? sid;
+        }
+    }
     // A changed source this person cites is the source's change (diffOther), not the person's: told once.
     // Anything else of the person (gender, the number, the question, the story, parents…).
-    const known = new Set<string>([...NAME_FIELDS, ...BIRTH_FIELDS, ...DEATH_FIELDS, ...CITATION_FIELDS, 'gender', 'notes', 'events', 'attachments', 'id']);
+    const known = new Set<string>([...NAME_FIELDS, ...BIRTH_FIELDS, ...DEATH_FIELDS, ...CITATION_FIELDS, 'gender', 'notes', 'events', 'attachments', 'photo', 'photoSource', 'id']);
     const rest = (p: Person): Record<string, unknown> => {
         const o: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(p)) if (!known.has(k) && !IGNORED_FIELDS.has(k)) o[k] = v;
@@ -156,7 +197,10 @@ function personKinds(before: Person, after: Person): Set<ChangeKind> {
     if (differs(rest(before), rest(after))) kinds.add('other');
     // A fact confirmed, or a confirmation taken back, goes to the research (`_STROM_CONFIRMED`).
     if (confirmationsDiffer(before, after)) kinds.add('other');
-    if (differs(ownAtts(before).map(a => ({ ...a, dataUrl: undefined })), ownAtts(after).map(a => ({ ...a, dataUrl: undefined })))
+    // What else of a file (its note, a crop): not its title, kind, date or places, told above.
+    const plain = (a: Attachment): Record<string, unknown> => ({ ...a, dataUrl: undefined, title: undefined, kind: undefined, date: undefined,
+        titleBy: undefined, kindBy: undefined, dateBy: undefined, places: undefined });
+    if (differs(ownBefore.map(plain), ownAfter.map(plain))
         && !kinds.has('attachment') && !kinds.has('attachmentRemoved')) kinds.add('other');
     return kinds;
 }
@@ -171,6 +215,13 @@ export function diffByPerson(base: StromData, current: StromData): PersonChange[
     };
     const bp = base.persons as Record<string, Person>;
     const cp = current.persons as Record<string, Person>;
+    const filesBefore = personMediaIndex(base);
+    const filesAfter = personMediaIndex(current);
+    const sourceTitle = (sid: string): string => current.sources?.[sid]?.title?.trim() || base.sources?.[sid]?.title?.trim() || sid;
+    const filesOf = (id: string): PersonFiles => ({
+        before: filesBefore.get(id as PersonId) ?? [], after: filesAfter.get(id as PersonId) ?? [], sourceTitle,
+    });
+    const details = new Map<string, PersonFileDetail>();
 
     for (const p of Object.values(cp)) {
         const before = bp[p.id];
@@ -186,9 +237,12 @@ export function diffByPerson(base: StromData, current: StromData): PersonChange[
             continue;
         }
         // Most people did not change: one comparison of the whole record, not one per field.
-        if (stable(before) === stable(p)) continue;
-        const kinds = personKinds(before, p);
+        const files = filesOf(p.id);
+        if (stable(before) === stable(p) && stable(files.before) === stable(files.after)) continue;
+        const detail: PersonFileDetail = {};
+        const kinds = personKinds(before, p, files, detail);
         if (kinds.size) kinds.forEach(k => touch(p.id, fullName(p)).add(k));
+        if (detail.mediaAt || detail.mediaFrom) details.set(p.id, detail);
     }
     for (const p of Object.values(bp)) {
         if (cp[p.id] || p.isPlaceholder) continue;
@@ -238,17 +292,24 @@ export function diffByPerson(base: StromData, current: StromData): PersonChange[
             kinds: KIND_ORDER.filter(k => e.kinds.has(k)),
             ...(e.deleted ? { deleted: true } : {}),
             ...(e.deleted && e.refn ? { refn: e.refn } : {}),
+            ...(details.get(personId)?.mediaAt ? { mediaAt: details.get(personId)!.mediaAt } : {}),
+            ...(details.get(personId)?.mediaFrom ? { mediaFrom: details.get(personId)!.mediaFrom } : {}),
         }))
         .sort((x, y) => x.name.localeCompare(y.name));
 }
 
 // ==================== CHANGES BEYOND PEOPLE ====================
 
-export type SourceChangeKind = 'added' | 'deleted' | 'title' | 'transcript' | 'page' | 'excerptAdded' | 'excerptRemoved' | 'attachment' | 'other';
-export type CoupleChangeKind = 'childOrder' | 'mainMarriage' | 'marriageEvidence' | 'singleParent';
+/** `doc`: the source's evidence files (its `attachment` told so to a research with `material.links`, spec 102 §10). */
+export type SourceChangeKind = 'added' | 'deleted' | 'title' | 'transcript' | 'page' | 'excerptAdded' | 'excerptRemoved' | 'attachment' | 'doc' | 'other';
+export type CoupleChangeKind = 'childOrder' | 'mainMarriage' | 'marriageEvidence' | 'singleParent'
+    | 'photo' | 'photoRemoved' | 'attachment' | 'attachmentRemoved' | 'attachmentEdited';
 
-const SOURCE_KIND_ORDER: SourceChangeKind[] = ['added', 'deleted', 'title', 'transcript', 'page', 'excerptAdded', 'excerptRemoved', 'attachment', 'other'];
-const COUPLE_KIND_ORDER: CoupleChangeKind[] = ['childOrder', 'mainMarriage', 'marriageEvidence', 'singleParent'];
+const SOURCE_KIND_ORDER: SourceChangeKind[] = ['added', 'deleted', 'title', 'transcript', 'page', 'excerptAdded', 'excerptRemoved', 'attachment', 'doc', 'other'];
+const COUPLE_KIND_ORDER: CoupleChangeKind[] = ['childOrder', 'mainMarriage', 'marriageEvidence', 'singleParent',
+    'photo', 'photoRemoved', 'attachment', 'attachmentRemoved', 'attachmentEdited'];
+/** A couple's kinds that are its own files (its photo): a write with `media.app` names them itself. */
+const COUPLE_MEDIA_KINDS: ReadonlySet<string> = new Set(['photo', 'photoRemoved', 'attachment', 'attachmentRemoved', 'attachmentEdited']);
 
 /** A source (or an attachment of one) changed since the research's version. */
 export interface SourceChange {
@@ -372,16 +433,18 @@ export function diffOther(base: StromData | null, current: StromData): OtherChan
     // Attachments that belong to a source, of the people in both versions (a new or deleted person's
     // attachments are that person's), by source: added, removed or changed.
     const attChanged = new Map<string, Attachment>();
-    for (const id of Object.keys(cp)) {
-        const before = bp[id];
-        if (!before) continue;
-        const a = new Map((before.attachments ?? []).map(x => [x.id, x]));
-        const b = new Map((cp[id].attachments ?? []).map(x => [x.id, x]));
-        for (const attId of new Set([...a.keys(), ...b.keys()])) {
-            const x = a.get(attId);
-            const y = b.get(attId);
-            if (x && y && !differs(x, y)) continue;
-            for (const att of [x, y]) if (att?.sourceId && !attChanged.has(att.sourceId)) attChanged.set(att.sourceId, att);
+    const bm = base.media ?? {};
+    const cm = current.media ?? {};
+    const inBoth = (pid: PersonId): boolean => !!bp[pid] && !!cp[pid];
+    for (const attId of new Set([...Object.keys(bm), ...Object.keys(cm)])) {
+        const x = bm[attId];
+        const y = cm[attId];
+        if (x && y && !differs(x, y)) continue;
+        for (const att of [x, y]) {
+            if (!att) continue;
+            const people = mediaPersonIds(att);
+            if (people.length > 0 && !people.some(inBoth)) continue;
+            for (const sid of mediaSourceIds(att)) if (!attChanged.has(sid)) attChanged.set(sid, att);
         }
     }
 
@@ -447,7 +510,11 @@ export function diffOther(base: StromData | null, current: StromData): OtherChan
             if (sameSet && a.childIds.some((c, i) => b.childIds[i] !== c)) kinds.add('childOrder');
             if (!!a.isPrimary !== !!b.isPrimary) kinds.add('mainMarriage');
             if ((a.startStatus ?? '') !== (b.startStatus ?? '') || (a.endStatus ?? '') !== (b.endStatus ?? '')) kinds.add('marriageEvidence');
+            // The couple's photo (spec 107): a new or other one, or taken off.
+            if (differs(a.photo, b.photo)) kinds.add(b.photo ? 'photo' : 'photoRemoved');
         }
+        // A new couple with its photo.
+        if (!a && b?.photo) kinds.add('photo');
         if (!kinds.size) continue;
         const u = (b ?? a)!;
         couples.push({ partnershipId: id, p1: u.person1Id, p2: u.person2Id, kinds: COUPLE_KIND_ORDER.filter(k => kinds.has(k)), ...(b ? {} : { deleted: true }) });
@@ -527,8 +594,17 @@ export function previewInexact(persons: readonly PersonChange[] | null, other: O
 export const RESEARCH_UNREAD_KINDS: ReadonlySet<string> = new Set([
     'source.excerptAdded', 'source.excerptRemoved', 'source.attachment',
     'couple.childOrder', 'couple.mainMarriage', 'couple.marriageEvidence',
+    // A couple's photo: kept only by a research with `media.app` (spec 108).
+    'couple.photo', 'couple.photoRemoved',
     'places.removed', 'variants', 'lineage',
 ]);
+
+/**
+ * The kinds a research with `media.app` reads besides (spec 108 K2.6): the
+ * tree's own files — a source's attachments, a couple's photo — are written
+ * changes there, never "app only".
+ */
+export const MEDIA_APP_READ_KINDS: readonly string[] = ['source.attachment', 'couple.photo', 'couple.photoRemoved'];
 
 /** Every one of a row's kinds is one the research does not read (a row with none is read). */
 function allUnread(keys: readonly string[], unread: ReadonlySet<string>): boolean {
@@ -555,6 +631,61 @@ export function variantsAppOnly(unread: ReadonlySet<string> = RESEARCH_UNREAD_KI
 /** The lineage corrections' row: read by a research that says `lineage.read`. */
 export function lineageAppOnly(unread: ReadonlySet<string> = RESEARCH_UNREAD_KINDS): boolean {
     return unread.has('lineage');
+}
+
+// ==================== WHAT A RESEARCH WRITES OF THE TREE'S FILES ====================
+
+/**
+ * What the research writes of the tree's files (spec 102 §10): `photos` —
+ * the portraits and the couples' photos (`media.app`); `links` — the files'
+ * titles and links (`material.links`).
+ */
+export interface MediaWrites { photos: boolean; links: boolean }
+
+/**
+ * The rows as a research of `w` writes them (spec 102 §10, R10 b): without
+ * `photos` a portrait or a couple's photo is not promised (no "app only"
+ * step); without `links` a file's title or new place is told as "other" and
+ * a file taken off a source only at the source. `doc`: a source's files
+ * named its evidence (`material.links`; not for rows kept for a write's
+ * answer, which names them `attachment`). `older`: something was not told as
+ * it is (one sentence under the list).
+ */
+export function gateMediaChanges(list: readonly PersonChange[], other: OtherChanges | null, w: MediaWrites, opts: { doc?: boolean } = {}):
+    { list: PersonChange[]; other: OtherChanges | null; older: boolean } {
+    let older = false;
+    const persons: PersonChange[] = [];
+    for (const ch of list) {
+        const kinds = new Set<ChangeKind>();
+        for (const k of ch.kinds) {
+            if (!w.photos && (k === 'photo' || k === 'photoRemoved')) { older = true; continue; }
+            if (!w.links && (k === 'attachmentTitle' || k === 'attachmentAt')) { older = true; kinds.add('other'); continue; }
+            if (!w.links && k === 'attachmentFrom') { older = true; continue; }
+            kinds.add(k);
+        }
+        if (!kinds.size && !ch.deleted) continue;
+        const { mediaAt, mediaFrom, ...rest } = ch;
+        persons.push({ ...rest, kinds: KIND_ORDER.filter(k => kinds.has(k)),
+            ...(kinds.has('attachmentAt') && mediaAt ? { mediaAt } : {}), ...(kinds.has('attachmentFrom') && mediaFrom ? { mediaFrom } : {}) });
+    }
+    if (!other) return { list: persons, other, older };
+    const sources = other.sources.map(sc => !(opts.doc && w.links) || !sc.kinds.includes('attachment') ? sc
+        : { ...sc, kinds: SOURCE_KIND_ORDER.filter(k => k !== 'attachment' && (k === 'doc' || sc.kinds.includes(k))) });
+    const couples: CoupleChange[] = [];
+    for (const cc of other.couples) {
+        if (w.photos || !cc.kinds.some(k => k === 'photo' || k === 'photoRemoved')) { couples.push(cc); continue; }
+        older = true;
+        const kinds = cc.kinds.filter(k => k !== 'photo' && k !== 'photoRemoved');
+        if (kinds.length) couples.push({ ...cc, kinds });
+    }
+    return { list: persons, other: { ...other, sources, couples }, older };
+}
+
+/** A written send's rows beyond the people with a source's files named its evidence (`material.links`). */
+export function docSentRows(rows: readonly SentOtherRow[], links: boolean): SentOtherRow[] {
+    if (!links) return [...rows];
+    return rows.map(r => r.type !== 'source' || !r.kinds.includes('attachment') ? r
+        : { ...r, kinds: SOURCE_KIND_ORDER.filter(k => k !== 'attachment' && (k === 'doc' || r.kinds.includes(k))) });
 }
 
 // ==================== WHAT A SEND CARRIED BEYOND THE PEOPLE ====================
@@ -625,6 +756,127 @@ export function sanitizeSentOtherRow(v: unknown): SentOtherRow | null {
         ...(typeof r.surname === 'string' && r.surname ? { surname: r.surname.slice(0, 120) } : {}),
         ...(r.deleted === true ? { deleted: true as const } : {}),
         ...(r.appOnly === true ? { appOnly: true as const } : {}),
+    };
+}
+
+// ==================== WHAT A WRITE WROTE OF THE TREE'S OWN FILES ====================
+
+/** One change of the tree's own files a write wrote, as its answer names it (research-link SyncMediaWritten). */
+export interface WrittenMediaItem {
+    kind: string;
+    person: string;
+    family: string;
+    source: string;
+    record: string;
+}
+
+/** The kind a row tells a written file change by (a portrait and a couple's photo alike). */
+function writtenMediaKind(kind: string): ChangeKind | null {
+    switch (kind) {
+        case 'media.photo': case 'media.couplePhoto': return 'photo';
+        case 'media.photo.removed': case 'media.couplePhoto.removed': return 'photoRemoved';
+        case 'media.attachment': return 'attachment';
+        case 'media.attachment.removed': return 'attachmentRemoved';
+        case 'media.edit': return 'attachmentTitle';
+        case 'media.link': case 'media.unlink': return 'attachmentEdited';
+        default: return null;
+    }
+}
+
+/**
+ * "What was written" of a write to a research with `media.app` (spec 108
+ * K2.6): the tree's own files are told as the research's answer names them
+ * (`media`), never as the app's comparison guessed them — a portrait or a
+ * couple's photo "photo" (taken off: "photoRemoved"), an attachment as
+ * before, a source's attachment at its source, none of them "app only". The
+ * rows of the comparison lose their file kinds (a row left with none goes),
+ * the answer's put to the person (by its number there), the couple (by its
+ * family there; a couple the tree does not know by it yet: the comparison's
+ * row of the same photo) or the source. `count`: how many the answer said it
+ * wrote; those beyond the list, and those it names nothing here for, are
+ * `more`. `unread`: the kinds the research does not read (a row of only such
+ * is "app only").
+ */
+export function withWrittenMedia(list: readonly PersonChange[], other: readonly SentOtherRow[], media: readonly WrittenMediaItem[],
+    count: number, data: StromData, unread: ReadonlySet<string> = RESEARCH_UNREAD_KINDS): { list: PersonChange[]; other: SentOtherRow[]; more: number } {
+    const persons = new Map<string, PersonChange & { kinds: ChangeKind[] }>();
+    for (const ch of list) {
+        const kinds = ch.kinds.filter(k => !PERSON_MEDIA_KINDS.has(k));
+        if (kinds.length || ch.deleted) persons.set(ch.personId, { ...ch, kinds });
+    }
+    // The comparison's couples' photos: a couple the answer names by a family the tree does not know yet.
+    const guessed: SentOtherRow[] = [];
+    const rows: SentOtherRow[] = [];
+    for (const r of other) {
+        if (r.type === 'source') {
+            const kinds = r.kinds.filter(k => k !== 'attachment');
+            if (kinds.length) rows.push({ ...r, kinds });
+        } else if (r.type === 'couple') {
+            if (r.kinds.some(k => COUPLE_MEDIA_KINDS.has(k))) guessed.push(r);
+            const kinds = r.kinds.filter(k => !COUPLE_MEDIA_KINDS.has(k));
+            if (kinds.length) rows.push({ ...r, kinds });
+        } else {
+            rows.push({ ...r });
+        }
+    }
+    const byRefn = new Map<string, Person>();
+    for (const p of Object.values(data.persons ?? {})) if (p?.refn?.trim()) byRefn.set(p.refn.trim(), p);
+    const couples = new Map<string, Partnership>();
+    for (const u of Object.values(data.partnerships ?? {})) if (u?.researchId) couples.set(u.researchId, u);
+    const sources = new Map<string, Source>();
+    for (const s of Object.values(data.sources ?? {})) if (s?.refn?.trim()) sources.set(s.refn.trim(), s);
+    const rowOf = (type: 'source' | 'couple', id: string, make: () => SentOtherRow): SentOtherRow => {
+        let row = rows.find(r => r.type === type && r.id === id);
+        if (!row) { row = make(); rows.push(row); }
+        return row;
+    };
+    let unnamed = 0;
+    for (const m of media) {
+        const kind = writtenMediaKind(m.kind);
+        if (!kind) { unnamed++; continue; }
+        if (m.person) {
+            const p = byRefn.get(m.person);
+            if (!p) { unnamed++; continue; }
+            const row = persons.get(p.id) ?? { personId: p.id, name: fullName(p), kinds: [] };
+            if (!row.kinds.includes(kind)) row.kinds.push(kind);
+            persons.set(p.id, row);
+        } else if (m.family) {
+            const u = couples.get(m.family);
+            let row: SentOtherRow | undefined;
+            if (u) {
+                row = rowOf('couple', u.id, () => ({ type: 'couple', id: u.id, title: '', kinds: [], p1: u.person1Id, p2: u.person2Id }));
+            } else {
+                // Not known here by its family yet (a couple new in this write): the comparison's row of the same photo.
+                const g = guessed.find(r => r.kinds.includes(kind));
+                if (g) {
+                    guessed.splice(guessed.indexOf(g), 1);
+                    row = rowOf('couple', g.id, () => ({ ...g, kinds: [] }));
+                }
+            }
+            if (!row) { unnamed++; continue; }
+            if (!row.kinds.includes(kind)) row.kinds.push(kind);
+        } else {
+            const s = sources.get(m.source);
+            if (!s) { unnamed++; continue; }
+            const row = rowOf('source', s.id, () => ({ type: 'source', id: s.id, title: s.title?.trim() || m.source, kinds: [] }));
+            if (!row.kinds.includes('attachment')) row.kinds.push('attachment');
+        }
+    }
+    const typeOrder = ['source', 'couple', 'places', 'variants', 'lineage'];
+    const out = rows.map(r => {
+        const kinds = r.type === 'source' ? SOURCE_KIND_ORDER.filter(k => r.kinds.includes(k))
+            : r.type === 'couple' ? COUPLE_KIND_ORDER.filter(k => r.kinds.includes(k)) : r.kinds;
+        const appOnly = r.type === 'source' ? sourceAppOnly(kinds as SourceChangeKind[], unread)
+            : r.type === 'couple' ? coupleAppOnly(kinds as CoupleChangeKind[], unread) : !!r.appOnly;
+        const { appOnly: _was, ...rest } = r;
+        return { ...rest, kinds, ...(appOnly ? { appOnly: true as const } : {}) };
+    }).sort((a, b) => typeOrder.indexOf(a.type) - typeOrder.indexOf(b.type)
+        || (a.type === 'source' && b.type === 'source' ? a.title.localeCompare(b.title) : 0));
+    return {
+        list: [...persons.values()].map(ch => ({ ...ch, kinds: KIND_ORDER.filter(k => ch.kinds.includes(k)) }))
+            .sort((x, y) => x.name.localeCompare(y.name)),
+        other: out,
+        more: Math.max(0, count - media.length) + unnamed,
     };
 }
 

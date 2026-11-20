@@ -13,6 +13,7 @@ import {
 } from '../ged-parser.js';
 import { exportToGedcom } from '../ged-exporter.js';
 import { migrateData } from '../data.js';
+import { personMedia } from '../media.js';
 import { applyLivingPrivacy, CONTENT_PRESETS } from '../privacy.js';
 import { StorageManager } from '../storage.js';
 import { createMergeState, updateMatchDecision } from '../merge/matching.js';
@@ -139,14 +140,17 @@ describe('media records (0 @O1@ OBJE)', () => {
         const v = byName(r.data, 'Vřesomil');
         expect(r.externalMedia).toEqual([{
             personId: v.id, fileName: 'vresomil-1910.jpg', filePath: 'photos/vresomil-1910.jpg', title: 'Vřesomil 1910',
+        }, {
+            // The family's picture: offered as the couple's photo (spec 107).
+            partnershipId: Object.keys(r.data.partnerships)[0], fileName: 'svatba.jpg', filePath: 'photos/svatba.jpg',
         }]);
-        expect(v.attachments).toHaveLength(1);
-        expect(v.attachments![0]).toMatchObject({ name: 'Kupní smlouva', mimeType: 'image/jpeg', dataUrl: JPEG });
+        expect(personMedia(r.data, v.id)).toHaveLength(1);
+        expect(personMedia(r.data, v.id)[0]).toMatchObject({ name: 'Kupní smlouva', mimeType: 'image/jpeg', dataUrl: JPEG });
         const src = Object.values(r.data.sources!)[0];
         expect(src.excerpts).toHaveLength(1);
         expect(src.excerpts![0]).toMatchObject({ dataUrl: JPEG, caption: 'folio 12' });
         // A link to a record the file lacks, a record nobody takes; the family's
-        // photo is kept for "Back to {prog}" instead.
+        // photo is kept for "Back to {prog}" until a file is connected to it.
         expect(r.stats.skippedMedia).toBe(2);
         expect(r.stats.droppedTagSummary).toContain('OBJE ×2');
         expect(r.stats.keptTagSummary).toBe('OBJE');
@@ -171,7 +175,7 @@ describe('media records (0 @O1@ OBJE)', () => {
     it('an unsafe embedded format is skipped and counted, never stored', () => {
         const svg = 'data:image/svg+xml;base64,PHN2Zz4=';
         const r = load(GRAMPS.replace(`1 FILE ${JPEG}\n2 FORM jpeg\n2 TITL Kupní smlouva`, `1 FILE ${svg}\n2 FORM svg`));
-        expect(byName(r.data, 'Vřesomil').attachments).toBeUndefined();
+        expect(personMedia(r.data, byName(r.data, 'Vřesomil').id)).toHaveLength(0);
         expect(JSON.stringify(r.data)).not.toContain('svg+xml');
         expect(r.stats.skippedMedia).toBe(3);
     });

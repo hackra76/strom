@@ -11,8 +11,12 @@
  */
 
 import { strings } from '../../strings.js';
+import { busySpinHtml } from '../busy.js';
 import { columnById, columnLabel, columnOffered, type SortSpec } from './table-columns.js';
 import { ROW_KEY, ROW_TYPES, type RowType } from './table-model.js';
+import { listKindIcon } from '../list-kind-icon.js';
+import type { ListKind } from '../../person-lists.js';
+import { isPhoneBar } from '../../breakpoints.js';
 
 export interface BarHandlers {
     /** A row type was chosen (segment or sheet). */
@@ -21,6 +25,10 @@ export interface BarHandlers {
     onRowTypeSheet(): void;
     /** The phone's ⋯ (12a): Columns, Export, Coverage row, Expand or Collapse unions. */
     onMoreMenu(): void;
+    /** ‹ / › (spec 103 §1): a jump by a name back or forward. */
+    onHistory(dir: -1 | 1): void;
+    /** Scope ▾ (spec 084 §9): the menu of the lists. */
+    onScopeMenu(anchor: HTMLElement): void;
 }
 
 function esc(text: string): string {
@@ -35,10 +43,32 @@ export function countText(type: RowType, shown: number, total: number): string {
 
 /** "Sort: Birth date ↑, Name ↓" (empty without a sort). */
 export function sortText(type: RowType, sort: readonly SortSpec[]): string {
+    // A list's own order (spec 084 §9): "Sort: # (list order)".
+    if (type === 'persons' && sort.length === 1 && sort[0].col === 'num' && sort[0].dir !== 'desc') return strings.table.sortList;
     const cols = sort
         .map(s => { const col = columnById(type, s.col); return col && columnOffered(col) ? `${columnLabel(col)} ${s.dir === 'desc' ? '↓' : '↑'}` : ''; })
         .filter(Boolean);
     return cols.length ? strings.table.sortedBy(cols.join(', ')) : '';
+}
+
+/**
+ * ‹ / › (spec 103 §1): shown from the first jump on, each off without a
+ * step that way; their names say where they lead.
+ */
+export function updateNav(bar: HTMLElement, any: boolean, back: string | null, forward: string | null): void {
+    const slot = bar.querySelector<HTMLElement>('.tv-slot-nav');
+    if (!slot) return;
+    slot.hidden = !any;
+    const set = (dir: string, label: string | null, named: (n: string) => string, plain: string): void => {
+        const btn = slot.querySelector<HTMLElement>(`[data-nav="${dir}"]`)!;
+        const text = label ? named(label) : plain;
+        btn.setAttribute('aria-disabled', label === null ? 'true' : 'false');
+        btn.setAttribute('aria-label', text);
+        btn.title = text;
+    };
+    const nav = strings.table.nav;
+    set('-1', back, nav.backTo, nav.back);
+    set('1', forward, nav.forwardTo, nav.forward);
 }
 
 /** The bar's skeleton; `updateBar` fills the row type. */
@@ -46,8 +76,15 @@ export function createBar(handlers: BarHandlers): HTMLElement {
     const bar = document.createElement('div');
     bar.className = 'tv-bar';
     bar.innerHTML = '<div class="tv-bar-row1">'
+        + '<div class="tv-slot tv-slot-nav" hidden>'
+        + `<button type="button" class="tv-nav-btn" data-nav="-1" aria-disabled="true" aria-label="${esc(strings.table.nav.back)}" title="${esc(strings.table.nav.back)}">‹</button>`
+        + `<button type="button" class="tv-nav-btn" data-nav="1" aria-disabled="true" aria-label="${esc(strings.table.nav.forward)}" title="${esc(strings.table.nav.forward)}">›</button>`
+        + '<span class="tv-bar-sep" aria-hidden="true"></span>'
+        + '</div>'
         + `<div class="tv-rowtype sel-seg" role="radiogroup" aria-label="${esc(strings.table.rowType)}"></div>`
         + '<button type="button" class="tv-rowtype-btn" aria-haspopup="dialog"></button>'
+        + `<div class="tv-slot tv-slot-scope"><span class="tv-scope-label" aria-hidden="true">${esc(strings.table.scope)}</span>`
+        + '<button type="button" class="tv-scope-btn" aria-haspopup="menu"></button></div>'
         + '<div class="tv-slot tv-slot-view"></div>'
         + '<div class="tv-bar-spacer"></div>'
         + '<div class="tv-slot tv-slot-search"></div>'
@@ -77,6 +114,12 @@ export function createBar(handlers: BarHandlers): HTMLElement {
     });
     bar.querySelector('.tv-rowtype-btn')!.addEventListener('click', () => handlers.onRowTypeSheet());
     bar.querySelector('.tv-more-menu-btn')!.addEventListener('click', () => handlers.onMoreMenu());
+    const scopeBtn = bar.querySelector<HTMLElement>('.tv-scope-btn')!;
+    scopeBtn.addEventListener('click', () => { if (scopeBtn.getAttribute('aria-disabled') !== 'true') handlers.onScopeMenu(scopeBtn); });
+    bar.querySelector('.tv-slot-nav')!.addEventListener('click', (e) => {
+        const btn = (e.target as Element).closest<HTMLElement>('[data-nav]');
+        if (btn && btn.getAttribute('aria-disabled') !== 'true') handlers.onHistory(Number(btn.dataset.nav) as -1 | 1);
+    });
     return bar;
 }
 
@@ -94,6 +137,81 @@ export function updateBar(bar: HTMLElement, type: RowType, counts: Record<RowTyp
     const label = strings.table.rows[type];
     btn.textContent = `${label} · ${counts[type]} ▾`;
     btn.setAttribute('aria-label', `${strings.table.rowType}: ${strings.table.rowTypeAria(label, counts[type])}`);
+}
+
+/** What Scope ▾ shows (spec 084 §9): the list's name and kind; null: the whole tree. */
+export interface ScopeShown {
+    list: { name: string; kind: ListKind } | null;
+    /** Sources: no scope by list (dimmed, says why). */
+    disabled: boolean;
+}
+
+/** The whole tree's glyph in a tight bar: lines of a list. */
+const SCOPE_GLYPH = '<svg class="tv-scope-glyph" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor"'
+    + ' stroke-width="1.6" stroke-linecap="round"><path d="M6 4h8M6 8h8M6 12h8"/><circle cx="2.5" cy="4" r=".6"/><circle cx="2.5" cy="8" r=".6"/><circle cx="2.5" cy="12" r=".6"/></svg>';
+
+/** Scope ▾ for the current row type (spec 084 §9; the phone has it in ⋯). */
+export function updateScope(bar: HTMLElement, shown: ScopeShown): void {
+    const btn = bar.querySelector<HTMLElement>('.tv-scope-btn')!;
+    const t = strings.table;
+    const name = shown.list?.name ?? t.scopeWhole;
+    const key = JSON.stringify(shown);
+    if (btn.dataset.key === key) return;
+    btn.dataset.key = key;
+    btn.classList.toggle('is-list', !!shown.list);
+    // The whole tree: its name, or where the bar is tight (a tablet, a changed view) only a list glyph.
+    btn.innerHTML = (shown.list ? listKindIcon(shown.list.kind, 14) : SCOPE_GLYPH)
+        + `<span class="tv-scope-name">${esc(name)}</span><span class="tv-scope-caret" aria-hidden="true">▾</span>`;
+    btn.setAttribute('aria-label', t.scopeAria(name));
+    if (shown.disabled) {
+        btn.setAttribute('aria-disabled', 'true');
+        btn.title = t.scopeSources;
+    } else {
+        btn.removeAttribute('aria-disabled');
+        btn.title = t.scopeAria(name);
+    }
+}
+
+/**
+ * The steps row 1 takes on a computer and at a tablet's width before it would wrap (⧉ and ⋯ alone on
+ * a second row): 1 the labels Scope and View hidden, the whole tree as a list
+ * glyph; 2 the search, the list's name and the view's name narrower (…);
+ * 3 a list as its kind's icon + ▾ (its name in the title and the label);
+ * 4 the search at 80 px. One class at a time (index.html reads each step as
+ * including the ones before). Measured, not by width thresholds: a changed
+ * view's buttons, a list's name, the language and the font decide what fits.
+ */
+const FIT_STEPS = ['tv-fit-1', 'tv-fit-2', 'tv-fit-3', 'tv-fit-4'] as const;
+
+/** Row 1 on more than one line, or past its edge. */
+function rowWraps(row: HTMLElement): boolean {
+    if (row.scrollWidth > row.clientWidth) return true;
+    let top = Infinity;
+    let bottom = -Infinity;
+    for (const el of row.children) {
+        if ((el as HTMLElement).offsetParent === null) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0) continue;
+        const mid = r.top + r.height / 2;
+        top = Math.min(top, mid);
+        bottom = Math.max(bottom, mid);
+    }
+    return bottom - top >= 8;
+}
+
+/** Keep row 1 on one line on a computer and at a tablet's width: the fewest steps that fit (the phone keeps its own rules). */
+export function fitBarRow(bar: HTMLElement): void {
+    const row = bar.querySelector<HTMLElement>('.tv-bar-row1');
+    if (!row) return;
+    row.classList.remove(...FIT_STEPS);
+    if (isPhoneBar() || row.offsetParent === null) return;
+    let at: string | null = null;
+    for (const step of FIT_STEPS) {
+        if (!rowWraps(row)) return;
+        if (at) row.classList.remove(at);
+        row.classList.add(step);
+        at = step;
+    }
 }
 
 /**
@@ -118,9 +236,12 @@ export function createStatus(): HTMLElement {
     el.className = 'tv-status';
     el.innerHTML = '<span class="tv-status-count" aria-live="polite"></span>'
         + '<span class="tv-status-sort"></span>'
+        + '<span class="tv-status-agent" hidden><svg class="tv-status-agent-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">'
+        + '<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>'
+        + `<span class="tv-status-agent-text" aria-live="polite"></span><button type="button" class="tv-status-agent-show">${esc(strings.table.link.showTemp)}</button></span>`
         + '<span class="tv-status-right">'
         + '<span class="tv-status-res" hidden></span>'
-        + `<span class="tv-status-checks" role="status" hidden><span class="tv-checks-ring" aria-hidden="true">◌</span> ${esc(strings.table.checksRunning)}</span>`
+        + `<span class="tv-status-checks" role="status" hidden>${busySpinHtml(12)}${esc(strings.table.checksRunning)}</span>`
         + `<span class="tv-status-ro" title="${esc(strings.table.readOnly)}" hidden><span class="tv-ro-long">${esc(strings.table.readOnly)}</span>`
         + `<span class="tv-ro-short">${esc(strings.table.readOnlyShort)}</span></span>`
         + `<button type="button" class="tv-legend-btn" aria-haspopup="dialog">${esc(strings.table.legend)} ⓘ</button>`
@@ -132,11 +253,37 @@ export function createStatus(): HTMLElement {
  * The count, the sort, (§13i) "Checks are running…" while the tree's
  * findings are computed and (§13j) the read-only sentence.
  */
-export function updateStatus(el: HTMLElement, type: RowType, shown: number, total: number, sort: readonly SortSpec[], checking = false, readOnly = false): void {
+export function updateStatus(
+    el: HTMLElement, type: RowType, shown: number, total: number, sort: readonly SortSpec[], checking = false, readOnly = false,
+    groups: { n: number; distinct: number | null } | null = null,
+): void {
     el.querySelector<HTMLElement>('.tv-status-ro')!.hidden = !readOnly;
-    el.querySelector('.tv-status-count')!.textContent = countText(type, shown, total);
+    // Grouped (spec 084 §10): "40 of 100 people · 12 groups"; "40 different people · 12 groups" when a person is in several.
+    const count = groups?.distinct != null ? strings.table.distinct(groups.distinct) : countText(type, shown, total);
+    el.querySelector('.tv-status-count')!.textContent = groups ? `${count} · ${strings.table.groupsN(groups.n)}` : count;
     el.querySelector('.tv-status-sort')!.textContent = sortText(type, sort);
     el.querySelector<HTMLElement>('.tv-status-checks')!.hidden = !checking;
+}
+
+/**
+ * Another window following the agent (spec 097 §5, dotaz 6): "◎ The agent's
+ * row is hidden by the filter · Show for now" after the sort while the
+ * agent's person (`person`) is hidden; null: none. The sentence is written
+ * (and so said) once per person of the agent.
+ */
+export function updateAgentNote(el: HTMLElement, person: string | null): void {
+    const note = el.querySelector<HTMLElement>('.tv-status-agent')!;
+    const text = note.querySelector<HTMLElement>('.tv-status-agent-text')!;
+    note.hidden = !person;
+    if (!person) {
+        delete note.dataset.person;
+        text.textContent = '';
+        return;
+    }
+    if (note.dataset.person === person) return;
+    note.dataset.person = person;
+    text.textContent = strings.table.agentRowHidden;
+    note.title = strings.table.agentRowHidden;
 }
 
 /**

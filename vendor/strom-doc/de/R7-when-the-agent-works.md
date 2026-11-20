@@ -296,14 +296,30 @@ Ein Agent, der nicht bei seinem Abonnement angemeldet ist, führt keine Sitzung 
 nicht angemeldet – einmal … starten und anmelden**.
 
 - **Grenzen:**
-  - vor der ersten Sitzung prüft strom das nur bei Claude Code mit einem eigenen Ordner (`agent.claudeConfigDir` oder
-    `CLAUDE_CONFIG_DIR`, ein anderer als `~/.claude`). Der Lauf endet dann ohne Sitzung und ohne Frage an die
-    Bedingung;
+  - vor der ersten Sitzung prüft strom das bei Claude Code: bis Forschung 1.33.0 nur mit einem eigenen Ordner
+    (`agent.claudeConfigDir` oder `CLAUDE_CONFIG_DIR`, ein anderer als `~/.claude`), seit 1.34.0 auch mit dem
+    Standardordner. Der Lauf endet dann ohne Sitzung und ohne Frage an die Bedingung;
   - sonst erkennt es die Bedingung `claude-usage` (sie hält an; bei einem Lauf von Hand kommt **Trotzdem starten?**,
     [R7.4.1](#R7.4.1)), oder eine Sitzung, die mit einem Fehler der Anmeldung endet.
 - **Gilt seit:** Forschung 1.25.2; das Anhalten nach einer Sitzung mit einem Fehler der Anmeldung seit 1.0.0
+- **Ab Forschung 1.34.0:** Claude Code im Terminal, das strom selbst startet (selbstständiges Arbeiten, die Leser von
+  Scans und Dokumenten, [R8.3](R8-reading-scans.md#R8.3)), hat eine eigene Anmeldung, nicht die der Claude-App. Wenn
+  `claude auth status` sagt, dass es nicht angemeldet ist:
+  - `strom read` und das übrige Lesen durch Leser (Ausschnitte, Abschriften, ein Dokument aus der App) starten keinen
+    Leser und enden sofort: **Claude Code im Terminal ist nicht angemeldet – … startet es selbst (nicht die
+    Claude-App, die ihre eigene Anmeldung hat)**, mit dem Hinweis **einmal im Terminal anmelden: …, dann /login**;
+  - ein Leser, der mit einem Fehler der Anmeldung endet, sagt das mit der Anleitung zur Anmeldung, im Verlauf und in
+    der Zusammenfassung, nie nur „auth“;
+  - `strom doctor` hat eine eigene Zeile **Anmeldung Claude Code**: **Claude Code im Terminal angemeldet** oder die
+    Warnung **Claude Code im Terminal ist nicht angemeldet – …** mit der Behebung **… im Terminal, dann /login**. In
+    einem Strom-Archiv wird die Anmeldung weder geprüft noch gesagt.
 
-<!-- zdroj: research:src/commands/session.ts:916 loggedOut, :1260-1264 auth · src/core/claudedir.ts claudeConfigSet :33, forClaude, claudeLoggedIn :91 · gate.ts:253-258 loggedIn · CHANGELOG.cs.md 1.25.2 -->
+  Eine Antwort, aus der die Anmeldung nicht hervorgeht, entscheidet nichts. Terminal: `claude`, dann `/login`;
+  `strom doctor`.
+- **Ab Forschung 1.35.0:** eine Anmeldeprüfung, die nicht innerhalb von 5 s antwortet, entscheidet nichts und beendet
+  alles, was sie gestartet hat, auch unter Windows, wo das Programm des Agenten früher weiterlaufen konnte.
+
+<!-- zdroj: research:src/commands/session.ts:916 loggedOut, :1260-1264 auth · src/core/claudedir.ts claudeConfigSet :33, forClaude, claudeLoggedIn :91 · gate.ts:253-258 loggedIn · CHANGELOG.cs.md 1.25.2 · 1.34.0 (K040): src/core/agentcli.ts requireClaudeLogin, agentLoggedOut (agent.logged-out) · src/commands/readers.ts refuseReadersLoggedOut, readerAuthSaid · src/commands/read.ts · src/commands/session.ts loggedOut bez claudeConfigSet · src/commands/setup.ts doctor login (ne v archivu) · assets/lang/*.json ui.read.auth, ui.doc.login*, ui.error.agent.logged-out* · CHANGELOG 1.34.0 · 1.35.0: research:bb79ee54 src/core/claudedir.ts AUTH_STATUS_MS 5000, claudeLoggedIn přes src/core/runsync.ts runSync (win32 taskkill /T /F, jinde skupina procesů) · CHANGELOG.cs.md 1.35.0 „Windows: po kontrole přihlášení nic neběží dál“ -->
 
 <a id="R7.8"></a>
 ## R7.8 Strom-Archiv: eine Forschung, an der kein Agent arbeitet
@@ -344,18 +360,22 @@ Eine Forschung, deren Agent auf diesem Computer nicht ist (nicht installiert, od
 anderen Computer übertragen), wartet auf ihn. Bis dahin verhält sie sich wie ein Strom-Archiv.
 
 - **Prüft der Code:**
-  - was die App sendet, wird wie im Archiv erfasst; für den Agenten entsteht nichts, und die Arbeit des Agenten wird
+  - was die App sendet, wird wie im Archiv erfasst; der Agent bekommt nichts, und die Arbeit des Agenten wird
     mit einem Satz abgelehnt, dass die Forschung auf einen Agenten wartet und wo er installiert oder ein anderer
     gewählt wird;
-  - der gespeicherte Modus ändert sich nicht, und die Aufgaben werden nicht zurückgestellt. Nach der Installation des
+  - der gespeicherte Modus ändert sich nicht, und die Aufgaben, die die Forschung hatte, werden nicht zurückgestellt. Nach der Installation des
     Agenten macht die Forschung von selbst mit den Aufgaben weiter, die sie hatte;
   - ein Agent, der gerade in der Forschung arbeitet (auch ein anderer als der eingestellte), macht sie zur Forschung.
 - **Warum:** ein Archiv ist die Wahl des Menschen, und strom erfasst sie nicht für ihn. Eine Forschung ohne Agenten
   verhält sich nur wie ein Archiv, deshalb macht sie nach der Installation des Agenten von selbst mit den Aufgaben
-  weiter, die sie hatte; keine ist zurückgestellt.
+  weiter, die sie hatte.
 - **Bedienung:** Terminal: Menü, erster Punkt (**Nur als Strom-Archiv behalten: die Daten aus der Strom-App
   speichern** oder die Installation des Agenten); `strom mode` zeigt den Zustand. Die App zeigt eine solche Forschung
   als **Archiv** ([S1.3](S1-connecting-app-and-research.md#S1.3)).
-- **Gilt seit:** Forschung 1.15.0
+- **Gilt seit:** Forschung 1.15.0; 1.35.0: neue Aufgaben zurückgestellt
+- **Ab Forschung 1.35.0:** eine Aufgabe, die inzwischen kommt (zu gesendetem Material, ein Scan zum Lesen), entsteht
+  zurückgestellt wie im Archiv. In die Warteschlange kehrt sie zurück, sobald ein Agent an der Forschung zu arbeiten
+  beginnt (Beginn einer Sitzung, `strom run`, Chat; auch ein anderer als der eingestellte), oder wenn der eingestellte
+  Agent wieder auf dem Computer ist.
 
-<!-- zdroj: research:src/core/state.ts (hlavička, stateOf, actsAsArchive, kindOf, refuseInArchive agent.missing) · cs.json ui.mode.is.waiting, ui.waiting.refuse, ui.menu.keeparchive · CHANGELOG 1.15.0 -->
+<!-- zdroj: research:src/core/state.ts (hlavička, stateOf, actsAsArchive, kindOf, refuseInArchive agent.missing) · cs.json ui.mode.is.waiting, ui.waiting.refuse, ui.menu.keeparchive · CHANGELOG 1.15.0 · 1.35.0: research:31def74a src/core/state.ts heldWhereNobody (parked, heldBy archive, waiting.held), settleWaiting (atWork: session start, run, chat; jinak stateOf research) · src/core/records.ts create · CHANGELOG.cs.md 1.35.0 „Rodinný materiál … odložený, dokud tu agent není“ -->

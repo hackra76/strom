@@ -14,6 +14,7 @@
 
 import {
     cleanText, isResearchHead, researchPersonRef, researchSchemeUrl, withAppVersion, type ResearchExperiment, type ResearchHypothesesDecide,
+    sanitizeBooksSettings, type LiveBooksSettings,
 } from './research-link.js';
 import { writeHeldOfRefusal, type ResearchWriteHeld } from './research-write-held.js';
 import { READ_TASK_NAMES, READ_TASK_SETTING_PATH, readTaskSettingBody, sanitizeTaskSetting, type ReadTaskSetting } from './research-read-task.js';
@@ -24,8 +25,8 @@ import {
     type HistoryPayload, type HistoryPlaceRegion,
 } from './history.js';
 
-/** How long a read of the events may take (a large tree: up to 8 MB). */
-export const HISTORY_READ_TIMEOUT_MS = 20_000;
+/** How long a read of the events may take (§10.3 of the waiting buttons: 15 s, a large tree's 8 MB included). */
+export const HISTORY_READ_TIMEOUT_MS = 15_000;
 /** How long a write may take (the research commits it). */
 export const HISTORY_WRITE_TIMEOUT_MS = 15_000;
 
@@ -43,10 +44,15 @@ function bridgeCode(body: unknown): string {
     return typeof r?.code === 'string' && /^[a-z0-9.-]{1,40}$/.test(r.code) ? r.code : '';
 }
 
-async function request(url: string, init: RequestInit, timeoutMs: number): Promise<{ status: number; text: string } | null> {
+/** What `request` gives when its time ran out (no answer within the limit: the result is not known). */
+const TIMED_OUT = '\u0000timeout';
+
+/** `timed`: the limit's end is told apart (TIMED_OUT), else it is no answer (null) as a network failure. */
+async function request(url: string, init: RequestInit, timeoutMs: number, timed = false): Promise<{ status: number; text: string } | null> {
     if (typeof fetch !== 'function') return null;
     const ctl = typeof AbortController === 'function' ? new AbortController() : null;
-    const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : null;
+    let late = false;
+    const timer = ctl ? setTimeout(() => { late = true; ctl.abort(); }, timeoutMs) : null;
     try {
         const res = await fetch(withAppVersion(url), {
             mode: 'cors', credentials: 'omit', cache: 'no-store', ...init, signal: ctl?.signal,
@@ -58,7 +64,7 @@ async function request(url: string, init: RequestInit, timeoutMs: number): Promi
         }
         return { status: res.status, text: await res.text() };
     } catch {
-        return null;
+        return late && timed ? { status: 0, text: TIMED_OUT } : null;
     } finally {
         if (timer) clearTimeout(timer);
     }
@@ -72,11 +78,15 @@ function jsonOf(text: string): unknown {
 
 export type HistoryReadResult =
     | { ok: true; payload: HistoryPayload }
-    /** network: no answer; too-big: over 8 MB (the cache stays); invalid: not a reply the app reads; refused: any other status. */
-    | { ok: false; code: 'network' | 'too-big' | 'invalid' | 'refused'; status: number };
+    /**
+     * network: the bridge not reached; timeout: no answer within the limit; too-big: over 8 MB (the cache stays);
+     * invalid: not a reply the app reads; refused: any other status.
+     */
+    | { ok: false; code: 'network' | 'timeout' | 'too-big' | 'invalid' | 'refused'; status: number };
 
 /** The reply to `GET /history`, typed. `rev`: `/status.history.rev` the read was made for. */
 export function historyReadReply(status: number, text: string, cachedAt: string, rev?: string): HistoryReadResult {
+    if (text === TIMED_OUT) return { ok: false, code: 'timeout', status };
     if (text === '\u0000too-big') return { ok: false, code: 'too-big', status };
     if (status < 200 || status >= 300) return { ok: false, code: 'refused', status };
     if (text.length > HISTORY_LIMITS.bytes || new TextEncoder().encode(text).length > HISTORY_LIMITS.bytes) {
@@ -88,7 +98,7 @@ export function historyReadReply(status: number, text: string, cachedAt: string,
 
 /** Read the events of the time (`base`: the bridge's address with its token). */
 export async function fetchBridgeHistory(base: string, opts: { rev?: string; timeoutMs?: number; now?: () => Date } = {}): Promise<HistoryReadResult> {
-    const res = await request(`${base}/history`, { method: 'GET' }, opts.timeoutMs ?? HISTORY_READ_TIMEOUT_MS);
+    const res = await request(`${base}/history`, { method: 'GET' }, opts.timeoutMs ?? HISTORY_READ_TIMEOUT_MS, true);
     if (!res) return { ok: false, code: 'network', status: 0 };
     return historyReadReply(res.status, res.text, (opts.now?.() ?? new Date()).toISOString(), opts.rev);
 }
@@ -250,7 +260,7 @@ export async function postBridgeExperimentsOff(base: string, features: readonly 
  * - `held`: sealed elsewhere / not downloaded / disk full; `busy`: 503 research.busy (or 409 busy);
  * - `network`: no answer; `unknown`: anything else (an older bridge).
  */
-export type HistoryWriteError = 'invalid' | 'gone' | 'off' | 'archive' | 'done' | 'retracted' | 'skipped' | 'link' | 'held' | 'busy' | 'network' | 'unknown';
+export type HistoryWriteError = 'invalid' | 'gone' | 'off' | 'archive' | 'done' | 'retracted' | 'skipped' | 'link' | 'held' | 'busy' | 'network' | 'timeout' | 'unknown';
 
 export interface HistoryWriteRefusal {
     ok: false;
@@ -330,9 +340,16 @@ function headsOf(body: unknown): { head: string; parent: string } {
 }
 
 async function postWrite(base: string, path: string, body: unknown, timeoutMs?: number): Promise<{ status: number; body: unknown } | null> {
+    const res = await postWriteTimed(base, path, body, timeoutMs);
+    return res === 'timeout' ? null : res;
+}
+
+/** A write that tells the limit apart (`timeout`: no answer within it, the write may have gone through). */
+async function postWriteTimed(base: string, path: string, body: unknown, timeoutMs?: number): Promise<{ status: number; body: unknown } | null | 'timeout'> {
     const res = await request(`${base}${path}`, {
         method: 'POST', headers: { 'Content-Type': 'text/plain; charset=utf-8' }, body: JSON.stringify(body),
-    }, timeoutMs ?? HISTORY_WRITE_TIMEOUT_MS);
+    }, timeoutMs ?? HISTORY_WRITE_TIMEOUT_MS, true);
+    if (res?.text === TIMED_OUT) return 'timeout';
     return res ? { status: res.status, body: jsonOf(res.text) } : null;
 }
 
@@ -500,7 +517,8 @@ export async function postBridgeMap(base: string, body: HistoryMapBody, features
         const note = body.note !== undefined ? historyMapNote(body.note) : '';
         send = { place: body.place, redo: true, ...(note ? { note } : {}) };
     }
-    const res = await postWrite(base, '/history/map', send);
+    const res = await postWriteTimed(base, '/history/map', send);
+    if (res === 'timeout') return { ...NETWORK, code: 'timeout' };
     return res ? mapReply(res.status, res.body, features) : NETWORK;
 }
 
@@ -642,6 +660,49 @@ export async function postBridgeReadTask(base: string, value: ReadTaskSetting, f
     return res ? readTaskSettingReply(res.status, res.body, features) : { ok: false, code: 'network', status: 0, reason: '', bridgeCode: '' };
 }
 
+// ==================== BOOKS (spec 105 §4) ====================
+
+/** One setting of the books written at once: a number of tasks, the downloaded book first, or back to the default. */
+export type BooksSettingBody = { minTasks: number | 'default' } | { sameBook: 'yes' | 'no' | 'default' };
+
+/**
+ * Why `POST /books` did not go: `archive` 409 directions.archive (the tree became an archive); `invalid` 400
+ * books.body; `busy` 503 research.busy; `locked` 423; `held` sealed elsewhere / not downloaded / disk full;
+ * `full` 507 without the feature of a held write; `network` no answer; `unknown` anything else (500 books.failed).
+ */
+export type BooksSettingError = 'archive' | 'invalid' | 'busy' | 'locked' | 'held' | 'full' | 'network' | 'unknown';
+
+export type BooksSettingResult =
+    | { ok: true; settings?: LiveBooksSettings }
+    | { ok: false; code: BooksSettingError; status: number; reason: string; bridgeCode: string; held?: ResearchWriteHeld };
+
+/** The reply to `POST /books`, typed: the settings the research keeps now. */
+export function booksSettingReply(status: number, body: unknown, features: readonly string[] | null | undefined): BooksSettingResult {
+    const r = asRecord(body) ?? {};
+    if (status >= 200 && status < 300) {
+        const settings = sanitizeBooksSettings(asRecord(r.books)?.settings);
+        return { ok: true, ...(settings ? { settings } : {}) };
+    }
+    const reason = bridgeSentence(body);
+    const code = typeof r.code === 'string' && /^[A-Za-z0-9.-]{1,40}$/.test(r.code) ? r.code : '';
+    const out = (c: BooksSettingError, extra: { held?: ResearchWriteHeld } = {}): BooksSettingResult =>
+        ({ ok: false, code: c, status, reason, bridgeCode: code, ...extra });
+    const held = writeHeldOfRefusal(code, r.error, features, r.params);
+    if (held) return out('held', { held });
+    if (status === 400) return out('invalid');
+    if (status === 409 && (code === 'directions.archive' || code === 'books.archive')) return out('archive');
+    if (status === 503 || code === 'research.busy' || code === 'busy') return out('busy');
+    if (status === 423 || code === 'locked') return out('locked');
+    if (status === 507 || code === 'disk.full') return out('full');
+    return out('unknown');
+}
+
+/** A setting of the books (`POST <token>/books`), written at once; the reply carries the settings kept now. */
+export async function postBridgeBooks(base: string, body: BooksSettingBody, features: readonly string[] | null | undefined): Promise<BooksSettingResult> {
+    const res = await postWrite(base, '/books', body);
+    return res ? booksSettingReply(res.status, res.body, features) : { ok: false, code: 'network', status: 0, reason: '', bridgeCode: '' };
+}
+
 // ==================== KINDS OF EVENTS (spec 035) ====================
 
 /** Whose value `POST /history/kinds` writes: this research's own (`tree`) or the default of the computer's researches. */
@@ -667,7 +728,7 @@ export interface HistoryKindsState {
  * - `archive`: 409 history.archive; `busy`: 503 research.busy; `held`: sealed elsewhere / not downloaded / disk full;
  * - `failed`: 500 history.kinds.failed / history.align.failed; `network`: no answer; `unknown`: anything else.
  */
-export type HistoryKindsError = 'link' | 'changed' | 'invalid' | 'gone' | 'undone' | 'archive' | 'busy' | 'held' | 'failed' | 'network' | 'unknown';
+export type HistoryKindsError = 'link' | 'changed' | 'invalid' | 'gone' | 'undone' | 'archive' | 'busy' | 'held' | 'failed' | 'network' | 'timeout' | 'unknown';
 
 export interface HistoryKindsRefusal {
     ok: false;
@@ -788,7 +849,8 @@ export async function postHistoryKinds(base: string, body: HistoryKindsBody, fea
     const send = 'inherit' in body
         ? { scope: 'tree', inherit: true }
         : { kinds: HISTORY_KINDS.filter(k => body.kinds.includes(k)), scope: body.scope };
-    const res = await postWrite(base, '/history/kinds', send);
+    const res = await postWriteTimed(base, '/history/kinds', send);
+    if (res === 'timeout') return { ...KINDS_NETWORK, code: 'timeout' };
     return res ? historyKindsReply(res.status, res.body, features, body, check) : KINDS_NETWORK;
 }
 

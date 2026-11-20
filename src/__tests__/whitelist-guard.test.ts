@@ -71,11 +71,9 @@ function fullTree(): Required<StromData> {
         version: STROM_DATA_VERSION,
         persons: {
             // Alice holds the full page the source excerpt was cut from.
-            [ALICE]: { ...person(ALICE, 'Alice'), attachments: [{
-                id: 'att1', name: 'page-57.jpg', mimeType: 'image/jpeg',
-                dataUrl: 'data:image/jpeg;base64,AA==', sizeBytes: 1,
-                original: { sha256: 'b'.repeat(64), name: 'page-57.tif', mimeType: 'image/tiff', bytes: 148_000_000, orientation: 6 },
-            }], importId: 'I1', importedValues: { firstName: { from: 'I1', value: 'Alice' } },
+            [ALICE]: { ...person(ALICE, 'Alice'), importId: 'I1', importedValues: { firstName: { from: 'I1', value: 'Alice' } }, addedAt: '2026-11-01T08:30:00.000Z',
+            // Her portrait cut from that page, turned and straightened (spec 107, data v23).
+            photo: 'data:image/jpeg;base64,AA==', photoSource: { attachmentId: 'att1', region: { x: 0.2, y: 0.1, w: 0.3, h: 0.3 }, quarterTurns: 1, angle: 3.5 },
             // One census of both (spec 085, data v20; its main citation, spec 095, v21): the share, a role of one's own, a godparent's own
             // record of a part at a baptism, a participant once rejected as Bob.
             events: [
@@ -89,7 +87,18 @@ function fullTree(): Required<StromData> {
                 { id: 'ev_bapt_b', type: 'baptism', date: '1909-03-14' },
             ] },
         },
-        partnerships: { [UNION]: { ...partnership(), importId: 'I1' } },
+        // The tree's files (data v24, spec 102): Alice's page, a document of the source too.
+        media: {
+            att1: {
+                id: 'att1', name: 'page-57.jpg', mimeType: 'image/jpeg',
+                dataUrl: 'data:image/jpeg;base64,AA==', sizeBytes: 1,
+                original: { sha256: 'b'.repeat(64), name: 'page-57.tif', mimeType: 'image/tiff', bytes: 148_000_000, orientation: 6 },
+                title: 'Page 57', kind: 'record', addedAt: '2026-11-01T08:31:00.000Z',
+                places: [{ personId: ALICE }, { sourceId: 's1' }],
+            },
+        },
+        // The couple's photo (spec 107, data v23).
+        partnerships: { [UNION]: { ...partnership(), importId: 'I1', photo: 'data:image/png;base64,iVBORw0KGgo=', photoOriginalName: 'wedding.png', photoDate: '1924-06-14' } },
         sources: {
             s1: {
                 id: 's1', title: 'Parish register, Kolín', quality: 3,
@@ -123,8 +132,15 @@ function fullTree(): Required<StromData> {
         tableViews: [{
             id: 'tv-1', name: 'Births 1840–1870', rowType: 'persons', columns: [{ id: 'name', width: 240 }, { id: 'bDate' }], pinned: 1,
             collapsedGroups: ['birth'], coverageRow: false, filter: { op: 'and', items: [{ chip: 'deceased' }] },
-            sort: [{ col: 'bDate', dir: -1 }], unions: { collapsed: true, except: [ALICE] }, updated: '2026-11-10T09:00:00.000Z',
+            sort: [{ col: 'bDate', dir: -1 }], unions: { collapsed: true, except: [ALICE] },
+            scope: { listId: 'pl-1' }, group: { by: 'rod', collapsed: ['r1'] }, updated: '2026-11-10T09:00:00.000Z',
         }],
+        // Lists of people (spec 084, data v22): a fixed checklist with its rule of origin, the ready-made one deleted.
+        personLists: [{
+            id: 'pl-1', name: 'Archive request', dynamic: false, rule: { kind: 'ancestors', personId: ALICE, generations: 3, personName: 'Alice' },
+            personIds: [ALICE], removed: [BOB], sort: 'manual', checklist: true, done: [ALICE], updated: '2026-11-12T10:00:00.000Z',
+        }],
+        personListsDropped: ['added30'],
         researchAsOf: '2026-09-20',
         researchDirections: {
             complete: true,
@@ -331,7 +347,7 @@ type EditedByUpdatePerson =
     | 'firstName' | 'lastName' | 'titleBefore' | 'titleAfter' | 'marriedSurname' | 'primaryName' | 'dismissedMarriedSuggestion' | 'gender' | 'nameVariants'
     | 'birthDate' | 'birthPlace' | 'birthAddress' | 'deathDate' | 'deathPlace'
     | 'deathCause' | 'deathAge' | 'deathAddress'
-    | 'notes' | 'refn' | 'question' | 'isDeceased' | 'isLocked' | 'photo' | 'story';
+    | 'notes' | 'refn' | 'question' | 'isDeceased' | 'isLocked' | 'photo' | 'photoSource' | 'story';
 
 /**
  * Fields updatePerson deliberately does NOT touch, and who owns them instead.
@@ -349,7 +365,6 @@ type OwnedElsewhere =
     | 'sourceIds'           // citePerson / uncitePerson
     | 'birthSourceIds'      // citePerson / uncitePerson with the birth
     | 'deathSourceIds'      // citePerson / uncitePerson with the death
-    | 'attachments'         // addAttachment / removeAttachment
     | 'photoOriginalName'   // set with the photo itself (import / upload)
     | 'photoDate'           // GEDCOM import only (G8): the portrait's date from the file, dropped with a new photo
     | 'refnType'            // GEDCOM import only; updatePerson drops it with a changed refn
@@ -369,7 +384,8 @@ type OwnedElsewhere =
     | 'citationMain'        // setCitationMain (spec 095): the main citation of the birth / death; follows its list (merge, removal)
     | 'researchOrigins'     // written by Strom Research only (GEDCOM import), never edited
     | 'confirmed'           // confirmFact / unconfirmFact (spec 065); a changed value ends it by itself
-    | 'researchVerify';     // written by Strom Research only (GEDCOM import, spec 065), never edited
+    | 'researchVerify'      // written by Strom Research only (GEDCOM import, spec 065), never edited
+    | 'addedAt';            // written when the person comes into the tree (spec 084 §8), never edited
 
 /**
  * Compile-time proof that the two lists together cover Person exactly. Add a
@@ -432,6 +448,8 @@ describe('updatePerson applies every field it owns', () => {
         isDeceased: true,
         isLocked: true,
         photo: 'data:image/png;base64,iVBORw0KGgo=',
+        // Saved with the portrait from the crop editor (spec 107); its original is the person's attachment (given below).
+        photoSource: { attachmentId: 'att-src', region: { x: 0.1, y: 0, w: 0.5, h: 1 }, angle: -2.5, mirror: true },
         story: {
             kind: 'vypraveni',
             title: 'Včelařka z Kolína',
@@ -444,8 +462,19 @@ describe('updatePerson applies every field it owns', () => {
 
     const { isLocked: _lock, ...editable } = edits;
 
-    it('writes back every one of them', () => {
+    /** A new person holding the image photoSource above names as its original. */
+    function createWithOriginal(): Person {
         const created = DataManager.createPerson({ firstName: 'Jan', lastName: 'Novak', gender: 'male' });
+        const att = DataManager.addAttachment(created.id, { name: 'studio.jpg', mimeType: 'image/png', dataUrl: 'data:image/png;base64,iVBORw0KGgo=', sizeBytes: 8 })!;
+        // The record under the id photoSource names (StromData.media is keyed by it).
+        const media = DataManager.getData().media!;
+        delete media[att.id];
+        media['att-src'] = { ...att, id: 'att-src' };
+        return created;
+    }
+
+    it('writes back every one of them', () => {
+        const created = createWithOriginal();
         DataManager.updatePerson(created.id, editable);
 
         const saved = DataManager.getPerson(created.id);
@@ -462,7 +491,7 @@ describe('updatePerson applies every field it owns', () => {
     });
 
     it('survives a load with all of them intact', () => {
-        const created = DataManager.createPerson({ firstName: 'Jan', lastName: 'Novak', gender: 'male' });
+        const created = createWithOriginal();
         DataManager.updatePerson(created.id, editable);
 
         // The two whitelists in one go: edited, then carried through a load.

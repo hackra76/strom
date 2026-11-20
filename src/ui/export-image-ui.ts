@@ -15,9 +15,10 @@ import { buildFanModel, buildFanPosterSvg, fanPosterGeometry } from '../fan-char
 import { computeTimelineModel } from '../timeline.js';
 import { buildTimelinePosterSvg, timelinePosterGeometry } from '../timeline-chart.js';
 import { uiModule } from './module.js';
+import { runBusy, activatedElement, nextPaint } from './busy.js';
 import { LayoutConfig, StromData, TreeSpacing, ViewMode, layoutConfigFor, personCardHeight } from '../types.js';
 import { applyLivingPrivacy, PrivacyMode, presumedDeceasedSet } from '../privacy.js';
-import { classifyBranches } from '../branch-colors.js';
+import { classifyBranches, BranchSet } from '../branch-colors.js';
 import { computeIndirectIds } from '../indirect.js';
 import { SettingsManager } from '../settings.js';
 import { safeFileName } from '../filenames.js';
@@ -130,9 +131,10 @@ export function treeCardDrawing(data: StromData, layout: ReturnType<typeof TreeR
 } {
     const mode = TreeRenderer.getViewMode();
     const focusId = TreeRenderer.getFocusPersonId();
-    const branchMap = (SettingsManager.isBranchColorsEnabled() && focusId)
-        ? classifyBranches(data, focusId) as unknown as Map<string, string>
-        : null;
+    // The lineage markers as on screen (spec 112): the chosen shape and tint, both lines (R4), 1 and 2 (R5).
+    const branchMarker = SettingsManager.getBranchMarker();
+    const branches = (SettingsManager.isBranchMarkingOn() && focusId) ? classifyBranches(data, focusId) : null;
+    const branchMap = branches ? new Map<string, BranchSet>([...branches.map].map(([id, set]) => [id as string, set])) : null;
     // Draw parity: the descendants / family views dim context-only people on
     // screen (opacity 0.5). Reuse the SAME membership rule so the image dims
     // exactly that set instead of printing everyone at full strength.
@@ -173,6 +175,7 @@ export function treeCardDrawing(data: StromData, layout: ReturnType<typeof TreeR
         // the Compact card shortens it with "…" where the screen does (1110).
         ...(density === 'normal' || density === 'compact' ? { measureCardTexts } : {}),
         branchMap,
+        ...(branches ? { branchMarker, branchTint: SettingsManager.isBranchTintOn(), branchNumbered: branches.numbered } : {}),
         deceasedSet,
         ...(dimmedIds ? { dimmedIds } : {}),
         // The photo on the card as the screen draws it (spec 096 P2): its size, shape and who was laid out with one.
@@ -184,7 +187,8 @@ export function treeCardDrawing(data: StromData, layout: ReturnType<typeof TreeR
         // The faces the cards are drawn in: the serif always, the lines' sans for the custom card.
         // A view with marriage-order pills brings their sans (600) too.
         fontFaceCss: appFontFaceCss(custom ? [...POSTER_SERIF_FACES, ...POSTER_LINE_FACES]
-            : unionOrderBadges(data, layout).size > 0 ? [...POSTER_SERIF_FACES, PILL_FACE] : POSTER_SERIF_FACES),
+            // The letter tag of the lineage markers (spec 112) is in the sans too.
+            : unionOrderBadges(data, layout).size > 0 || (branches && branchMarker === 'tag') ? [...POSTER_SERIF_FACES, PILL_FACE] : POSTER_SERIF_FACES),
         ...(custom ? {
             cardLines: cardLinesMap,
             cardDateColumn: TreeRenderer.getPosterCardMetrics(spacing)?.dateColumn ?? 0,
@@ -301,6 +305,21 @@ function posterPaper(): { format: string; orientation: string } {
     };
 }
 
+/** From this many cards the poster's button says its state at once (building it takes longer than 120 ms). */
+export const POSTER_SHOWN_AT_ONCE = 1500;
+
+/**
+ * A poster built under the working state of the button that asked for it (§8), "Saving the file…": painted before
+ * the build, at once for a large view (the page cannot paint while it builds). Without a button: built at once.
+ */
+async function posterBusy(work: () => void | Promise<void>): Promise<void> {
+    const el = activatedElement();
+    if (!el) { await work(); return; }
+    const cards = TreeRenderer.getPosterLayout({ includeView: true }).positions.size;
+    await runBusy(el, async () => { await nextPaint(); await work(); },
+        { heavy: cards >= POSTER_SHOWN_AT_ONCE ? 'now' : true, label: strings.busy.savingFile });
+}
+
 function buildCurrentPoster(): PosterBuild | null {
     const mode = TreeRenderer.getViewMode();
     if (mode === 'map' || mode === 'table') return null; // not printable
@@ -318,12 +337,17 @@ function buildCurrentPoster(): PosterBuild | null {
         // Poster rasterises to PNG without a CSS context, so var(--male/--female)
         // cannot resolve — read the concrete token values now (light fallback).
         const rootStyle = getComputedStyle(document.documentElement);
+        // The lineage signs before the names as on screen (spec 112 §3), in the light theme's P2 hex.
+        const marker = SettingsManager.getBranchMarker();
+        const timelineFocus = TreeRenderer.getFocusPersonId();
+        const signs = marker !== 'none' && timelineFocus ? classifyBranches(data, timelineFocus) : null;
         const svg = buildTimelinePosterSvg(model, {
             esc: escapeXml,
             focusId: TreeRenderer.getFocusPersonId(),
             maleColor: rootStyle.getPropertyValue('--male').trim() || '#5b7f9e',
             femaleColor: rootStyle.getPropertyValue('--female').trim() || '#a1706e',
             unknownColor: rootStyle.getPropertyValue('--unknown').trim() || '#857d6c',
+            branches: signs ? { marker, numbered: signs.numbered, lines: signs.map as ReadonlyMap<string, BranchSet> } : null,
         }, meta);
         const geom = timelinePosterGeometry(model, meta);
         return { svg, widthPx: geom.width, heightPx: geom.height, hasContent: geom.hasContent };
@@ -340,7 +364,17 @@ function buildCurrentPoster(): PosterBuild | null {
         });
         if (!model) return null;
         const colorMode = TreeRenderer.getFanColorMode();
+        // The family lines in the colours the view shows (spec 114 §7), not assigned anew.
+        const view = TreeRenderer.getFanView();
+        const shown = view?.getModel();
+        const rodColors = colorMode === 'rod' && shown && shown.focus.id === focusId && shown.shape === model.shape
+            && shown.generations === model.generations && shown.descGenerations === model.descGenerations
+            ? view?.getRodAssignment() ?? null : null;
+        // A highlighted family line prints as it is seen (spec 114 §7).
+        const highlight = view?.getPrintHighlight() ?? null;
         const svg = buildFanPosterSvg(model, {
+            ...(rodColors ? { rodColors } : {}),
+            ...(highlight ? { highlight } : {}),
             esc: escapeXml,
             editable: false,
             addParentLabel: '',
@@ -349,7 +383,7 @@ function buildCurrentPoster(): PosterBuild | null {
             mmPerPx: MM_PER_PX,
             fontFaceCss: appFontFaceCss([...POSTER_SERIF_FACES, ...POSTER_LINE_FACES]),
         }, meta);
-        const geom = fanPosterGeometry(model, meta, { colorMode });
+        const geom = fanPosterGeometry(model, meta, { colorMode, ...(rodColors ? { rodColors } : {}), ...(highlight ? { highlight } : {}) });
         return { svg, widthPx: geom.width, heightPx: geom.height, hasContent: geom.hasContent };
     }
 
@@ -458,69 +492,73 @@ export const exportImageMethods = uiModule({
         this.clearDialogStack();
     },
 
-    /** Download the current view as a self-contained SVG. */
-    exportPosterSvg(): void {
-        const poster = buildCurrentPoster();
-        if (!poster) {
-            this.showAlert(strings.poster.empty, 'warning');
-            return;
-        }
-        downloadBlob(poster.svg, 'image/svg+xml', posterFilename('svg'));
-        this.closePosterDialog();
+    /** Download the current view as a self-contained SVG (built under its button's working state, §8). */
+    exportPosterSvg(): Promise<void> {
+        return posterBusy(() => {
+            const poster = buildCurrentPoster();
+            if (!poster) {
+                this.showAlert(strings.poster.empty, 'warning');
+                return;
+            }
+            downloadBlob(poster.svg, 'image/svg+xml', posterFilename('svg'));
+            this.closePosterDialog();
+        });
     },
 
-    /** Rasterize the current view to a 2x PNG (clamped to the canvas limit). */
-    async exportPosterPng(): Promise<void> {
-        const poster = buildCurrentPoster();
-        if (!poster) {
-            this.showAlert(strings.poster.empty, 'warning');
-            return;
-        }
-        const svg = poster.svg;
-        const baseW = poster.widthPx;
-        const baseH = poster.heightPx;
-
-        let scale = 2;
-        const maxScale = Math.min(MAX_CANVAS_PX / baseW, MAX_CANVAS_PX / baseH);
-        let clamped = false;
-        if (scale > maxScale) {
-            scale = Math.max(1, maxScale);
-            clamped = true;
-        }
-
-        try {
-            const img = new Image();
-            img.width = baseW;
-            img.height = baseH;
-            await new Promise<void>((resolve, reject) => {
-                img.onload = () => resolve();
-                img.onerror = () => reject(new Error('SVG image load failed'));
-                img.src = svgDataUrl(svg);
-            });
-
-            const canvas = document.createElement('canvas');
-            canvas.width = Math.round(baseW * scale);
-            canvas.height = Math.round(baseH * scale);
-            const ctx = canvas.getContext('2d');
-            if (!ctx) throw new Error('Canvas 2D context unavailable');
-            ctx.fillStyle = '#ffffff';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-            const dataUrl = canvas.toDataURL('image/png');
-            const a = document.createElement('a');
-            a.href = dataUrl;
-            a.download = posterFilename('png');
-            a.click();
-
-            if (clamped) {
-                this.showToast(strings.poster.pngScaledDown);
+    /** Rasterize the current view to a 2x PNG (clamped to the canvas limit), under its button's working state (§8). */
+    exportPosterPng(): Promise<void> {
+        return posterBusy(async () => {
+            const poster = buildCurrentPoster();
+            if (!poster) {
+                this.showAlert(strings.poster.empty, 'warning');
+                return;
             }
-            this.closePosterDialog();
-        } catch (e) {
-            console.error('PNG export failed:', e);
-            this.showAlert(strings.poster.pngError, 'error');
-        }
+            const svg = poster.svg;
+            const baseW = poster.widthPx;
+            const baseH = poster.heightPx;
+
+            let scale = 2;
+            const maxScale = Math.min(MAX_CANVAS_PX / baseW, MAX_CANVAS_PX / baseH);
+            let clamped = false;
+            if (scale > maxScale) {
+                scale = Math.max(1, maxScale);
+                clamped = true;
+            }
+
+            try {
+                const img = new Image();
+                img.width = baseW;
+                img.height = baseH;
+                await new Promise<void>((resolve, reject) => {
+                    img.onload = () => resolve();
+                    img.onerror = () => reject(new Error('SVG image load failed'));
+                    img.src = svgDataUrl(svg);
+                });
+
+                const canvas = document.createElement('canvas');
+                canvas.width = Math.round(baseW * scale);
+                canvas.height = Math.round(baseH * scale);
+                const ctx = canvas.getContext('2d');
+                if (!ctx) throw new Error('Canvas 2D context unavailable');
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+                const dataUrl = canvas.toDataURL('image/png');
+                const a = document.createElement('a');
+                a.href = dataUrl;
+                a.download = posterFilename('png');
+                a.click();
+
+                if (clamped) {
+                    this.showToast(strings.poster.pngScaledDown);
+                }
+                this.closePosterDialog();
+            } catch (e) {
+                console.error('PNG export failed:', e);
+                this.showAlert(strings.poster.pngError, 'error');
+            }
+        });
     },
 
     /**

@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { openApp, card, openTreeStructure } from './helpers.js';
+import { syntheticTree } from '../src/__tests__/helpers/synthetic-tree';
 
 /**
  * "Split into families" (N4): break one tree into the families it contains,
@@ -68,12 +69,12 @@ async function partition(page: import('@playwright/test').Page): Promise<string[
 test('the split is the same whoever the focus is — only the order changes', async ({ page }) => {
     await loadTree(page);
 
-    await page.evaluate(() => { window.Strom.TreeRenderer.setFocus('me', false); window.Strom.UI.showSplitFamiliesDialog(); });
+    await page.evaluate(async () => { window.Strom.TreeRenderer.setFocus('me', false); await window.Strom.UI.showSplitFamiliesDialog(); });
     const fromMe = await partition(page);
     const firstFromMe = await page.evaluate(() => window.Strom.UI.splitFamiliesComponents[0].personIds.includes('me'));
     await page.keyboard.press('Escape');
 
-    await page.evaluate(() => { window.Strom.TreeRenderer.setFocus('wdad', false); window.Strom.UI.showSplitFamiliesDialog(); });
+    await page.evaluate(async () => { window.Strom.TreeRenderer.setFocus('wdad', false); await window.Strom.UI.showSplitFamiliesDialog(); });
     const fromWdad = await partition(page);
     const firstFromWdad = await page.evaluate(() => window.Strom.UI.splitFamiliesComponents[0].personIds.includes('wdad'));
 
@@ -151,6 +152,10 @@ test('creating the checked families copies them and leaves the original untouche
     await expect(modal).toBeVisible();
     await expect(page.getByRole('button', { name: 'Create 2 trees' })).toBeEnabled();
     await page.getByRole('button', { name: 'Create 2 trees' }).click();
+    // 8b: the dialog stays with the sentence; Create locked, Cancel is Close.
+    await expect(modal.locator('.busy-prog-done')).toHaveText('2 trees created.');
+    await expect(modal.locator('#splitfam-go')).toBeDisabled();
+    await modal.locator('#splitfam-cancel', { hasText: 'Close' }).click();
     await expect(modal).toBeHidden();
 
     const trees = await page.evaluate(() => window.Strom.TreeManager.getTrees()
@@ -222,6 +227,8 @@ test('the connector person appears in both created trees and links them', async 
     await expect(svoboda.locator('.splitfam-crossref')).toContainText('connected through Eva Nováková (*1962)');
 
     await page.getByRole('button', { name: 'Create 2 trees' }).click();
+    await expect(modal.locator('.busy-prog-done')).toHaveText('2 trees created.');
+    await modal.locator('#splitfam-cancel').click();
     await expect(modal).toBeHidden();
 
     await page.evaluate(async () => { await window.Strom.TreeRenderer.renderAsync?.(); });
@@ -327,4 +334,102 @@ test('tree manager row: split opens the proposals directly; a tree not open offe
     await expect(modal).toBeVisible();
     await expect(modal.locator('.splitfam-row')).toHaveCount(2);
     await expect(page.locator('#split-fam-picker-modal')).toHaveCount(0);
+});
+
+test('Create N trees works at once: the button says Creating…, each tree its step with k/n above the footer, a double click creates them once (8b)', async ({ page }) => {
+    await loadTree(page);
+    await page.evaluate(() => window.Strom.UI.showSplitFamiliesDialog());
+    const modal = page.locator('#split-families-modal');
+    await expect(modal).toBeVisible();
+    const before = await page.evaluate(() => window.Strom.TreeManager.getTrees().length);
+    const go = page.getByRole('button', { name: 'Create 2 trees' });
+    await expect(go).toBeEnabled();
+    // The words the button says while it works, every change of them kept.
+    const seen = await go.evaluate(async (b: HTMLButtonElement) => {
+        const words: string[] = [];
+        const steps: string[] = [];
+        const dlg = b.closest('.splitfam-modal') as HTMLElement;
+        const look = () => {
+            const w = b.querySelector('.b-busy')?.textContent ?? '';
+            if (w && words.at(-1) !== w) words.push(w);
+            const p = dlg.querySelector('.busy-prog');
+            const st = p ? `${p.querySelector('.busy-prog__text')?.textContent}|${p.querySelector('.busy-prog__k')?.textContent}` : '';
+            if (st && steps.at(-1) !== st) steps.push(st);
+        };
+        new MutationObserver(look).observe(dlg, { subtree: true, childList: true, characterData: true, attributes: true });
+        b.click();
+        const at = b.getAttribute('aria-busy');
+        b.click();
+        await new Promise(r => setTimeout(r, 1500));
+        const prog = dlg.querySelector('.busy-prog-done, .busy-prog');
+        const footer = dlg.querySelector('.splitfam-footer');
+        return { at, words, steps, aboveFooter: !!prog && prog.nextElementSibling === footer };
+    });
+    expect(seen.at).toBe('true');
+    expect(seen.words.every(w => !/Creating tree/.test(w))).toBe(true);
+    expect(seen.steps.some(w => /^Creating tree 1 of 2: .+…\|1\/2$/.test(w))).toBe(true);
+    expect(seen.steps.some(w => /^Creating tree 2 of 2: .+…\|2\/2$/.test(w))).toBe(true);
+    expect(seen.aboveFooter).toBe(true);
+    await expect(modal.locator('.busy-prog-done')).toHaveText('2 trees created.');
+    await expect(go).toBeDisabled();
+    await modal.locator('#splitfam-cancel').click();
+    await expect(modal).toBeHidden();
+    const trees = await page.evaluate(() => window.Strom.TreeManager.getTrees().map((t: { name: string }) => t.name));
+    expect(trees.length).toBe(before + 2);
+    expect(trees.filter((n: string) => n === 'Old Novák (*1900) family')).toHaveLength(1);
+});
+
+test.describe('finding the families of a large tree (B210/B211, waiting buttons §8)', () => {
+    test('from the menu under the canvas overlay; another cut under its button\'s "Finding the families…"', async ({ page }) => {
+        test.setTimeout(120_000);
+        await page.setViewportSize({ width: 1440, height: 900 });
+        await openApp(page);
+        const { data, rootId } = syntheticTree({ persons: 3200, seed: 5 });
+        await page.evaluate(async ({ data, rootId }) => {
+            const S = window.Strom;
+            await S.DataManager.importAsNewTree(data, 'Synthetic');
+            S.TreeRenderer.setFocus(rootId);
+            await S.TreeRenderer.renderAsync();
+        }, { data, rootId });
+        // The menu closed on the choice: the canvas overlay is there before the dialog (watched, the work blocks).
+        await page.evaluate(() => {
+            const w = window as unknown as { __overlay: boolean; __said: string[] };
+            w.__overlay = false;
+            w.__said = [];
+            new MutationObserver(() => {
+                const o = document.querySelector('#tree-container > .canvas-busy');
+                if (o && !document.getElementById('split-families-modal')) {
+                    w.__overlay = true;
+                    w.__said.push(o.textContent ?? '');
+                }
+            }).observe(document.getElementById('tree-container')!, { childList: true, subtree: true, characterData: true });
+        });
+        await page.evaluate(() => window.Strom.UI.showSplitFamiliesDialog());
+        const modal = page.locator('#split-families-modal');
+        await expect(modal).toBeVisible({ timeout: 60_000 });
+        const seen = await page.evaluate(() => { const w = window as unknown as { __overlay: boolean; __said: string[] }; return { __overlay: w.__overlay, __said: w.__said }; });
+        expect(seen.__overlay).toBe(true);
+        expect(seen.__said.some(t => t.includes('Finding the families…'))).toBe(true);
+
+        // Another cut: its segment shows the spinner and the hint under the segments says what happens, before
+        // the families are computed again.
+        // A tree this large shows the state at the click itself: it is read then, without waiting the many
+        // seconds of the computation that follows.
+        const other = modal.locator('.splitfam-mode-btn:not(.active)').first();
+        await expect(other).toBeVisible();
+        const said = await other.evaluate(async (b: HTMLButtonElement) => {
+            const said: string[] = [];
+            const hint = document.querySelector('#split-families-modal .splitfam-mode-hint')!;
+            new MutationObserver(() => {
+                if (b.getAttribute('aria-busy') === 'true') said.push(hint.textContent ?? '');
+            }).observe(b, { attributes: true, childList: true, subtree: true, characterData: true });
+            b.click();
+            for (let i = 0; i < 3; i++) await Promise.resolve();
+            return said;
+        });
+        expect(said.some(t => t.includes('Finding the families…'))).toBe(true);
+        // The computation the click started is not looked at: stopped, so closing the page does not wait for it.
+        const cdp = await page.context().newCDPSession(page);
+        await cdp.send('Runtime.terminateExecution');
+    });
 });

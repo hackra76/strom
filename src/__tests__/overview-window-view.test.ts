@@ -15,9 +15,11 @@ import {
     type OverviewWindowHost, type OverviewWindowPort,
 } from '../ui/overview-window-view.js';
 import { overviewWindowScreen } from '../ui/overview-window-states.js';
+import { waitingAuditShown } from '../ui/waiting-task-ui.js';
 import {
     OVERVIEW_STATE_VERSION, emptyOverviewExtras, type OverviewActionId, type OverviewResearchState, type OverviewSessionData,
 } from '../windows/overview-window.js';
+import { strings } from '../strings.js';
 import { SECTION_PREFS_EVENT, SECTION_PREFS_KEY } from '../ui/live-section-prefs.js';
 
 const TREE = 'ow-tree' as TreeId;
@@ -179,7 +181,6 @@ describe('the overview\'s controls ask the main window', () => {
     it('actions that stay where they are: sent, the main window stays behind', async () => {
         const { o, sent, port } = overrides();
         o.stopLiveFollow();
-        o.startFollowLive();
         o.setLiveFollow(false);
         o.setLiveFollowView('fan');
         await o.toggleResearchLive();
@@ -194,7 +195,6 @@ describe('the overview\'s controls ask the main window', () => {
         o.answerResearchTask(W1);
         expect(sent).toEqual([
             { action: 'stop-follow', args: undefined },
-            { action: 'follow-live', args: undefined },
             { action: 'follow-tree', args: { on: false } },
             { action: 'follow-view', args: { view: 'fan' } },
             { action: 'turn-on', args: undefined },
@@ -207,6 +207,58 @@ describe('the overview\'s controls ask the main window', () => {
             { action: 'hypotheses-accept', args: { ids: ['H1', 'H2'] } },
             { action: 'answer-task', args: { itemId: 'W1' } },
         ]);
+        expect(port.focusMain).not.toHaveBeenCalled();
+    });
+
+    it('Leave as is at a finding (spec 109 §4): asked of the main window, the row gone here at once; Undo too', async () => {
+        const { o, sent, port } = overrides();
+        const audit = { kinds: ['images-as-text'], fix: 'whole' as const, stamp: 'T0377@2026-11-12T09:00:00Z' };
+        const w = { id: 'T0377', what: 'x', on: 'user', at: '', audit } as LiveWaiting;
+        const s = { treeId: 'tree-w', ended: false, lostSince: null } as unknown as LiveSession;
+        const renderResearchOverview = vi.fn();
+        await o.keepWaitingAudit.call({ renderResearchOverview }, s, w);
+        expect(waitingAuditShown(s, w)).toBeNull();
+        await o.unkeepWaitingAudit.call({ renderResearchOverview }, s, 'T0377');
+        expect(waitingAuditShown(s, w)).toEqual(audit);
+        expect(sent).toEqual([
+            { action: 'waiting-audit', args: { itemId: 'T0377', do: 'keep' } },
+            { action: 'waiting-audit', args: { itemId: 'T0377', do: 'unkeep' } },
+        ]);
+        expect(renderResearchOverview).toHaveBeenCalledTimes(2);
+        expect(port.focusMain).not.toHaveBeenCalled();
+        // The research unavailable: nothing asked.
+        await o.keepWaitingAudit.call({ renderResearchOverview }, { ...s, lostSince: 1 }, w);
+        expect(sent).toHaveLength(2);
+    });
+
+    it('Fix at a finding (spec 109 §2): the preview and the write asked of the main window, its answers read again; Undo too', async () => {
+        const { o, sent, port } = overrides();
+        const w = { id: 'T0377', what: 'x', on: 'user', at: '' } as LiveWaiting;
+        const s = { treeId: 'tree-w', ended: false, lostSince: null } as unknown as LiveSession;
+        const preview = {
+            task: 'T0377', can: 'whole', stamp: 'T0377@2026-11-12T09:00:00Z', left: [], unknown: [],
+            changes: [{ op: 'folder', task: 'T0377', book: 'B0003', folder: 'Smyšlenka 3 N' }, { op: 'delete', task: 'T0377' }],
+        };
+        port.ask.mockResolvedValueOnce({ ok: true, preview });
+        const read = await o.readWaitingAuditPreview(s, w);
+        expect(port.ask).toHaveBeenLastCalledWith('waiting-audit', { itemId: 'T0377', do: 'preview' }, 30_000);
+        expect(read).toEqual({ ok: true, preview: { ...preview, changes: [preview.changes[0]] } });
+        // A preview that is not one, a refusal, no answer.
+        port.ask.mockResolvedValueOnce({ ok: true, preview: { ...preview, stamp: 'has space' } });
+        expect(await o.readWaitingAuditPreview(s, w)).toMatchObject({ ok: false, code: 'network' });
+        port.ask.mockResolvedValueOnce({ ok: false, code: 'audit-changed', status: 409 });
+        expect(await o.readWaitingAuditPreview(s, w)).toMatchObject({ ok: false, code: 'audit-changed' });
+        port.ask.mockResolvedValueOnce(null);
+        expect(await o.readWaitingAuditPreview(s, w)).toMatchObject({ ok: false, code: 'network' });
+
+        port.ask.mockResolvedValueOnce({ ok: true, task: 'T0377', tasks: ['T0377', 'bad'], woke: ['T0377'] });
+        expect(await o.writeWaitingAuditFix(s, w, preview.stamp)).toEqual({ ok: true, task: 'T0377', tasks: ['T0377'], woke: ['T0377'], head: '' });
+        expect(port.ask).toHaveBeenLastCalledWith('waiting-audit', { itemId: 'T0377', do: 'fix', expect: preview.stamp }, 30_000);
+        port.ask.mockResolvedValueOnce({ ok: false, code: 'locked', status: 423 });
+        expect(await o.writeWaitingAuditFix(s, w, preview.stamp)).toMatchObject({ ok: false, code: 'locked' });
+
+        await o.undoWaitingAuditFix(s, 'T0377');
+        expect(sent).toEqual([{ action: 'waiting-audit', args: { itemId: 'T0377', do: 'unfix' } }]);
         expect(port.focusMain).not.toHaveBeenCalled();
     });
 
@@ -237,18 +289,67 @@ describe('the overview\'s controls ask the main window', () => {
         const { o, sent, port } = overrides(stateOf({ extras: { ...emptyOverviewExtras(), verify } }));
         expect(o.treeVerifyNow()).toEqual(verify);
         expect(overrides().o.treeVerifyNow()).toBeNull();
-        await o.verifyStop(null);
-        expect(sent).toEqual([{ action: 'verify-stop', args: undefined }]);
+        // Stop asks the main window and waits for its answer (said under the button here), no fire-and-forget send.
+        port.ask.mockResolvedValueOnce({ ok: true });
+        await expect(o.writeVerifyStop()).resolves.toEqual({ ok: true });
+        expect(port.ask).toHaveBeenCalledWith('verify-stop', undefined, expect.any(Number));
+        expect(sent).toEqual([]);
         expect(port.focusMain).not.toHaveBeenCalled();
         o.showVerifyBulkDialog();
-        expect(sent[1]).toEqual({ action: 'verify-bulk', args: undefined });
+        expect(sent[0]).toEqual({ action: 'verify-bulk', args: undefined });
         expect(port.focusMain).toHaveBeenCalledTimes(1);
+    });
+
+    it('Stop and "All questions": the main window silent for 10 s is said here; a snapshot of the work keeps it waiting', async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('2026-11-18T10:00:00Z'));
+        try {
+            const verify = { waiting: 4, stop: true, bulk: true };
+            const silent = overrides(stateOf({ extras: { ...emptyOverviewExtras(), verify } }));
+            silent.port.ask.mockImplementation(() => new Promise(() => {}));
+            const stop = silent.o.writeVerifyStop() as Promise<unknown>;
+            await vi.advanceTimersByTimeAsync(10_500);
+            await expect(stop).resolves.toEqual({ ok: false, text: strings.busy.mainWindowSilent });
+            const note = silent.o.readWaitingGroupNote(null, 'questions', 'Questions') as Promise<unknown>;
+            expect(silent.port.focusMain).toHaveBeenCalledTimes(1);
+            expect(silent.port.ask).toHaveBeenLastCalledWith('waiting-group-note', { group: 'questions', name: 'Questions' }, expect.any(Number));
+            await vi.advanceTimersByTimeAsync(10_500);
+            await expect(note).resolves.toBe(strings.busy.mainWindowSilent);
+
+            // The main window says the work runs (its snapshot): no silence, its answer awaited.
+            const extras = { ...emptyOverviewExtras(), verify, verifyStopping: true, noteReading: ['questions'] };
+            const heard = overrides(stateOf({ extras }));
+            let answerStop!: (v: unknown) => void;
+            let answerNote!: (v: unknown) => void;
+            heard.port.ask.mockImplementationOnce(() => new Promise(r => { answerStop = r; }));
+            heard.port.ask.mockImplementationOnce(() => new Promise(r => { answerNote = r; }));
+            const stop2 = heard.o.writeVerifyStop() as Promise<unknown>;
+            const note2 = heard.o.readWaitingGroupNote(null, 'questions', 'Questions') as Promise<unknown>;
+            let settled = false;
+            void Promise.all([stop2, note2]).then(() => { settled = true; });
+            await vi.advanceTimersByTimeAsync(15_000);
+            expect(settled).toBe(false);
+            answerStop({ ok: false, text: 'Locked.' });
+            answerNote({ failed: null });
+            await vi.advanceTimersByTimeAsync(300);
+            await expect(stop2).resolves.toEqual({ ok: false, text: 'Locked.' });
+            await expect(note2).resolves.toBeNull();
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it('the tree\'s choice beside "Outside the directions": Research for this tree opens in the main window (forward)', () => {
         const { o, sent, port } = overrides(stateOf());
         o.openOffLineSettings();
         expect(sent).toEqual([{ action: 'offline-settings', args: undefined }]);
+        expect(port.focusMain).toHaveBeenCalledTimes(1);
+    });
+
+    it('Settings… of "Faster by downloading": Research for this tree at Books opens in the main window (forward)', () => {
+        const { o, sent, port } = overrides(stateOf());
+        o.openBooksSettings();
+        expect(sent).toEqual([{ action: 'books-settings', args: undefined }]);
         expect(port.focusMain).toHaveBeenCalledTimes(1);
     });
 

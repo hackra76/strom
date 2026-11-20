@@ -103,7 +103,7 @@ test.describe('desktop (1440)', () => {
 
         await row(page, 'e:l:c:bc').locator('.tv-nm', { hasText: 'Bořivoj Mlýnek' }).click();
         const menu = page.locator('.tv-menu');
-        await expect(menu.locator('.tv-menu-label')).toHaveText(['Filter: godparent Bořivoj Mlýnek', 'Open person']);
+        await expect(menu.locator('.tv-menu-label')).toHaveText(['Go to Bořivoj Mlýnek', 'Filter: godparent Bořivoj Mlýnek', 'Open person']);
         await menu.locator('.tv-menu-item[data-id="participant"]').click();
         await expect(partChip(page)).toContainText('Godparent: Bořivoj Mlýnek');
         await expect(status(page)).toHaveText('2 of 9 events');
@@ -123,7 +123,8 @@ test.describe('desktop (1440)', () => {
         await page.keyboard.press('Tab');
         await expect(col(page, 'e:l:c:bc', 6).locator('.tv-nm').first()).toBeFocused();
         await page.keyboard.press('Enter');
-        await expect(menu.locator('.tv-menu-label').first()).toHaveText('Filter: godparent Bořivoj Mlýnek');
+        await expect(menu.locator('.tv-menu-label').nth(1)).toHaveText('Filter: godparent Bořivoj Mlýnek');
+        await page.keyboard.press('ArrowDown');
         await page.keyboard.press('Enter');
         await expect(status(page)).toHaveText('2 of 9 events');
     });
@@ -252,8 +253,12 @@ test.describe('desktop in German (1440)', () => {
         const seg = (await page.locator('#table-container .tv-rowtype').boundingBox())!;
         expect(Math.abs((exp.y + exp.height / 2) - (seg.y + seg.height / 2))).toBeLessThan(2);
         expect(bar.height).toBeLessThanOrEqual(53);
-        // The search gave way, not below its 160 px.
-        expect((await page.locator('#table-container .tv-search-q').boundingBox())!.width).toBeGreaterThanOrEqual(159);
+        // The search gave way, not below the 80 px of the last fitting step (fitBarRow: a wider font
+        // narrows it earlier, as on CI's Linux).
+        expect((await page.locator('#table-container .tv-search-q').boundingBox())!.width).toBeGreaterThanOrEqual(79);
+        await expect(page.locator('#table-container .tv-slot-more')).toBeVisible();
+        const more = (await page.locator('#table-container .tv-slot-more').boundingBox())!;
+        expect(Math.abs((more.y + more.height / 2) - (seg.y + seg.height / 2))).toBeLessThan(2);
         await noPageOverflow(page);
     });
 });
@@ -272,9 +277,9 @@ test.describe('phone (390)', () => {
         await row(page, 'e:l:c:bc').locator('.tv-nm', { hasText: 'Bořivoj Mlýnek' }).tap();
         await expect(sheet).toBeVisible();
         const items = sheet.locator('.bottom-sheet-item');
-        await expect(items.locator('.bottom-sheet-label')).toHaveText(['Filter: godparent Bořivoj Mlýnek', 'Open person']);
+        await expect(items.locator('.bottom-sheet-label')).toHaveText(['Go to Bořivoj Mlýnek', 'Filter: godparent Bořivoj Mlýnek', 'Open person']);
         expect((await items.first().boundingBox())!.height).toBeGreaterThanOrEqual(44);
-        await items.first().tap();
+        await items.nth(1).tap();
         await expect(status(page)).toHaveText('2 of 9 events');
 
         // The filter sheet lists it with its ×.
@@ -329,7 +334,7 @@ test.describe('phone held sideways (844 × 390)', () => {
         }
 
         await row(page, 'e:l:c:bc').locator('.tv-nm', { hasText: 'Bořivoj Mlýnek' }).tap();
-        await page.locator('.bottom-sheet-menu .bottom-sheet-item').first().tap();
+        await page.locator('.bottom-sheet-menu .bottom-sheet-item').nth(1).tap();
         await expect(status(page)).toHaveText('2 of 9 events');
         await page.locator('#table-container .tv-filters-btn').tap();
         const part = page.locator('.tv-fs-part');

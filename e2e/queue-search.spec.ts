@@ -149,7 +149,15 @@ test.describe('the queue searched through the bridge (queue.search)', () => {
         await expect(result(page)).toHaveText('108 tasks found');
         await expect(rows(page)).toHaveCount(50);
         await expect(overview(page).locator('.live-queue-shown')).toHaveText('50 of 108 shown');
+        // While the page is read: its spinner before "Loading tasks…", locked (A212).
+        let release: () => void = () => {};
+        b.queueHold = new Promise<void>(r => { release = r; });
         await overview(page).locator('.live-queue-load').click();
+        await expect(overview(page).locator('.live-queue-load')).toHaveText('Loading tasks…');
+        await expect(overview(page).locator('.live-queue-load .busy-spin')).toHaveCount(1);
+        await expect(overview(page).locator('.live-queue-load')).toHaveAttribute('aria-disabled', 'true');
+        b.queueHold = null;
+        release();
         await expect(rows(page)).toHaveCount(100);
         expect(b.queueReads.at(-1)).toBe('from=50&count=50&q=Smrkov');
         await expect(overview(page).locator('.live-queue-load')).toBeFocused();
@@ -173,6 +181,34 @@ test.describe('the queue searched through the bridge (queue.search)', () => {
         await expect(field(page)).toBeFocused();
         await field(page).press('Escape');
         await expect(overview(page)).toHaveCount(0);
+    });
+
+    test('6c: a line\'s pill pressed at once; its first page read once, the list dimmed and aria-busy, "Loading tasks…" in the heading', async ({ page }) => {
+        const b = await follow(page, { features: FEATURES });
+        await openOverview(page);
+        await unfoldQueue(page);
+        const pill = overview(page).locator('.research-overview__queue-filters .research-overview__filter[data-direction="G0002"]');
+        await expect(pill).toBeVisible();
+        let release: () => void = () => {};
+        b.queueHold = new Promise<void>(r => { release = r; });
+        const before = b.queueReads.length;
+        await pill.click();
+        await expect(pill).toHaveAttribute('aria-checked', 'true');
+        const list = overview(page).locator('#ov-sec-queue .live-queue');
+        await expect(list).toHaveAttribute('aria-busy', 'true');
+        // After 120 ms: dimmed (the only dimmed area), the words in the heading; the window's tasks of the line stay.
+        await expect(list).toHaveClass(/busy-list-dim/);
+        await expect(queueHead(page).locator('.busy-st')).toHaveText('Loading tasks…');
+        await expect(overview(page).locator('.live-queue-state')).toHaveCount(0);
+        await expect(rows(page).first()).toBeVisible();
+        b.queueHold = null;
+        release();
+        await expect(list).not.toHaveAttribute('aria-busy', 'true');
+        await expect(list).not.toHaveClass(/busy-list-dim/);
+        await expect(queueHead(page).locator('.busy-st')).toHaveCount(0);
+        // Its 12 up next and the one set aside.
+        await expect(rows(page)).toHaveCount(13);
+        expect(b.queueReads.slice(before).filter(q => q.includes('research=G0002'))).toHaveLength(1);
     });
 
     test('while typed and read the old list stands dimmed; the answer is said once; a failed or busy bridge says so with Try again', async ({ page }) => {
@@ -229,6 +265,30 @@ test.describe('the queue searched through the bridge (queue.search)', () => {
         await openOverview(page);
         await expect(field(page)).toHaveValue('');
         await expect(result(page)).toHaveCount(0);
+    });
+
+    test('an empty field shows no indicator and is not busy: at opening, once its text is cleared, after closing and opening again', async ({ page }) => {
+        await follow(page);
+        await openOverview(page);
+        await unfoldQueue(page);
+        const spin = overview(page).locator('.research-overview__queue-search-spin');
+        const idle = async (): Promise<void> => {
+            await expect(field(page)).toHaveValue('');
+            await expect(field(page)).not.toHaveAttribute('aria-busy', 'true');
+            await expect(spin).toBeHidden();
+            await expect(overview(page).locator('#ov-sec-queue')).not.toHaveClass(/research-queue--pending/);
+        };
+        await idle();
+        await search(page, 'Smrkov');
+        await expect(spin).toBeHidden();
+        // Emptied by hand: the queue at once, the indicator gone.
+        await field(page).fill('');
+        await idle();
+        await search(page, 'Fíška');
+        await overview(page).locator('.research-overview__close').click();
+        await openOverview(page);
+        await unfoldQueue(page);
+        await idle();
     });
 
     test('"Search the queue…" in the small panel: the Queue unfolded at the top, the caret in its field, its choice kept', async ({ page }) => {

@@ -61,6 +61,8 @@ export interface OverviewLinesState {
     orderSaving: boolean;
     /** Lines whose state write is on its way. */
     busy: string[];
+    /** Their look (past 120 ms: the spinner and the words), as the main window draws them. */
+    shown?: { id: string; label: string; shown: boolean }[];
     problems: OverviewLineProblem[];
     /** The bridge said its research is an archive: the lines are read-only. */
     archive: boolean;
@@ -80,7 +82,7 @@ export interface OverviewExtras {
     /** Hypotheses asked of the research and waiting for its answer, and the list of proposals accepted at once. */
     hypotheses: { pending: Record<string, unknown>; batch: unknown | null };
     /** Tasks whose own place in the queue is being written, and what a refused one says (by task). */
-    taskOrder: { busy: string[]; problems: Record<string, string> };
+    taskOrder: { busy: string[]; problems: Record<string, string>; shown?: { id: string; label: string; shown: boolean }[] };
     /**
      * The tree's "Verifying" (spec 065 §10k) as the main window has it: facts waiting, Stop and the bulk
      * verification offered (null: the research does not verify, or its bridge does not answer).
@@ -90,6 +92,18 @@ export interface OverviewExtras {
     highlight?: OverviewHighlight | null;
     /** Research for this tree has its group "Work outside the directions" (offLineSettingsOffered); absent: not. */
     offLineSettings?: boolean;
+    /** "Work on the queue…" starting (waiting buttons 3a, 3b) as the main window has it; absent or null: none. */
+    queueStart?: { phase: 'starting' | 'silent'; startedAt: number } | null;
+    /** "Follow live" starting in the main window (waiting buttons §11.2): its step; absent or null: none. */
+    followStart?: 'connect' | 'tree' | null;
+    /** Rows of "Awaiting action" whose file the main window writes for this window now (§11.2); absent: none. */
+    fileSending?: string[];
+    /** Places whose queries' text the main window reads for this window now (§11.2); absent: none. */
+    noteReading?: string[];
+    /** Stop of the tree's verification asked for this window and written by the main window now (§11.2); absent: not. */
+    verifyStopping?: boolean;
+    /** Rows of "Awaiting action" whose own write is confirmed now ("saving") or was refused (§7); absent: none. */
+    waitingWrite?: { saving: string[]; refused: { id: string; text: string; tint: boolean; retry: boolean }[] } | null;
 }
 
 /** The tree's verification as the overview's "Verifying" block draws it. */
@@ -299,6 +313,8 @@ export type OverviewAction =
     | { action: 'verify-bulk'; args?: Record<string, never> }
     /** The tree's choice beside "Outside the directions": Research for this tree at it. */
     | { action: 'offline-settings'; args?: Record<string, never> }
+    /** Settings… of "Faster by downloading" (spec 105 §3): Research for this tree at Books. */
+    | { action: 'books-settings'; args?: Record<string, never> }
     // ---- in the main window, it stays where it is ----
     /** A row hovered: its card lit up in the main window's tree (null: none). */
     | { action: 'hover-person'; args: { personId: string | null } }
@@ -331,6 +347,14 @@ export type OverviewAction =
     | { action: 'waiting-unsent'; args: { itemId: string } }
     /** Mark a whole place's items sent. */
     | { action: 'waiting-group-sent'; args: { group: string } }
+    /** "Try again" in a row whose write was refused (§7). */
+    | { action: 'waiting-retry'; args: { itemId: string } }
+    /**
+     * A task's finding (spec 109 §2, §4): Leave as is, or its Undo (the main window writes it and says it with
+     * Undo); the fix's preview read (answered: WaitingAuditPreviewResult); the fix written with the preview's
+     * stamp (answered: WaitingAuditResult; the main window says it with Undo), or undone.
+     */
+    | { action: 'waiting-audit'; args: { itemId: string; do: 'keep' | 'unkeep' | 'preview' | 'unfix' } | { itemId: string; do: 'fix'; expect: string } }
     /** A file picked in the window for a task. */
     | { action: 'waiting-file'; args: { itemId: string; file: File } }
     /** Ask the research (its terminal) to decide a hypothesis of "Awaiting action". */
@@ -358,10 +382,10 @@ export type OverviewActionArgs<T extends OverviewActionId> = Extract<OverviewAct
 
 export const OVERVIEW_ACTION_IDS = [
     'show-person', 'show-people', 'show-direction', 'direction-found', 'person-research', 'tree-overview', 'waiting-places', 'waiting-group-note',
-    'waiting-images', 'line-edit', 'line-new', 'verify-bulk', 'offline-settings',
+    'waiting-images', 'line-edit', 'line-new', 'verify-bulk', 'offline-settings', 'books-settings',
     'hover-person', 'verify-stop', 'highlight-end', 'follow-live', 'stop-follow', 'follow-tree', 'follow-view', 'turn-on',
     'line-select', 'line-state', 'line-move', 'line-retry',
-    'waiting-answer', 'waiting-sent', 'waiting-unsent', 'waiting-group-sent', 'waiting-file',
+    'waiting-answer', 'waiting-sent', 'waiting-unsent', 'waiting-group-sent', 'waiting-retry', 'waiting-file', 'waiting-audit',
     'hypothesis-ask', 'hypotheses-accept', 'answer-task', 'research-link',
     'queue-list', 'queue-order',
 ] as const satisfies readonly OverviewActionId[];
@@ -369,7 +393,7 @@ export const OVERVIEW_ACTION_IDS = [
 /** Actions whose result shows in the main window: the overview window asks it to the front after them. */
 export const OVERVIEW_ACTIONS_TO_MAIN: ReadonlySet<OverviewActionId> = new Set<OverviewActionId>([
     'show-person', 'show-people', 'show-direction', 'direction-found', 'person-research', 'tree-overview', 'waiting-places', 'waiting-group-note',
-    'waiting-images', 'line-edit', 'line-new', 'verify-bulk', 'offline-settings',
+    'waiting-images', 'line-edit', 'line-new', 'verify-bulk', 'offline-settings', 'books-settings',
 ]);
 
 const str = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
@@ -436,6 +460,7 @@ export function readOverviewAction(action: unknown, args: unknown): OverviewActi
         case 'line-new':
         case 'verify-bulk':
         case 'offline-settings':
+        case 'books-settings':
         case 'verify-stop':
         case 'follow-live':
         case 'stop-follow':
@@ -474,10 +499,15 @@ export function readOverviewAction(action: unknown, args: unknown): OverviewActi
             return str(a.itemId) && typeof a.text === 'string' ? { action, args: { itemId: a.itemId, text: a.text } } : null;
         case 'waiting-sent':
         case 'waiting-unsent':
+        case 'waiting-retry':
         case 'answer-task':
             return str(a.itemId) ? { action, args: { itemId: a.itemId } } as OverviewAction : null;
         case 'waiting-group-sent':
             return str(a.group) ? { action, args: { group: a.group } } : null;
+        case 'waiting-audit':
+            if (!str(a.itemId)) return null;
+            if (a.do === 'fix') return str(a.expect) && a.expect.length <= 120 ? { action, args: { itemId: a.itemId, do: 'fix', expect: a.expect } } : null;
+            return a.do === 'keep' || a.do === 'unkeep' || a.do === 'preview' || a.do === 'unfix' ? { action, args: { itemId: a.itemId, do: a.do } } : null;
         case 'waiting-file':
             return str(a.itemId) && isFile(a.file) ? { action, args: { itemId: a.itemId, file: a.file } } : null;
         case 'hypothesis-ask': {
@@ -548,7 +578,16 @@ export function setOverviewChangeListener(fn: (() => void) | null): void {
     changeListener = fn;
 }
 
+/** Others told of the same hint (the agent's state for other windows, spec 097). */
+const hintListeners = new Set<() => void>();
+
+export function onOverviewChanged(fn: () => void): () => void {
+    hintListeners.add(fn);
+    return () => { hintListeners.delete(fn); };
+}
+
 /** What the overview shows may have changed (every redraw of the research panel says so). */
 export function overviewChanged(): void {
     changeListener?.();
+    for (const fn of [...hintListeners]) fn();
 }

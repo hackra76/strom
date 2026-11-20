@@ -14,6 +14,7 @@ import { marriagesInOrder } from '../../marriage-order.js';
 import { assignGenerations } from '../../generations.js';
 import { inferBirthUpperBounds, isLivingPerson } from '../../privacy.js';
 import { buildLineages, rodLabels, type LineageIndex, type RodId } from '../../lineage.js';
+import { classifyBranches, type Branch, type BranchResult } from '../../branch-colors.js';
 import type { ReliabilityOptions } from '../../reliability.js';
 import type { Language } from '../../strings.js';
 import type { CheckIndex } from './table-checks.js';
@@ -40,9 +41,19 @@ export interface CellIssue {
 }
 
 /** One cell's value: what is shown, what sorts and filters, and how it reads. */
+/** What the Table's scope gives its cells (spec 084 §9, §13d). */
+export interface ScopeCells {
+    /** 1-based place of each person of the list. */
+    pos: ReadonlyMap<string, number>;
+    /** The ticked-off people of a work list; null: the list is not a work list. */
+    done: ReadonlySet<string> | null;
+}
+
 export interface CellValue {
     /** The text shown (plain; the grid escapes it). */
     text: string;
+    /** A box ticked off or not (spec 084 §13d: a work list's Done); undefined: no box. */
+    check?: boolean;
     /** Sort key; null sorts last in both directions. */
     sortKey: number | string | null;
     /** Nothing recorded. */
@@ -66,10 +77,14 @@ export interface CellValue {
     mark?: CellSeverity;
     /** A faint value: no findings ("0"), the checks still running ("…"). */
     ghost?: boolean;
+    /** A word in place of a missing value, shown faint in italics (spec 084 §8: Added "earlier"). */
+    word?: boolean;
     /** A reliability step for pill columns. */
     pill?: string;
     /** A percentage for completeness columns (0–100). */
     percent?: number;
+    /** A picture shown small in the cell (spec 107 §8: the couple's photo, a data URL); its text is "yes" for exports. */
+    thumb?: string;
     /** The cell's tooltip, when it says more than the text. */
     title?: string;
     /** A date's qualifier as a short word shown before the text ("abt.", §5.3). */
@@ -113,6 +128,13 @@ export interface CellValue {
     shared?: { count: number; more: number };
     /** A shared event's ages, each person's own (4a): the cell opens their bubble. */
     sharedAges?: boolean;
+    /**
+     * The Lineage column's lines (spec 112 §3): the grid draws their signs
+     * before the text in the marker shape chosen in the settings (none while
+     * the markers are off); `lineageNumbered` = R5, the tag's letters 1 and 2.
+     */
+    lineage?: Branch[];
+    lineageNumbered?: boolean;
 }
 
 /** The research signal a cell starts with, drawn as its mark (§16.3). */
@@ -248,6 +270,8 @@ export interface TableContext {
     readonly reliability: ReliabilityOptions;
     generations(): Map<string, number>;
     lineage(): { index: LineageIndex; labels: Map<RodId, string> };
+    /** Each person's lineage relative to the home (focused) person (spec 112, classifyBranches); null without one. */
+    branches(): BranchResult | null;
     birthBounds(): Map<string, number>;
     living(p: Person): boolean;
     /** Blood relatives of the home person (ancestors and all their descendants). */
@@ -267,6 +291,13 @@ export interface TableContext {
     research: ResearchTableEnv | null;
     /** The other trees a person is in (§16 crossTree); null: not read. Set by the view, like `research`. */
     crossTree: ((p: Person) => readonly CrossTreeMatch[]) | null;
+    /**
+     * The list of people the Table is narrowed to (spec 084 §9): each
+     * person's place in the list's order and, for a work list (§13d), the
+     * people ticked off. Set by the view; its cells (# and Done) are never
+     * cached.
+     */
+    scope: ScopeCells | null;
     /** Whether the tree has any source (the person's status mark, §16 personStatus). */
     hasSources(): boolean;
     /** Each person's unions (the person's status mark). */
@@ -338,6 +369,7 @@ function bloodOf(data: StromData, homeId: PersonId | null): Set<string> {
 function makeContext(data: StromData, opts: BuildOptions): TableContext {
     let gens: Map<string, number> | null = null;
     let lin: { index: LineageIndex; labels: Map<RodId, string> } | null = null;
+    let branches: BranchResult | null | undefined;
     let bounds: Map<string, number> | null = null;
     let blood: Set<string> | null = null;
     const livingCache = new Map<string, boolean>();
@@ -352,6 +384,10 @@ function makeContext(data: StromData, opts: BuildOptions): TableContext {
             if (!lin) { const index = buildLineages(data); lin = { index, labels: rodLabels(index) }; }
             return lin;
         },
+        branches: () => {
+            if (branches === undefined) branches = opts.homeId && data.persons[opts.homeId] ? classifyBranches(data, opts.homeId) : null;
+            return branches;
+        },
         birthBounds: () => bounds ??= inferBirthUpperBounds(data),
         living(p) {
             let v = livingCache.get(p.id);
@@ -363,6 +399,7 @@ function makeContext(data: StromData, opts: BuildOptions): TableContext {
         checks: null,
         research: null,
         crossTree: null,
+        scope: null,
         hasSources: () => hasSources ??= treeHasAnySource(data),
         unionsOf: () => unions ??= unionsByPerson(data),
     };

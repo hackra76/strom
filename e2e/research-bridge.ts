@@ -54,8 +54,14 @@ export interface FakeBridge {
     down: boolean;
     links: string[];
     posts: string[];
+    /** The query of each `POST /sync` (`?media=app&app=…`, spec 108), beside `posts`. */
+    postQueries?: URLSearchParams[];
     /** The bridge takes this long to answer a send (ms). */
     syncDelayMs?: number;
+    /** The bridge takes this long to give `tree.ged` (ms). */
+    treeDelayMs?: number;
+    /** Every `GET …/tree.ged` asked. */
+    treeGets?: number;
     /** A write at once (the research's reply has `inbox: false` and no `pending`): the version it makes. */
     onWrite?: (posted: string) => { head: string; ged: string };
     /** The sends asked to be written again (`POST /sync/<R…>/again`), by their marks. */
@@ -93,6 +99,16 @@ export interface FakeBridge {
     /** More fields of `/status` (e.g. `channel`, `linkScheme`). */
     statusExtra?: Record<string, unknown>;
     /**
+     * The links the research took in the last minute (`/status.handoffs`, with `handoffs` in `features`; Strom
+     * Research 1.35): a test puts a handed-over link's id here (`handedOff(page)`) to confirm it.
+     */
+    handoffs?: string[];
+    /**
+     * The books of the tasks (spec 105, `books` in `features`): `/status.books` (`books`; the part `books` of the light
+     * status), every `POST /books` body (`posts`), written into `books.settings` and said back; `reply` answers instead.
+     */
+    books?: { books: Record<string, unknown>; posts: Record<string, unknown>[]; reply?: { status: number; body: unknown } };
+    /**
      * Who decides hypotheses (spec 060, `hypotheses.decide`): `/status.hypotheses.decide` (`decide`, not said
      * when unset); `POST /hypotheses` bodies (`writes`); `person` written at once, `agent` 403
      * `hypotheses.link` (the terminal confirms; a test does it by changing `decide`); `reply` answers instead.
@@ -100,8 +116,11 @@ export interface FakeBridge {
     hypotheses?: { decide?: string; writes: Record<string, unknown>[]; reply?: { status: number; body: unknown }; link?: string };
     /** Stuck (SIGSTOP): `/status` never answers. */
     statusHang?: boolean;
-    /** Slow (a big research): `/status` answers after this many ms of real time. */
-    statusDelayMs?: number;
+    /**
+     * Slow (a big research): `/status` answers once this promise is settled (the test settles it after
+     * running the page's clock on as long as the research takes).
+     */
+    statusGate?: Promise<void>;
     /** How each `/status` was asked: `full`, or `parts` (`parts=1`, the light status). */
     statusAsks?: string[];
     /** Heavy parts read apart (`GET /status/<part>`, a bridge with `status.parts` in its features). */
@@ -135,7 +154,7 @@ export interface FakeBridge {
     /** Reading a document (`/read*`, spec 013); its readings go into `/status.reads`. */
     read?: FakeRead;
     /**
-     * The family's material (`GET /material`, `POST /material/assign|hide`, `?thumb=`, spec 017).
+     * The family's material (`GET /material`, `POST /material/assign|hide|edit`, `?thumb=`, spec 017, 102).
      * Answered per `features`: `material.list`, `material.assign`, `material.thumb`.
      */
     material?: FakeMaterial;
@@ -1343,6 +1362,12 @@ export interface FakeMaterialFile {
     kind?: 'photo' | 'document' | 'record' | 'other';
     date?: string;
     hidden?: { at?: string; by?: string; reason?: 'unrelated' | 'duplicate' };
+    /** Where the research uses it (`material.uses`); `of`: the sources it is the file of (`material.sourceOf`). */
+    uses?: { excerpts: number; sources: string[]; tasks: number; of?: Record<string, unknown>[] };
+    /** The agent left it unassigned (`material.left`). */
+    left?: { at: string; sort?: string; why: 'nothing-said' | 'nothing-new' | 'dropped'; said?: string };
+    /** The oldest other file with the same content (`material.sameAs`). */
+    sameAs?: string;
 }
 
 export interface FakeMaterialBatch {
@@ -1366,6 +1391,8 @@ export interface FakeMaterial {
     /** Every `POST /material/assign` and `/hide` body. */
     assigns: Record<string, unknown>[];
     hides: Record<string, unknown>[];
+    /** Every `POST /material/edit` body (only with the feature `material.edit`, spec 102 §2). */
+    edits?: Record<string, unknown>[];
     /** Every preview asked ("<sha>@<px>"). */
     thumbAsks: string[];
     /** The next this many requests to `/material*` answer 409 `material.busy`. */
@@ -1386,6 +1413,47 @@ export interface FakeMaterial {
     writeParent?: boolean;
     /** Before the next this many writes, right as each arrives, the research's agent commits a change of its own (foreignCommit). */
     foreignAtWrite?: number;
+    /** Every `POST /material/sort` body (only with the feature `material.sort`, spec 102 §13). */
+    sorts?: Record<string, unknown>[];
+    /** Every sorting cancelled (`POST /material/sort/<id>/cancel`). */
+    cancels?: string[];
+    /** The sortings, by id; a new one starts `working` (or `done` with `sortDoneAt` 0). */
+    sortJobs?: Map<string, { id: string; state: string; files: string[]; at: string; polls: number; proposals?: unknown[]; reason?: string; filesDone?: number; unproposed?: unknown[]; run?: string; part?: number; parts?: number }>;
+    /**
+     * Runs of batches (`material.sortRun`, spec 102 §3): `POST /material/sort` with 51–1500 files; each batch of 50
+     * is a sorting of `sortJobs`. Each GET of the run moves it one step: the next batch starts (12 files judged),
+     * then ends; `sortRunHold` keeps it where it is.
+     */
+    sortRuns?: Map<string, { id: string; parts: string[] }>;
+    sortRunHold?: boolean;
+    /** The batch (1…) of a run that fails: the readers' limit (its sorting's reason `limit`, as the research says it). */
+    sortRunFail?: number;
+    /** The batch next to start waits (the research's `waiting`): the run stays where it is while set. */
+    sortRunWaiting?: { why: string; retry?: number };
+    /** The run is cancelled elsewhere (the research's CLI) when batch (1…) is about to start. */
+    sortRunStopAt?: number;
+    /** Every run cancelled (`POST /material/sort/<run-…>/cancel`). */
+    runCancels?: string[];
+    /** What the agent proposes for each sorting (by default none: every file unassigned). */
+    sortProposals?: Record<string, unknown>[];
+    /** The sorting is done after this many GETs (default 1). */
+    sortDoneAt?: number;
+    /** While working, the sorting shows this many of its proposals already (a cancel then asks Keep / Discard). */
+    sortWorkingProposals?: number;
+    /** While working, the sorting says this many files judged already (`filesDone`); unset: it does not say it. */
+    sortFilesDone?: number;
+    /** Once done, the sorting says why these files have no proposal (`unproposed`); unset: it does not say it. */
+    sortUnproposed?: Record<string, unknown>[];
+    /** `POST /material/sort` refuses with this code (`sort.limit`, `sort.queue`, `sort.not-ready`). */
+    sortRefuse?: string;
+    /** A batch closed (`POST /batch/<id>/done`) lists its new files and itself, as the research does (spec 102 §8). */
+    listBatches?: boolean;
+    /** Every `POST /material/delete` body, dry runs and confirmations (only with `material.delete`, spec 102 §9). */
+    deletes?: Record<string, unknown>[];
+    /** What deleting a file takes with it (I… → fields of its impact over the defaults: nothing but its people). */
+    deleteImpacts?: Record<string, Record<string, unknown>>;
+    /** Right before the next confirmation, the research changes: these impacts replace the ones of their files (409 `material.delete-changed`). */
+    deleteChangeOnce?: Record<string, Record<string, unknown>>;
 }
 
 /**
@@ -1413,6 +1481,9 @@ export function foreignCommit(b: FakeBridge): string {
 }
 
 /** A write of the app committed (foreignAtWrite first, if due): its answer's `head` (and `parent` with writeParent). */
+/** The deletions' confirmations each bridge signed (confirm → the files and the list it was given for). */
+const deleteConfirms = new WeakMap<FakeBridge, Map<string, string>>();
+
 function commitWrite(b: FakeBridge): { head: string; parent?: string } {
     if (b.material?.foreignAtWrite) {
         b.material.foreignAtWrite--;
@@ -1526,10 +1597,108 @@ function serveMaterial(b: FakeBridge, method: string, url: URL, postData: string
     { status: number; body: unknown; headers?: Record<string, string> } | null {
     const m = b.material;
     const rest = url.pathname.replace(/^\/[^/]+/, '');
-    if (!m || !/^\/material(\/assign|\/hide)?$/.test(rest)) return null;
+    const sortPath = /^\/material\/sort(?:\/([^/]+)(\/cancel)?)?$/.exec(rest);
+    if (!m || (!sortPath && !/^\/material(\/assign|\/hide|\/edit|\/delete)?$/.test(rest))) return null;
     const features = b.features ?? [];
     const refusal = (status: number, code: string, params?: Record<string, unknown>) =>
         ({ status, body: { error: code, code, text: code, ...(params ? { params } : {}) } });
+    if (sortPath) {
+        // Sort with the agent (spec 102 §13): only with an agent, only the research's files.
+        if (!features.includes('material.sort')) return { status: 404, body: '' };
+        const jobs = (m.sortJobs ??= new Map());
+        const [, id, cancel] = sortPath;
+        const shownJob = (j: NonNullable<FakeMaterial['sortJobs']> extends Map<string, infer J> ? J : never) => {
+            const { polls: _p, ...out } = j;
+            return out;
+        };
+        if (!id) {
+            if (method !== 'POST') return { status: 404, body: '' };
+            let body: Record<string, unknown>;
+            try { body = JSON.parse(postData ?? ''); } catch { return refusal(400, 'sort.body'); }
+            (m.sorts ??= []).push(body);
+            if (m.sortRefuse === 'sort.not-ready') {
+                return { status: 503, body: { error: 'not ready', code: 'sort.not-ready', text: 'not ready', params: { why: 'agent-busy' } }, headers: { 'retry-after': '30' } };
+            }
+            if (m.sortRefuse) return refusal(429, m.sortRefuse);
+            const files = Array.isArray(body.ids) ? body.ids.filter((x): x is string => typeof x === 'string') : [];
+            const most = features.includes('material.sortRun') ? 1500 : 50;
+            if (!files.length || files.length > most || files.some(f => !m.files.some(x => x.id === f))) return refusal(400, 'sort.ids');
+            if (files.length > 50) {
+                // A run: batches of 50 in the order sent, each its own sorting.
+                const runs = (m.sortRuns ??= new Map());
+                const runId = `run-20261117120000-${String(runs.size + 1).padStart(4, '0')}`;
+                const parts: string[] = [];
+                const n = Math.ceil(files.length / 50);
+                for (let k = 0; k < n; k++) {
+                    const part = { id: `sort-20261117120000-${String(jobs.size + 1).padStart(4, '0')}`, state: 'queued', files: files.slice(k * 50, k * 50 + 50), at: '2026-11-17T12:00:00Z', polls: 0, run: runId, part: k + 1, parts: n };
+                    jobs.set(part.id, part);
+                    parts.push(part.id);
+                }
+                runs.set(runId, { id: runId, parts });
+                return { status: 202, body: { id: parts[0], state: 'queued', run: runId, parts } };
+            }
+            const job = { id: `sort-20261117120000-${String(jobs.size + 1).padStart(4, '0')}`, state: m.sortDoneAt === 0 ? 'done' : 'queued', files, at: '2026-11-17T12:00:00Z', polls: 0 };
+            jobs.set(job.id, job);
+            return { status: 202, body: { id: job.id, state: job.state } };
+        }
+        const run = m.sortRuns?.get(id);
+        if (run) {
+            const parts = run.parts.map(p => jobs.get(p)!);
+            const live = (j: { state: string }) => j.state === 'queued' || j.state === 'working';
+            const runState = () => parts.some(j => j.state === 'working') ? 'working' : parts.some(j => j.state === 'queued') ? 'queued'
+                : parts.some(j => j.state === 'cancelled') ? 'cancelled' : parts.some(j => j.state === 'done') ? 'done' : 'failed';
+            if (cancel) {
+                if (method !== 'POST') return { status: 404, body: '' };
+                (m.runCancels ??= []).push(id);
+                let stopped = false;
+                for (const j of parts) if (live(j)) { j.state = 'cancelled'; stopped = true; }
+                return { status: 200, body: { id, state: runState(), cancelled: stopped } };
+            }
+            if (method !== 'GET') return { status: 404, body: '' };
+            const at = parts.find(live);
+            const waits = !!m.sortRunWaiting && at?.state === 'queued';
+            if (at && at.state === 'queued' && m.sortRunStopAt === at.part) {
+                for (const j of parts) if (live(j)) j.state = 'cancelled';
+            } else if (at && !m.sortRunHold && !waits) {
+                if (at.state === 'queued') { at.state = 'working'; at.filesDone = Math.min(12, at.files.length); }
+                else if (m.sortRunFail === at.part) { at.state = 'failed'; at.reason = 'limit'; }
+                else { at.state = 'done'; at.filesDone = at.files.length; }
+            }
+            const done = (j: typeof parts[number]) => j.state === 'done' ? j.files.length : j.filesDone ?? 0;
+            return {
+                status: 200, body: {
+                    id, run: true, state: runState(), files: parts.reduce((t, j) => t + j.files.length, 0), filesDone: parts.reduce((t, j) => t + done(j), 0),
+                    parts: parts.map(j => ({ id: j.id, part: j.part, state: j.state, files: j.files.length, ...(j.filesDone !== undefined ? { filesDone: j.filesDone } : {}) })),
+                    ...(waits ? { waiting: m.sortRunWaiting } : {}),
+                },
+            };
+        }
+        const job = jobs.get(id);
+        if (!job) return refusal(404, 'sort.none');
+        if (cancel) {
+            if (method !== 'POST') return { status: 404, body: '' };
+            (m.cancels ??= []).push(id);
+            if (job.state === 'queued' || job.state === 'working') job.state = 'cancelled';
+            return { status: 200, body: shownJob(job) };
+        }
+        if (method !== 'GET') return { status: 404, body: '' };
+        job.polls++;
+        // A batch of a run moves with its run's GETs.
+        if (job.run) { /* as the run says */ }
+        else if ((job.state === 'queued' || job.state === 'working') && job.polls >= (m.sortDoneAt ?? 1)) job.state = 'done';
+        else if (job.state === 'queued') job.state = 'working';
+        if (job.state === 'working' && m.sortFilesDone !== undefined && !job.run) job.filesDone = m.sortFilesDone;
+        if (job.state === 'working' && m.sortWorkingProposals) {
+            job.proposals = (m.sortProposals ?? []).filter(p => job.files.includes(String(p.id))).slice(0, m.sortWorkingProposals);
+        }
+        if (job.state === 'done' && !job.proposals) {
+            job.proposals = (m.sortProposals ?? []).filter(p => job.files.includes(String(p.id)));
+        }
+        if (job.state === 'done' && m.sortUnproposed && !job.unproposed) {
+            job.unproposed = m.sortUnproposed.filter(u => job.files.includes(String(u.id)));
+        }
+        return { status: 200, body: shownJob(job) };
+    }
     const busy = () => {
         m.busyTimes = (m.busyTimes ?? 0) - 1;
         const retry = m.busyRetry ?? 0;
@@ -1540,16 +1709,22 @@ function serveMaterial(b: FakeBridge, method: string, url: URL, postData: string
     const concerns = (f: FakeMaterialFile, p: string) =>
         f.persons.includes(p) || !!f.sorted?.persons?.includes(p) || !!batchOf(f.batch)?.persons?.includes(p);
     const assignOn = features.includes('material.assign');
+    const sourceOfOn = features.includes('material.sourceOf');
     const shown = (f: FakeMaterialFile): Record<string, unknown> => {
-        if (assignOn) return { ...f };
+        // `uses.of` only behind `material.sourceOf` (Strom Research 1.35, spec 102 V1).
+        const { of: _of, ...usesOlder } = f.uses ?? { excerpts: 0, sources: [], tasks: 0 };
+        const g = f.uses && !sourceOfOn ? { ...f, uses: usesOlder } : f;
+        if (assignOn) return { ...g };
         // An older research: no title, kind, date nor hidden.
-        const { title: _t, kind: _k, date: _d, hidden: _h, ...older } = f;
+        const { title: _t, kind: _k, date: _d, hidden: _h, ...older } = g;
         return older;
     };
     const peopleOf = (files: FakeMaterialFile[], batches: FakeMaterialBatch[]) => {
         const out: Record<string, string> = {};
         const add = (p: string) => { if (m.people[p]) out[p] = m.people[p]; };
         files.forEach(f => { f.persons.forEach(add); f.sorted?.persons?.forEach(add); });
+        // The people citing a source the file is the file of (`material.sourceOf`, V1c).
+        if (sourceOfOn) files.forEach(f => f.uses?.of?.forEach(o => (Array.isArray(o.cited) ? o.cited as string[] : []).forEach(add)));
         batches.forEach(x => x.persons?.forEach(add));
         return out;
     };
@@ -1581,9 +1756,76 @@ function serveMaterial(b: FakeBridge, method: string, url: URL, postData: string
     }
 
     if (method !== 'POST' || !assignOn) return { status: 404, body: '' };
+    if (rest === '/material/edit' && !features.includes('material.edit')) return { status: 404, body: '' };
     let body: Record<string, unknown>;
     try { body = JSON.parse(postData ?? ''); } catch { return refusal(400, 'material.body'); }
     if (!body || typeof body !== 'object') return refusal(400, 'material.body');
+    if (rest === '/material/delete') {
+        // Delete for good (spec 102 §9, the research's V3): a dry run lists what goes and signs that list; only that
+        // confirmation deletes, and only while the list is still the same.
+        if (!features.includes('material.delete')) return { status: 404, body: '' };
+        (m.deletes ??= []).push(body);
+        if ((m.busyTimes ?? 0) > 0) return busy();
+        if (m.readonly) return refusal(403, 'material.readonly');
+        const ids = body.files;
+        if (!Array.isArray(ids) || ids.length === 0 || ids.length > 500 || !ids.every(i => typeof i === 'string' && FILE_REF.test(i))
+            || (body.dryRun !== true && typeof body.confirm !== 'string')) {
+            return refusal(400, 'material.body');
+        }
+        const files = (ids as string[]).map(id => m.files.find(f => f.id === id));
+        const missing = (ids as string[]).find((_, i) => !files[i]);
+        if (missing) return refusal(404, 'material.file', { id: missing });
+        const impacts = () => (files as FakeMaterialFile[]).map(f => ({
+            id: f.id, name: f.name, sha: f.sha, sources: [], excerpts: 0, people: f.persons, links: 0, tasks: [], bytes: 'deleted', sameAs: [],
+            ...(m.deleteImpacts?.[f.id] ?? {}),
+        }));
+        const signed = (deleteConfirms.get(b) ?? new Map<string, string>());
+        deleteConfirms.set(b, signed);
+        if (body.dryRun === true) {
+            const confirm = `confirm-${signed.size + 1}`;
+            const list = impacts();
+            signed.set(confirm, JSON.stringify({ ids, list }));
+            return { status: 200, body: { files: ids, dryRun: true, impacts: list, confirm } };
+        }
+        const was = signed.get(body.confirm as string);
+        if (!was || JSON.stringify((JSON.parse(was) as { ids: unknown }).ids) !== JSON.stringify(ids)) return refusal(400, 'material.body');
+        if (m.deleteChangeOnce) {
+            m.deleteImpacts = { ...(m.deleteImpacts ?? {}), ...m.deleteChangeOnce };
+            delete m.deleteChangeOnce;
+        }
+        const list = impacts();
+        if (JSON.stringify((JSON.parse(was) as { list: unknown }).list) !== JSON.stringify(list)) {
+            return { status: 409, body: { error: 'changed', code: 'material.delete-changed', text: 'changed', impacts: list } };
+        }
+        signed.delete(body.confirm as string);
+        m.files = m.files.filter(f => !(ids as string[]).includes(f.id));
+        return { status: 200, body: { files: ids, deleted: ids, impacts: list, ...commitWrite(b) } };
+    }
+    if (rest === '/material/edit') {
+        (m.edits ??= []).push(body);
+        if ((m.busyTimes ?? 0) > 0) return busy();
+        if (m.readonly) return refusal(403, 'material.readonly');
+        const ids = body.ids;
+        const fields = (['title', 'kind', 'date'] as const).filter(k => body[k] !== undefined);
+        if (!Array.isArray(ids) || ids.length === 0 || ids.length > 500 || !ids.every(i => typeof i === 'string' && FILE_REF.test(i))
+            || fields.length === 0 || !fields.every(k => typeof body[k] === 'string')
+            || (body.kind !== undefined && !['', 'photo', 'document', 'record', 'other'].includes(body.kind as string))) {
+            return refusal(400, 'material.body');
+        }
+        const files = (ids as string[]).map(id => m.files.find(f => f.id === id));
+        const missing = (ids as string[]).find((_, i) => !files[i]);
+        if (missing) return refusal(404, 'material.file', { id: missing });
+        const was: Record<string, Record<string, string>> = {};
+        for (const f of files as FakeMaterialFile[]) {
+            was[f.id] = {};
+            for (const k of fields) {
+                was[f.id][k] = (f[k] as string | undefined) ?? '';
+                const v = body[k] as string;
+                if (v) (f as unknown as Record<string, string>)[k] = v; else delete f[k];
+            }
+        }
+        return { status: 200, body: { files: (files as FakeMaterialFile[]).map(shown), changed: files.length, was, people: peopleOf(files as FakeMaterialFile[], []), ...commitWrite(b) } };
+    }
     (rest === '/material/assign' ? m.assigns : m.hides).push(body);
     if ((m.busyTimes ?? 0) > 0) return busy();
     if (m.readonly) return refusal(403, 'material.readonly');
@@ -1914,19 +2156,38 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
             }
             return json(400, { error: 'Not a body /live takes.', code: 'live.body' });
         }
+        // The books' settings (spec 105 §4): a number of tasks or the downloaded book first, or back to the default.
+        if (b.books && method === 'POST' && /\/books$/.test(url.pathname) && b.features?.includes('books')) {
+            let body: Record<string, unknown> = {};
+            try { body = JSON.parse(route.request().postData() ?? '{}'); } catch { /* keep empty */ }
+            b.books.posts.push(body);
+            if (b.books.reply) return json(b.books.reply.status, b.books.reply.body);
+            const set = { ...(b.books.books.settings as Record<string, unknown>) };
+            if (body.minTasks === 'default') Object.assign(set, { minTasks: set.minTasksDefault ?? 5, minTasksOwn: false });
+            else if (typeof body.minTasks === 'number' && Number.isInteger(body.minTasks) && body.minTasks >= 1 && body.minTasks <= 999) {
+                Object.assign(set, { minTasks: body.minTasks, minTasksOwn: true });
+            } else if (body.sameBook === 'default') Object.assign(set, { sameBook: set.sameBookDefault ?? 'no', sameBookOwn: false });
+            else if (body.sameBook === 'yes' || body.sameBook === 'no') Object.assign(set, { sameBook: body.sameBook, sameBookOwn: true });
+            else return json(400, { error: 'Not a body /books takes.', code: 'books.body' });
+            b.books.books = { ...b.books.books, settings: set };
+            return json(200, { books: { settings: set }, head: b.head, parent: b.head });
+        }
         // A heavy part apart (research 1.26.0, `status.parts`): its rev and its fields as the full status has them.
         const partPath = /\/status\/([A-Za-z]+)$/.exec(url.pathname);
         if (partPath && method === 'GET' && b.features?.includes('status.parts')) {
             (b.partReads ??= []).push(partPath[1]);
+            if (partPath[1] === 'books' && b.books && b.features.includes('books')) {
+                return json(200, { part: 'books', rev: partRev(b.books.books), head: b.head, books: b.books.books });
+            }
             if (partPath[1] !== 'waiting') return json(404, { error: 'no such part', code: 'status.part' });
             return json(200, { part: 'waiting', rev: partRev(b.waiting), head: b.head, ...(b.waiting ? { waiting: b.waiting } : {}) });
         }
         if (url.pathname.endsWith('/status')) {
             if (b.statusHang) return new Promise<void>(() => { /* never answers */ });
-            if (b.statusDelayMs) {
+            if (b.statusGate) {
                 b.statusOpen = (b.statusOpen ?? 0) + 1;
                 b.statusOpenMax = Math.max(b.statusOpenMax ?? 0, b.statusOpen);
-                await new Promise(r => setTimeout(r, b.statusDelayMs));
+                await b.statusGate;
                 b.statusOpen--;
             }
             if (b.statusCode) return json(b.statusCode, { error: 'not here' });
@@ -1939,7 +2200,8 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
                 ...(b.batches ? { batches: b.batches } : {}),
                 ...(b.strom ? { strom: b.strom } : {}),
                 ...(b.waiting && !light ? { waiting: b.waiting } : {}),
-                ...(light ? { parts: { waiting: partRev(b.waiting) } } : {}),
+                ...(light ? { parts: { waiting: partRev(b.waiting), ...(b.books && b.features?.includes('books') ? { books: partRev(b.books.books) } : {}) } } : {}),
+                ...(b.books && !light && b.features?.includes('books') ? { books: b.books.books } : {}),
                 ...(b.features ? { features: b.features } : {}),
                 ...(b.accepts ? { sends: b.sends } : {}),
                 ...(b.read ? { reads: b.read.reads } : {}),
@@ -1956,6 +2218,7 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
                 ...(b.quality ? { quality: { rev: b.quality.rev } } : {}),
                 ...(b.hypotheses?.decide !== undefined ? { hypotheses: { decide: b.hypotheses.decide } } : {}),
                 ...(b.live ? { live: { idleMinutes: b.live.idleMinutes, idleChoices: b.live.idleChoices ?? [0, 120] } } : {}),
+                ...(b.handoffs ? { handoffs: b.handoffs } : {}),
                 ...(b.statusExtra ?? {}),
             });
         }
@@ -1977,6 +2240,7 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
             if (b.syncDelayMs) await new Promise(r => setTimeout(r, b.syncDelayMs));
             const body = route.request().postData() ?? '';
             b.posts.push(body);
+            (b.postQueries ??= []).push(url.searchParams);
             const sent = /1 _STROM_SENT (\S+)/.exec(body)?.[1] ?? '';
             const appTree = /1 _STROM_APP_TREE (\S+)/.exec(body)?.[1] ?? UUID;
             const intake = `R${Date.now()}-${b.posts.length}`;
@@ -2001,6 +2265,8 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
             return json(b.syncReply.status, b.syncReply.status < 300 ? { ...(b.syncReply.body as object), intake } : b.syncReply.body);
         }
         if (url.pathname.endsWith('/tree.ged')) {
+            b.treeGets = (b.treeGets ?? 0) + 1;
+            if (b.treeDelayMs) await new Promise(r => setTimeout(r, b.treeDelayMs));
             return route.fulfill({ status: 200, headers: { ...cors, 'content-type': 'text/plain; charset=utf-8' }, body: b.treeGed });
         }
         if (url.pathname.endsWith('/cancel')) return json(200, { ok: true });
@@ -2010,6 +2276,15 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
             try { body = JSON.parse(route.request().postData() ?? '{}'); } catch { /* keep empty */ }
             (b.batchDone ??= []).push({ id: decodeURIComponent(done[1]), body });
             const files = b.mediaPuts.filter(p => p.headers['x-strom-batch'] === decodeURIComponent(done[1])).length;
+            const mat = b.material;
+            if (mat?.listBatches && files) {
+                const id = decodeURIComponent(done[1]);
+                mat.batches.push({ id, name: String(body.name ?? id), at: new Date().toISOString() });
+                b.mediaPuts.filter(p => p.headers['x-strom-batch'] === id).forEach((p, i) => {
+                    const n = 500 + mat.files.length + i;
+                    mat.files.push(materialFile(n, { batch: id, path: p.headers['x-strom-path'], name: (p.headers['x-strom-path'] ?? `scan-${n}.jpg`).split('/').pop()! }));
+                });
+            }
             return json(200, { batch: done[1], name: body.name, inputs: files, known: 0, refused: 0, nested: [], tasks: files ? ['T0101'] : [], head: b.head,
                 ...(b.material?.writeParent ? { parent: b.head } : {}) });
         }
@@ -2081,9 +2356,11 @@ export async function openResearch(page: Page, opts: { edit?: boolean; bridge?: 
     await openApp(page);
     await page.evaluate(() => {
         // Opening links in the system is not testable: record them instead.
-        const ui = window.Strom.UI as unknown as { handOverResearchLink: (u: string) => void; __links: string[] };
+        const ui = window.Strom.UI as unknown as { handOverResearchLink: (u: string, h?: string | null) => void; __links: string[]; __handoffs: string[] };
         ui.__links = [];
-        ui.handOverResearchLink = (u: string) => { ui.__links.push(u); };
+        ui.__handoffs = [];
+        // The link's handoff id (waiting buttons §3.1) apart: the links compare as they are built.
+        ui.handOverResearchLink = (u: string, h?: string | null) => { ui.__links.push(u); if (h) ui.__handoffs.push(h); };
     });
     await dropFile(page, 'tree-strom.ged', opts.ged ?? researchGed());
     await expect(card(page, 'Jan')).toBeVisible();
@@ -2105,6 +2382,11 @@ export async function openResearch(page: Page, opts: { edit?: boolean; bridge?: 
             modeAsked: true, skipPreview: true, ...(placesOffer ? {} : { placesOffer: 'done' }) }));
     }, { auto: !!opts.auto, placesOffer: !!opts.placesOffer });
     if (opts.edit) await editJan(page);
+}
+
+/** The handoff ids of the links handed over so far (`openResearch` records them). */
+export async function handedOff(page: Page): Promise<string[]> {
+    return page.evaluate(() => (window.Strom.UI as unknown as { __handoffs?: string[] }).__handoffs ?? []);
 }
 
 export async function editJan(page: Page, place = 'Praha'): Promise<void> {

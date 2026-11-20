@@ -13,9 +13,13 @@ import { researchActionLabel, researchMarkFlags, type ResearchNoteLink } from '.
 import { strings, getCurrentLanguage } from '../strings.js';
 import { manageCan, manageSwitchOn } from '../history-manage.js';
 import { historyPlaceOfferable, historyWaiting, pickHistoryText } from '../history.js';
-import { postBridgePlace, type HistoryWriteRefusal } from '../history-bridge.js';
+import { postBridgePlace, HISTORY_WRITE_TIMEOUT_MS, type HistoryWriteRefusal } from '../history-bridge.js';
 import { HISTORY_PLACE_DIRECT_FEATURE, researchLinkMark, researchUrlMark } from '../research-link.js';
 import { uiModule } from './module.js';
+import { runBusy } from './busy.js';
+
+/** Places whose history is asked again and not answered yet (B192). */
+const placeAgainAsking = new Set<string>();
 
 export const HISTORY_PLACE_DIALOG_ID = 'history-place-modal';
 
@@ -120,7 +124,7 @@ export const historyPlaceMethods = uiModule({
             + '</div>'
             + '<div class="buttons hpf-foot">'
             + `<button type="button" class="secondary" data-hpf="cancel">${esc(strings.buttons.cancel)}</button>`
-            + `<button type="button" class="primary" data-hpf="go"${st.busy ? ' disabled aria-busy="true"' : ''}>`
+            + `<button type="button" class="primary" id="hpf-go" data-hpf="go"${st.busy ? ' aria-disabled="true"' : ''}>`
             // The terminal: the research opens and its agent searches (AI); the direct form writes from here.
             + `${terminal ? researchActionLabel(h.placeGoTerminal, (st.link && researchUrlMark(st.link)) || researchLinkMark('history')) : esc(h.placeGo)}</button>`
             + '</div>';
@@ -161,13 +165,26 @@ export const historyPlaceMethods = uiModule({
             this.renderHistoryPlaceFind();
             return;
         }
-        st.busy = true;
-        st.note = null;
-        this.renderHistoryPlaceFind();
+        const base = ctx.base;
         const before = this.researchHeadNow(st.rid);
-        const r = await postBridgePlace(ctx.base, st.id, ctx.features, this.historyOffCheck(st.rid, 'places'));
+        // The button says "Sending…" from the click until the research answers (B191); its id keeps it through the redraw.
+        const write = async () => {
+            st.busy = true;
+            st.note = null;
+            this.renderHistoryPlaceFind();
+            try {
+                return await postBridgePlace(base, st.id, ctx.features, this.historyOffCheck(st.rid, 'places'));
+            } finally {
+                st.busy = false;
+            }
+        };
+        const el = document.getElementById('hpf-go');
+        const r = el ? await runBusy(el, write, { label: strings.busy.sending, kind: 'write', timeoutMs: HISTORY_WRITE_TIMEOUT_MS + 5000 }) : await write();
         if (state !== st) return;
-        st.busy = false;
+        if (!r) {
+            this.renderHistoryPlaceFind();
+            return;
+        }
         if (r.ok) {
             // Only a research that says `history.place.direct`: first in line.
             this.closeHistoryPlaceFind();
@@ -213,8 +230,15 @@ export const historyPlaceMethods = uiModule({
     async historyPlaceSearchAgain(key: string): Promise<void> {
         const d = this.historyManageDrawn();
         const id = d?.payload?.places[key]?.id;
-        if (!d?.base || !id) return;
-        const r = await postBridgePlace(d.base, id, d.features, this.historyOffCheck(d.rid, 'places'));
+        // Asked already and not answered (the detail drawn anew meanwhile has a new link): nothing more.
+        if (!d?.base || !id || placeAgainAsking.has(key)) return;
+        placeAgainAsking.add(key);
+        let r: Awaited<ReturnType<typeof postBridgePlace>>;
+        try {
+            r = await postBridgePlace(d.base, id, d.features, this.historyOffCheck(d.rid, 'places'));
+        } finally {
+            placeAgainAsking.delete(key);
+        }
         if (r.ok) {
             this.showToast(strings.history.placeToast(d.names.place(key)), 6000, { kind: 'history-place' });
             this.historyManageWritten(d.rid, this.researchHeadNow(d.rid), r);

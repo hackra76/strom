@@ -21,11 +21,14 @@ import {
     CARD_MARK_WIDTH, CARD_COLUMN_GAP, CUSTOM_CARD_PAD_X, CARD_ROW_HEIGHT, CARD_DETAIL_GAP, CARD_LABEL_GAP,
     CARD_VALUE_DATE_GAP, CARD_NAME_ROW_HEIGHT, CARD_YEARS_ROW_HEIGHT, CARD_BIRTH_ROW_HEIGHT, CARD_AVATAR_WIDTH, CARD_HEAD_GAP,
     MeasureTexts, CardRow, cardPlaceOffset, cardLinesTop, customCardRows, cardHeadBlock, CARD_STATUS_MARK_ROOM,
-    CARD_NAME_MAX_ROWS, normalCardNameRows, NORMAL_CARD_NAME_ROW_HEIGHT, normalCardTextWidth, cardAvatarSize,
+    CARD_NAME_MAX_ROWS, normalCardNameRows, NORMAL_CARD_NAME_ROW_HEIGHT, normalCardTextWidth, cardAvatarSize, avatarInitialsSize,
 } from './card-width.js';
 import { shownName, shownNameParts, birthNoteText } from './person-name.js';
 import { strings } from './strings.js';
 import { unionOrderGlyphLift } from './union-order-measure.js';
+import type { BranchSet } from './branch-colors.js';
+import type { BranchMarker } from './types.js';
+import { branchMarkerSvg, branchMarkerDefs, branchTintFill, branchLetters } from './branch-marker-svg.js';
 import { isClusterBoundary } from './ged-exporter.js';
 import {
     unionOrderBadges, UnionOrderBadge, PillMetrics, estimatePillMetrics, estimateShortPillMetrics, placeUnionOrderPill, viewLineSegments,
@@ -77,23 +80,8 @@ export const POSTER_PADDING = PADDING;
 export const POSTER_FONT = FONT;
 export const POSTER_BG = COLORS.background;
 
-/** Branch stripe colours (match the on-screen --branch-* variables). */
-const BRANCH_COLORS: Record<string, string> = {
-    paternal: '#d08a5a', maternal: '#5a8fc0', descendant: '#57a869',
-};
-
-/**
- * The branch stripe: the left `w` px of the card's rounded rectangle (corner
- * radius r), so it runs into the rounded corners like the on-screen stripe
- * instead of being a separate bar. Exported for tests.
- */
-export function branchStripePath(x: number, y: number, h: number, r: number, w: number): string {
-    const f = (n: number) => n.toFixed(2);
-    // Where the corner arc meets the stripe's inner edge (x + w).
-    const dy = w < r ? r - Math.sqrt(r * r - (r - w) * (r - w)) : 0;
-    return `M${f(x + w)} ${f(y + dy)}A${r} ${r} 0 0 0 ${f(x)} ${f(y + r)}`
-        + `L${f(x)} ${f(y + h - r)}A${r} ${r} 0 0 0 ${f(x + w)} ${f(y + h - dy)}Z`;
-}
+// The lineage markers (spec 112) are drawn by src/branch-marker-svg.ts, shared with other posters.
+export { branchStripePath, BRANCH_COLORS, BRANCH_INK, BRANCH_TINT } from './branch-marker-svg.js';
 
 /** The status mark's place (index.html .card-status-mark): 4px above the bottom, 15px in beside a fold, 5px without. */
 const STATUS_MARK_H = 12;
@@ -333,8 +321,18 @@ export interface PosterOptions extends PosterFooterMeta {
      * Register, Custom) are drawn from `cardLines`.
      */
     cardDensity?: 'compact' | 'normal';
-    /** Branch classification (person id -> paternal|maternal|descendant). */
-    branchMap?: Map<string, string> | null;
+    /**
+     * The lineage of each marked person (src/branch-colors.ts classifyBranches;
+     * both ancestral lines at once for pedigree collapse, R4). Absent or null:
+     * no markers.
+     */
+    branchMap?: Map<string, BranchSet> | null;
+    /** The marker's shape from Settings (spec 112 R1); default arc. 'none' draws no shape (the tint may still fill the card). */
+    branchMarker?: BranchMarker;
+    /** The marked cards' ground in their line's tint (Settings, R1). */
+    branchTint?: boolean;
+    /** Two same-gender parents (R5): the tag's letters are 1 and 2. */
+    branchNumbered?: boolean;
     /** Persons drawn with the † marker. */
     deceasedSet?: Set<string>;
     /**
@@ -402,12 +400,13 @@ export interface PosterOptions extends PosterFooterMeta {
     cardMarks?: Map<string, PosterCardMarks>;
     /**
      * The photo on the card (spec 096), as the screen draws it: `size` the
-     * view's photo size (the chosen one when someone laid out has a photo,
+     * view's photo size (the chosen one when someone laid out has an avatar,
      * else small: the layout's card box was made for it), `shape` the
      * photo's and the initials' shape. `photoIds`: the people laid out with
-     * a photo; a living-privacy mode takes the photo from the data drawn,
-     * and such a card keeps the box it was laid out with, its initials in
-     * the photo's place. Absent: small and a circle, the card as it always was.
+     * the avatar of that size, a photo or the initials (spec 103 K2.1; absent:
+     * everyone with an avatar); a living-privacy mode takes the photo from the
+     * data drawn, and such a card keeps its box, its initials in the photo's
+     * place. Absent: small and a circle, the card as it always was.
      */
     cardPhoto?: PosterCardPhoto;
 }
@@ -435,6 +434,8 @@ function avatarSvg(a: {
     photo?: string; clipId: string; initials: string; initialsSize: number;
 }): string[] {
     const r = a.size / 2;
+    // The initials' baseline: 4px below the middle at 11–12px, in proportion at a larger size.
+    const baseline = a.initialsSize <= 12 ? 4 : a.initialsSize * 0.35;
     const outline = (attrs: string): string => a.shape === 'rounded'
         ? `<rect x="${(a.cx - r).toFixed(1)}" y="${(a.cy - r).toFixed(1)}" width="${a.size}" height="${a.size}" rx="${ROUNDED_AVATAR_RADIUS[a.size] ?? 5}"${attrs}/>`
         : `<circle cx="${a.cx.toFixed(1)}" cy="${a.cy.toFixed(1)}" r="${r}"${attrs}/>`;
@@ -447,7 +448,7 @@ function avatarSvg(a: {
     }
     return [
         outline(` fill="${COLORS.avatarBg}" stroke="${a.ring}" stroke-width="${a.stroke}"`),
-        `<text x="${a.cx.toFixed(1)}" y="${(a.cy + 4).toFixed(1)}" text-anchor="middle" font-size="${a.initialsSize}" font-weight="600" fill="${COLORS.initials}">${escapeXml(a.initials)}</text>`,
+        `<text x="${a.cx.toFixed(1)}" y="${(a.cy + baseline).toFixed(1)}" text-anchor="middle" font-size="${a.initialsSize}" font-weight="600" fill="${COLORS.initials}">${escapeXml(a.initials)}</text>`,
     ];
 }
 
@@ -534,14 +535,16 @@ function customCardSvg(
     const head = heads[0];
     let textX = left;
     if (!person.isPlaceholder) {
-        // A medium or large photo (spec 096 §3): 44 / 72px at the header's top left, a 2px ring.
+        // A medium or large avatar (spec 096 §3; a photo or the initials, spec 103 K2.1):
+        // 44 / 72px at the header's top left, a 2px ring.
         const size = photo ? cardAvatarSize(photo) : CARD_AVATAR_WIDTH;
         const cx = left + size / 2;
         // The small avatar where a one-row name puts it (the middle of that header), however many rows the name takes (T39).
         const cy = photo ? pos.y + 10 + size / 2 : pos.y + 10 + Math.min(head.block, cardHeadBlock(1, !!head.years)) / 2;
         out.push(...avatarSvg({
             cx, cy, size, shape, ring, stroke: photo ? 2 : 1.5, clipId, photo: person.photo,
-            initials: personInitials(person.firstName, shownNameParts(person, '', false).surname) || '?', initialsSize: 11,
+            initials: personInitials(person.firstName, shownNameParts(person, '', false).surname) || '?',
+            initialsSize: photo ? avatarInitialsSize(size) : 11,
         }));
         textX = left + size + CARD_HEAD_GAP;
     }
@@ -926,12 +929,24 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
     // --- Cards (id order for deterministic output) ---
     out.push('<g class="cards">');
     let clipCounter = 0;
-    // The photo on the card (spec 096): a card laid out with a medium or large photo is drawn with it.
+    // Lineage markers (spec 112): the shape chosen in Settings, the tint, R4 and R5.
+    const branchMarker: BranchMarker = options.branchMap ? (options.branchMarker ?? 'arc') : 'none';
+    const branchTint = !!options.branchTint && !!options.branchMap;
+    const branchDraw = {
+        marker: branchMarker,
+        compact: !options.cardLines && options.cardDensity === 'compact',
+        letters: branchLetters(!!options.branchNumbered),
+        nextId: () => `bm${clipCounter++}`,
+    };
+    const branchDefs = options.branchMap ? branchMarkerDefs(options.branchMap.values(), branchMarker, branchTint) : '';
+    if (branchDefs) out.push(branchDefs);
+    // The photo on the card (spec 096): a card laid out with a medium or large avatar is drawn
+    // with it, a photo or the initials (spec 103 K2.1).
     const photoView = options.cardPhoto?.size ?? 'small';
     const photoShape = options.cardPhoto?.shape ?? 'circle';
     const photoIds = options.cardPhoto?.photoIds;
     const laidOutWithPhoto = (id: string, p: StromData['persons'][keyof StromData['persons']] | undefined): boolean =>
-        photoView !== 'small' && !!p && !p.isPlaceholder && (photoIds ? photoIds.has(id) : !!p.photo);
+        photoView !== 'small' && !!p && !p.isPlaceholder && (photoIds ? photoIds.has(id) : true);
     const entries = [...result.positions.entries()].sort((a, b) => String(a[0]).localeCompare(String(b[0])));
     for (const [personId, pos] of entries) {
         const person = data.persons[personId];
@@ -954,15 +969,14 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
         // Custom cards are made to be printed: a firmer border on paper.
         const borderDash = isPlaceholder ? ' stroke-dasharray="4,3"' : '';
         const border = options.cardLines ? COLORS.printBorder : COLORS.cardBorder;
-        out.push(`<rect x="${pos.x.toFixed(1)}" y="${pos.y.toFixed(1)}" width="${cw}" height="${ch}" rx="8" fill="${COLORS.cardBg}" stroke="${border}" stroke-width="1"${borderDash}/>`);
+        // The lineage (a placeholder carries none, as on screen).
+        const branchSet = isPlaceholder || (branchMarker === 'none' && !branchTint) ? undefined : options.branchMap?.get(personId);
+        const cardFill = (branchTint && branchTintFill(branchSet)) || COLORS.cardBg;
+        out.push(`<rect x="${pos.x.toFixed(1)}" y="${pos.y.toFixed(1)}" width="${cw}" height="${ch}" rx="8" fill="${cardFill}" stroke="${border}" stroke-width="1"${borderDash}/>`);
 
-        // Branch colour stripe (matches the on-screen ::before stripe): from the
-        // outer edge of the 1px border, following the card's rounded corners.
-        const branch = options.branchMap?.get(personId);
-        const stripeColor = branch ? BRANCH_COLORS[branch] : undefined;
-        if (stripeColor) {
-            out.push(`<path class="branch-stripe" d="${branchStripePath(pos.x - 0.5, pos.y - 0.5, ch + 1, 8.5, 4.5)}" fill="${stripeColor}"/>`);
-        }
+        // The lineage marker as on screen: the arc, stripe and corner on the card, the tag over its content.
+        const branchMarks = branchMarkerSvg(branchSet, { x: pos.x, y: pos.y, w: cw, h: ch }, branchDraw);
+        out.push(...branchMarks.under);
 
         if (person && options.cardLines) {
             out.push(customCardSvg(person, pos, cw, options.cardLines.get(personId) ?? [], ring, `av${clipCounter++}`,
@@ -987,9 +1001,9 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
             // Avatar: gender-ring circle with a photo or initials (like on
             // screen), 34px (r=17) centred on the card's height; 10px left
             // padding (border + padding) — matches the CSS. A card laid out
-            // with a medium or large photo (spec 096 §2, NORMAL_PHOTO_BOX):
-            // the photo's size and the card's padding of that box; the initials
-            // of a card without one stay 34px in the wider card.
+            // with a medium or large avatar (spec 096 §2, NORMAL_PHOTO_BOX):
+            // the avatar's size and the card's padding of that box, a photo or
+            // the initials alike (spec 103 K2.1).
             const photoCard = laidOutWithPhoto(personId, person);
             const box = NORMAL_PHOTO_BOX[photoCard ? photoView : 'small'];
             const pad = 1 + box.padX;
@@ -999,7 +1013,8 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
             out.push(...avatarSvg({
                 cx: cxAv, cy: cyAv, size: box.avatar, shape: photoShape, ring, stroke: 2,
                 photo: person.photo, clipId: person.photo ? `av${clipCounter++}` : '',
-                initials: personInitials(person.firstName, shownNameParts(person, '', false).surname) || '?', initialsSize: 12,
+                initials: personInitials(person.firstName, shownNameParts(person, '', false).surname) || '?',
+                initialsSize: photoCard ? avatarInitialsSize(box.avatar) : 12,
             }));
 
             // Text column right of the avatar (padding + avatar + gap): 125px beside a photo of any size.
@@ -1027,17 +1042,22 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
             const measure = options.measureCardTexts ?? estimateCardTexts;
             // In a view of a medium or large photo the column of its box (src/card-width.ts normalCardTextWidth).
             const split = normalCardNameRows([{ given: parts.given, surname: parts.surname, avatar: true,
-                ...(photoView === 'small' ? {} : { textWidth: normalCardTextWidth(photoView, true, photoCard) }) }], measure)[0];
+                ...(photoView === 'small' ? {} : { textWidth: normalCardTextWidth(photoView, true) }) }], measure)[0];
             const nameRows = [...split.given, ...split.surname];
             const wrapped = nameRows.length > 2;
-            // With the birth surname's row the name stays on one line 15 → 14 → 13px, else goes on rows.
-            const oneLine = wrapped || !birthText ? undefined : [15, 14, 13].find(fs => estWidth(fullName, fs, true) <= contentW);
-            if (!wrapped && !birthText) {
-                out.push(fittedText(fullName, cx, pos.y + 28, contentW, [15, 13, 11], true, COLORS.text));
+            // One line as the screen fits it (renderer.ts fitCardNamesNow): 15 → 14 → 13px, measured in the
+            // screen's font; still too wide, the rows (step 2) — never smaller than the screen's 13px floor.
+            const nameAt15 = measure('name', [fullName]).get(fullName) ?? 0;
+            const oneLine = wrapped ? undefined : [15, 14, 13].find(fs => nameAt15 * fs / 15 <= contentW);
+            if (!wrapped && !birthText && oneLine) {
+                // Measured by the screen: drawn at that width (inside the column in any font).
+                const nameW = nameAt15 * oneLine / 15;
+                const clamp = options.measureCardTexts && nameW > 0 ? ` textLength="${nameW.toFixed(1)}" lengthAdjust="spacingAndGlyphs"` : '';
+                out.push(`<text x="${cx.toFixed(1)}" y="${(pos.y + 28).toFixed(1)}" text-anchor="middle" font-size="${oneLine}" font-weight="600" fill="${COLORS.text}"${clamp}>${escapeXml(fullName)}</text>`);
                 if (meta) {
                     out.push(fittedText(meta, cx - markRoom / 2, pos.y + 45, contentW - markRoom, [11, 10, 9], false, COLORS.textLight));
                 }
-            } else if (oneLine) {
+            } else if (oneLine && birthText) {
                 out.push(`<text x="${cx.toFixed(1)}" y="${(pos.y + 24).toFixed(1)}" text-anchor="middle" font-size="${oneLine}" font-weight="600" fill="${COLORS.text}">${escapeXml(fullName)}</text>`);
                 out.push(`<text class="card-birth" x="${cx.toFixed(1)}" y="${(pos.y + 38.5).toFixed(1)}" text-anchor="middle" font-size="11" fill="${COLORS.textFaint}">${escapeXml(birthText)}</text>`);
                 if (meta) out.push(fittedText(meta, cx - markRoom / 2, pos.y + 52.5, contentW - markRoom, [11, 10, 9], false, COLORS.textLight));
@@ -1070,6 +1090,7 @@ export function buildTreeSvg(data: StromData, result: PosterLayout, options: Pos
 
         if (marks?.story) out.push(storyFoldSvg(marks.story, pos.x + cw + 0.5, pos.y + ch + 0.5));
         if (markCls) out.push(statusMarkSvg(markCls, pos.x + cw + 0.5, pos.y + ch + 0.5, !!marks?.story));
+        out.push(...branchMarks.over);
 
         if (dimmed) out.push('</g>');
     }

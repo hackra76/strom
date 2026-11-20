@@ -8,7 +8,7 @@
  *   and any other section remembered open are computed when the dialog
  *   opens; the rest on idle callbacks (family lines → life → time → quality →
  *   highlights, one per callback) or at once when expanded first.
- * - A section still calculating shows "Calculating…" after 150 ms and keeps
+ * - A section still calculating shows "Calculating…" after 120 ms and keeps
  *   it at least 300 ms once shown (aria-busy on its body).
  * - Results are cached by section + tree + chosen person + revision; the
  *   revision moves on every data change (edits and undo included) and tree
@@ -26,6 +26,8 @@
  *   evidence pill with "Back to overview", which reopens it where it was).
  */
 
+import { BUSY_SHOW_MS, BUSY_MIN_MS as BUSY_HOLD_MS, busyButtonHtml } from './busy.js';
+import { treeMedia } from '../media.js';
 import { DataManager } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { TreeRenderer } from '../renderer.js';
@@ -115,10 +117,10 @@ const REFRESH_DELAY_MS = 120;
 const rootKey = (treeId: string): string => `overview.root.${treeId}`;
 const recentKey = (treeId: string): string => `overview.recent.${treeId}`;
 const MAX_RECENT = 3;
-/** "Calculating…" appears after this long … */
-const BUSY_DELAY_MS = 150;
-/** … and, once shown, stays at least this long. */
-const BUSY_MIN_MS = 300;
+/** "Calculating…" appears after this long (the app's one threshold, waiting buttons §8: 120 ms) … */
+const BUSY_DELAY_MS = BUSY_SHOW_MS;
+/** … and, once shown, stays at least this long (300 ms). */
+const BUSY_MIN_MS = BUSY_HOLD_MS;
 /** Ancestor rows shown at least (empty generations padded). */
 const MIN_ANCESTOR_ROWS = 3;
 /** A touch screen: no tooltips to read. */
@@ -149,6 +151,15 @@ let closePopover: (() => void) | null = null;
 let titlebarObserver: ResizeObserver | null = null;
 
 /** The head's height as --tov-bar-h on the dialog (CSS: the sticky person row's top on a phone). */
+/**
+ * The inside of a button that opens the tree check (C102): its short working words drawn with it, so the button
+ * keeps its width while the check runs (the sentence with the count would widen it by half).
+ */
+function checkBtn(label: string): string {
+    const esc = (t: string): string => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return busyButtonHtml(esc(label), strings.busy.checking, undefined, { own: true });
+}
+
 function watchTitlebarHeight(overlay: HTMLElement): void {
     titlebarObserver?.disconnect();
     titlebarObserver = null;
@@ -870,7 +881,7 @@ export const treeOverviewMethods = uiModule({
     },
 
     /**
-     * Fill one section: "Calculating…" (visible after 150 ms) while the
+     * Fill one section: "Calculating…" (visible after 120 ms) while the
      * result is computed after the next frame, then the content and summary.
      * `now` (the idle callbacks): compute right away, without the indicator.
      */
@@ -995,7 +1006,7 @@ export const treeOverviewMethods = uiModule({
                     text = t.cardValidation(card.count, topErrorType ? typeInSentence(topErrorType) : '');
                     // Outside the open tree nothing can be fixed, but the details only read:
                     // "Validation details" instead of a disabled "Fix".
-                    button = `<button type="button" class="tov-btn tov-btn--danger" data-tov="validation">${esc(st.active ? t.actFix : t.actValidation)}</button>`;
+                    button = `<button type="button" class="tov-btn tov-btn--danger" data-tov="validation" data-busy="idle">${checkBtn(st.active ? t.actFix : t.actValidation)}</button>`;
                     break;
                 case 'ancestorGap':
                     text = t.cardGap(capitalize(ancestorGenerationLabel(card.n, lang)), card.known, card.expected);
@@ -1883,7 +1894,8 @@ export const treeOverviewMethods = uiModule({
             const persons = Object.values(data.persons).filter(p => !p.isPlaceholder);
             const year = new Date().getFullYear();
             const bounds = inferBirthUpperBounds(data);
-            let deceased = 0, deceasedWithDeathDate = 0, photos = 0, events = 0, attachments = 0;
+            let deceased = 0, deceasedWithDeathDate = 0, photos = 0, events = 0;
+            const attachments = treeMedia(data).length;
             for (const p of persons) {
                 if (!isLivingPerson(p, year, bounds)) {
                     deceased++;
@@ -1891,8 +1903,9 @@ export const treeOverviewMethods = uiModule({
                 }
                 if (p.photo) photos++;
                 events += p.events?.length ?? 0;
-                attachments += p.attachments?.length ?? 0;
             }
+            // A couple's photo is a photo too (spec 107).
+            for (const u of Object.values(data.partnerships)) if (u.photo) photos++;
             const parts = findComponents(data).filter(c => c.count > 0).map(c => ({
                 name: componentName(c, strings.split.familyName, strings.split.noSurname), count: c.count,
             }));
@@ -2020,7 +2033,7 @@ export const treeOverviewMethods = uiModule({
             ? `<button type="button" class="tov-btn is-disabled" disabled>${esc(t.actCleanPlaces(0))}</button>`
             : this.treeOverviewActionHtml('clean-places', t.actCleanPlaces(q.orphanPlaces), 'tov-btn');
         const actions = block('actions', t.quickActions, `<div class="tov-actions">
-            <button type="button" class="tov-btn" data-tov="validation">${esc(t.actValidation)}</button>
+            <button type="button" class="tov-btn" data-tov="validation" data-busy="idle">${checkBtn(t.actValidation)}</button>
             ${clean}
             ${this.treeOverviewActionHtml('split-families', t.actSplitFamilies, 'tov-btn')}
         </div>`);

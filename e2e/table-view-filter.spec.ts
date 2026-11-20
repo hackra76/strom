@@ -70,7 +70,13 @@ test.describe('desktop (1440)', () => {
         await expect(panel).toHaveCount(0);
         await expect(status(page)).toHaveText('3 of 7 people');
         expect((await keys(page)).sort()).toEqual(['p:c', 'p:d', 'p:e']);
-        await expect(head(page, 'bDate').locator('.tv-filter-mark')).toHaveText('filter');
+        // The mark is the filled funnel, named (T54 H10: no word taking a narrow column's room).
+        const mark = head(page, 'bDate').locator('.tv-filter-mark');
+        await expect(mark).toHaveText('');
+        await expect(mark).toHaveAttribute('aria-label', 'Column filtered');
+        await expect(mark).toHaveAttribute('title', 'Column filtered');
+        await expect(mark.locator('svg')).toHaveAttribute('fill', 'currentColor');
+        await expect(head(page, 'bDate')).toHaveAttribute('aria-label', 'Birth date · Column filtered');
         const colChip = page.locator('#table-container .tv-chip--col');
         await expect(colChip).toHaveText(/Birth date 1880–1920/);
         await colChip.locator('.tv-chip-x').click();
@@ -155,7 +161,10 @@ test.describe('phone (390)', () => {
         const sheet = page.locator('.tv-fsheet');
         await expect(sheet).toBeVisible();
         await expect(sheet.locator('.tv-cp-title')).toHaveText('Filters');
-        const rowH = await sheet.locator('label.tv-fs-row').first().evaluate(el => el.getBoundingClientRect().height);
+        // Measured from the sheet, which outlives its redraws: a row found first and drawn anew before it
+        // is measured (the table's update after the sheet opens) is out of the page, 0 px high.
+        await expect(sheet.locator('label.tv-fs-row').first()).toBeVisible();
+        const rowH = await sheet.evaluate(el => el.querySelector('label.tv-fs-row')!.getBoundingClientRect().height);
         expect(rowH).toBeGreaterThanOrEqual(48);
         await sheet.locator('input[data-chip="deceased"]').check();
         await expect(status(page)).toHaveText('5 of 7 people');

@@ -16,7 +16,7 @@ import { acceptBatch } from '../research-hypothesis-waiting.js';
 import { fetchQueuePage, type QueuePageResult } from '../research-queue-pages.js';
 import { researchHypotheses } from '../view-links.js';
 import { uiModule } from './module.js';
-import { liveSession, overviewViewing, queuePaged, researchSession, type LiveSession } from './research-ui.js';
+import { followStartOf, liveSession, overviewViewing, queuePaged, researchSession, type LiveSession } from './research-ui.js';
 import { directionsWindowState, retryDirectionProblem } from './research-directions-ui.js';
 import { queueNextOffered, taskOrderWindowState } from './research-offline-ui.js';
 import { hoverCard } from './research-overview-ui.js';
@@ -24,6 +24,13 @@ import {
     OVERVIEW_STATE_VERSION, bridgeSecrets, cloneSafe, emptyOverviewExtras, overviewChanged, overviewSessionData,
     type OverviewAction, type OverviewExtras, type OverviewResearchState, type OverviewSource, type OverviewViewingData,
 } from '../windows/overview-window.js';
+
+/** Rows whose file the main window writes for the overview window now (its snapshot says so). */
+const filesSending = new Set<string>();
+/** Places whose queries' text the main window reads for the overview window now. */
+const notesReading = new Set<string>();
+/** Stop of the verification asked by the overview window and written here now. */
+let verifyStopping = false;
 
 /** What the overview window draws: the followed research of the open tree, else its research viewed without following. */
 function windowSession(): { s: LiveSession; source: OverviewSource } | null {
@@ -98,12 +105,18 @@ export const overviewWindowMethods = uiModule({
             // The tree's "Verifying" as the docked overview draws it (its Stop and bulk verification are run here).
             extras.verify = this.treeVerifyNow();
             extras.offLineSettings = this.offLineSettingsOffered(treeId);
+            extras.queueStart = this.queueStartNow();
+            extras.followStart = followStartOf(researchId);
+            if (filesSending.size) extras.fileSending = [...filesSending];
+            if (notesReading.size) extras.noteReading = [...notesReading];
+            if (verifyStopping) extras.verifyStopping = true;
         }
         // What the evidence pill lights up in the tree here (the window's rows say it).
         extras.highlight = this.evidenceHighlightNow();
         extras.follow = { on: this.isLiveFollowOn(), view: this.liveFollowView() };
         extras.lines = directionsWindowState(researchSession());
         extras.taskOrder = taskOrderWindowState();
+        extras.waitingWrite = this.waitingRowsWindowState(w?.s ?? null);
         const meta = treeId ? TreeManager.getTreeMetadata(treeId as TreeId) : null;
         const state: OverviewResearchState = {
             v: OVERVIEW_STATE_VERSION,
@@ -160,10 +173,18 @@ export const overviewWindowMethods = uiModule({
             case 'waiting-places':
                 this.showWaitingPlaces(a.args.focus);
                 return true;
-            case 'waiting-group-note':
-                if (!s) return false;
-                void this.showWaitingGroupNote(s, a.args.group, a.args.name);
-                return true;
+            case 'waiting-group-note': {
+                if (!s || !this.liveWaitingWrites(s).note) return false;
+                // Read here, its window shown here; the failure's sentence goes back to the window's button, its
+                // snapshot says the read runs meanwhile (it heard the ask, §11.2).
+                const key = a.args.group;
+                notesReading.add(key);
+                overviewChanged();
+                return this.readWaitingGroupNote(s, key, a.args.name).then(failed => ({ failed })).finally(() => {
+                    notesReading.delete(key);
+                    overviewChanged();
+                });
+            }
             case 'waiting-images': {
                 const w = item(a.args.itemId);
                 if (!s || !w) return false;
@@ -191,18 +212,26 @@ export const overviewWindowMethods = uiModule({
             case 'offline-settings':
                 this.openOffLineSettings();
                 return true;
+            case 'books-settings':
+                this.openBooksSettings();
+                return true;
             case 'verify-stop':
                 if (!this.treeVerifyNow()?.stop) return false;
-                void this.verifyStop(null);
-                return true;
+                // Written here; its outcome goes back to the window's Stop, the snapshot says the write runs (§11.2).
+                verifyStopping = true;
+                overviewChanged();
+                return this.writeVerifyStop().finally(() => {
+                    verifyStopping = false;
+                    overviewChanged();
+                });
             case 'highlight-end':
                 // Only the highlight the window saw: another one begun here since stays.
                 if (this.evidenceHighlightKind() !== a.args.kind) return false;
                 this.endEvidenceHighlight();
                 return true;
             case 'follow-live':
-                this.startFollowLive('overview');
-                return true;
+                // Its outcome goes back once the start ended: the window shows the state till then (§11.2).
+                return this.startFollowLive('window');
             case 'stop-follow':
                 if (ws?.source !== 'live') return false;
                 this.stopLiveFollow();
@@ -252,11 +281,43 @@ export const overviewWindowMethods = uiModule({
                 if (!s) return false;
                 void this.markWaitingGroupSent(s, a.args.group);
                 return true;
+            case 'waiting-retry':
+                return !!s && this.retryWaitingRow(s, a.args.itemId);
+            case 'waiting-audit': {
+                const args = a.args;
+                if (args.do === 'preview' || args.do === 'fix') {
+                    // Read or written through this window's bridge, the outcome to the window (it shows the preview and its refusals).
+                    const w = item(args.itemId);
+                    if (!s || !w?.audit) return { ok: false, code: 'audit-none', status: 0 };
+                    return args.do === 'fix' ? this.writeWaitingAuditFix(s, w, args.expect) : this.readWaitingAuditPreview(s, w);
+                }
+                if (!s) return false;
+                if (args.do === 'unkeep') {
+                    void this.unkeepWaitingAudit(s, args.itemId);
+                    return true;
+                }
+                if (args.do === 'unfix') {
+                    void this.undoWaitingAuditFix(s, args.itemId);
+                    return true;
+                }
+                const w = item(args.itemId);
+                if (!w?.audit) return false;
+                void this.keepWaitingAudit(s, w);
+                return true;
+            }
             case 'waiting-file': {
                 const w = item(a.args.itemId);
                 const task = w ? researchTaskRef(w.id) : null;
                 if (!s || !w || !task || !this.liveWaitingWrites(s).file || !waitingFileWritable(w)) return false;
-                return this.sendWaitingFile(s, task, a.args.file).then(() => true);
+                // The write's outcome goes back; the window says it on its button, its snapshot says the write runs
+                // (it heard the ask, §11.2).
+                const id = w.id;
+                filesSending.add(id);
+                overviewChanged();
+                return this.writeWaitingFile(s, task, a.args.file).finally(() => {
+                    filesSending.delete(id);
+                    overviewChanged();
+                });
             }
             case 'hypothesis-ask': {
                 const h = researchHypotheses(DataManager.getData()).get(a.args.hypothesisId);
@@ -277,7 +338,9 @@ export const overviewWindowMethods = uiModule({
                 // Built here for the open tree from the action and its parameters (never an address the window sends).
                 const url = this.activeResearchLink(a.args.link, (a.args.params ?? {}) as Omit<ResearchLinkParams, 'tree'>);
                 if (!url) return false;
-                this.launchResearchLink(url, a.args.kind ?? 'terminal');
+                // "Work on the queue…" starts here, its state in Now of both windows (3a).
+                if (a.args.link === 'work') this.beginQueueWork(url);
+                else this.launchResearchLink(url, a.args.kind ?? 'terminal');
                 return true;
             }
             case 'queue-order': {

@@ -24,7 +24,7 @@ import { DataManager } from '../data.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import type { PlaceGeo } from '../types.js';
 import { knownStreets, townOfPlace } from '../places.js';
-import { geocodeTown, placesCentroid, searchPlaceForms } from '../geocode.js';
+import { GEOCODE_TIMEOUT_MS, geocodeTown, placesCentroid, searchPlaceForms, type GeocodeFailure } from '../geocode.js';
 import { expandPlaceQuery } from '../place-query.js';
 import {
     crossDescription, findResults, findResultTexts, findTreePoints, miniMapFit, otherForms, stampedGeo,
@@ -34,9 +34,10 @@ import {
     fitBounds, panCenter, pointInViewport, tilesForViewport, tileUrl, MAX_ZOOM, MIN_ZOOM, TILE_ATTRIBUTION,
 } from '../map.js';
 import { SettingsManager } from '../settings.js';
-import { loadMapTile, mapTilesBlocked, onMapTilesChange, releaseMapTile } from './map-tiles.js';
+import { loadMapTile, mapTilesBlocked, mapTilesFailedIn, onMapTilesChange, releaseMapTile, retryMapTiles, tilesFailedNote } from './map-tiles.js';
 import { managerKnownStreets, managerPlaceUsage, managerResearchActions } from './places-manager-ui.js';
-import { placesView } from './places-identify-ui.js';
+import { placesView, PLACES_STEP_MS } from './places-identify-ui.js';
+import { runBusy, serviceFailText } from './busy.js';
 import { uiModule } from './module.js';
 
 /** The small map beside the results (CSS px; on a phone it takes the panel's width). */
@@ -89,13 +90,31 @@ export function drawTiles(layer: HTMLElement, view: SmallMapView, width: number,
         if (!seen.has(key)) { releaseMapTile(img); img.remove(); live.delete(key); }
     }
     renderTilesBlockedNote(layer);
+    renderTilesFailedNote(layer);
     if (!smallMapTilesBound) {
         smallMapTilesBound = true;
-        // The refusal arrives after the tiles were asked for: every small map on the page says so then.
+        // The refusal (or a failed tile) arrives after the tiles were asked for: every small map on the page says so then.
         onMapTilesChange(() => {
-            document.querySelectorAll<HTMLElement>('.place-mini-tiles').forEach(renderTilesBlockedNote);
+            document.querySelectorAll<HTMLElement>('.place-mini-tiles').forEach(l => {
+                renderTilesBlockedNote(l);
+                renderTilesFailedNote(l);
+            });
         });
     }
+}
+
+/**
+ * Tiles of a small map did not come (§10.3): the main map's sentence with Try again right under it (a small map
+ * has no free corner: its letters may stand anywhere); it goes once none is left failed.
+ */
+function renderTilesFailedNote(layer: HTMLElement): void {
+    const map = layer.parentElement;
+    if (!map) return;
+    const next = map.nextElementSibling;
+    const note = next?.classList.contains('map-tiles-failed') ? next : null;
+    if (!mapTilesFailedIn(layer)) { note?.remove(); return; }
+    if (note) return;
+    map.after(tilesFailedNote(() => retryMapTiles(layer)));
 }
 
 /** The small maps listen once for the tile server's refusal (its note). */
@@ -171,16 +190,25 @@ export const placesFindMethods = uiModule({
         this.placeSearchBusy = true;
         let found: Awaited<ReturnType<typeof searchPlaceForms>> = [];
         let byTown: PlaceGeo | null = null;
+        // §10.3: a form without an answer stops the search; nothing found then is not "not found".
+        let failure: GeocodeFailure | null = null;
+        const onFailure = (kind: GeocodeFailure): void => { failure ??= kind; };
         try {
-            found = await searchPlaceForms(forms);
-            if (found.length === 0) {
+            found = await searchPlaceForms(forms, { onFailure });
+            if (found.length === 0 && !failure) {
                 const parsed = townOfPlace(text, knownStreets(data));
-                if (parsed) byTown = await geocodeTown(parsed.town, { centroid: placesCentroid(data.places) });
+                if (parsed) byTown = await geocodeTown(parsed.town, { centroid: placesCentroid(data.places), onFailure });
             }
         } finally {
             this.placeSearchBusy = false;
         }
         if (!row.isConnected) return;   // the dialog was redrawn meanwhile
+        if (failure && found.length === 0) {
+            const show = (): void => this.renderPlaceFindFailed(failure!, row);
+            lastFind.set(row, show);
+            show();
+            return;
+        }
         if (byTown?.byTown) {
             this.attachPlaceByTown(key, stampedGeo(byTown, 'map', { now: DATE_NOW() }), byTown.byTown);
             return;
@@ -390,6 +418,17 @@ export const placesFindMethods = uiModule({
         this.refreshPlacesManager();
     },
 
+    /** The search got no answer (§10.3): why (the network, no answer in time, the request limit), with Try again. */
+    renderPlaceFindFailed(kind: GeocodeFailure, row: HTMLElement): void {
+        const results = row.querySelector('.place-results') as HTMLElement;
+        const esc = (s: string): string => this.escapeHtml(s);
+        results.innerHTML = `<div class="busy-msg is-err place-find-failed" role="alert"><span class="busy-msg__text">${esc(serviceFailText(kind, GEOCODE_TIMEOUT_MS))}</span>`
+            + `<button type="button" class="link busy-msg__retry">${esc(strings.busy.retry)}</button></div>`;
+        (results.querySelector('.busy-msg__retry') as HTMLButtonElement).onclick = () => {
+            row.querySelector<HTMLButtonElement>('.place-search-go')?.click();
+        };
+    },
+
     /** Nothing found: what was asked, a town nearby, placing by hand and the research's way. */
     renderPlaceFindEmpty(key: string, query: string, also: readonly string[], row: HTMLElement): void {
         const results = row.querySelector('.place-results') as HTMLElement;
@@ -412,6 +451,7 @@ export const placesFindMethods = uiModule({
         results.innerHTML = `
             <div class="place-empty">
                 <p class="place-empty-head">${esc(d.emptyHead(query, [...also]))}</p>
+                <button type="button" class="place-search-other">${esc(strings.busy.searchOther)}</button>
                 <div class="place-near">
                     <label class="place-field-label">${esc(d.nearTown)}
                         <span class="place-search-row">
@@ -429,8 +469,16 @@ export const placesFindMethods = uiModule({
         (results.querySelector('.place-near-go') as HTMLButtonElement).onclick = run;
         input.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); run(); } };
         (results.querySelector('.place-pin-open') as HTMLButtonElement).onclick = () => this.openPlaceByHand(key, row);
+        // "Search differently" (10a): back to the query, its words chosen for typing anew.
+        (results.querySelector('.place-search-other') as HTMLButtonElement).onclick = () => {
+            const q = row.querySelector<HTMLInputElement>('.place-query');
+            q?.focus();
+            q?.select();
+        };
         const look = results.querySelector<HTMLButtonElement>('.place-empty-look');
-        if (look) look.onclick = () => void this.queuePlaces([key], false);
+        // "Look up in the research" (B148): working until the bridge answers, a refusal said under it.
+        if (look) look.onclick = () => void runBusy(look, async ctl => { await this.queuePlaces([key], false, ctl); },
+            { label: strings.busy.sending, timeoutMs: PLACES_STEP_MS });
         const more = results.querySelector<HTMLButtonElement>('.place-empty-more');
         if (more) more.onclick = () => { this.closePlacesManager(); this.showResearchInfoDialog(); };
     },
@@ -444,12 +492,21 @@ export const placesFindMethods = uiModule({
         if (note) note.textContent = strings.map.searching;
         this.placeSearchBusy = true;
         let geo: PlaceGeo | null = null;
+        let failure: GeocodeFailure | null = null;
         try {
-            geo = await geocodeTown(name, { centroid: placesCentroid(DataManager.getData().places) });
+            geo = await geocodeTown(name, { centroid: placesCentroid(DataManager.getData().places), onFailure: k => { failure = k; } });
         } finally {
             this.placeSearchBusy = false;
         }
         if (!row.isConnected) return;
+        if (failure) {
+            // §10.3: no answer is not "no such town".
+            if (note) {
+                note.textContent = serviceFailText(failure, GEOCODE_TIMEOUT_MS);
+                note.dataset.tone = 'warn';
+            }
+            return;
+        }
         if (!geo) {
             if (note) {
                 note.textContent = strings.places.dialog.nearNone(name);

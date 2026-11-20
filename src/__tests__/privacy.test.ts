@@ -5,6 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import { applyLivingPrivacy, isLivingPerson, inferBirthUpperBounds, presumedDeceasedSet } from '../privacy.js';
 import { strings } from '../strings.js';
+import { addPersonMedia, personMedia } from '../media.js';
 import { StromData, Person, PersonId, PartnershipId } from '../types.js';
 
 const NOW = 2026;
@@ -113,6 +114,16 @@ describe('applyLivingPrivacy', () => {
         expect(p.birthDate).toBeUndefined();
     });
 
+    it('when a living person came into the tree goes like their other details (spec 084 §8)', () => {
+        const data = tree({ ...living, addedAt: '2026-11-02T09:00:00.000Z' }, { ...deceased, addedAt: '2026-11-02T09:00:00.000Z' });
+        expect(P(applyLivingPrivacy(data, 'full', NOW))['living'].addedAt).toBe('2026-11-02T09:00:00.000Z');
+        for (const mode of ['initials', 'anonymous', 'minimal'] as const) {
+            const out = applyLivingPrivacy(data, mode, NOW);
+            expect(P(out)['living'].addedAt, mode).toBeUndefined();
+            expect(P(out)['dead'].addedAt, mode).toBe('2026-11-02T09:00:00.000Z');
+        }
+    });
+
     it('leaves deceased persons untouched', () => {
         const out = applyLivingPrivacy(tree(deceased), 'anonymous', NOW);
         expect(P(out)['dead']).toEqual(deceased);
@@ -141,16 +152,16 @@ describe('keepDeceasedSources (person page, spec 025 K2.7)', () => {
         const data = tree(
             person('dead', {
                 birthDate: '1900', deathDate: '1970', sourceIds: ['s-dead'], deathSourceIds: ['s-shared'],
-                attachments: [{ id: 'a1', name: 'scan.jpg', mimeType: 'image/jpeg', dataUrl: 'data:,', sizeBytes: 1, sourceId: 's-att' }],
                 events: [{ id: 'e1', type: 'burial', date: '1970', sourceIds: ['s-event'] }],
             }),
             person('living', {
                 birthDate: '1990', sourceIds: ['s-living'], birthSourceIds: ['s-shared'],
-                attachments: [{ id: 'a2', name: 'photo.jpg', mimeType: 'image/jpeg', dataUrl: 'data:,', sizeBytes: 1 }],
             }),
         );
         data.sources = Object.fromEntries(['s-dead', 's-shared', 's-att', 's-event', 's-living', 's-unused']
             .map(id => [id, { id, title: id }]));
+        addPersonMedia(data, 'dead' as PersonId, { id: 'a1', name: 'scan.jpg', mimeType: 'image/jpeg', dataUrl: 'data:,', sizeBytes: 1 }, 's-att');
+        addPersonMedia(data, 'living' as PersonId, { id: 'a2', name: 'photo.jpg', mimeType: 'image/jpeg', dataUrl: 'data:,', sizeBytes: 1 });
         return data;
     }
 
@@ -158,11 +169,11 @@ describe('keepDeceasedSources (person page, spec 025 K2.7)', () => {
         const out = applyLivingPrivacy(withSources(), 'initials', NOW, { keepDeceasedSources: true });
         expect(P(out)['dead'].sourceIds).toEqual(['s-dead']);
         expect(P(out)['dead'].deathSourceIds).toEqual(['s-shared']);
-        expect(P(out)['dead'].attachments).toHaveLength(1);
+        expect(personMedia(out, 'dead' as PersonId)).toHaveLength(1);
         expect(P(out)['dead'].events?.[0].sourceIds).toEqual(['s-event']);
         expect(P(out)['living'].sourceIds).toBeUndefined();
         expect(P(out)['living'].birthSourceIds).toBeUndefined();
-        expect(P(out)['living'].attachments).toBeUndefined();
+        expect(personMedia(out, 'living' as PersonId)).toHaveLength(0);
         // Only the sources someone still cites stay in the catalog.
         expect(Object.keys(out.sources ?? {}).sort()).toEqual(['s-att', 's-dead', 's-event', 's-shared']);
     });
@@ -181,7 +192,7 @@ describe('keepDeceasedSources (person page, spec 025 K2.7)', () => {
         const out = applyLivingPrivacy(withSources(), 'initials', NOW);
         expect(out.sources).toBeUndefined();
         expect(P(out)['dead'].sourceIds).toBeUndefined();
-        expect(P(out)['dead'].attachments).toBeUndefined();
+        expect(personMedia(out, 'dead' as PersonId)).toHaveLength(0);
         expect(P(out)['dead'].events?.[0].sourceIds).toBeUndefined();
     });
 });

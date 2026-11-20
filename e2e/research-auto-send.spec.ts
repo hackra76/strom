@@ -1364,7 +1364,7 @@ test.describe('the toolbar', () => {
         bridge.syncDelayMs = 1500;
         await editJan(page);
         void page.evaluate(() => window.Strom.UI.researchAutoLeave()).catch(() => undefined);
-        const spinner = mark(page).locator('.research-sync-spinner');
+        const spinner = mark(page).locator('.busy-spin');
         await expect(spinner).toBeVisible();
         expect(await spinner.evaluate(el => getComputedStyle(el).animationName)).toBe('none');
     });
@@ -1710,6 +1710,12 @@ test.describe('the research as an archive', () => {
         await poll(page);
         await page.evaluate(() => window.Strom.UI.researchActionTreeSettings());
         await expect(where).toHaveText('The Strom archive is switched to research in the research, with the first item of its menu: “Switch research on”. Open the research, opens in the research');
+        // A person's next step, not the second click of a double click (the same link within 400 ms hands nothing over).
+        // The button drawn again shows the first open's "Opening the research…" until its 10 s limit (no proof
+        // comes from this bridge): the limit passes on the page's clock.
+        await expect(where.locator('#research-mode-where-open')).toHaveAttribute('aria-busy', 'true');
+        await page.clock.fastForward(10_500);
+        await expect(where.locator('#research-mode-where-open')).not.toHaveAttribute('aria-busy', 'true');
         await where.locator('#research-mode-where-open').click();
         expect(await links(page)).toEqual([`strom-research://open?tree=${UUID}`, `strom-research://open?tree=${UUID}`]);
     });
