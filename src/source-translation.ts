@@ -10,7 +10,7 @@
  */
 
 /** The research's GEDCOM labels of the section (en, cs, de, pl; other research languages write the English one). */
-export const SOURCE_TRANSLATION_LABELS = ['Translation', 'Překlad', 'Übersetzung', 'Tłumaczenie'] as const;
+export const SOURCE_TRANSLATION_LABELS = ['Translation', 'Preklad', 'Překlad', 'Übersetzung', 'Tłumaczenie'] as const;
 
 const HEADER = new RegExp(`(^|\\n[ \\t]*\\n)(?:${SOURCE_TRANSLATION_LABELS.join('|')}):\\n`);
 

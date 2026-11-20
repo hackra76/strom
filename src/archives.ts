@@ -101,6 +101,30 @@ export const ARCHIVE_PORTALS: ArchivePortal[] = [
         keywords: ['bruntal', 'frydek', 'mistek', 'karvina', 'novy jicin', 'opava', 'ostrava',
             'jesenik', 'olomouc', 'prostejov', 'prerov', 'sumperk'],
     },
+    {
+        id: 'slovakiana',
+        name: 'Slovakiana · Sčítacie hárky',
+        institution: 'Slovenský národný archív',
+        url: 'https://www.slovakiana.sk/',
+        coverage: { cs: 'Slovensko (sčítání 1930)', en: 'Slovakia (1930 census)', de: 'Slowakei (Volkszählung 1930)' },
+        keywords: ['bardejov', 'presov', 'kosice', 'roznava', 'dobsina', 'gocovo', 'coltovo', 'velka ida', 'lukov', 'gaboltov', 'klusov', 'slovensko', 'slovakia'],
+    },
+    {
+        id: 'geneteka',
+        name: 'Geneteka / Skanoteka PTG',
+        institution: 'Polskie Towarzystwo Genealogiczne',
+        url: 'https://geneteka.genealodzy.pl/',
+        coverage: { cs: 'Polsko / Halič (indexy a skeny matrik)', en: 'Poland / Galicia (parish indexes & scans)', de: 'Polen / Galizien (Matrikenindexe und Scans)' },
+        keywords: ['gorlice', 'szymbark', 'cieklin', 'jaslo', 'krakow', 'malopolskie', 'galicia', 'halic', 'polsko', 'poland'],
+    },
+    {
+        id: 'szukajwarchiwach',
+        name: 'Szukaj w Archiwach',
+        institution: 'Archiwa Państwowe (Polsko)',
+        url: 'https://www.szukajwarchiwach.gov.pl/',
+        coverage: { cs: 'Polské státní archivy', en: 'Polish State Archives', de: 'Polnische Staatsarchive' },
+        keywords: ['gorlice', 'szymbark', 'cieklin', 'jaslo', 'krakow', 'przemysl', 'rzeszow', 'malopolskie', 'galicia', 'polsko', 'poland'],
+    },
 ];
 
 /**

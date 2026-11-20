@@ -504,7 +504,7 @@ export function formatFlexDate(value?: string, lang?: 'cs' | 'en' | 'de' | 'pl')
     if (d.end) {
         const endCore = flexDateCore(d.end, locale, 'ins');
         return locale === 'cs'
-            ? `mezi ${core('ins')} a ${endCore}`
+            ? `medzi ${core('ins')} a ${endCore}`
             : locale === 'de'
                 ? `zwischen ${core('ins')} und ${endCore}`
                 : locale === 'pl'

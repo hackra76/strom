@@ -1383,7 +1383,7 @@ function placesIndexHtml(r: Render, page: SetPage): string {
 
 /** The letters of a language's alphabet for a split index (1102 §7.4); a letter of the names not among them is added. */
 const INDEX_ALPHABET: Record<Language, string[]> = {
-    cs: 'A B C Č D E F G H Ch I J K L M N O P Q R Ř S Š T U V W X Y Z Ž'.split(' '),
+    cs: 'A Ä B C Č D Ď E F G H Ch I J K L Ĺ Ľ M N Ň O Ó Ô P Q R Ŕ S Š T Ť U V W X Y Z Ž'.split(' '),
     en: 'A B C D E F G H I J K L M N O P Q R S T U V W X Y Z'.split(' '),
     de: 'A B C D E F G H I J K L M N O P Q R S T U V W X Y Z'.split(' '),
     pl: 'A Ą B C Ć D E Ę F G H I J K L Ł M N Ń O Ó P Q R S Ś T U V W X Y Z Ź Ż'.split(' '),

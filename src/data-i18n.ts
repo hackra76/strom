@@ -157,6 +157,18 @@ const EXACT_EN: Record<string, string> = {
     'vojak na dovolenke (Urlauber), gramotný (kann)': 'soldier on furlough (Urlauber), literate',
     'Želiar vo Veľkej Ide': 'Cottager (zsellér) in Veľká Ida',
     'Želiar vo Veľkej Ide, syn Jána Bučinu a Kataríny Oroszovej': 'Cottager (zsellér) in Veľká Ida, son of Ján Bučina and Katarína Oroszová',
+    'Kurič na dráhe, majiteľ domu Nová ulica 38/753 v Bardejove (prišiel 1901). Pochovaný v hrobe 02/05/1/27 († 1964).': 'Railway stoker, owner of house Nová ulica 38/753 in Bardejov (arrived 1901). Buried in grave 02/05/1/27 († 1964).',
+    'Manželka Andreja Jurčáka st. (sobáš 21. 5. 1922), vydatá Jurčáková, pochovaná v hrobe 02/05/1/27 († 1948).': 'Wife of Andrej Jurčák Sr. (married 21 May 1922), married name Jurčáková, buried in grave 02/05/1/27 († 1948).',
+    'Manželstvo 21. 5. 1922 zo sčítania 1930 (Nová ulica 38/753). Andrej ml. (* 1935) pochovaný v tom istom hrobe 02/05/1/27 s Andrejom st. († 1964) a Žofiou († 1948).': 'Marriage of 21 May 1922 from the 1930 census (Nová ulica 38/753). Andrej Jr. (* 1935) buried in the same grave 02/05/1/27 with Andrej Sr. († 1964) and Žofia († 1948).',
+    'Matka Andreja Jurčáka st. (* 1900). Do Bardejova prišla v r. 1900/1901, dňa 15. 10. 1920 sa vydala za Ladislava Gorčáka (* 6. 2. 1869, otčim p. d. v sčítaní 1930 na Novej ul. 38/753).': 'Mother of Andrej Jurčák Sr. (* 1900). Came to Bardejov in 1900/1901; on 15 Oct 1920 married Ladislav Gorčák (* 6 Feb 1869, stepfather of head of household in the 1930 census at Nová ul. 38/753).',
+    'Roľník v Szymbarku č. 136 a č. 139, manžel Marianny Stawiarzovej (sobáš 16. 11. 1841), po ktorom nesie rod priezvisko Jurczak/Jurčák. Syn Grzegorza Jurczaka († 22. 2. 1828 dom 136) a Marianny Baran († 27. 1. 1838 dom 136).': 'Farmer in Szymbark No. 136 and No. 139, husband of Marianna Stawiarzová (married 16 Nov 1841), from whom the family carries the surname Jurczak/Jurčák. Son of Grzegorz Jurczak († 22 Feb 1828 house 136) and Marianna Baran († 27 Jan 1838 house 136).',
+    'Roľník v Szymbarku č. 99 a č. 136 (pri synovi Janovi * 29. 12. 1806 uvedený aj pod priezviskom Chowaniec zo Szklarky / gr.-kat. farnosť Klimkówka).': 'Farmer in Szymbark No. 99 and No. 136 (at the birth of his son Jan * 29 Dec 1806 also recorded under the surname Chowaniec from Szklarka / Greek Catholic parish of Klimkówka).',
+    'V záznamoch detí 1812–1823 uvádzaná aj pod priezviskom Wierzbicka (dcéra Marcina).': 'In her children\'s records (1812–1823) also recorded under the surname Wierzbicka (daughter of Marcin).',
+    'Vdova po roľníkovi Stanisławovi Kostkovi Jurczakovi (* 11. 11. 1813 Szymbark č. 136 – † 4. 2. 1865 Szymbark č. 139, sobáš 16. 11. 1841), po ktorom nesie rod priezvisko Jurczak/Jurčák.': 'Widow of farmer Stanisław Kostka Jurczak (* 11 Nov 1813 Szymbark No. 136 – † 4 Feb 1865 Szymbark No. 139, married 16 Nov 1841), from whom the family carries the surname Jurczak/Jurčák.',
+    'Manželka Matěja Kamínka / Ramerta v Mlazických viniciach čp. 82 (S0082)': 'Wife of Matěj Kamínek / Ramert in Mlazice Vineyards No. 82 (S0082)',
+    'Sobáš Václava Špačka a Alžbety Bláhovej v Mělníku (1755)': 'Marriage of Václav Špaček and Alžbeta Bláhová in Mělník (1755)',
+    'Krst Alžbety Kamínkovej (Ramertovej) v Mlazických viniciach čp. 82 (1777)': 'Baptism of Alžbeta Kamínková (Ramertová) in Mlazice Vineyards No. 82 (1777)',
+    'Úmrtie Žigmunda Dvorského v Boršiciach čp. 171 (1791)': 'Death of Žigmund Dvorský in Boršice No. 171 (1791)',
 };
 
 function translateLineEn(line: string): string {

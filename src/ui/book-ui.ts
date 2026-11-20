@@ -1468,7 +1468,7 @@ export const bookUiMethods = uiModule({
         const data = DataManager.getData();
         const firstId = Object.keys(data.persons)[0];
         const lang = options.lang;
-        const locale = lang === 'cs' ? 'cs-CZ' : lang === 'de' ? 'de-DE' : lang === 'pl' ? 'pl-PL' : 'en-GB';
+        const locale = lang === 'cs' ? 'sk-SK' : lang === 'de' ? 'de-DE' : lang === 'pl' ? 'pl-PL' : 'en-GB';
         return buildFamilyBook(data, options, {
             treeName: TreeManager.getActiveTreeMetadata()?.name,
             dateLabel: getStringsForLang(lang).book.compiled(new Date().toLocaleDateString(locale)),
