@@ -193,6 +193,8 @@ const EXACT_EN: Record<string, string> = {
     'Majiteľ domu Vaniškovce č. 20, roľník': 'House owner in Vaniškovce No. 20, farmer',
     'Rodné priezvisko neznáme (overiť sobáš 10. 11. 1909); 6 detí / 1 zomrelo': 'Maiden surname unknown (verify marriage of 10 Nov 1909); 6 children / 1 died',
     'Svedkovia: Ondrej Stašek (Abrahamovce č. 25), Jozef Serafín (Bardejov)': 'Witnesses: Ondrej Stašek (Abrahamovce No. 25), Jozef Serafín (Bardejov)',
+    'Vydatá Jenčová; sestra Jozefa Jurčáka (* 1963)': 'Married name Jenčová; sister of Jozef Jurčák (* 1963)',
+    'Dcéra Márie Jenčovej rod. Jurčákovej (* 13. 7. 1967); dátum narodenia doplniť': 'Daughter of Mária Jenčová née Jurčáková (* 13 Jul 1967); birth date to be added',
 };
 
 function translateLineEn(line: string): string {
