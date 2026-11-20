@@ -169,6 +169,13 @@ const EXACT_EN: Record<string, string> = {
     'Sobáš Václava Špačka a Alžbety Bláhovej v Mělníku (1755)': 'Marriage of Václav Špaček and Alžbeta Bláhová in Mělník (1755)',
     'Krst Alžbety Kamínkovej (Ramertovej) v Mlazických viniciach čp. 82 (1777)': 'Baptism of Alžbeta Kamínková (Ramertová) in Mlazice Vineyards No. 82 (1777)',
     'Úmrtie Žigmunda Dvorského v Boršiciach čp. 171 (1791)': 'Death of Žigmund Dvorský in Boršice No. 171 (1791)',
+    'Krst Mária Andrássy, Veľká Ida 1864 (FamilySearch index)': 'Baptism of Mária Andrássy, Veľká Ida 1864 (FamilySearch index)',
+    'Krst Jozef Andrássy, Veľká Ida 1866 (FamilySearch index)': 'Baptism of Jozef Andrássy, Veľká Ida 1866 (FamilySearch index)',
+    'Krst Štefan Andrássy, Veľká Ida 1888 (FamilySearch index)': 'Baptism of Štefan Andrássy, Veľká Ida 1888 (FamilySearch index)',
+    'Krst Andrej Andrássy, Veľká Ida 1867 (FamilySearch index)': 'Baptism of Andrej Andrássy, Veľká Ida 1867 (FamilySearch index)',
+    'Úmrtie Štefan Andrássy, Lenartov 1891 (FamilySearch index)': 'Death of Štefan Andrássy, Lenartov 1891 (FamilySearch index)',
+    'Sobáš Jána Andrássyho a Alžbety Jávorskej, Veľká Ida 1859': 'Marriage of Ján Andrássy and Alžbeta Jávorská, Veľká Ida 1859',
+    'Krst Jána Andrássyho, Hídvégardó 1834': 'Baptism of Ján Andrássy, Hídvégardó 1834',
 };
 
 function translateLineEn(line: string): string {
