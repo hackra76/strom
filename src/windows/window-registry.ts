@@ -15,6 +15,7 @@
  */
 
 import { DataManager } from '../data.js';
+import { IMAGES_ARRIVED_EVENT } from '../image-loads.js';
 import { TreeManager } from '../tree-manager.js';
 import type { TreeId } from '../types.js';
 import { WindowBus, answerWhenFocused, FOCUS_WAIT_MS, type MessageOf, type WindowBounds, type WindowStatus, type EditRefusal } from './window-bus.js';
@@ -31,7 +32,8 @@ export interface MainWindowHost {
     /** Values that change whenever the open tree changes (compared item by item, by identity). */
     stateStamp(): readonly unknown[];
     /** Save a satellite's edit as an edit of this window (one undo step named `label`). */
-    applyEdit(json: string, label: string): boolean;
+    /** `listsOnly`: the edit changed only the lists of people (N2): only those are taken. */
+    applyEdit(json: string, label: string, listsOnly?: boolean): boolean;
     /** A staged dialog is open here: no edit from outside now. */
     busy(): boolean;
     undo(): void;
@@ -41,6 +43,10 @@ export interface MainWindowHost {
     live(): boolean;
     locked(): boolean;
     readOnly(): boolean;
+    /** The lists of people may be changed (also while readOnly because the tree follows a research, N2). */
+    listsOpen?(): boolean;
+    /** Undo / redo would be refused now (DataManager.undoLocked: a list's step goes while following, N2). */
+    undoLocked?(which: 'undo' | 'redo'): boolean;
     researchState(): unknown;
     /** Subscribe to every save of the open tree; returns the unsubscribe. */
     onSaved(cb: () => void): () => void;
@@ -63,7 +69,7 @@ export function dataManagerHost(overrides: Partial<MainWindowHost> = {}): MainWi
         treeExists: (id) => TreeManager.getTrees().some(t => t.id === id),
         storedJson: () => DataManager.storedDataJson(),
         stateStamp: () => [DataManager.getCurrentTreeId(), DataManager.getData(), DataManager.getContentRevision(), DataManager.isLocked()],
-        applyEdit: (json, label) => DataManager.applyWindowEdit(json, label),
+        applyEdit: (json, label, listsOnly) => DataManager.applyWindowEdit(json, label, listsOnly),
         busy: () => DataManager.isEditSessionActive(),
         undo: () => { if (DataManager.undo()) changed(); },
         redo: () => { if (DataManager.redo()) changed(); },
@@ -72,6 +78,8 @@ export function dataManagerHost(overrides: Partial<MainWindowHost> = {}): MainWi
         live: () => DataManager.isLiveFollowing(),
         locked: () => DataManager.isLocked(),
         readOnly: () => DataManager.isReadOnly() || DataManager.isTreeLocked(),
+        listsOpen: () => !DataManager.listsReadOnly(),
+        undoLocked: (which) => DataManager.undoLocked(which),
         researchState: () => null,
         onSaved: (cb) => DataManager.onTreeSaved(cb),
         focusSelf: () => { if (typeof window !== 'undefined') window.focus(); },
@@ -207,6 +215,8 @@ export class WindowRegistry {
     private readonly sendEndHandlers = new Set<(windowId: string) => void>();
     private linkHandler: LinkHandler | null = null;
     private researchHandler: ResearchActionHandler | null = null;
+    /** "On the map" of a satellite's Table (spec 098 §6): the selection's encoded ref and its tree. */
+    private showOnMapHandler: ((ref: string, treeId: TreeId | null) => void) | null = null;
     private researchMenuProvider: ((personId: string) => unknown[]) | null = null;
     private readonly heldLinks: { link: { search?: string; files?: unknown[] }; from: string }[] = [];
     private readonly heldActions: HeldAction[] = [];
@@ -265,6 +275,7 @@ export class WindowRegistry {
             b.on('link', m => this.onLink({ search: m.search, files: m.files }, m.from)),
             b.on('research-action', m => this.onResearchAction({ action: m.action, args: m.args, from: m.from, reqId: m.reqId })),
             b.on('research-menu-req', m => this.onResearchMenuRequest(m)),
+            b.on('show-on-map', m => this.showOnMapHandler?.(m.ref, m.treeId)),
             b.on('agent-state-req', m => this.agentStateAsked(m.windowId || m.from)),
             this.host.onSaved(() => this.sync()),
         );
@@ -276,11 +287,14 @@ export class WindowRegistry {
             window.addEventListener('strom:data-changed', sync);
             window.addEventListener('strom:tree-switched', sync);
             window.addEventListener('strom:tree-renamed', sync);
+            // Images that came after the tree (spec 116, I6): to the satellites as any change of the data, no edit.
+            window.addEventListener(IMAGES_ARRIVED_EVENT, sync);
             window.addEventListener('pagehide', bye);
             this.unsubscribe.push(() => {
                 window.removeEventListener('strom:data-changed', sync);
                 window.removeEventListener('strom:tree-switched', sync);
                 window.removeEventListener('strom:tree-renamed', sync);
+                window.removeEventListener(IMAGES_ARRIVED_EVENT, sync);
                 window.removeEventListener('strom:fan-rod-colors', rodColors);
                 window.removeEventListener('pagehide', bye);
             });
@@ -423,6 +437,11 @@ export class WindowRegistry {
     }
 
     /** Who runs a research action asked for by a satellite (§2, §6). */
+    /** Who shows a satellite's selection on the map here (spec 098 §6). */
+    setShowOnMapHandler(cb: ((ref: string, treeId: TreeId | null) => void) | null): void {
+        this.showOnMapHandler = cb;
+    }
+
     setResearchActionHandler(cb: ResearchActionHandler | null): void {
         this.researchHandler = cb;
         if (cb) for (const a of this.heldActions.splice(0)) this.runResearchAction(a);
@@ -552,6 +571,7 @@ export class WindowRegistry {
             live: this.host.live(),
             locked: this.host.locked(),
             readOnly: this.host.readOnly(),
+            listsOpen: this.host.listsOpen?.() ?? !this.host.readOnly(),
             researchState: this.host.researchState(),
             treeExists: !!treeId && this.host.treeExists(treeId),
             treeId,
@@ -559,6 +579,8 @@ export class WindowRegistry {
             revision: this.rev,
             canUndo: this.host.canUndo(),
             canRedo: this.host.canRedo(),
+            undoOpen: this.host.canUndo() && !(this.host.undoLocked?.('undo') ?? this.host.readOnly()),
+            redoOpen: this.host.canRedo() && !(this.host.undoLocked?.('redo') ?? this.host.readOnly()),
             windows: [...this.entries.keys()],
             agentRev: this.agentRev,
             ...this.agentsField(),
@@ -641,10 +663,12 @@ export class WindowRegistry {
             this.postStatus(true);
         };
         if (m.treeId !== this.host.treeId()) return refuse('tree');
-        if (this.host.readOnly() || this.host.locked()) return refuse('read-only');
+        // A change of the lists alone also while the tree follows a research (N2).
+        const listsOnly = m.listsOnly === true;
+        if (this.host.locked() || (this.host.readOnly() && !(listsOnly && this.host.listsOpen?.()))) return refuse('read-only');
         if (this.host.busy()) return refuse('busy');
         if (m.baseRevision !== this.rev) return refuse('revision');
-        if (!this.host.applyEdit(m.json, m.label)) return refuse('invalid');
+        if (!this.host.applyEdit(m.json, m.label, listsOnly)) return refuse('invalid');
         this.checkRevision();
         this.bus.post({ type: 'edit-result', to: m.from, editId: m.editId, ok: true, revision: this.rev });
         this.postStatus(false);

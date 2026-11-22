@@ -14,8 +14,10 @@
  */
 
 import {
-    TimelineModel, TimelineRow, TimelineEvent, TimelineHistory, TimelineHistoryItem, TimelineSharedMark,
+    TimelineModel, TimelineRow, TimelineEvent, TimelineHistory, TimelineHistoryItem, TimelineSharedMark, TimelineLocalItem,
     yearToFraction, axisTicks, axisLabelStep, clusterTimelineHistory, timelineHistoryYears,
+    timelineClusterKind, timelineClusterKinds, timelinePeriodTracks, timelineHistoryRowState, timelineFilterKindCount,
+    layoutTimelineLocal,
 } from './timeline.js';
 import { strings } from './strings.js';
 import { historyKindSvg } from './history-symbols.js';
@@ -97,12 +99,23 @@ export interface TimelineSvgOptions {
     femaleColor?: string;
     /** Life-bar fill for a sex the records do not give. Screen: 'var(--unknown)'. Poster: resolved hex. */
     unknownColor?: string;
-    /** A phone's narrow layout: the history row 26 px, its clusters 22 px apart, its label without the name. */
+    /** A phone's narrow layout: the history row 26 px, its clusters 22 px apart. */
     narrow?: boolean;
     /** A shared mark's label width in px as drawn (screen: measured in the page's font); default an estimate. */
     measureLabel?: (text: string) => number;
     /** Lineage signs before the names (spec 112); absent or the marker off: none. */
     branches?: TimelineBranchSigns | null;
+    /**
+     * The window's selection highlighted (spec 098 §11a, screen only): its
+     * rows framed (`evidence-hit`), the others dimmed (`evidence-dim`).
+     */
+    selection?: ReadonlySet<string> | null;
+    /**
+     * Only the rows `from` ≤ i < `to` drawn (a long timeline draws the rows
+     * in view and a margin); the height, the axis and the grid stay the
+     * whole timeline's. Absent: every row.
+     */
+    rowWindow?: { from: number; to: number } | null;
 }
 
 /** Whether the rows carry a lineage sign slot (the markers on). */
@@ -120,6 +133,20 @@ export function historyClusterGap(narrow: boolean): number {
     return narrow ? 22 : 16;
 }
 
+/** A history cluster's count badge width: 13 px, wider for more digits. */
+function historyBadgeWidth(n: number): number {
+    return Math.max(13, 5 + String(n).length * 6);
+}
+
+/**
+ * How far the next cluster of the history row must be from one of `n`
+ * events: its badge (3 px right of the centre, `historyBadgeWidth` wide)
+ * clear of the next 12 px symbol by 1 px; a single symbol clear of the next.
+ */
+export function historyClusterClearance(n: number): number {
+    return n > 1 ? 3 + historyBadgeWidth(n) + 6 + 1 : 13;
+}
+
 /** A history event's year text: "1866", a period "1897–1901". */
 function historyItemYears(e: TimelineHistoryItem): string {
     return e.year2 !== undefined ? `${e.year}–${e.year2}` : String(e.year);
@@ -130,59 +157,94 @@ function historyKindName(e: TimelineHistoryItem): string {
 }
 
 /**
- * The focused person's history row under the axis band (§9, variant 9a): the
- * label "History · name" in the name column, a tint over the person's life,
- * each cluster the first event's kind symbol coloured by its origin, a count
- * badge for more, a period's 3 px stripe, the list on hover (<title>). A
- * cluster is a button (Enter / a click: the renderer opens the card or, on a
- * phone, a sheet) with a 44 × 44 touch target. Screen only: never printed,
- * never on the poster.
+ * The label's filter: "· 3 kinds" (the kinds chosen the timeline has: "0 kinds"
+ * when it has none of them, §10), "· Valdorie", "· 2 filters" (spec 121 §5);
+ * empty without a filter.
+ */
+export function historyFilterText(h: TimelineHistory): string {
+    const S = strings.history;
+    const { kinds, region, regionName } = h.filtered;
+    if (kinds && region) return S.timelineFilterBoth(2);
+    if (kinds) return S.timelineFilterKinds(timelineFilterKindCount(h));
+    if (region) return regionName ?? region;
+    return '';
+}
+
+/**
+ * The history row of the whole timeline under the axis band (spec 121 §1):
+ * the label "History ▾" as the options' button (the filter in it), a tint
+ * across the whole axis, the focused person's life as a thin line at its
+ * bottom, the periods' stripes in two tracks (§4), each cluster the kind
+ * most of its events have, coloured by its origin, a count badge for more,
+ * an event a line on hover (<title>). A cluster is a button (Enter / a
+ * click: the renderer opens a popover or, on a phone, a sheet) with a 44 × 44
+ * touch target. Screen only: never printed, never on the poster.
  */
 function historyRowSvg(
-    h: TimelineHistory, opts: TimelineSvgOptions, xOf: (y: number) => number, rowH: number, plotX0: number,
+    h: TimelineHistory, rows: readonly TimelineRow[], opts: TimelineSvgOptions, xOf: (y: number) => number, rowH: number, plotX0: number,
 ): string {
     const { esc, labelW, width: W } = opts;
     const narrow = !!opts.narrow;
     const S = strings.history;
     const cy = TOP + rowH / 2;
-    const who = `${S.timelineRowLabel} · ${h.name}`;
+    const filterText = historyFilterText(h);
     const label = `<foreignObject x="2" y="${TOP}" width="${labelW - 6}" height="${rowH}">`
-        + `<div xmlns="http://www.w3.org/1999/xhtml" class="tl-hist-label" title="${esc(who)}"><span class="tl-hist-txt">`
-        + `<b>${esc(S.timelineRowLabel)}</b>${narrow || !h.name ? '' : ` · ${esc(h.name)}`}</span></div></foreignObject>`;
-    const bx1 = Math.max(plotX0 - 4, xOf(h.startYear) - 10);
-    const bx2 = Math.min(W - 2, xOf(h.endYear) + 10);
-    const band = `<rect class="tl-hist-band" x="${bx1.toFixed(1)}" y="${TOP + 3}" width="${Math.max(0, bx2 - bx1).toFixed(1)}"`
+        + `<div xmlns="http://www.w3.org/1999/xhtml" class="tl-hist-label">`
+        + `<button type="button" class="tl-hist-btn${filterText ? ' is-filtered' : ''}" aria-haspopup="dialog" aria-expanded="false"`
+        + ` title="${esc(filterText ? `${S.timelineOptionsAria} (${filterText})` : S.timelineOptionsAria)}">`
+        + `<b>${esc(S.timelineRowLabel)}</b>${filterText ? `<span class="tl-hist-meta">· ${esc(filterText)}</span>` : ''}`
+        + `<span class="tl-hist-caret" aria-hidden="true">▾</span></button></div></foreignObject>`;
+    const bx1 = plotX0 - 4;
+    const band = `<rect class="tl-hist-band" x="${bx1.toFixed(1)}" y="${TOP + 3}" width="${Math.max(0, W - 2 - bx1).toFixed(1)}"`
         + ` height="${rowH - 6}" rx="6"/>`;
-    const periods = h.events.filter(e => e.year2 !== undefined).map(e => {
-        const x1 = xOf(e.year), x2 = xOf(e.year2!);
-        return `<rect class="tl-hist-period is-${e.scope}" x="${x1.toFixed(1)}" y="${(cy + 8).toFixed(1)}"`
-            + ` width="${Math.max(2, x2 - x1).toFixed(1)}" height="3" rx="1.5"/>`;
-    }).join('');
-    const clusters = clusterTimelineHistory(h.events, xOf, historyClusterGap(narrow)).map(c => {
-        const first = c.items[0];
+    const life = h.focus
+        ? `<rect class="tl-hist-life" x="${xOf(h.focus.startYear).toFixed(1)}" y="${TOP + rowH - 5}"`
+            + ` width="${Math.max(2, xOf(h.focus.endYear) - xOf(h.focus.startYear)).toFixed(1)}" height="2" rx="1"/>`
+        : '';
+    const spans = h.events.filter(e => e.year2 !== undefined).map(e => ({ e, x1: xOf(e.year), x2: xOf(e.year2!) }));
+    const tracks = timelinePeriodTracks(spans);
+    const periods = spans.map(({ e, x1, x2 }, i) =>
+        `<rect class="tl-hist-period is-${e.scope}" x="${x1.toFixed(1)}" y="${(cy + 7 + tracks[i] * 3.5).toFixed(1)}"`
+        + ` width="${Math.max(2, x2 - x1).toFixed(1)}" height="2.5" rx="1.25"/>`).join('');
+    const clusters = clusterTimelineHistory(h.events, xOf, historyClusterGap(narrow), historyClusterClearance).map(c => {
+        const main = timelineClusterKind(c.items);
         const x = c.x;
-        const kinds = [...new Set(c.items.map(historyKindName))].join(', ');
-        const aria = S.timelineClusterAria(timelineHistoryYears(c.items), kinds);
-        const tip = c.items.map(e => `${historyItemYears(e)} ${historyKindName(e)} – ${e.text}`).join('\n');
-        const sym = historyKindSvg(first.kind, 12).replace('<svg ', `<svg x="${(x - 6).toFixed(1)}" y="${(cy - 6).toFixed(1)}" `);
+        const { kinds, more } = timelineClusterKinds(c.items);
+        const names = kinds.map(k => S.kinds[k] ?? S.kinds.other);
+        if (more) names.push(S.clusterMore(more));
+        const persons = new Set(c.items.flatMap(e => e.persons)).size;
+        const aria = S.timelineClusterAria(timelineHistoryYears(c.items), names.join(', '), persons);
+        const tip = c.items.map(e => S.timelineEventLine(historyItemYears(e), historyKindName(e), e.region, e.text)).join('\n');
+        const sym = historyKindSvg(main.kind, 12).replace('<svg ', `<svg x="${(x - 6).toFixed(1)}" y="${(cy - 6).toFixed(1)}" `);
         const n = c.items.length;
         let badge = '';
         if (n > 1) {
-            const bw = Math.max(13, 5 + String(n).length * 6);
+            const bw = historyBadgeWidth(n);
             const bx = x + 3, by = cy - 14;
             badge = `<rect class="tl-hist-n" x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${bw}" height="13" rx="6.5"/>`
                 + `<text class="tl-hist-n-txt" x="${(bx + bw / 2).toFixed(1)}" y="${(by + 6.5).toFixed(1)}"`
                 + ` text-anchor="middle" dominant-baseline="central" aria-hidden="true">${n}</text>`;
         }
         const ids = c.items.map(e => encodeURIComponent(e.id)).join(' ');
-        return `<g class="tl-hist is-${first.scope}" role="button" tabindex="0" aria-label="${esc(aria)}" data-hist-ids="${esc(ids)}">`
+        return `<g class="tl-hist is-${main.scope}" role="button" tabindex="0" aria-haspopup="dialog" aria-label="${esc(aria)}" data-hist-ids="${esc(ids)}">`
             + `<title>${esc(tip)}</title>`
             + `<rect class="tl-hist-hit" x="${(x - 22).toFixed(1)}" y="${(cy - 22).toFixed(1)}" width="44" height="44" fill="transparent"/>`
             + `<rect class="tl-hist-ring" x="${(x - 9).toFixed(1)}" y="${(cy - 9).toFixed(1)}" width="18" height="18" rx="5"/>`
             + `${sym}${badge}</g>`;
     }).join('');
-    return `<g class="tl-hist-row" data-hist-person="${esc(h.personId)}">${label}${band}`
-        + `<g aria-hidden="true">${periods}</g>${clusters}</g>`;
+    // A filter that leaves nothing (§10): a muted sentence and "Clear filter" in the row (a phone: short, the whole in its name).
+    let empty = '';
+    if (timelineHistoryRowState(h, rows) === 'emptyFilter') {
+        const ex = plotX0 + 6;
+        const text = narrow
+            ? `<span class="tl-hist-empty-text" role="note" aria-label="${esc(S.timelineEmptyFilter)}" title="${esc(S.timelineEmptyFilter)}">${esc(S.timelineEmptyFilterShort)}</span>`
+            : `<span class="tl-hist-empty-text">${esc(S.timelineEmptyFilter)}</span>`;
+        empty = `<foreignObject x="${ex}" y="${TOP}" width="${Math.max(0, W - PAD_R - 6 - ex)}" height="${rowH}">`
+            + `<div xmlns="http://www.w3.org/1999/xhtml" class="tl-hist-empty">${text}`
+            + `<button type="button" class="link-button tl-hist-clear">${esc(S.timelineClearFilter)}</button></div></foreignObject>`;
+    }
+    return `<g class="tl-hist-row">${label}${band}${life}`
+        + `<g aria-hidden="true">${periods}</g>${clusters}${empty}</g>`;
 }
 
 /** Localized label for an event dot's tooltip (mirror of the renderer). */
@@ -254,10 +316,12 @@ interface SharedLabelSpot { text: string; x1: number; baseline: number }
  * rows or below its last, the nearest such spot first; only when no spot
  * holds the whole label, the longest text cut with "…" that fits; none at
  * all when not even a few characters do (the tooltip still names it).
+ * `topTaken`: the gap above the first row is not free (the history row lies
+ * there, spec 121): a mark from the first row puts its label lower.
  */
 export function placeSharedLabels(
     geoms: readonly { x: number; bars: readonly Box[]; links: readonly Box[]; label: string; rows: readonly number[] }[],
-    o: { rowH: number; rowCount: number; plotX0: number; plotX1: number; measure: (text: string) => number },
+    o: { rowH: number; rowCount: number; plotX0: number; plotX1: number; measure: (text: string) => number; topTaken?: boolean },
 ): (SharedLabelSpot | null)[] {
     const obstacles: Box[] = geoms.flatMap(g => [...g.bars, ...g.links]);
     const placed: Box[] = [];
@@ -271,7 +335,7 @@ export function placeSharedLabels(
             const w = o.measure(text);
             if (w > o.plotX1 - o.plotX0) return null;
             let best: { spot: SharedLabelSpot; box: Box; cost: number } | null = null;
-            for (let gap = first; gap <= Math.min(last + 1, o.rowCount); gap++) {
+            for (let gap = o.topTaken ? Math.max(first, 1) : first; gap <= Math.min(last + 1, o.rowCount); gap++) {
                 const baseline = baselineOf(gap);
                 const y1 = baseline - SHARED_LABEL_ASC, y2 = baseline + SHARED_LABEL_DESC;
                 const inBand = [...obstacles, ...placed].filter(b => b.y1 < y2 && y1 < b.y2);
@@ -338,6 +402,7 @@ function sharedMarkSvg(g: SharedMarkGeom, spot: SharedLabelSpot | null, rows: re
 /** SVG for one timeline row (name label + life-bar + event dots). */
 function rowSvg(
     r: TimelineRow, i: number, opts: TimelineSvgOptions, xOf: (y: number) => number, marked: ReadonlySet<string> = new Set(),
+    plot: { x0: number; pxPerYear: number } = { x0: opts.labelW, pxPerYear: Infinity },
 ): string {
     const { esc, rowH, labelW, width: rowWidth, mode } = opts;
     const y = TOP + i * rowH;
@@ -351,6 +416,8 @@ function rowSvg(
     const focused = r.personId === opts.focusId ? ' focused' : '';
     const highlight = opts.highlightIds
         ? (opts.highlightIds.has(r.personId) ? ' search-hit' : ' search-dim') : '';
+    const selected = opts.selection && mode === 'screen'
+        ? (opts.selection.has(r.personId) ? ' evidence-hit' : ' evidence-dim') : '';
 
     const nameEsc = esc(r.name);
     const yearsStr = rowYears(r);
@@ -402,11 +469,84 @@ function rowSvg(
             + `${slot}<span class="tl-nm">${nameEsc}</span> <span class="tl-yr">${yearsEsc}</span></div></foreignObject>`;
     }
 
-    return `<g class="timeline-bar${focused}${highlight}" data-person-id="${esc(r.personId)}">`
+    return `<g class="timeline-bar${focused}${highlight}${selected}" data-person-id="${esc(r.personId)}">`
         + `<rect x="0" y="${y}" width="${rowWidth}" height="${rowH}" class="tl-rowhit" fill="transparent"/>`
         + label
         + `<rect x="${x1.toFixed(1)}" y="${barY}" width="${w.toFixed(1)}" height="14" rx="3" fill="${color}" class="tl-bar-rect"/>`
-        + `${fade}${arrow}${dots}</g>`;
+        + `${fade}${arrow}${dots}${localSvg(r, opts, xOf, y, barY, x1, x1 + w, plot)}</g>`;
+}
+
+/** A local event's year text: "1891", a period "1845–1847". */
+function localItemYears(e: TimelineLocalItem): string {
+    return e.year2 !== undefined ? `${e.year}–${e.year2}` : String(e.year);
+}
+
+/** A finding's source in a local symbol's tooltip is cut to this many characters. */
+const LOCAL_SOURCE_MAX = 60;
+
+/**
+ * A life line's local history (spec 121 §4, §6–§8), screen only: each symbol
+ * on a 14 px box over the bar in its origin's colour, stepped aside from the
+ * line's dots and shared marks, grouped like the history row with a count
+ * badge at its top left (below 1.5 px per year one symbol with them all), a
+ * period's stripe under the bar. A symbol is clicked, not tabbed to: its
+ * target is 24 px wide and the row high, kept off the dots beside it; a line
+ * per event on hover, a finding's source under it.
+ */
+function localSvg(
+    r: TimelineRow, opts: TimelineSvgOptions, xOf: (y: number) => number, y: number, barY: number, barX1: number, barX2: number,
+    plot: { x0: number; pxPerYear: number },
+): string {
+    if (opts.mode !== 'screen' || !r.local?.length) return '';
+    const { esc, rowH } = opts;
+    const S = strings.history;
+    const obstacles = r.events.map(ev => xOf(ev.year));
+    const layout = layoutTimelineLocal(r.local, {
+        xOf, barX1, barX2, obstacles, gap: historyClusterGap(!!opts.narrow), pxPerYear: plot.pxPerYear,
+    });
+    const periods = layout.periods.map(({ item, x1, x2 }) =>
+        `<rect class="tl-loc-period is-${item.scope}" x="${x1.toFixed(1)}" y="${(barY + 16).toFixed(1)}"`
+        + ` width="${Math.max(2, x2 - x1).toFixed(1)}" height="2.5" rx="1.25"/>`).join('');
+    // The dots a symbol's target must leave to their own tooltips.
+    const dots = r.events.map(ev => ({ x: xOf(ev.year), r: ev.type === 'wedding' ? 5.5 : 3 }));
+    const marks = layout.marks.map(m => {
+        const x = m.x;
+        const first = m.items[0];
+        const kind = (e: TimelineLocalItem): string => S.kinds[e.kind] ?? S.kinds.other;
+        const aria = m.items.map(e => S.timelineLocalAria(localItemYears(e), kind(e), e.place, e.text)).join('; ');
+        const tip = m.items.map(e => S.timelineEventLine(localItemYears(e), kind(e), e.place, e.text)
+            + (e.scope === 'local' && e.source ? `\n${S.timelineLocalSource(truncate(e.source, LOCAL_SOURCE_MAX))}` : '')).join('\n');
+        let hx1 = x - 12, hx2 = x + 12;
+        for (const d of dots) {
+            if (d.x <= x) hx1 = Math.max(hx1, Math.min(x - 4, d.x + d.r + 1));
+            else hx2 = Math.min(hx2, Math.max(x + 4, d.x - d.r - 1));
+        }
+        const sym = historyKindSvg(first.kind, 10).replace('<svg ', `<svg x="${(x - 5).toFixed(1)}" y="${(barY + 2).toFixed(1)}" `);
+        const n = m.items.length;
+        let badge = '';
+        if (n > 1) {
+            const bw = Math.max(11, 4 + String(n).length * 5);
+            const bx = Math.max(plot.x0, x - 9), by = barY - 6;
+            badge = `<rect class="tl-loc-n" x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${bw}" height="11" rx="5.5" aria-hidden="true"/>`
+                + `<text class="tl-loc-n-txt" x="${(bx + bw / 2).toFixed(1)}" y="${(by + 5.5).toFixed(1)}"`
+                + ` text-anchor="middle" dominant-baseline="central" aria-hidden="true">${n}</text>`;
+        }
+        const ids = m.items.map(e => encodeURIComponent(e.id)).join(' ');
+        return `<g class="tl-loc is-${first.scope}" role="img" aria-label="${esc(aria)}" data-hist-ids="${esc(ids)}">`
+            + `<title>${esc(tip)}</title>`
+            + `<rect class="tl-loc-hit" x="${hx1.toFixed(1)}" y="${y}" width="${(hx2 - hx1).toFixed(1)}" height="${rowH}" fill="transparent" aria-hidden="true"/>`
+            + `<rect class="tl-loc-box" x="${(x - 7).toFixed(1)}" y="${barY}" width="14" height="14" rx="3" aria-hidden="true"/>`
+            + `${sym}${badge}</g>`;
+    }).join('');
+    return (periods ? `<g aria-hidden="true">${periods}</g>` : '') + marks;
+}
+
+/**
+ * Where the first row starts in the timeline's SVG (px): under the axis band
+ * and, on screen, the history row. Row i starts `i * rowH` below it.
+ */
+export function timelineRowsTop(model: TimelineModel, opts: Pick<TimelineSvgOptions, 'mode' | 'narrow'>): number {
+    return TOP + (opts.mode === 'screen' && model.history ? historyRowHeight(!!opts.narrow) : 0);
 }
 
 /**
@@ -418,7 +558,7 @@ export function buildTimelineSvg(model: TimelineModel, opts: TimelineSvgOptions)
     const { width: W, rowH: ROW_H, labelW: LABEL_W, mode } = opts;
     const plotX0 = LABEL_W;
     const plotW = Math.max(40, W - LABEL_W - PAD_R);
-    // The focused person's history row (screen only): under the axis band, the rows below it.
+    // The history row of the whole timeline (screen only): under the axis band, the rows below it.
     const hist = mode === 'screen' ? model.history : undefined;
     const histH = hist ? historyRowHeight(!!opts.narrow) : 0;
     const H = TOP + histH + model.rows.length * ROW_H + 12;
@@ -438,18 +578,27 @@ export function buildTimelineSvg(model: TimelineModel, opts: TimelineSvgOptions)
     }).join('');
 
     // A shared event of two rows or more: one mark instead of the rows' dots, drawn over them (spec 085 §2e).
-    const shared = model.shared ?? [];
-    const marked = new Set(shared.map(m => m.shareId));
+    // A window of rows (a long timeline): the rows in it, the marks over them.
+    const win = opts.rowWindow ?? null;
+    const inWindow = (i: number): boolean => !win || (i >= win.from && i < win.to);
+    const allShared = model.shared ?? [];
+    const marked = new Set(allShared.map(m => m.shareId));
+    const shared = win ? allShared.filter(m => m.rows[0] < win.to && m.rows[m.rows.length - 1] >= win.from) : allShared;
     const geoms = shared.map(m => sharedMarkGeom(m, ROW_H, xOf));
     const spots = placeSharedLabels(geoms.map(g => ({ ...g, rows: g.mark.rows })), {
         rowH: ROW_H, rowCount: model.rows.length, plotX0, plotX1: plotX0 + plotW, measure: opts.measureLabel ?? estimateLabelWidth,
+        topTaken: !!hist,
     });
     const marks = geoms.map((g, i) => sharedMarkSvg(g, spots[i], model.rows, opts)).join('');
-    const rowsSvg = model.rows.map((r, i) => rowSvg(r, i, opts, xOf, marked)).join('') + marks;
+    // Local history on the lines (spec 121 §8): below 1.5 px per year one symbol per line.
+    const plot = { x0: plotX0, pxPerYear: plotW / Math.max(1, model.axis.maxYear - model.axis.minYear) };
+    let rowsSvg = '';
+    model.rows.forEach((r, i) => { if (inWindow(i)) rowsSvg += rowSvg(r, i, opts, xOf, marked, plot); });
+    rowsSvg += marks;
     // Shifted by the history row; print drops the row and the shift (index.html @media print).
     const rows = hist ? `<g class="tl-rows" transform="translate(0 ${histH})">${rowsSvg}</g>` : rowsSvg;
     // Drawn after the rows: a cluster's touch target may reach into the first row.
-    const histRow = hist ? historyRowSvg(hist, opts, xOf, histH, plotX0) : '';
+    const histRow = hist ? historyRowSvg(hist, model.rows, opts, xOf, histH, plotX0) : '';
 
     // Fade-out gradients for bars with an unknown end (deceased, no death date).
     const maleColor = opts.maleColor ?? FALLBACK_MALE;

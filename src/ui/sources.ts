@@ -11,7 +11,8 @@
  */
 
 import { researchActionLabel } from './research-open-mark.js';
-import { researchLinkMark } from '../research-link.js';
+import { researchLinkMark, researchSourceRef } from '../research-link.js';
+import { rememberDeletedSource, sourceRetractEditMode, sourceRetractOffered } from '../source-retract.js';
 import { DataManager, CitedFact, personCitationField, SourceCitationRef } from '../data.js';
 import { bookReference, entryDateLine, sameBookReference } from '../source-page.js';
 import { sourcePlaceSearchText, recognizeLocation, imageWord, hasPlaceFields, sourcePlaceParts, sourcePlaceLine } from '../source-location.js';
@@ -21,7 +22,8 @@ import { TreeRenderer } from '../renderer.js';
 import { TreeManager } from '../tree-manager.js';
 import { treeMedia } from '../media.js';
 import { SettingsManager } from '../settings.js';
-import { PersonId, PartnershipId, Source, SourceExcerpt, MediaOriginal, MediaPlace, MAX_EXCERPTS_UI, StromData } from '../types.js';
+import { PersonId, PartnershipId, Source, SourceExcerpt, MediaOriginal, MediaPlace, StromData } from '../types.js';
+import { MAX_EXCERPTS_UI } from '../model-values.js';
 import { strings } from '../strings.js';
 import { personEvidence } from '../evidence-level.js';
 import { uiModule } from './module.js';
@@ -34,6 +36,9 @@ import { dataUrlByteSize } from '../photo.js';
 import { totalExcerptBytes } from '../attachments.js';
 import { excerptFromDataUrl, excerptImageUrl } from '../excerpts.js';
 import { shownExcerpts } from '../research-images.js';
+import { imageLoads, type FieldKey } from '../image-loads.js';
+import { isPendingImageUrl, type ImageRef } from '../research-image-refs.js';
+import { imgGlyphHtml, imgStateAttr, waitingTileHtml } from './image-slot.js';
 import { openCropEditor, compressWholeImage, CropRegion } from './crop-editor.js';
 import { coupleEventLabel } from '../events.js';
 import { eventTypeLabel } from './person-events.js';
@@ -107,6 +112,31 @@ export function qualityLabel(q: number | undefined): string {
     return q >= 3 ? strings.sources.quality3 : q === 2 ? strings.sources.quality2 : strings.sources.quality1;
 }
 
+/** A crop of a source on its way after the tree, or one that did not come (imageLoads.waitingExcerpts). */
+export interface WaitingExcerpt { key: FieldKey; state: 'pending' | 'failed' | 'loaded'; ref: ImageRef; record: SourceExcerpt }
+
+/** The ratio of an image of the research (`_WIDTH/_HEIGHT`) for its place while it comes (spec 116 §1.4). */
+export function refRatioStyle(ref: Pick<ImageRef, 'width' | 'height'>): string {
+    return ref.width && ref.height ? ` style="aspect-ratio: ${ref.width} / ${ref.height}"` : '';
+}
+
+/**
+ * A crop as the source's viewer and editor show it while it comes or once it
+ * did not (spec 116 §5, as §4.4): its place in the image's ratio under the
+ * veil with "Loading the photo…"; the struck-through picture with "Not
+ * loaded" and, under it, "The photo did not load." with Try again.
+ */
+export function waitingExcerptHtml(w: WaitingExcerpt, cls: string): string {
+    const ph = strings.photos;
+    const loading = w.state === 'pending';
+    const box = `<div class="${cls} excerpt-wait"${imgStateAttr(loading ? 'loading' : 'failed')}${refRatioStyle(w.ref)} role="img"`
+        + ` aria-label="${esc(loading ? ph.ariaLoading : ph.ariaFailed)}">`
+        + `${loading ? imgGlyphHtml('image', ph.loading) : imgGlyphHtml('image-off', ph.tileFailed)}</div>`;
+    if (loading) return box;
+    return `${box}<div class="busy-msg excerpt-wait-msg" role="status"><span>${esc(ph.failed)}</span>`
+        + `<button type="button" class="link" data-excerpt-retry="${esc(w.key)}">${esc(strings.busy.retry)}</button></div>`;
+}
+
 /** Thumbnail (or document icon) for a source, in one of the three sizes. */
 export function sourceThumbHtml(src: Source, kind: 'chip' | 'row' | 'picker'): string {
     // Excerpts of the file first, then those loaded from the research.
@@ -116,6 +146,12 @@ export function sourceThumbHtml(src: Source, kind: 'chip' | 'row' | 'picker'): s
     // Putting every excerpt into the markup parsed and escaped ~100 MB of
     // text for a catalog of a few hundred scans.
     if (first) return `<img class="source-${kind}-thumb" data-thumb-source="${esc(src.id)}" alt="">`;
+    // Its crop is on its way after the tree, or did not come (spec 116 §5): small, so no glyph while it comes.
+    const waiting = imageLoads.waitingExcerpts(src.id)[0];
+    if (waiting) {
+        return waitingTileHtml(waiting.state === 'pending' ? 'loading' : 'failed',
+            { tag: 'span', cls: `source-${kind}-thumb is-waiting`, px: 0, glyph: kind === 'chip' ? 11 : 12, attrs: ' aria-hidden="true"' });
+    }
     // The image is only in the research: a dashed outline in its place.
     if (src.imageHeld && src.imageHeld !== 'missing') {
         return `<span class="source-${kind}-thumb is-held" title="${esc(strings.researchImages.held[heldReasonKey(src.imageHeld)])}" aria-hidden="true"></span>`;
@@ -126,6 +162,13 @@ export function sourceThumbHtml(src: Source, kind: 'chip' | 'row' | 'picker'): s
 /** The sentence key of a held image's reason (unknown reasons read as "other"). */
 export function heldReasonKey(held: Source['imageHeld']): 'scope' | 'limit' | 'later' | 'other' {
     return held === 'scope' || held === 'limit' || held === 'later' ? held : 'other';
+}
+
+/** "Try again" under a crop that did not come: asks for it again (spec 116 §2). */
+function wireExcerptRetry(root: HTMLElement): void {
+    root.querySelectorAll<HTMLElement>('[data-excerpt-retry]').forEach(btn => btn.addEventListener('click', () => {
+        imageLoads.retry([btn.dataset.excerptRetry as FieldKey]);
+    }));
 }
 
 /** One observer per list, replaced on every render. */
@@ -244,7 +287,8 @@ export const sourcesMethods = uiModule({
 
     /** The sources manager; `focusSourceId` (the Table view's Sources rows): that source's row marked, scrolled to and focused. */
     showSourcesDialog(focusSourceId?: string): void {
-        if (DataManager.isTreeLocked()) return;
+        // A followed tree: only read, deleting through its research (spec 117 §1); without that, not at all.
+        if (DataManager.isTreeLocked() && sourceRetractOffered() === null) return;
         const search = document.getElementById('sources-search') as HTMLInputElement | null;
         if (search) {
             search.value = '';
@@ -287,8 +331,10 @@ export const sourcesMethods = uiModule({
         const all = Object.values(DataManager.getData().sources ?? {});
         // The empty state carries "Add source" itself; the footer copy hides
         // meanwhile so the dialog keeps a single primary action.
+        // A followed tree's window only reads (spec 117 §1): no adding, editing or edit filters.
+        const readOnly = this.sourcesReadOnly();
         const addBtn = document.querySelector<HTMLElement>('#sources-modal .sources-footer .primary');
-        if (addBtn) addBtn.hidden = all.length === 0;
+        if (addBtn) addBtn.hidden = all.length === 0 || readOnly;
         const search = document.getElementById('sources-search') as HTMLInputElement | null;
         if (search) search.hidden = all.length <= 10;
         const totalEl = document.getElementById('sources-total');
@@ -303,8 +349,7 @@ export const sourcesMethods = uiModule({
             container.innerHTML = emptyStateHtml({
                 title: strings.emptyStates.sourcesTitle,
                 text: strings.emptyStates.sourcesText,
-                actionLabel: strings.sources.add,
-                actionId: 'sources-empty-add',
+                ...(readOnly ? {} : { actionLabel: strings.sources.add, actionId: 'sources-empty-add' }),
                 className: 'sources-empty',
             });
             document.getElementById('sources-empty-add')
@@ -320,14 +365,40 @@ export const sourcesMethods = uiModule({
         const unverified = new Set(unverifiedOlderSources(DataManager.getData(), link).map(src => src.id));
         // "Image in research": sources whose image the research left out and the app can still load.
         const held = new Set(this.heldSources().map(h => h.src.id));
+        if (readOnly) this.sourcesFilter = 'all';
         if (this.sourcesFilter === 'unverifiedTranscript' && unverified.size === 0) this.sourcesFilter = 'all';
         if (this.sourcesFilter === 'imageHeld' && held.size === 0 && !this.researchImagesBulkBusy()) this.sourcesFilter = 'all';
-        this.renderSourcesFilter(unverified.size > 0, held.size);
+        this.renderSourcesFilter(!readOnly && unverified.size > 0, readOnly ? 0 : held.size);
         const filtered = this.sourcesFilter === 'unverifiedTranscript' ? all.filter(src => unverified.has(src.id))
             : this.sourcesFilter === 'imageHeld' ? all.filter(src => held.has(src.id)) : all;
         const sources = filtered.filter(s => this.sourceMatches(s, query)).sort((a, b) => a.title.localeCompare(b.title));
         const counts = DataManager.sourceCitationCounts();
         const phone = (() => { try { return window.matchMedia?.(MQ_MOBILE).matches ?? false; } catch { return false; } })();
+        // Deleting a followed tree's source goes through its research: offered, at rest while its bridge is down, or not.
+        const retract = readOnly ? sourceRetractOffered() : null;
+        // On touch one ⋯ per row opens its sheet (a local tree keeps its two 44 px buttons).
+        const rowMenu = readOnly && retract !== null && (phone || isCoarsePointer());
+        const R = strings.sources.retract;
+        const actions = (src: Source): string => {
+            const id = esc(src.id);
+            if (!readOnly) {
+                return `<button type="button" class="source-edit-btn" title="${esc(strings.sources.edit)}" aria-label="${esc(strings.sources.edit)}"
+                            data-source-id="${id}">${iconSvg('pencil')}</button>
+                        <button type="button" class="source-delete-btn" title="${esc(strings.danger.deleteSource)}" aria-label="${esc(strings.danger.deleteSource)}"
+                            data-source-id="${id}">${iconSvg('trash')}</button>`;
+            }
+            // Only a source the research knows (its REFN) can be deleted there.
+            if (retract === null || !researchSourceRef(src.refn)) return '';
+            if (rowMenu) {
+                return `<button type="button" class="source-more-btn" aria-haspopup="menu" aria-label="${esc(R.rowMenu(src.title))}"
+                            data-source-id="${id}">⋯</button>`;
+            }
+            // Not working now (its bridge is down): it stays, can be focused and says why; never `disabled`.
+            const off = retract === 'off';
+            return `<button type="button" class="source-delete-btn" title="${esc(off ? R.trashOff : strings.danger.deleteSource)}"
+                            aria-label="${esc(strings.danger.deleteSource)}"${off ? ' aria-disabled="true"' : ''}
+                            data-source-id="${id}">${iconSvg('trash')}</button>`;
+        };
         container.innerHTML = sources.map(src => {
             const count = counts.get(src.id) ?? 0;
             // The place on one line (spec 075 §2): on a phone without the archive when the call number names the book.
@@ -343,23 +414,26 @@ export const sourcesMethods = uiModule({
                         ${count > 0 ? `<span class="source-count">${esc(strings.sources.citations(count))}</span>` : ''}
                     </div>
                     <div class="source-actions">
-                        <button type="button" class="source-edit-btn" title="${esc(strings.sources.edit)}" aria-label="${esc(strings.sources.edit)}"
-                            data-source-id="${esc(src.id)}">${iconSvg('pencil')}</button>
-                        <button type="button" class="source-delete-btn" title="${esc(strings.danger.deleteSource)}" aria-label="${esc(strings.danger.deleteSource)}"
-                            data-source-id="${esc(src.id)}">${iconSvg('trash')}</button>
+                        ${actions(src)}
                     </div>
                 </div>`;
         }).join('');
         // Source ids come from data files: handlers via data attributes, never
         // inline JS (&#39; is decoded back to a quote inside an attribute).
         container.querySelectorAll<HTMLElement>('.source-row-open[data-source-id]').forEach(btn => {
-            btn.addEventListener('click', () => this.showSourceViewer(btn.dataset.sourceId ?? '', null));
+            btn.addEventListener('click', () => this.showSourceViewer(btn.dataset.sourceId ?? '', null, readOnly ? { readOnly: true } : {}));
+        });
+        container.querySelectorAll<HTMLElement>('.source-more-btn[data-source-id]').forEach(btn => {
+            btn.addEventListener('click', () => this.openSourceRowSheet(btn.dataset.sourceId ?? ''));
         });
         container.querySelectorAll<HTMLElement>('.source-edit-btn[data-source-id]').forEach(btn => {
             btn.addEventListener('click', () => this.showEditSourceModal(btn.dataset.sourceId ?? ''));
         });
         container.querySelectorAll<HTMLElement>('.source-delete-btn[data-source-id]').forEach(btn => {
-            btn.addEventListener('click', () => { void this.deleteSource(btn.dataset.sourceId ?? ''); });
+            btn.addEventListener('click', () => {
+                if (btn.getAttribute('aria-disabled') === 'true') return;
+                void this.deleteSource(btn.dataset.sourceId ?? '');
+            });
         });
         hydrateThumbs(container);
         this.renderResearchImagesBulk();
@@ -398,7 +472,42 @@ export const sourcesMethods = uiModule({
         return [src.title, sourceMeta(src), sourcePlaceSearchText(src), src.transcript ?? ''].some(t => t.toLowerCase().includes(query));
     },
 
+    /** The Sources window of a followed tree: only read (spec 117 §1), deleting goes through its research. */
+    sourcesReadOnly(): boolean {
+        return DataManager.isTreeLocked();
+    },
+
+    /** A followed tree's source row on touch (⋯): its sheet with Open and Delete (at rest, with why, while the bridge is down). */
+    openSourceRowSheet(sourceId: string): void {
+        const src = DataManager.getData().sources?.[sourceId];
+        const ref = researchSourceRef(src?.refn);
+        const offer = sourceRetractOffered();
+        if (!src || !ref || offer === null) return;
+        const R = strings.sources.retract;
+        const count = DataManager.sourceCitationCounts().get(sourceId) ?? 0;
+        this.presentMenuSheet(src.title, [
+            { rows: [{ label: R.menuOpen, id: 'source-sheet-open', run: () => this.showSourceViewer(sourceId, null, { readOnly: true }) }] },
+            { divider: true, rows: [{
+                label: R.menuDelete, id: 'source-sheet-delete', danger: true,
+                run: () => { void this.openSourceRetractDialog(sourceId); },
+                ...(offer === 'off' ? { disabled: true, why: R.trashOff } : {}),
+            }] },
+        ], { subtitle: count > 0 ? `${ref} · ${strings.sources.citations(count)}` : ref });
+    },
+
     async deleteSource(sourceId: string): Promise<void> {
+        // A followed tree: deleted in its research (spec 117 §2), only while that works.
+        if (this.sourcesReadOnly()) {
+            if (sourceRetractOffered() === 'on') void this.openSourceRetractDialog(sourceId);
+            return;
+        }
+        const refn = DataManager.getData().sources?.[sourceId]?.refn;
+        // A source of the research in a tree tied to it but not followed (spec 117 §4): the research's list when it answers.
+        const editMode = sourceRetractEditMode(refn);
+        if (editMode === 'preview' && this.researchSyncLink()) {
+            await this.openSourceRetractDialog(sourceId, { editMode: true });
+            return;
+        }
         const count = DataManager.countSourceCitations(sourceId);
         // Name what is being deleted — several rows would otherwise get the
         // same sentence and the wrong one is one click away.
@@ -408,11 +517,18 @@ export const sourcesMethods = uiModule({
         const at = (p: MediaPlace) => 'sourceId' in p && p.sourceId === sourceId;
         const archive = !!this.materialsContext()?.caps.list;
         const files = treeMedia(DataManager.getData()).filter(a => a.places.some(at) && (archive || !a.places.every(at))).length;
-        const message = [count > 0 ? d.sourceCited(count) : '', files ? strings.sources.deleteFiles(files) : '', d.undoHint].filter(Boolean).join(' ');
+        // What the research does with it: retracts it with the next write (the gate), or keeps it (an older one).
+        const R = strings.sources.retract;
+        const fate = editMode === 'preview' || editMode === 'plain' ? R.editMode : editMode === 'old' ? R.editModeOld : '';
+        const message = [count > 0 ? d.sourceCited(count) : '', files ? strings.sources.deleteFiles(files) : '', fate, d.undoHint].filter(Boolean).join(' ');
         const confirmed = await this.showConfirm(message, d.deleteSourceTitle(title),
             { confirmLabel: d.deleteSource, variant: 'danger' });
         if (!confirmed) return;
         DataManager.removeSource(sourceId);
+        // Said deleted to the research with the next write (only to one with the gate: the send decides, §4).
+        const treeId = DataManager.getCurrentTreeId();
+        const ref = typeof refn === 'string' ? refn.trim() : '';
+        if (treeId && ref && editMode && editMode !== 'old') rememberDeletedSource(treeId, ref);
         this.renderSourcesList();
         // Any open citation chips may now be stale.
         this.refreshCitationChips();
@@ -588,9 +704,12 @@ export const sourcesMethods = uiModule({
                     ${loaded ? this.researchExcerptExtrasHtml(exc, src) : exc.caption ? `<figcaption>${esc(exc.caption)}</figcaption>` : ''}
                 </figure>${this.excerptFromHtml(exc)}${again ? `<div class="viewer-excerpt-links">${full}${again}</div>` : full}`);
         });
+        // The crops on their way after the tree, or not come (spec 116 §5).
+        const waiting = imageLoads.waitingExcerpts(src.id);
+        for (const w of waiting) chunks.push(`<figure class="viewer-excerpt">${waitingExcerptHtml(w, 'viewer-excerpt-box')}</figure>`);
         // What is only in the research: loading slots, one line with a button, or why not here.
         chunks.push(this.researchImagesViewerHtml(src));
-        if (excerpts.length === 0 && editable && !src.imageHeld) {
+        if (excerpts.length === 0 && waiting.length === 0 && editable && !src.imageHeld) {
             chunks.push(`<button type="button" class="secondary viewer-add-excerpt">${esc(s.addExcerpt)}</button>`);
         }
         const pageUrl = safeHttpUrl(excerpts[0]?.pageUrl) ?? safeHttpUrl(src.url);
@@ -687,6 +806,7 @@ export const sourcesMethods = uiModule({
             });
         });
         body.querySelector('.viewer-add-excerpt')?.addEventListener('click', () => this.editFromSourceViewer(true));
+        wireExcerptRetry(body);
         body.querySelectorAll<HTMLElement>('.viewer-cite [data-cite-act]').forEach(btn => {
             btn.addEventListener('click', () => {
                 const act = btn.dataset.citeAct;
@@ -767,6 +887,8 @@ export const sourcesMethods = uiModule({
         const titleInput = document.getElementById('input-source-title') as HTMLInputElement | null;
         if (titleInput) titleInput.placeholder = titlePlaceholder;
         this.excerptDrafts = (src.excerpts ?? []).map(e => ({ excerpt: structuredClone(e) }));
+        // Its crops on their way: shown, and one that comes meanwhile is kept by Save (spec 116 §5).
+        this.excerptsWaitingAtOpen = new Set(imageLoads.waitingExcerpts(src.id ?? '').flatMap(w => w.record.id ? [w.record.id] : []));
         // The files it is taken from (spec 102 §5/§6): staged until Save.
         this.resetSourceDocs(src);
         this.sourceQualityDraft = src.quality;
@@ -1035,6 +1157,11 @@ export const sourcesMethods = uiModule({
                 }
                 return exc;
             });
+            // A crop that came while the editor was open is the source's: Save keeps it (spec 116 §5).
+            const came = editingId ? DataManager.getData().sources?.[editingId]?.excerpts ?? [] : [];
+            for (const e of came) {
+                if (this.excerptsWaitingAtOpen.has(e.id) && !excerpts.some(x => x.id === e.id)) excerpts.push(e);
+            }
             if (excerpts.length > 0) payload.excerpts = excerpts;
             if (editingId) {
                 // A confirmation of the research's transcript holds for its wording only (spec 022):
@@ -1126,13 +1253,22 @@ export const sourcesMethods = uiModule({
                     ${this.excerptFromHtml(d.excerpt)}
                 </div>`;
         }).join('');
-        const count = this.excerptDrafts.length;
+        // Its crops on their way after the tree, or not come: shown, not edited until they come (spec 116 §5).
+        const waits = this.editingSourceId ? imageLoads.waitingExcerpts(this.editingSourceId) : [];
+        const waitItems = waits.map(w => `
+                <div class="excerpt-item is-waiting">
+                    ${waitingExcerptHtml(w, 'excerpt-img')}
+                    ${w.record.caption ? `<div class="excerpt-bar"><span class="excerpt-caption-text">${esc(w.record.caption)}</span></div>` : ''}
+                </div>`).join('');
+        const count = this.excerptDrafts.length + waits.length;
         const adder = count === 0
             ? this.excerptAdderHtml(-1, true)
             : count < MAX_EXCERPTS_UI
                 ? `<button type="button" class="link-button excerpt-add-second" data-action="add-second">+ ${esc(s.excerptAddSecond)}</button>`
                 : '';
-        box.innerHTML = items + adder;
+        box.innerHTML = items + waitItems + adder;
+        box.dataset.waits = waits.map(w => `${w.key}~${w.state}`).join(',');
+        wireExcerptRetry(box);
         const material = document.getElementById('source-editor-material');
         if (material) material.hidden = !this.editingSourceId || !this.materialAvailable();
         box.querySelectorAll<HTMLElement>('.media-full-quality[data-excerpt-full]').forEach(el => el.addEventListener('click', () => {
@@ -1345,7 +1481,8 @@ export const sourcesMethods = uiModule({
 
     showAttachmentPagePicker(anchor: HTMLElement, target: number, only?: { id: string; dataUrl: string; name: string; title?: string }[]): void {
         document.querySelector('.excerpt-page-picker')?.remove();
-        const pages = only ?? this.excerptContextPages();
+        // A page still on its way is not offered for cutting (spec 116 §5).
+        const pages = (only ?? this.excerptContextPages()).filter(p => !isPendingImageUrl(p.dataUrl));
         if (pages.length === 0) return;
         const grid = document.createElement('div');
         grid.className = 'excerpt-page-picker';
@@ -1555,7 +1692,11 @@ export const sourcesMethods = uiModule({
         }
         if (v.folio || v.image) {
             const overlap = recognizeLocation({ folio: v.folio, image: v.image, reference: v.reference })?.overlap;
-            const text = overlap?.image && !overlap.image.same ? s.conflictImage(overlap.image.named, v.image)
+            // An image the research found from its scans (imageDerived, unchanged in the field): GEDCOM keeps the
+            // location whole and only adds the image (composePage), so another image named there is no conflict
+            const stored = this.editingSourceId ? DataManager.getData().sources?.[this.editingSourceId] : undefined;
+            const derivedImage = !!stored?.imageDerived && (stored.image ?? '').trim() === v.image;
+            const text = overlap?.image && !overlap.image.same && !derivedImage ? s.conflictImage(overlap.image.named, v.image)
                 : overlap?.folio && !overlap.folio.same ? s.conflictFolio(overlap.folio.named, v.folio) : '';
             if (overlap && text) {
                 const fix = overlap.rest ? s.conflictFix(overlap.rest) : s.conflictFixEmpty;

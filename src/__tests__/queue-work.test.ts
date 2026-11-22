@@ -6,11 +6,12 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
-    RUN_TASKS_FEATURE, STATUS_BUSY_FEATURE, WORK_LINK_FEATURE, researchSchemeUrl, sanitizeLiveStatus, sanitizeLiveWork, workTasksCount,
-    type LiveQueueItem,
+    RUN_TASKS_FEATURE, STATUS_BUSY_FEATURE, WORK_LINK_FEATURE, researchSchemeUrl, sanitizeLiveStatus, sanitizeLiveWork, workTaskIds, workTasksCount,
+    type LiveDirection, type LiveQueueItem, type LiveRunWire, type LiveWorker,
 } from '../research-link.js';
 import {
     queueWorkCounted, queueWorkFirst, queueWorkMore, queueWorkMoreCount, queueWorkOffer, queueWorkParams, queueWorkRest, queueWorkSessionLine,
+    lineWorkQueue, workConfirmText, workDialogAddsUp, workDialogAgents, generalWorkQueue, queueWorkSkipsText, queueWorkLimitText,
     type QueueWorkContext, type QueueWorkState,
 } from '../ui/queue-work-dialog.js';
 import { setLanguage, strings } from '../strings.js';
@@ -30,6 +31,22 @@ describe('the work link', () => {
         expect(researchSchemeUrl('work', { tree: TREE, workDo: 'tasks' })).toBeNull();
         expect(researchSchemeUrl('work', { tree: TREE, workDo: 'loop', n: 5 })).toBeNull();
         expect(researchSchemeUrl('work', { tree: TREE })).toBeNull();
+    });
+
+    it('names exactly the tasks of "Process now": 1–100 task ids, never with a count (spec 065 K7.2)', () => {
+        const link = (workTasks: readonly string[], extra: { n?: number } = {}) => researchSchemeUrl('work', { tree: TREE, workDo: 'tasks', workTasks, ...extra });
+        expect(link(['T0412', 'T0413', 'T0414'])).toBe(`strom-research://work?tree=${TREE}&do=tasks&task=T0412,T0413,T0414`);
+        // Each task once, in its first place.
+        expect(link(['T0413', 'T0412', 'T0413'])).toBe(`strom-research://work?tree=${TREE}&do=tasks&task=T0413,T0412`);
+        const hundred = Array.from({ length: 100 }, (_, i) => `T${1000 + i}`);
+        expect(link(hundred)).toBe(`strom-research://work?tree=${TREE}&do=tasks&task=${hundred.join(',')}`);
+        expect(link([...hundred, 'T2000'])).toBeNull();
+        expect(link([])).toBeNull();
+        for (const bad of ['P0412', 'T', 'T12345678', '', ' T0412', 'T0412;', 'Т0412', 'T04,12', 'task']) expect(link(['T0001', bad])).toBeNull();
+        expect(link(['T0412'], { n: 3 })).toBeNull();
+        expect(researchSchemeUrl('work', { tree: TREE, workDo: 'loop', workTasks: ['T0412'] })).toBeNull();
+        expect(workTaskIds('T0412')).toBeNull();
+        expect(workTaskIds([1, 2])).toBeNull();
     });
 
     it('reads a count as a whole number 1–100', () => {
@@ -189,6 +206,144 @@ describe('More under First up', () => {
         setLanguage('pl');
         expect([L().queueWorkMore('12'), L().queueWorkRest(1), L().queueWorkRest(3), L().queueWorkRest(37)])
             .toEqual(['Kolejne (12)', 'i jeszcze 1 zadanie w kolejce', 'i jeszcze 3 zadania w kolejce', 'i jeszcze 37 zadań w kolejce']);
+        setLanguage('en');
+    });
+});
+
+describe('a direction\'s own run (spec 126 U10 §2)', () => {
+    const LINES = ['run.lines', 'run.agents', 'work.link', 'run.tasks', 'queue.page'];
+    const dir = (id: string, name: string): LiveDirection => ({ id, name, state: 'active', tasks: 0 } as LiveDirection);
+    const wire = (id: string, research: string | null): LiveRunWire => ({ id, research, agent: 'claude', agentName: 'Claude', since: '2026-11-21T09:42:00Z', state: 'working' });
+    const AGENTS = [{ id: 'claude', name: 'Claude', default: true as const }, { id: 'codex', name: 'Codex' }];
+    const base = (extra: Partial<QueueWorkState> = {}): QueueWorkState => ({
+        features: LINES, queue: [], working: [], runs: [], agents: AGENTS,
+        researches: [dir('G0001', 'Kubíčkovi z Dolní Lhoty'), dir('G0002', 'Malí z Horní Vsi'), dir('G0003', 'Šustrovi')], ...extra,
+    });
+
+    beforeEach(() => setLanguage('en'));
+
+    it('takes the direction\'s queue: its tasks and those helping it, first and more as for the whole queue', () => {
+        const queue = [
+            task('T0301', { research: 'G0001', pos: 1 }),
+            task('T0305', { research: 'G0002', pos: 2 }),
+            task('T0306', { pos: 3, why: { kind: 'helps', research: 'G0002' } as LiveQueueItem['why'] }),
+            task('T0307', { research: 'G0003', pos: 4 }),
+            task('T0308', { research: 'G0002', pos: 5 }),
+            task('T0309', { kind: 'history', research: 'G0002', pos: 6 }),
+        ];
+        const q = lineWorkQueue(base({ queue }), 'G0002');
+        expect(q.map(x => x.id)).toEqual(['T0305', 'T0306', 'T0308']);
+        const first = queueWorkFirst(q);
+        expect(first?.id).toBe('T0305');
+        expect(queueWorkMore(q, first).map(x => x.id)).toEqual(['T0306', 'T0308']);
+        // The direction's count up next, not the whole queue's.
+        const st = base({ queue: q, queueCounts: { research: { G0002: 7 }, branch: {}, next: 40, parked: 0, rev: '0' } });
+        expect(queueWorkMoreCount(st, queueWorkMore(q, first), 7)).toBe('6');
+        expect(queueWorkRest(st, queueWorkMore(q, first), 7)).toBe(4);
+        expect(strings.live.lineRunRest(4)).toBe("and 4 more of the direction's tasks in the queue");
+    });
+
+    it('the link\'s parameters carry the direction and its agent (the agent only with a direction)', () => {
+        expect(queueWorkParams('tasks', 5, { research: 'G0002', agent: 'codex' })).toEqual({ workDo: 'tasks', n: '5', research: 'G0002', agent: 'codex' });
+        expect(queueWorkParams('loop', '', { research: 'G0002' })).toEqual({ workDo: 'loop', research: 'G0002' });
+        expect(queueWorkParams('loop', '', { agent: 'codex' })).toEqual({ workDo: 'loop' });
+        expect(queueWorkParams('tasks', 0, { research: 'G0002' })).toBeNull();
+        expect(researchSchemeUrl('work', { tree: TREE, workDo: 'tasks', n: '5', research: 'G0002', agent: 'codex' }))
+            .toBe(`strom-research://work?tree=${TREE}&do=tasks&n=5&research=G0002&agent=codex`);
+    });
+
+    it('says usage adds up only while a run works (an older research: never)', () => {
+        expect(workDialogAddsUp(base())).toBe(0);
+        expect(workDialogAddsUp(base({ runs: [wire('run-1a07', 'G0001')] }))).toBe(1);
+        expect(workDialogAddsUp(base({ runs: [wire('run-1a07', 'G0001'), wire('run-8f2c', null)] }))).toBe(2);
+        expect(workDialogAddsUp(base({ features: ['work.link'], runs: [wire('run-1a07', 'G0001')] }))).toBe(0);
+        expect(strings.live.runsAddUp(2)).toBe('2 agents are already working. Subscription usage adds up.');
+    });
+
+    it('offers the agent only with two or more agents and run.agents', () => {
+        expect(workDialogAgents(base())?.map(a => a.id)).toEqual(['claude', 'codex']);
+        expect(workDialogAgents(base({ agents: [AGENTS[0]] }))).toBeNull();
+        expect(workDialogAgents(base({ features: ['run.lines', 'work.link'] }))).toBeNull();
+        expect(workDialogAgents(base({ agents: undefined }))).toBeNull();
+    });
+
+    it('the footer\'s sentence: the terminal confirms unless the research says it starts at once', () => {
+        expect(workConfirmText(undefined)).toBe(strings.live.queueWorkConfirm);
+        expect(workConfirmText({ gate: null, minutes: 0, confirm: 'ask' })).toBe(strings.live.queueWorkConfirm);
+        expect(workConfirmText({ gate: null, minutes: 0, confirm: 'no' })).toBe(strings.live.lineRunConfirm);
+    });
+});
+
+describe('the most runs at once and the whole queue beside the directions\' runs (spec 126 U10 §5, §6)', () => {
+    const LINES = ['run.lines', 'run.limit', 'work.link', 'run.tasks', 'queue.page'];
+    const dir = (id: string, name: string, order: number): LiveDirection => ({ id, name, state: 'active', tasks: 0, order } as LiveDirection);
+    const wire = (id: string, research: string | null, session?: string): LiveRunWire =>
+        ({ id, research, agent: 'claude', agentName: 'Claude', since: '2026-11-21T09:42:00Z', state: 'working', ...(session ? { session } : {}) });
+    const row = (extra: Partial<LiveWorker> = {}): LiveWorker => ({ who: 'Claude', since: '2026-11-21T09:42:00Z', task: 'T0231 Baptism', ...extra });
+    const base = (extra: Partial<QueueWorkState> = {}): QueueWorkState => ({
+        features: LINES, queue: [task('T0101')], working: [], runs: [],
+        researches: [dir('G0001', 'Kubíčkovi z Dolní Lhoty', 0), dir('G0002', 'Malí z Horní Vsi', 1), dir('G0003', 'Šustrovi', 2)], ...extra,
+    });
+
+    beforeEach(() => setLanguage('en'));
+
+    it('only the directions\' runs at work: offered; the general run or a session of no run: busy', () => {
+        expect(queueWorkOffer(base({ runs: [wire('run-1a07', 'G0001')], working: [row({ run: 'run-1a07' })] }), OK)).toBe('offer');
+        expect(queueWorkOffer(base({ runs: [wire('run-8f2c', null)] }), OK)).toBe('busy');
+        // A conversation: a row of working[] none of the runs holds.
+        expect(queueWorkOffer(base({ runs: [wire('run-1a07', 'G0001', 's1')], working: [row({ session: 's1' }), row({ session: 's9' })] }), OK)).toBe('busy');
+        expect(queueWorkOffer(base({ runs: [wire('run-1a07', 'G0001', 's1')], working: [row({ session: 's1' })] }), OK)).toBe('offer');
+    });
+
+    it('at the most runs at once: held (limit), the starts on their way counted, the runs ended not', () => {
+        const three = [wire('run-1a07', 'G0001'), wire('run-2b11', 'G0002'), wire('run-3c22', 'G0003')];
+        expect(queueWorkOffer(base({ runs: three, limits: { maxRuns: 3, running: 3 } }), OK)).toBe('limit');
+        expect(queueWorkOffer(base({ runs: three.slice(0, 2), limits: { maxRuns: 3, running: 2 } }), OK)).toBe('offer');
+        expect(queueWorkOffer(base({ runs: three.slice(0, 2), limits: { maxRuns: 3, running: 2 } }), { ...OK, starting: 1 })).toBe('limit');
+        // 3 when the research says no limit.
+        expect(queueWorkOffer(base({ runs: three }), OK)).toBe('limit');
+        expect(queueWorkOffer(base({ runs: three, limits: { maxRuns: 4, running: 3 } }), OK)).toBe('offer');
+        expect(queueWorkLimitText(base({ runs: three }))).toBe(strings.live.runsLimitReached(3));
+        // Nothing offered stays nothing even at the limit.
+        expect(queueWorkOffer(base({ runs: three }), { ...OK, phone: true })).toBe('none');
+    });
+
+    it('an older research (no run.lines, no runs): as before', () => {
+        const features = [WORK_LINK_FEATURE, RUN_TASKS_FEATURE, STATUS_BUSY_FEATURE];
+        expect(queueWorkOffer({ features, queue: [task('T1')], busy: { sessions: 1, runs: 0 } }, OK)).toBe('busy');
+        expect(queueWorkOffer({ features, queue: [task('T1')], busy: { sessions: 0, runs: 0 } }, OK)).toBe('offer');
+        expect(queueWorkOffer({ features: [...LINES], queue: [task('T1')] }, OK)).toBe('offer');
+        expect(generalWorkQueue({ features, queue: [task('T1', { research: 'G0001' })] }).skips).toEqual([]);
+    });
+
+    it('First up skips the tasks of a direction with its own run (and those helping it); its count without them', () => {
+        const queue = [
+            task('T0390', { research: 'G0001', pos: 1 }),
+            task('T0391', { pos: 2, why: { kind: 'helps', research: 'G0001' } as LiveQueueItem['why'] }),
+            task('T0392', { research: 'G0002', pos: 3 }),
+            task('T0393', { pos: 4 }),
+        ];
+        const st = base({ queue, runs: [wire('run-1a07', 'G0001')], queueCounts: { research: { G0001: 5, G0002: 3 }, branch: {}, next: 12, parked: 0, rev: '0', general: 6 } });
+        const g = generalWorkQueue(st);
+        expect(g.queue.map(q => q.id)).toEqual(['T0392', 'T0393']);
+        expect(queueWorkFirst(g.queue)?.id).toBe('T0392');
+        expect(g.total).toBe(6);
+        expect(g.skips.map(d => d.id)).toEqual(['G0001']);
+        // Without a run of a direction: the whole queue.
+        expect(generalWorkQueue(base({ queue })).queue.map(q => q.id)).toEqual(['T0390', 'T0391', 'T0392', 'T0393']);
+    });
+
+    it('says which directions it skips, one or more, in the directions\' order', () => {
+        const st = base({ runs: [wire('run-3c22', 'G0003'), wire('run-1a07', 'G0001')] });
+        const skips = generalWorkQueue(st).skips;
+        expect(skips.map(d => d.id)).toEqual(['G0001', 'G0003']);
+        expect(queueWorkSkipsText([])).toBeNull();
+        expect(queueWorkSkipsText(skips.slice(0, 1))).toBe('Skips the direction Kubíčkovi z Dolní Lhoty (its own agent works on it).');
+        expect(queueWorkSkipsText(skips)).toBe('Skips the directions Kubíčkovi z Dolní Lhoty, Šustrovi (their own agents work on them).');
+        setLanguage('cs');
+        expect(queueWorkSkipsText(skips.slice(0, 1))).toBe('Přeskočí linii Kubíčkovi z Dolní Lhoty (pracuje na ní vlastní agent).');
+        setLanguage('pl');
+        expect(queueWorkSkipsText(skips)).toMatch(/^Pominie linie /);
         setLanguage('en');
     });
 });

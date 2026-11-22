@@ -20,6 +20,7 @@
  * The pure logic lives in src/research-link.ts.
  */
 
+import { batchHeldChange } from '../batch.js';
 import { allMedia } from '../media.js';
 import { noteOverviewSectionRows } from './overview-columns-ui.js';
 import { waitingAuditMarkEl, waitingAuditShown } from './waiting-task-ui.js';
@@ -30,6 +31,7 @@ import { setResearchActionLabel, researchActionMark } from './research-open-mark
 import { DataManager, migrateData } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { TreeRenderer } from '../renderer.js';
+import { imageLoads, pendingFromNotes, startImageLoad, takePendingImages, windowEmit, withArrivedImages, type PendingImage } from '../image-loads.js';
 import { ZoomPan } from '../zoom.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { researchHypothesisLogLine } from '../research-hypotheses.js';
@@ -37,21 +39,23 @@ import { sessionTone } from '../live-follow-targets.js';
 import { hasFollowPrefs, resetFollowPrefs, restoreFollowPrefs } from '../live-follow-prefs.js';
 import { helpMark } from './help-mark.js';
 import type { HelpTopic } from '../help/topics.js';
+import { deletedSourcesToSend } from '../source-retract.js';
 import { StromData, TreeId, PersonId, SourceExcerpt, TreeImagesVariant } from '../types.js';
 import { parseGedcom, convertToStrom, decodeGedcomFile, parseGedcomDate } from '../ged-parser.js';
 import { formatFlexDate, instantLocalDay } from '../dates.js';
 import { formatLiveTime, formatLiveClock } from '../live-time.js';
+import { generalQueueCount, lineRunGroups, lineRunOf, linesWithRun, liveRuns, queueTaskTakenByLine, runLinesOn } from '../research-runs.js';
 import { isDesktop, isMobile } from '../breakpoints.js';
 import { livePanelDrawnSections, livePanelNothingAtWork, livePanelWorkingOnly } from './live-panel-working-only.js';
 import {
     readResearchHeader, parseLoopbackUrl, parseLiveBridge, contentFingerprint, fingerprintLike,
     decideResearchOpen, stabilizeIds, keepEventShares, keepTitles, keepMarriedSurname, keepSurnameVariants, keepLineageOverrides, researchHasTitles, withResearchTitles, TITLES_FEATURE, carryOverMedia, carryOverUnknownPartners, sanitizeLiveStatus, sanitizeLiveChange,
-    sanitizeLiveEnd, sanitizeWorking, WORKING_HELPS_FEATURE, researchFamilyPartners, workingWithFamilyPersons, parseEventData, extractChangedRefs, personsByRefs,
+    sanitizeLiveEnd, sanitizeWorking, WORKING_HELPS_FEATURE, holdsSaid, researchFamilyPartners, workingWithFamilyPersons, parseEventData, extractChangedRefs, personsByRefs,
     humanizeChange, isGedcomFileName, isSafariBrowser,
     parseSendBridge, pickSendDefault, sanitizeSyncReply, researchSchemeUrl, researchTaskRef,
     ResearchLinkAction, ResearchLinkParams, LiveBridgeUrls, LiveStatus, LiveChange, LiveWorker, LiveWaiting,
-    LiveQueueItem, LiveSpend, LiveIntake, LiveDirection, LiveBusy, LiveWork, ResearchCaps, BrowserInfo, LiveOffLine, LiveBooks, ResearchHeaderInfo, ExportXrefs, ResearchAccepts, statusAgentless,
-    LiveQueueCounts, QUEUE_PAGE_FEATURE, QUEUE_SEARCH_FEATURE,
+    LiveQueueItem, LiveSpend, LiveIntake, LiveDirection, LiveBusy, LiveRunWire, LiveRunEnded, LiveRunLimits, LiveAgent, LiveWork, ResearchCaps, BrowserInfo, LiveOffLine, LiveBooks, ResearchHeaderInfo, ExportXrefs, ResearchAccepts, statusAgentless,
+    LiveQueueCounts, QUEUE_PAGE_FEATURE, QUEUE_SEARCH_FEATURE, type QueueTaskKind,
     researchLinkMark, researchUrlMark, researchMediaKeys, MEDIA_BASE_MAX, researchMediaSentAfterReturn,
 } from '../research-link.js';
 import { keepImports } from '../import-origin.js';
@@ -65,6 +69,7 @@ import {
     taskDirectionName, workingLineCount, workingLineGroups,
 } from './research-directions-ui.js';
 import { iconSvg } from '../icons.js';
+import { queueHoldText, waitsText, workingHoldText } from '../research-holds.js';
 import {
     branchName, focusQueueMoved, personByRefn, queueBranchFilter, queueNextFor, queueNextOffered, queueRowFlash, queueWhyText, setQueueBranchFilter, taskMenuOrders, taskOrderOffered,
     taskProblemBox, waitBranchText, workingWhyText,
@@ -87,6 +92,7 @@ import {
 import {
     QueueSearch, activeQueueSearch, clearQueueSearch, markQueueSearchPending, queueSearchFor, queueSearchOffered, sayQueueSearch,
 } from './queue-search-ui.js';
+import { queueKindFilter, queueKindName, queueKindRow, setQueueKindFilter } from './queue-kind-ui.js';
 import { parseDeepLink } from '../deep-link.js';
 import { followNotice, researchNameBeside, FOLLOW_NOTICE_MS, FOLLOW_HIGHLIGHT_MS, FollowTreeRef } from '../research-follow.js';
 import { SettingsManager } from '../settings.js';
@@ -116,7 +122,7 @@ import { shownName, shownNameOrEmpty, fitNameHtml } from '../person-name.js';
 import { bindSectionMenu, keepSectionControlFocus, sectionClickSwallowed, sectionMovedNow } from './live-section-edit-ui.js';
 import { BRIDGE_ANSWER_MS } from '../bridge-ask.js';
 import { bridgeGivesEtag, bridgeGivesImagesByHash, bridgeGivesStale, staleTreeUrl, storedTreeEtag, treeAsksAppMedia, treeFamilyPartners, treeFileState, treeReplyEtag, treeReplyHeads, treeReplyImages, TREE_GED_TIMEOUT_MS, type TreeReplyHeads } from '../research-tree-file.js';
-import { findImageRefs, findNamedFileShas, forgetHeldImages, imagesUrlOf, refTreeUrl, resolveImageRefs, sha256Hex, type ImageResolveDeps } from '../research-image-refs.js';
+import { addHeldImages, findImageRefs, findNamedFileShas, forgetHeldImages, imagesUrlOf, refTreeUrl, resolveHeldImageRefs, resolveImageRefs, sha256Hex, type ImageRef, type ImageResolveDeps } from '../research-image-refs.js';
 import { completeStatus, statusAskUrl } from '../status-parts.js';
 
 /** What a research open needs to know from the file (or the bridge). */
@@ -303,6 +309,14 @@ export interface LiveSession {
     update: { version: string } | null;
     /** Sessions and runs working now (its last status's `busy`; absent: not said). */
     busy?: LiveBusy;
+    /** The runs working now (its last status's `runs`, with `run.lines`, spec 126 U10; absent: not said). */
+    runs?: LiveRunWire[];
+    /** The runs ended in the research's last 10 minutes (its last status's `runsEnded`, with `run.lines`; absent: not said). */
+    runsEnded?: LiveRunEnded[];
+    /** The most runs at once and how many run (its last status's `limits`, with `run.lines`; absent: not said). */
+    limits?: LiveRunLimits;
+    /** The agents the research can start (its last status's `agents`, with `run.agents`; absent: not said). */
+    agents?: LiveAgent[];
     /** The gate and a session's length for "Work on the queue…" (its last status's `work`, `work.link`; absent: not said). */
     work?: LiveWork;
     spend: LiveSpend | null;
@@ -651,6 +665,22 @@ function markQueueNextRow(li: HTMLElement, text: HTMLElement, q: LiveQueueItem, 
     }
 }
 
+/**
+ * The note of a queued task another session holds, or whose archive is used
+ * now (spec 127; null: none). A task in the status's window takes the
+ * status's word (fresh); a page's item beyond it keeps its own. `cls`: the
+ * note's class where the row is drawn.
+ */
+export function queueHoldNote(q: LiveQueueItem, s: LiveSession, cls = 'live-queue-note live-queue-held'): HTMLElement | null {
+    const fresh = s.queue.find(x => x.id === q.id) ?? q;
+    // The row names the task's line itself (two or more lines): the sentence leaves it out.
+    const text = queueHoldText(fresh, '');
+    if (!text) return null;
+    const note = el('span', cls, text);
+    note.dataset.held = fresh.heldBy ? 'task' : 'archive';
+    return note;
+}
+
 /** A queued task has its ⋯: the research's actions, a place by hand, or "Do next" for it. */
 function queueRowMenu(s: LiveSession, q: LiveQueueItem, canTask: boolean, canOrder: boolean): boolean {
     return canTask || canOrder || (queueNextOffered(s) && queueNextFor(s, q));
@@ -662,6 +692,9 @@ function queueRowMenu(s: LiveSession, q: LiveQueueItem, canTask: boolean, canOrd
  * in its title), else what an older research says of it.
  */
 function appendQueueNote(text: HTMLElement, q: LiveQueueItem, s: LiveSession): void {
+    // Who holds the task, or who uses its archive (spec 127): before anything else, whatever its place.
+    const held = queueHoldNote(q, s);
+    if (held) text.appendChild(held);
     // `queue.next`: a task set to come next carries its tag instead of the sentence.
     if (queueNextTagged(q, s)) return;
     const why = queueWhyText(q, s);
@@ -813,6 +846,11 @@ let externalReady = false;
 /** Removes the listeners of the open ⋯ task menu (null: none open). */
 let liveTaskMenuCleanup: (() => void) | null = null;
 let live: LiveSession | null = null;
+/**
+ * The followed research's changes held while a batch of this page is sent to it
+ * (media.queued, batchHoldsLive): its tree is read once, after the batch's close.
+ */
+let heldLive: { session: LiveSession; changes: LiveChange[] } | null = null;
 /** The "Waiting for you" panel while no research is followed (the research's id). */
 let idlePanel: string | null = null;
 /**
@@ -1308,6 +1346,13 @@ export interface FetchedTree extends TreeReplyHeads {
     images?: ReadonlyMap<string, string>;
     /** It came with the tree's own files (`media=app`, spec 108 §5): its portraits, couples' photos and attachments are the archive's. */
     media?: true;
+    /**
+     * The images the file names that are neither held nor in the stored tree
+     * (a load with `defer`, spec 116): the parser puts a stand-in for each
+     * (convertToStrom `pendingImages`), they come after the tree from `imagesUrl`.
+     */
+    pendingImages?: ReadonlyMap<string, ImageRef>;
+    imagesUrl?: string;
 }
 
 /**
@@ -1330,6 +1375,9 @@ async function researchTreeImages(researchId: string): Promise<string[]> {
     for (const u of Object.values(data?.partnerships ?? {})) if (u?.photo) out.push(u.photo);
     return out;
 }
+
+/** The images coming after a tree stop when another tree opens (wired once). */
+let imageLoadsWired = false;
 
 /** What resolving the images by hash takes from the app: the network, hashing, the stored tree. */
 const imageDeps: ImageResolveDeps = {
@@ -1354,7 +1402,7 @@ const imageDeps: ImageResolveDeps = {
  * files (`media=app`, spec 108 §5) — the answer says so (`media`); the file
  * with the images in it it falls back to never has them.
  */
-export async function fetchResearchTree(url: string, opts: { stale?: boolean; etag?: string | null; byHash?: boolean; images?: boolean; media?: boolean; watch?: TreeDownloadWatch } = {}): Promise<FetchedTree> {
+export async function fetchResearchTree(url: string, opts: { stale?: boolean; etag?: string | null; byHash?: boolean; images?: boolean; media?: boolean; defer?: boolean; watch?: TreeDownloadWatch } = {}): Promise<FetchedTree> {
     if (opts.byHash) {
         const got = await fetchRefTree(url, opts);
         if (got) return got;
@@ -1378,7 +1426,7 @@ export async function fetchResearchTree(url: string, opts: { stale?: boolean; et
  * null when they could not all be had (the caller then takes the file with
  * them in it). A bridge that cannot be reached throws, as for the whole file.
  */
-async function fetchRefTree(url: string, opts: { stale?: boolean; etag?: string | null; images?: boolean; media?: boolean; watch?: TreeDownloadWatch }): Promise<FetchedTree | null> {
+async function fetchRefTree(url: string, opts: { stale?: boolean; etag?: string | null; images?: boolean; media?: boolean; defer?: boolean; watch?: TreeDownloadWatch }): Promise<FetchedTree | null> {
     const res = await fetchWithTimeout(refTreeUrl(opts.stale ? staleTreeUrl(url) : url, !!opts.media), TREE_GED_TIMEOUT_MS,
         opts.etag ? { 'If-None-Match': opts.etag } : undefined, opts.watch?.signal);
     const get = (name: string): string | null => res.headers?.get(name) ?? null;
@@ -1401,6 +1449,12 @@ async function fetchRefTree(url: string, opts: { stale?: boolean; etag?: string 
     const refs = findImageRefs(text);
     // The tree's files the archive names by their name alone: the very files this browser holds stay (a PDF).
     const files = opts.media ? findNamedFileShas(text) : [];
+    if (opts.defer) {
+        // Only what this browser holds now; the others come after the tree (spec 116).
+        const got = await resolveHeldImageRefs({ researchId: readResearchHeader(text).treeId, refs, files }, imageDeps);
+        const pending = got.pending.length ? { pendingImages: new Map(got.pending.map(r => [r.sha, r])), imagesUrl: imagesUrlOf(url) } : {};
+        return { ...base, variant: 'ref', images: got.images, ...pending };
+    }
     try {
         const got = await resolveImageRefs({ researchId: readResearchHeader(text).treeId, refs, imagesUrl: imagesUrlOf(url), files }, imageDeps);
         return { ...base, variant: 'ref', images: got.images };
@@ -1696,13 +1750,38 @@ export function liveState(s: LiveSession): { label: string; cls: 'is-working' | 
     return { label: L.stateIdle, cls: 'is-idle' };
 }
 
+/**
+ * Why a run is paused (`paused.reason`): the research's codes `limit` and `archive` in the app's words,
+ * any other reason (free text in the research's language) as it is (spec 126 U10).
+ */
+export function pausedReasonText(reason: string): string {
+    const L = strings.live;
+    return reason === 'limit' ? L.runStateLimitNoTime : reason === 'archive' ? L.runStateArchiveNoTime : reason;
+}
+
 /** A paused run: "Paused · <why> · resumes at 21:30" (what the research says of it). */
 export function pausedText(w: LiveWorker): string {
     if (!w.paused) return '';
-    const ts = Date.parse(w.paused.until);
     const L = strings.live;
-    return [L.statePaused, w.paused.reason, Number.isFinite(ts) ? L.pausedUntil(formatLiveClock(ts, Date.now(), getCurrentLanguage())) : '']
+    // Waiting for an archive (spec 127): which one, and when the run gives up (not "resumes").
+    if (w.waits) return [L.statePaused, waitsText(w)].join(' · ');
+    const ts = Date.parse(w.paused.until);
+    return [L.statePaused, pausedReasonText(w.paused.reason), Number.isFinite(ts) ? L.pausedUntil(formatLiveClock(ts, Date.now(), getCurrentLanguage())) : '']
         .filter(Boolean).join(' · ');
+}
+
+/** A row at work: its last sign and when its hold ends (spec 127; nothing without a hold or beyond its since). */
+export function workingHoldEl(w: LiveWorker): HTMLElement | null {
+    const text = w.paused ? '' : workingHoldText(w.hold);
+    return text ? el('span', 'live-hold', text) : null;
+}
+
+/** `workingHoldEl` as a line of its own under a row's since (a block of its own there). */
+export function appendWorkingHold(host: HTMLElement, w: LiveWorker): void {
+    const hold = workingHoldEl(w);
+    if (!hold) return;
+    hold.classList.add('live-hold--line');
+    host.appendChild(hold);
 }
 
 /** "Preparing a newer version…" with a small spinner (the tree shown is an older one the bridge gave at once). */
@@ -1747,10 +1826,11 @@ export function waitsOnUser(on: string | undefined): boolean {
  * the bottom bar (its height and the 8px gap above it; 0 without a strip, or
  * when the panel is a card at the top). The tree's pills stand on top of it.
  */
-/** A session's number in "At work": a 20px circle in the session's colour. */
-export function workingNumberBadge(n: number): HTMLElement {
-    const badge = el('span', `live-working-num follow-${sessionTone(n)}`, String(n));
-    badge.title = strings.live.sessionN(n);
+/** A session's number in "At work": a 20px circle in the session's colour (a run's label, "↑ 2", in the run's). */
+export function workingNumberBadge(m: { session: number; label?: string; tone?: 'primary' | 'accent' }): HTMLElement {
+    const label = m.label ?? String(m.session);
+    const badge = el('span', `live-working-num follow-${m.tone ?? sessionTone(m.session)}${label.length > 2 ? ' is-wide' : ''}`, label);
+    badge.title = strings.live.sessionN(m.session);
     return badge;
 }
 
@@ -1779,8 +1859,8 @@ function placeLivePanel(panel: HTMLElement): void {
     const base = panel.getBoundingClientRect();
     const overlaps = (r: DOMRect) => r.width > 0 && r.height > 0 && r.left < base.right && r.right > base.left;
     let top = base.top;
-    // The Table view's bar spans the width under the top bar (and may wrap): the card stands below it.
-    for (const sel of ['#embedded-mode-banner.visible', '#collab-bar', '#collab-badge', 'body[data-view-mode="table"] #table-container > .tv-bar']) {
+    // The Table's and the Timeline's bars span the width under the top bar (and may wrap): the card stands below it.
+    for (const sel of ['#embedded-mode-banner.visible', '#collab-bar', '#collab-badge', 'body[data-view-mode="table"] #table-container > .tv-bar', 'body[data-view-mode="timeline"] #timeline-toolbar']) {
         const node = document.querySelector<HTMLElement>(sel);
         if (!node || getComputedStyle(node).display === 'none') continue;
         const r = node.getBoundingClientRect();
@@ -2531,7 +2611,12 @@ export const researchUiMethods = uiModule({
         /** "Load the new version" from the running research: the very same tree under a new head is only taken (no question). */
         takeSame?: boolean;
         /** Told back: whether the file's images were taken (the setting, or the choice in a question). */
-        taken?: { images: boolean } }): Promise<TreeId | null> {
+        taken?: { images: boolean };
+        /**
+         * Images of the file still on their way (stand-ins in `data`, spec 116): they come after
+         * the tree from `url`; `onDone` once all came or failed (`failed` of them did not come).
+         */
+        pendingImages?: { refs: ReadonlyMap<string, ImageRef>; url: string; onDone?(o: { treeId: TreeId; failed: number }): void } }): Promise<TreeId | null> {
         const name = source.name || strings.research.defaultName;
         const dateLabel = researchDateLabel(source.date, source.asOf);
         const existing = source.treeId ? TreeManager.findTreeByResearchId(source.treeId) : null;
@@ -2711,6 +2796,8 @@ export const researchUiMethods = uiModule({
         /** The backup of the tree as it was before the research's version replaced it, and the tie it built on. */
         let backupId: string | null = null;
         let tieBefore: ResearchLinkBefore | undefined;
+        /** The images of the file still to come, by their place in the tree as loaded. */
+        let waiting: PendingImage[] = [];
         if (!existing || asCopy) {
             // The new tree takes the updates: the next open of this research
             // updates it. The tree the user changed stays exactly as it is and
@@ -2718,7 +2805,10 @@ export const researchUiMethods = uiModule({
             if (existing?.research) TreeManager.setResearchLink(existing.id, { ...existing.research, copy: true });
             const treeName = existing ? strings.research.copyName(name, formatFlexDate(todayIso())) : name;
             // Everyone comes into the new tree now, or on the research's own date (spec 084 §8).
-            treeId = await DataManager.importAsNewTree(stampResearchTree(data, new Date().toISOString()), treeName);
+            // Images still on their way stay out of what is stored: the tree shows at once, they follow (spec 116).
+            const out = takePendingImages(data, null, opts.pendingImages?.refs);
+            waiting = out.pending;
+            treeId = await DataManager.importAsNewTree(stampResearchTree(out.data, new Date().toISOString()), treeName);
             created = true;
         } else {
             treeId = existing.id;
@@ -2736,7 +2826,10 @@ export const researchUiMethods = uiModule({
             backupId = await DataManager.snapshotNow('pre-research-load');
             const was = TreeManager.getTreeMetadata(treeId)?.research;
             if (was) tieBefore = { head: was.head ?? '', fingerprint: was.fingerprint ?? '', syncedAt: was.syncedAt, ...(was.sent ? { sent: was.sent } : {}) };
-            DataManager.loadStromData(stable);
+            // Images still on their way: a field keeps the image it had until the new one comes (spec 116).
+            const out = takePendingImages(stable, previous, opts.pendingImages?.refs);
+            waiting = out.pending;
+            DataManager.loadStromData(out.data);
         }
 
         if (source.treeId) {
@@ -2766,6 +2859,10 @@ export const researchUiMethods = uiModule({
                 ...(tieBefore ? { before: tieBefore } : {}) } });
         }
         const loadedAfterSend = !created && (holdsSent || (!!opts.afterSend && opts.afterSend === treeId));
+        if (waiting.length && opts.pendingImages && DataManager.getCurrentTreeId() === treeId) {
+            this.researchLoadImagesLater(treeId, source.treeId, waiting, opts.pendingImages, source.appMedia && includeImages && source.treeId
+                ? { researchId: source.treeId, research: data, carried } : null);
+        }
 
         const switched = previousTreeId !== treeId;
         this.updateTreeSwitcher();
@@ -2946,7 +3043,7 @@ export const researchUiMethods = uiModule({
         const releaseLeave = holdLeave('send', tree.id);
         let res: Response;
         try {
-            res = await postSync(bridge.sync, researchGedcom(data, tree.name, { id: link.id, head: link.head, appTree: tree.id, transcripts: this.researchTranscriptsLink(link).transcripts }, researchGedcomTitles(status), researchSendsReadings(status), researchSendsSourceFields(status), researchCitationsOut(status)), 120000);
+            res = await postSync(bridge.sync, researchGedcom(data, tree.name, { id: link.id, head: link.head, appTree: tree.id, transcripts: this.researchTranscriptsLink(link).transcripts, deletedSources: deletedSourcesToSend(link) }, researchGedcomTitles(status), researchSendsReadings(status), researchSendsSourceFields(status), researchCitationsOut(status)), 120000);
         } catch (err) {
             releaseLeave();
             console.warn('Sending to the research failed', err);
@@ -3391,7 +3488,7 @@ export const researchUiMethods = uiModule({
         s.working = withFamilyPersons(status.working, s.bridge);
         s.features = status.features;
         s.accepts = status.accepts;
-        s.waiting = this.withoutBranchAnswers(this.liveWaitingShown(s, status.waiting));
+        s.waiting = this.withoutAsideAnswers(this.withoutBranchAnswers(this.liveWaitingShown(s, status.waiting)));
         // A task new since the overview opened unfolds as it does while following (the first answer is no news).
         const fresh = status.waiting.filter(w => !s.seenWaiting.has(w.id));
         for (const w of fresh) s.seenWaiting.add(w.id);
@@ -3405,13 +3502,17 @@ export const researchUiMethods = uiModule({
         s.queue = status.queue;
         s.queueMore = status.queueMore;
         s.queueCounts = status.queueCounts;
-        if (status.queueCounts) noteQueueRev(s.bridge.base, status.queueCounts.rev);
+        if (status.queueCounts) noteQueueRev(s.bridge.base, status.queueCounts.rev, status.features);
         s.researches = status.researches;
         s.caps = status.caps;
         s.offLine = status.offLine;
         s.books = status.books;
         s.update = status.update;
         s.busy = status.busy;
+        s.runs = status.runs;
+        s.runsEnded = status.runsEnded;
+        s.limits = status.limits;
+        s.agents = status.agents;
         s.work = status.work;
         s.browser = status.browser;
         s.spend = status.spend;
@@ -3508,6 +3609,8 @@ export const researchUiMethods = uiModule({
 
     /** "Answer (research)" can be offered at this waiting item (a link the research takes leads there). */
     canAnswerResearchWaiting(w: LiveWaiting): boolean {
+        // A file of a book's inbox set aside is answered through the bridge, in its row (never in the research's terminal).
+        if (w.kind === 'aside') return false;
         if (this.researchLinkAvailable('open')) return true;
         return w.kind === 'permission' ? this.researchLinkAvailable('archive') : this.researchLinkAvailable('task');
     },
@@ -3546,7 +3649,7 @@ export const researchUiMethods = uiModule({
             await this.showAlert(strings.storageSafety.treeLocked, 'warning');
             return;
         }
-        const research = { id: meta.research.id, head: meta.research.head, appTree: treeId, transcripts: this.researchTranscriptsLink(meta.research).transcripts };
+        const research = { id: meta.research.id, head: meta.research.head, appTree: treeId, transcripts: this.researchTranscriptsLink(meta.research).transcripts, deletedSources: deletedSourcesToSend(meta.research) };
         const blob = new Blob([researchGedcom(data, meta.name, research, researchGedcomTitles(this.researchStatusOf(meta.research.id)), researchSendsReadings(this.researchStatusOf(meta.research.id)), researchSendsSourceFields(this.researchStatusOf(meta.research.id)), researchCitationsOut(this.researchStatusOf(meta.research.id)), researchMediaOut(this.researchStatusOf(meta.research.id)))], { type: 'text/plain;charset=utf-8' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -3580,6 +3683,94 @@ export const researchUiMethods = uiModule({
     },
 
     /** Keep the tag of the file just loaded into `treeId` with its tie (only that research's, not a copy's), with the file's variant (and whether it had the tree's own files). */
+    /**
+     * The images of a research's version still on their way into the tree
+     * just loaded (spec 116): asked from its bridge in the background, the
+     * people shown first, put in as they come (no undo step, no change of the
+     * user's). A tree that was in step with the research stays in step;
+     * `appMedia`: the base of the tree's own files is noted again with the
+     * images that came. Once all came or failed, `o.onDone`.
+     */
+    researchLoadImagesLater(treeId: TreeId, researchId: string | null | undefined, waiting: readonly PendingImage[], o: { url: string; onDone?(r: { treeId: TreeId; failed: number }): void; history?: 'now' | 'all' },
+        appMedia: { researchId: string; research: StromData; carried: number } | null): void {
+        if (!imageLoadsWired) {
+            imageLoadsWired = true;
+            window.addEventListener('strom:tree-switched', () => imageLoads.onTreeSwitch(DataManager.getCurrentTreeId()));
+        }
+        // The history from now on takes the images that come (undo, redo never bring the older ones back: I3).
+        DataManager.noteImageLoadStart(treeId, o.history);
+        const q = startImageLoad({
+            treeId,
+            url: o.url,
+            pending: waiting,
+            // The cards on screen first, then around the focus (K1.6); a pan or a zoom orders them anew (TreeRenderer).
+            priority: TreeRenderer.imagePriority(),
+            deps: {
+                fetch: imageDeps,
+                currentTreeId: () => DataManager.getCurrentTreeId(),
+                write: (id, fills) => {
+                    const link = TreeManager.getTreeMetadata(id as TreeId)?.research;
+                    const before = contentFingerprint(DataManager.getData());
+                    const inStep = !!link?.fingerprint && fingerprintLike(DataManager.getData(), link.fingerprint) === link.fingerprint;
+                    const written = DataManager.writeArrivedImages(id as TreeId, fills) ?? [];
+                    if (!written.length) return written;
+                    const after = contentFingerprint(DataManager.getData());
+                    // Images coming are no change: the tree in step with the research stays so, and the load stays undoable.
+                    if (inStep && link?.fingerprint) TreeManager.patchResearchLink(id as TreeId, { fingerprint: fingerprintLike(DataManager.getData(), link.fingerprint) });
+                    const backup = researchAutoState(id).loadBackup;
+                    if (backup?.fingerprint === before) patchResearchAutoState(id, { loadBackup: { ...backup, fingerprint: after } });
+                    // No redraw: the cards take the images in place (strom:images-arrived, TreeRenderer.updateCardImages).
+                    return written;
+                },
+                store: id => DataManager.storeArrivedImages(id as TreeId),
+                emit: windowEmit,
+                // The images held for the research's next file grow by them (a reload asks no more for them).
+                arrived: images => { if (researchId) addHeldImages(researchId, images); },
+            },
+            onDone: ({ arrived, failed }) => {
+                if (DataManager.getCurrentTreeId() !== treeId) return;
+                const link = TreeManager.getTreeMetadata(treeId)?.research;
+                // The research's version as kept for its changes: with the images that came.
+                if (link?.fingerprint && fingerprintLike(DataManager.getData(), link.fingerprint) === link.fingerprint) {
+                    this.researchKeepCopy(treeId, DataManager.getData());
+                }
+                if (appMedia) {
+                    patchResearchAutoState(treeId, { mediaBase: { research: appMedia.researchId,
+                        keys: researchMediaKeys(withArrivedImages(appMedia.research, arrived)).slice(0, MEDIA_BASE_MAX) } });
+                    // The tree lacks files the archive holds: its writes only add until they came (spec 108). The images
+                    // not had are said by the photos' notice with Try again (spec 116 §7, src/ui/image-load-chip.ts).
+                    if (failed > 0) noteResearchMediaMissed(treeId, appMedia.researchId);
+                    else if (researchAutoState(treeId).mediaMissed?.toLowerCase() === appMedia.researchId.toLowerCase()) {
+                        // A Try again brought them all: the tree holds the archive's files again.
+                        patchResearchAutoState(treeId, { mediaMissed: undefined });
+                        mediaRetryDone(treeId);
+                    }
+                }
+                o.onDone?.({ treeId, failed });
+            },
+        });
+        // Noted with the tree at once: a page closed before they came asks for them at the next connect (I1).
+        if (q) TreeManager.setPendingImages(treeId, q.notes(!SettingsManager.isEncryptionEnabled()));
+    },
+
+    /**
+     * The images noted with the open tree `treeId` as not come (a page closed
+     * or a bridge gone while they came, spec 116 I1): those the tree still
+     * waits for are asked from the research's bridge `imagesUrl` again —
+     * unless a load of the tree runs already. What no longer waits is let go.
+     */
+    researchResumePendingImages(treeId: TreeId, researchId: string, imagesUrl: string): void {
+        if (DataManager.getCurrentTreeId() !== treeId || imageLoads.current()?.treeId === treeId) return;
+        const notes = TreeManager.getTreeMetadata(treeId)?.pendingImages;
+        if (!notes) return;
+        const waiting = pendingFromNotes(DataManager.getData(), notes);
+        if (!waiting.length) {
+            TreeManager.setPendingImages(treeId, null);
+            return;
+        }
+        this.researchLoadImagesLater(treeId, researchId, waiting, { url: imagesUrl, history: 'all' }, null);
+    },
+
     researchKeepTreeEtag(treeId: TreeId, researchId: string, tag: string, images: boolean, variant: TreeImagesVariant = 'data', media = false): void {
         const link = TreeManager.getTreeMetadata(treeId)?.research;
         if (!link || link.copy || link.id !== researchId.toLowerCase() || !link.fingerprint) return;
@@ -3751,6 +3942,8 @@ export const researchUiMethods = uiModule({
             let held: HeldResearchFile | null = null;
             // A bridge with `ged.imagesByHash`: the file with its images by their hash, and those images.
             let images: ReadonlyMap<string, string> | undefined;
+            // Those not held here: they come after the tree is shown (spec 116).
+            let later: { refs: ReadonlyMap<string, ImageRef>; url: string } | null = null;
             let variant: TreeImagesVariant = 'data';
             /** The file came with the tree's own files (spec 108 §5). */
             let appMedia = false;
@@ -3776,18 +3969,19 @@ export const researchUiMethods = uiModule({
                 const media = treeAsksAppMedia(status.features, SettingsManager.isImportImages());
                 opts.progress?.step('tree');
                 const ask = tagged ? await this.researchHeldFile(status.treeId, asked, media) : null;
-                let got = await fetchResearchTree(bridge.ged, { stale, etag: ask?.etag, byHash, media });
+                let got = await fetchResearchTree(bridge.ged, { stale, etag: ask?.etag, byHash, media, defer: true });
                 if (got.notModified) {
                     // Still exactly that tree (nothing changed it meanwhile): kept. Else the file itself.
                     const now = await this.researchHeldFile(status.treeId, asked, media);
                     if (now && now.etag === ask?.etag && now.treeId === ask.treeId) {
                         held = now;
                     } else {
-                        got = await fetchResearchTree(bridge.ged, { stale, byHash, media });
+                        got = await fetchResearchTree(bridge.ged, { stale, byHash, media, defer: true });
                     }
                 }
                 text = got.text;
                 images = got.images;
+                later = got.pendingImages && got.imagesUrl ? { refs: got.pendingImages, url: got.imagesUrl } : null;
                 variant = got.variant;
                 appMedia = !!got.media && !got.notModified;
                 if (stale) reply = got;
@@ -3826,7 +4020,7 @@ export const researchUiMethods = uiModule({
             }
             let data: StromData;
             try {
-                data = held ? held.data : convertToStrom(parseGedcom(text), { images }).data;
+                data = held ? held.data : convertToStrom(parseGedcom(text), { images, ...(later ? { pendingImages: later.refs } : {}) }).data;
             } catch {
                 opts.progress?.settle();
                 if (auto) passive();
@@ -3850,22 +4044,31 @@ export const researchUiMethods = uiModule({
                 return;
             }
             const taken = { images: SettingsManager.isImportImages() };
+            /** Every image came after the tree: the file's tag is kept with it then (a reload asks with it). */
+            const tag = etag;
+            const researchId = status.treeId;
+            const keepTag = (r: { treeId: TreeId; failed: number }): void => {
+                if (tag && r.failed === 0) this.researchKeepTreeEtag(r.treeId, researchId, tag, taken.images, variant, appMedia);
+            };
             const treeId = held
                 ? await this.researchKeepHeldFile(held, status.treeId, { head: file.head, quiet: opts.resume, noDialog: !!auto })
                 : await this.applyResearch(
                     data,
                     { treeId: status.treeId, name, date: header.date, ...(header.asOf ? { asOf: header.asOf } : {}), mode: header.mode,
                         ...(appMedia ? { appMedia: true as const } : {}) },
-                    { head: file.head, quiet: opts.resume, noAsk: true, live: raw, ...(auto ? { noDialog: true } : {}), taken }
+                    { head: file.head, quiet: opts.resume, noAsk: true, live: raw, ...(auto ? { noDialog: true } : {}), taken,
+                        ...(later ? { pendingImages: { ...later, onDone: keepTag } } : {}) }
                 );
             // The file's tag kept with the tree it was loaded into (only a file sent with one: one built without
-            // all its images has none and is never kept as a finished state).
-            if (treeId && etag && !held) this.researchKeepTreeEtag(treeId, status.treeId, etag, taken.images, variant, appMedia);
+            // all its images has none and is never kept as a finished state — nor is it while its images still come).
+            if (treeId && etag && !held && !(later && imageLoads.current()?.treeId === treeId)) this.researchKeepTreeEtag(treeId, status.treeId, etag, taken.images, variant, appMedia);
             if (!treeId) {
                 if (opts.resume) forgetLiveBridge();
                 passive();
                 return;
             }
+            // Images of an earlier load the tree still lacks (the page closed while they came): asked again (spec 116, I1).
+            if (bridgeGivesImagesByHash(status.features)) this.researchResumePendingImages(treeId, status.treeId, imagesUrlOf(bridge.ged));
             // An archive has no agent to follow: the tree opens for editing, its
             // bridge remembered (the changes go to it by themselves).
             if (statusAgentless(status)) {
@@ -3894,6 +4097,10 @@ export const researchUiMethods = uiModule({
                 ...(status.queueCounts ? { queueCounts: status.queueCounts } : {}),
                 update: status.update,
                 ...(status.busy ? { busy: status.busy } : {}),
+                ...(status.runs ? { runs: status.runs } : {}),
+                ...(status.runsEnded ? { runsEnded: status.runsEnded } : {}),
+                ...(status.limits ? { limits: status.limits } : {}),
+                ...(status.agents ? { agents: status.agents } : {}),
                 ...(status.work ? { work: status.work } : {}),
                 spend: status.spend,
                 lastIntake: status.lastIntake,
@@ -3931,7 +4138,7 @@ export const researchUiMethods = uiModule({
             live.overview = viewed || this.researchOverviewRemembered();
             // Pages of the queue read through the bridge redraw the overview when they come.
             resetQueueLists();
-            if (live.queueCounts) noteQueueRev(bridge.base, live.queueCounts.rev);
+            if (live.queueCounts) noteQueueRev(bridge.base, live.queueCounts.rev, live.features);
             onQueueListsChange(() => this.queueListsChanged());
             // Which tree is followed now, said in the panel (never a toast): started, or moved from another tree.
             if (from) this.noteLiveFollowStarted(live, from);
@@ -3975,7 +4182,7 @@ export const researchUiMethods = uiModule({
         es.addEventListener('change', (e) => {
             this.liveBridgeBack(s);
             const change = sanitizeLiveChange(payload(e));
-            if (change) this.enqueueLive(s, () => this.onLiveChange(s, change));
+            if (change) this.liveChangeOrHold(s, change);
             // The stream stays open (hello comes once): a change may be a switch of mode
             // (`strom mode archive` commits), which only the status says.
             this.liveStatusSoon(s);
@@ -3998,7 +4205,7 @@ export const researchUiMethods = uiModule({
         });
         es.addEventListener('working', (e) => {
             s.workingEvents = (s.workingEvents ?? 0) + 1;
-            s.working = withFamilyPersons(sanitizeWorking(payload(e), !!s.features?.includes(WORKING_HELPS_FEATURE)), s.bridge);
+            s.working = withFamilyPersons(sanitizeWorking(payload(e), !!s.features?.includes(WORKING_HELPS_FEATURE), holdsSaid(s.features)), s.bridge);
             this.renderLivePanel();
             // The event names only who works: the directions (their spinner, tasks and what waits) come with a status.
             this.liveStatusSoon(s);
@@ -4113,6 +4320,25 @@ export const researchUiMethods = uiModule({
         if (s) this.researchStatusAfterWrite(s);
     },
 
+    /**
+     * A write of this page through the bridge changed the followed tree (a
+     * source deleted or put back): its new version loaded now, not when the
+     * stream says it (the stream's own event for the same head is then
+     * nothing new). No head said: the status is asked, a new head loads.
+     * False: the tree is not followed here.
+     */
+    async liveLoadAfterWrite(head: string): Promise<boolean> {
+        const s = live;
+        if (!s || s.ended || DataManager.getCurrentTreeId() !== s.treeId) return false;
+        if (!head) {
+            this.liveStatusSoon(s);
+            return true;
+        }
+        this.enqueueLive(s, () => this.onLiveChange(s, { head, what: [], at: '' }));
+        await s.chain;
+        return true;
+    },
+
     /** The bridge answered: following goes on (after a silence: say so by redrawing). */
     liveBridgeBack(s: LiveSession): void {
         s.failures = 0;
@@ -4127,6 +4353,30 @@ export const researchUiMethods = uiModule({
             s.timer = null;
             if (!s.ended && live === s) run();
         }, ms);
+    },
+
+    /**
+     * A change of the followed research: its tree read now — or, while a batch of this page goes to it
+     * (batchHoldsLive), held until the batch is closed and then read once for all (liveReleaseHeld).
+     */
+    liveChangeOrHold(s: LiveSession, change: LiveChange): void {
+        if (this.batchHoldsLive(s.researchId)) {
+            if (heldLive?.session !== s) heldLive = { session: s, changes: [] };
+            heldLive.changes.push(change);
+            return;
+        }
+        this.enqueueLive(s, () => this.onLiveChange(s, change));
+    },
+
+    /** The batch is closed (or paused): the changes held meanwhile read as one (nothing held: nothing). */
+    liveReleaseHeld(): void {
+        const held = heldLive;
+        heldLive = null;
+        const s = held?.session;
+        const change = held ? batchHeldChange(held.changes) : null;
+        // Following that ended or moved on meanwhile: nothing (onLiveChange looks again as it runs).
+        if (!s || !change || s.ended) return;
+        this.enqueueLive(s, () => this.onLiveChange(s, change));
     },
 
     enqueueLive(s: LiveSession, job: () => Promise<void>): void {
@@ -4154,7 +4404,7 @@ export const researchUiMethods = uiModule({
         s.features = status.features;
         s.accepts = status.accepts;
         // A row moved by a write the research has not reported yet stays where it was moved.
-        s.waiting = this.withoutBranchAnswers(this.liveWaitingShown(s, status.waiting));
+        s.waiting = this.withoutAsideAnswers(this.withoutBranchAnswers(this.liveWaitingShown(s, status.waiting)));
         // A task that was not there before unfolds "Waiting for you" (its phase and its group;
         // the section is expanded by default). Collapsed or hidden by the user, nothing opens:
         // the heading counts it as new, and expanding it later opens what came meanwhile.
@@ -4175,13 +4425,17 @@ export const researchUiMethods = uiModule({
         s.queueMore = status.queueMore;
         s.queueCounts = status.queueCounts;
         // A new order of the queue: the pages on screen are read again (after a pause), the others forgotten.
-        if (status.queueCounts) noteQueueRev(s.bridge.base, status.queueCounts.rev);
+        if (status.queueCounts) noteQueueRev(s.bridge.base, status.queueCounts.rev, status.features);
         s.researches = status.researches;
         s.caps = status.caps;
         s.offLine = status.offLine;
         s.books = status.books;
         s.update = status.update;
         s.busy = status.busy;
+        s.runs = status.runs;
+        s.runsEnded = status.runsEnded;
+        s.limits = status.limits;
+        s.agents = status.agents;
         s.work = status.work;
         s.browser = status.browser;
         s.spend = status.spend;
@@ -4191,9 +4445,7 @@ export const researchUiMethods = uiModule({
         s.directionsRev = status.directionsRev;
         if (status.treeId) noteResearchWaiting(status.treeId, status.waiting, status);
         this.refreshActionMenuBadges();
-        if (status.head && status.head !== s.head) {
-            this.enqueueLive(s, () => this.onLiveChange(s, { head: status.head, what: [], at: '' }));
-        }
+        if (status.head && status.head !== s.head) this.liveChangeOrHold(s, { head: status.head, what: [], at: '' });
         this.refreshDirectionPeople(s, status.head || s.head);
         this.renderLivePanel();
     },
@@ -4554,6 +4806,20 @@ export const researchUiMethods = uiModule({
         this.renderLivePanel();
     },
 
+    /** The followed research's panel shows unfolded (a phone held sideways folds it for the photos' indicator or a message). */
+    livePanelOpen(): boolean {
+        return !!live && !live.ended && !live.collapsed && !(document.getElementById('live-panel')?.hidden ?? true);
+    },
+
+    /** Fold the panel to its strip for something it would cover; not remembered as the computer's choice, no unfolding later. */
+    foldLivePanelForOverlay(): void {
+        if (!live || live.ended || live.collapsed) return;
+        live.collapsed = true;
+        live.seenChanges = live.changes.length;
+        waitingFocus = null;
+        this.renderLivePanel();
+    },
+
     syncLivePanelVisibility(): void {
         this.renderResearchOverview();
         const panel = document.getElementById('live-panel');
@@ -4629,7 +4895,7 @@ export const researchUiMethods = uiModule({
             else if (w.section) what.appendChild(waitingKindLabel(w));
             // A hypothesis (spec 074 §9): its id before its question.
             if (w.kind === 'hypothesis') what.append(el('strong', 'hwr-id', w.id), ' · ');
-            what.append(w.kind === 'branch' ? waitBranchText(w, liveSession()) : w.what);
+            what.append(w.kind === 'branch' ? waitBranchText(w, liveSession()) : w.kind === 'aside' ? this.asideText(w, researchSession()) : w.what);
             // "on" is the agent's free text; "user" only repeats the heading.
             // A compact row: a long instruction is clamped to two lines here, whole in the overview.
             if (!waitsOnUser(w.on)) {
@@ -4651,6 +4917,15 @@ export const researchUiMethods = uiModule({
                 answer.dataset.action = 'place';
                 answer.onclick = () => this.showWaitingPlaces(w.place ?? w.id);
                 li.appendChild(answer);
+            } else if (w.kind === 'aside') {
+                // A file of a book's inbox set aside: decided in the overview's row (it opens there).
+                if (answerable && this.canExpandLivePanel()) {
+                    const open = el('button', 'live-waiting-answer', strings.live.aside.panelOpen);
+                    open.type = 'button';
+                    open.dataset.action = 'aside-open';
+                    open.onclick = () => this.showOverviewWaitingItem(w.id);
+                    li.appendChild(open);
+                }
             } else if (w.kind === 'hypothesis') {
                 // A hypothesis: decided in its card (or in the overview's row), "More ›" leads there.
                 const personId = this.waitingHypothesisPerson(w);
@@ -4712,7 +4987,7 @@ export const researchUiMethods = uiModule({
         const B = strings.live.books;
         const order = storedWaitingOrder(true);
         const groupsShown = shownWaitingGroups(storedWaitingGroupMode(), order, true);
-        const opts: WaitingGroupOpts = groupsShown === 'book' ? { by: 'book', books: s.books } : {};
+        const opts: WaitingGroupOpts = { ...(groupsShown === 'book' ? { by: 'book' as const } : {}), books: s.books };
         if (todoWaiting(items).length >= 2) {
             host.appendChild(this.overviewWaitingOrderEl(order, true, 'docked', true, { compact: true, redraw: () => this.renderLivePanel() }));
         }
@@ -4862,6 +5137,7 @@ export const researchUiMethods = uiModule({
             if (w.paused) li.appendChild(el('span', 'live-paused', pausedText(w)));
             const since = timeEl(w.since, 'sincefor');
             if (since) li.appendChild(since);
+            appendWorkingHold(li, w);
             working.appendChild(li);
         });
     },
@@ -5277,20 +5553,31 @@ export const researchUiMethods = uiModule({
         const multi = directions && (directionsMulti(s) || dirFilter !== 'all');
         // The overview narrowed to one branch outside the directions ("All N tasks in the queue ›").
         const branch = directions ? queueBranchFilter(s) : null;
-        const inFilter = (q: LiveQueueItem): boolean => branch ? q.branch === branch
-            : dirFilter === 'all' || q.research === dirFilter;
         const allNext = s.queue.filter(q => q.state === 'next');
         const counts = s.queueCounts;
         if (s.queue.length === 0 && s.queueMore === 0 && !(counts && counts.next + counts.parked > 0)) return;
-        // The counts of the whole queue (`queueCounts`), else of the status's window.
-        const nextCount = counts ? counts.next : allNext.length + s.queueMore;
+        // Runs side by side (spec 126 U10 §6): the tasks of the directions with their own run are not the whole
+        // queue's – folded into a row per direction above it, its count and its numbers without them.
+        const runsAll = directions && runLinesOn(s.features) && Array.isArray(s.runs) ? liveRuns(s) : [];
+        const runLines = linesWithRun(runsAll);
+        const apart = runLines.size > 0 && dirFilter === 'all' && !branch;
+        const filterRun = runLines.size > 0 && dirFilter !== 'all' && !branch ? lineRunOf(runsAll, dirFilter) : null;
+        const forGeneral = (q: LiveQueueItem): boolean => !queueTaskTakenByLine(q, runLines, runsAll);
+        // The counts of the whole queue (`queueCounts`), else of the status's window (the general run's, with runs side by side).
+        const nextCount = runLines.size === 0 ? (counts ? counts.next : allNext.length + s.queueMore)
+            : counts ? generalQueueCount(s.queue, counts, runsAll) : allNext.filter(forGeneral).length + s.queueMore;
         const lineCount = (id: string): number => counts ? counts.research[id] ?? 0 : allNext.filter(q => q.research === id).length;
         // The overview reads the whole queue by pages through the bridge (`queue.page`): a filter's
         // tasks from all of it, the rest of the queue by "Load more"; never while the section is folded.
         const paged = directions && !fold.collapsed && !!counts && queuePaged(s);
+        // The kind of work picked (`queue.kind`, spec 065 K7.4): with the line or the branch, read by pages only.
+        const kind = paged ? queueKindFilter(s) : null;
+        const inFilter = (q: LiveQueueItem): boolean => (branch ? q.branch === branch
+            : dirFilter === 'all' || q.research === dirFilter) && (!kind || q.taskKind === kind);
         const base = s.bridge.base;
+        const lineF: QueueFilter | null = branch ? { branch } : dirFilter !== 'all' ? { research: dirFilter } : null;
         const filter: QueueFilter | null = !paged ? null
-            : branch ? { branch } : dirFilter !== 'all' ? { research: dirFilter } : null;
+            : kind ? { ...lineF, kind } : lineF;
         const whole: QueueFilter = { state: 'next' };
         // A filter's list is read when shown; the whole queue's only once "Load more" was asked.
         const read = filter ? requestQueueList(base, filter, 'queue')
@@ -5301,7 +5588,7 @@ export const researchUiMethods = uiModule({
         const list = loadingFirst ? null : read;
         const loadShown = loadingFirst && queueLoadShown(read.key, () => this.renderResearchOverview());
         if (read && !loadingFirst) queueLoadSince.delete(read.key);
-        const next = list ? list.items.filter(q => q.state === 'next') : allNext.filter(inFilter);
+        const next = (list ? list.items.filter(q => q.state === 'next') : allNext.filter(inFilter)).filter(q => !apart || forGeneral(q));
         const windowParked = s.queue.filter(q => q.state === 'parked' && inFilter(q));
         const parked = list ? [...list.items.filter(q => q.state === 'parked'),
             ...windowParked.filter(q => !list.items.some(x => x.id === q.id))] : windowParked;
@@ -5327,6 +5614,8 @@ export const researchUiMethods = uiModule({
                     : L.queueCount(nextCount),
             }),
         });
+        // "Work on the queue…" held at the most runs at once (spec 126 U10 §5, 5d): the reason under the heading.
+        if (action?.dataset.offer === 'limit') host.appendChild(this.queueWorkLimitNote(s, 'queue-work-limit-queue'));
         if (search) search.field.mount(host);
         if (multi) {
             const pills = el('div', 'research-overview__filters research-overview__queue-filters');
@@ -5337,7 +5626,7 @@ export const researchUiMethods = uiModule({
             const picked = s.researches.find(d => d.id === dirFilter);
             if (picked && !active.includes(picked)) active.push(picked);
             const options: [string, string, number][] = [
-                ['all', L.filterAll, counts ? counts.next : allNext.length],
+                ['all', L.filterAll, runLines.size > 0 ? nextCount : counts ? counts.next : allNext.length],
                 ...active.map(d => [d.id, d.name, lineCount(d.id)] as [string, string, number]),
             ];
             for (const [id, label, n] of options) {
@@ -5370,7 +5659,21 @@ export const researchUiMethods = uiModule({
             pills.prepend(chip);
             pills.scrollLeft = 0;
         }
-        if (search && this.appendQueueSearchResult(host, s, search, { base, branch, dirFilter, multi })) return;
+        // The kinds of work (`queue.kind`): their own row of chips under the lines' ones, the same chips.
+        const kinds = paged ? queueKindRow(s, (k) => this.pickQueueKind(s, k)) : null;
+        if (kinds) host.appendChild(kinds);
+        if (search && this.appendQueueSearchResult(host, s, search, { base, branch, dirFilter, multi, kind })) return;
+        // A row per direction with its own run above the whole queue's tasks; its own tasks under its filter, said so.
+        if (apart) {
+            for (const g of lineRunGroups(s.queue, counts, runsAll, s.researches)) {
+                if (g.tasks > 0) host.appendChild(this.queueLineRunRow(s, g.research, g.direction, g.run.agentName, g.tasks));
+            }
+        }
+        if (filterRun) {
+            const at = Date.parse(filterRun.since);
+            const time = Number.isFinite(at) ? formatLiveClock(at, Date.now(), getCurrentLanguage()) : '';
+            host.appendChild(el('p', 'research-queue__line-run-filtered', L.queueLineRunFiltered(filterRun.agentName, time)));
+        }
         const ul = el('ul', 'live-panel-list live-queue');
         host.appendChild(ul);
         if (loadingFirst) {
@@ -5393,8 +5696,10 @@ export const researchUiMethods = uiModule({
         // the same number as under the branch (a line's filter counts anew,
         // unless the bridge says each task's place).
         const placeOf = branch ? new Map(allNext.map((q, i) => [q.id, i + 1])) : null;
-        const placeAt = (q: LiveQueueItem, i: number): number =>
-            (list || branch || dirFilter === 'all' ? q.pos : undefined) ?? placeOf?.get(q.id) ?? i + 1;
+        // The general run's tasks and a direction's own run's are numbered anew, in the order each takes them.
+        const renumbered = apart || !!filterRun;
+        const placeAt = (q: LiveQueueItem, i: number): number => renumbered ? i + 1
+            : (list || branch || dirFilter === 'all' ? q.pos : undefined) ?? placeOf?.get(q.id) ?? i + 1;
         // One width for every number of the list (the widest place's digits): the texts start in one column.
         const widest = shownNext.reduce((m, q, i) => Math.max(m, placeAt(q, i)), 0);
         if (widest >= 10) ul.style.setProperty('--live-queue-num', `${String(widest).length}ch`);
@@ -5405,7 +5710,7 @@ export const researchUiMethods = uiModule({
             if (search) li.tabIndex = -1;
             const place = placeAt(q, i);
             const num = el('span', 'live-queue-num', String(place));
-            if (placeOf || list) num.setAttribute('aria-label', L.branchQueuePos(place));
+            if ((placeOf || list) && !renumbered) num.setAttribute('aria-label', L.branchQueuePos(place));
             li.appendChild(num);
             const text = el('span', 'live-queue-text', q.text);
             // The panel, two or more lines at work: the task's line first.
@@ -5460,10 +5765,12 @@ export const researchUiMethods = uiModule({
             // How far the list goes: "Load more" (a page) while there is more, the cap said at its end.
             // Only the tasks up next count, as the chips do: a filter's list holds the set-aside ones
             // after them (the research's order), never part of "N of M shown".
+            // A kind with a line or a branch: the count of the list read (the status counts each alone).
             const filterNext = !filter ? counts.next
+                : filter.kind ? (filter.branch || filter.research ? undefined : counts.kind?.[filter.kind] ?? 0)
                 : filter.branch ? counts.branch[filter.branch] : filter.research ? counts.research[filter.research] : undefined;
-            const total = list ? filterNext ?? list.total ?? 0 : counts.next;
-            const has = list ? next.length : allNext.length;
+            const total = apart && !filter?.kind ? nextCount : list ? filterNext ?? list.total ?? 0 : counts.next;
+            const has = list || apart ? next.length : allNext.length;
             const more = list ? list.next !== null && has < total : allNext.length < counts.next;
             if (list?.error) {
                 this.appendQueueListState(ul, list.error, () => {
@@ -5522,6 +5829,36 @@ export const researchUiMethods = uiModule({
     },
 
     /**
+     * A direction with its own run in the whole queue (spec 126 U10 §6, 6a): its glyph, name and tasks, under
+     * it who does them with its code, and "Show ›" = the queue's filter of that direction.
+     */
+    queueLineRunRow(s: LiveSession, id: string, d: LiveDirection | undefined, agent: string, tasks: number): HTMLElement {
+        const L = strings.live;
+        const row = el('div', 'research-queue__line-run');
+        row.dataset.direction = id;
+        const glyph = el('span', 'research-queue__line-run-glyph', directionGlyph(d));
+        glyph.setAttribute('aria-hidden', 'true');
+        row.appendChild(glyph);
+        const text = el('div', 'research-queue__line-run-text');
+        const head = el('div', 'research-queue__line-run-head');
+        head.append(el('strong', undefined, d?.name ?? id), ` · ${L.dirTasks(tasks)}`);
+        text.appendChild(head);
+        const note = el('div', 'research-queue__line-run-note', `${L.queueLineRunNote(agent)} `);
+        note.appendChild(el('span', 'research-overview__run-code research-queue__line-run-code', id));
+        text.appendChild(note);
+        row.appendChild(text);
+        const show = el('button', 'link-button research-queue__line-run-show', L.queueLineRunShow);
+        show.type = 'button';
+        show.setAttribute('aria-label', `${L.queueLineRunShow.replace(/\s*›\s*$/, '')}: ${d?.name ?? id}`);
+        show.onclick = () => {
+            setQueueBranchFilter(s, null);
+            this.setWorkingLine(id);
+        };
+        row.appendChild(show);
+        return row;
+    },
+
+    /**
      * The control on the right of the overview's Queue heading (null: none). Its
      * being there also puts the queue's count into the title ("QUEUE · 1 240").
      */
@@ -5530,13 +5867,22 @@ export const researchUiMethods = uiModule({
         return this.queueWorkHead(s);
     },
 
+    /** A kind's chip picked (null: every kind again): the queue drawn anew, the focus kept on that chip. */
+    pickQueueKind(s: LiveSession, kind: QueueTaskKind | null): void {
+        const was = (document.activeElement as HTMLElement | null)?.dataset?.taskKind;
+        setQueueKindFilter(s, kind);
+        this.renderResearchOverview();
+        const sel = was ? `#research-overview .research-overview__queue-kinds [data-task-kind="${CSS.escape(was)}"]` : null;
+        if (sel) document.querySelector<HTMLElement>(sel)?.focus({ preventScroll: true });
+    },
+
     /**
      * The search's answer under the field (`queue.search`): the line saying what
      * was found, then its tasks. False: nothing searched (or the first answer not
      * read yet), the queue itself is drawn (dimmed while a search is typed or read).
      */
     appendQueueSearchResult(host: HTMLElement, s: LiveSession, search: QueueSearch,
-        o: { base: string; branch: string | null; dirFilter: string; multi: boolean }): boolean {
+        o: { base: string; branch: string | null; dirFilter: string; multi: boolean; kind: QueueTaskKind | null }): boolean {
         const L = strings.live;
         if (!search.applied) {
             search.shown = null;
@@ -5544,8 +5890,11 @@ export const researchUiMethods = uiModule({
             return false;
         }
         // The chips narrow the search too: the tasks of the chip that match the text.
-        const filter: QueueFilter = o.branch ? { branch: o.branch, q: search.applied }
-            : o.dirFilter !== 'all' ? { research: o.dirFilter, q: search.applied } : { q: search.applied };
+        const filter: QueueFilter = {
+            ...(o.branch ? { branch: o.branch } : o.dirFilter !== 'all' ? { research: o.dirFilter } : {}),
+            ...(o.kind ? { kind: o.kind } : {}), q: search.applied,
+        };
+        const kindName = o.kind ? queueKindName(o.kind) : '';
         const list = requestQueueList(o.base, filter, 'search');
         const read = list.total !== null;
         if (read) search.shown = list;
@@ -5583,7 +5932,8 @@ export const researchUiMethods = uiModule({
         const total = drawn.total;
         let said: string;
         if (total > 0 || drawn.items.length > 0) {
-            said = L.queueSearchFound(total) + (narrowed ? ` · ${L.queueSearchInDir(narrowed)}` : '');
+            said = L.queueSearchFound(total) + (narrowed ? ` · ${L.queueSearchInDir(narrowed)}` : '')
+                + (kindName ? ` · ${L.queueSearchInKind(kindName)}` : '');
             line.appendChild(el('span', 'research-overview__queue-result-text', said));
         } else if (drawn.elsewhere) {
             // A task's number outside the queue: where it is now.
@@ -5591,8 +5941,20 @@ export const researchUiMethods = uiModule({
             said = L.queueSearchElsewhere(drawn.elsewhere.id, state);
             line.append(el('span', 'research-overview__queue-result-text', said), cancel());
         } else {
-            said = narrowed ? L.queueSearchNoneDir(narrowed) : L.queueSearchNone;
+            said = narrowed ? L.queueSearchNoneDir(narrowed) : kindName ? L.queueSearchNoneKind(kindName) : L.queueSearchNone;
             line.appendChild(el('span', 'research-overview__queue-result-text', said));
+            if (!narrowed && kindName) {
+                // The same text among every kind: the kind's chip cleared.
+                const all = el('button', 'link-button research-overview__queue-all', L.queueSearchAllKinds);
+                all.type = 'button';
+                all.dataset.do = 'all-kinds';
+                all.onclick = () => {
+                    setQueueKindFilter(s, null);
+                    this.renderResearchOverview();
+                    activeQueueSearch()?.input.focus({ preventScroll: true });
+                };
+                line.appendChild(all);
+            }
             if (narrowed) {
                 // The same text in the whole queue: the chip back on All.
                 const all = el('button', 'link-button research-overview__queue-all', L.queueSearchAllDirs);

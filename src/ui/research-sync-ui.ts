@@ -25,6 +25,7 @@ import { researchActionLabel, researchMarkFlags, researchLinkFlags } from './res
 import { DataManager } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { researchCitationsOut, setCitationFeaturesLookup } from '../citation-gates.js';
+import { deletedSourcesToSend, forgetDeletedSources, forgetDeletedSourcesBack, setSourceRetractLookup } from '../source-retract.js';
 import { TreeRenderer } from '../renderer.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { TreeId, PersonId, ResearchLink, ResearchSend, ResearchSendMode, StromData, TreeMetadata, ResearchConflict, ResearchHypothesis } from '../types.js';
@@ -461,6 +462,17 @@ export function researchBridgeDownNow(researchId: string, now = Date.now()): boo
 
 // The citation gates (main citation, removal, order) read the features from here.
 setCitationFeaturesLookup(id => (researchStatusNow(id) ?? lastBridgeStatus(id))?.features ?? null);
+
+// Deleting a source of a followed tree (spec 117 §1) reads the bridge from here: its features (now, else as last said),
+// whether it answers now with its address known, and whether the research can be written here (not sealed elsewhere).
+setSourceRetractLookup(id => {
+    const status = researchStatusNow(id) ?? lastBridgeStatus(id);
+    return {
+        features: status?.features ?? null,
+        bridgeUp: !!runtime.get(id)?.up && !!parseLiveBridge(storedResearchBridge(id)?.base),
+        readOnly: status?.seal === 'elsewhere',
+    };
+});
 
 /**
  * A satellite window (spec 097 K1.3): the research's status as the main
@@ -1370,6 +1382,9 @@ export const researchSyncMethods = uiModule({
 
     /** A send waiting in the research (its inbox, or still being written): written, discarded, or still there. */
     async settleResearchSend(treeId: TreeId, status: LiveStatus): Promise<void> {
+        // The sources deleted here that a written send of this tree retracted (spec 117 §4; under review: once confirmed there).
+        const retracted = (status.sends ?? []).filter(r => r.state === 'written' && r.tree === treeId).flatMap(r => r.retracted ?? []);
+        if (retracted.length) forgetDeletedSources(treeId, retracted);
         const link = TreeManager.getTreeMetadata(treeId)?.research;
         const sent = link?.sent;
         if (!link || !sent || sent.state !== 'pending') return;
@@ -1428,7 +1443,7 @@ export const researchSyncMethods = uiModule({
             // What it wrote of the tree's own files, as its record says (spec 108 K2.6, a research with `media.app`).
             const mediaRec = fate.inherited ? undefined : status.sends?.find(r => r.intake === sent.intake && r.state === 'written');
             this.researchNoteWritten(treeId, sent.fingerprint, closed.closedAt!, undefined,
-                { items: mediaRec?.media ?? [], count: mediaRec?.mediaCount ?? 0 });
+                { items: mediaRec?.media ?? [], count: mediaRec?.mediaCount ?? 0 }, mediaRec?.retracted ?? []);
         } else if (!fate.inherited) {
             this.researchNoteTookNothing(treeId, sent.fingerprint);
         }
@@ -1589,6 +1604,9 @@ export const researchSyncMethods = uiModule({
         // "Restore the state before loading" stands until the next edit of the tree (O2, V-H): never offered
         // again, not even when an undo brings the tree back to what was loaded.
         if (researchAutoState(treeId).loadBackup) patchResearchAutoState(treeId, { loadBackup: undefined });
+        // Following the research: the one edit open is a list of people (N2), which the research never gets —
+        // nothing waits to be sent and nothing goes.
+        if (DataManager.getCurrentTreeId() === treeId && DataManager.isLiveFollowing()) return;
         const link = TreeManager.getTreeMetadata(treeId)?.research;
         if (!link || !this.researchSyncCapable(link.id)) return;
         fpCache = null;
@@ -2109,9 +2127,12 @@ export const researchSyncMethods = uiModule({
         // by name and hash): said so (`?media=app`), the archive takes off what the tree no longer has (spec 108 P4).
         // A send taken back, written again, is as it was said then (the research keeps that).
         const declaresMedia = !again && this.researchSendDeclaresMediaFor(treeId, link);
+        // The sources deleted here in edit mode (spec 117 §4): one back in the tree (Undo) forgotten, the rest said deleted.
+        if (!again) forgetDeletedSourcesBack(treeId, data);
+        const deletedSources = again ? [] : deletedSourcesToSend(TreeManager.getTreeMetadata(treeId)?.research);
         const exported = again ? null : researchGedcomExport(data, meta?.name ?? '', {
             id: link.id, head: link.head, appTree: treeId, transcripts: this.researchTranscriptsLink(link).transcripts, sent: fps.current,
-            ...(since ? { since } : {}),
+            ...(since ? { since } : {}), ...(deletedSources.length ? { deletedSources } : {}),
         }, titles, researchSendsReadings(this.researchStatusOf(link.id)), researchSendsSourceFields(this.researchStatusOf(link.id)), researchCitationsOut(this.researchStatusOf(link.id)),
         researchMediaOut(this.researchStatusOf(link.id)));
         const gedcom = exported?.content ?? '';
@@ -2338,7 +2359,9 @@ export const researchSyncMethods = uiModule({
         // so the next sends name them even while its version is not loaded here (no duplicate person).
         const retagged = written && reply.ids && exported && active ? this.researchTakeSyncIds(treeId, exported.xrefs, reply.ids, sentFp) : null;
         // The research's version is the state sent with its numbers: the copy goes under the fingerprint the send now has.
-        if (written && reply.changes !== 0) this.researchNoteWritten(treeId, sentFp, now, retagged ?? undefined, { items: reply.media, count: reply.mediaCount });
+        if (written && reply.changes !== 0) this.researchNoteWritten(treeId, sentFp, now, retagged ?? undefined, { items: reply.media, count: reply.mediaCount }, reply.retracted);
+        // The sources deleted here that the write retracted (spec 117 §4): no longer said deleted.
+        if (reply.retracted.length) forgetDeletedSources(treeId, reply.retracted);
         // Nothing new taken: the copy stays the research's version, now for this send too (N40).
         else if (written && reply.changes === 0 && !undone) this.researchNoteTookNothing(treeId, sentFp, retagged?.fingerprint);
         // Edits since the send taken back were not in it: they still wait.
@@ -3158,12 +3181,23 @@ export const researchSyncMethods = uiModule({
      * while the tree has portraits, couples' photos or attachments no file
      * copy holds: the research does not keep those (spec 108 K1b.1) — unless
      * it keeps them and a write handed them over (researchArchiveHoldsMedia).
+     * `photos`: it holds everything but those (the indicator says it is the
+     * photos; `until`, if any, is when the rest stops being held too).
      */
-    researchHoldsTree(treeId: TreeId, now = Date.now()): { holds: boolean; until?: number } {
+    researchHoldsTree(treeId: TreeId, now = Date.now()): { holds: boolean; until?: number; photos?: boolean } {
         const meta = TreeManager.getTreeMetadata(treeId);
         const link = meta?.research;
         if (!link || !onComputer() || !researchLinksEnabled() || !this.researchSyncCapable(link.id)) return { holds: false };
-        if (!browserMediaSafe(this.researchTreeMediaFp(treeId, meta), meta.fileCopyMediaFp, this.researchArchiveHoldsMedia(treeId))) return { holds: false };
+        const rest = this.researchHoldsTreeText(treeId, now);
+        if (browserMediaSafe(this.researchTreeMediaFp(treeId, meta), meta.fileCopyMediaFp, this.researchArchiveHoldsMedia(treeId))) return rest;
+        return rest.holds ? { holds: false, photos: true, ...(rest.until ? { until: rest.until } : {}) } : { holds: false };
+    },
+
+    /** researchHoldsTree without the pictures: the tree's data is in the research or on its way (a linked tree only). */
+    researchHoldsTreeText(treeId: TreeId, now: number): { holds: boolean; until?: number } {
+        const meta = TreeManager.getTreeMetadata(treeId);
+        const link = meta?.research;
+        if (!meta || !link) return { holds: false };
         const st = researchAutoState(treeId);
         const sentGone = link.sent?.state === 'discarded' || link.sent?.state === 'undone';
         let unsent: boolean;

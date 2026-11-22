@@ -13,7 +13,7 @@
  * the others forgotten. A request for a list no longer shown is aborted.
  */
 
-import { LiveQueueItem, sanitizeQueue, withAppVersion } from './research-link.js';
+import { CENSUS_FEATURE, LiveQueueItem, QUEUE_TASK_KINDS, holdsSaid, sanitizeQueue, withAppVersion, type QueueTaskKind } from './research-link.js';
 import { BRIDGE_ANSWER_MS } from './bridge-ask.js';
 
 /** Tasks asked per page. */
@@ -37,6 +37,8 @@ export interface QueueFilter {
     branch?: string;
     research?: string;
     state?: 'next' | 'parked';
+    /** The tasks of one kind of work (`queue.kind`, spec 065 K7.4); sent only to a research that has the feature. */
+    kind?: QueueTaskKind;
     /**
      * Searched text (`queue.search`, Strom Research 1.32): the tasks the bridge finds by it, after the
      * other filters (trimmed, 1–100 characters; never kept anywhere).
@@ -90,12 +92,13 @@ export type QueuePageResult =
         match?: Record<string, QueueMatch>; elsewhere?: QueueElsewhere }
     | { ok: false; code: 'busy' | 'failed' | 'aborted' };
 
-/** A filter's key (`branch=B-P0004&research=…&state=…&q=…`, '' = the whole queue). */
+/** A filter's key (`branch=B-P0004&research=…&state=…&kind=…&q=…`, '' = the whole queue). */
 export function queueFilterKey(f: QueueFilter): string {
     const parts: string[] = [];
     if (f.branch) parts.push(`branch=${f.branch}`);
     if (f.research) parts.push(`research=${f.research}`);
     if (f.state) parts.push(`state=${f.state}`);
+    if (f.kind) parts.push(`kind=${f.kind}`);
     if (f.q) parts.push(`q=${encodeURIComponent(f.q)}`);
     return parts.join('&');
 }
@@ -137,18 +140,38 @@ const asRecord = (v: unknown): Record<string, unknown> | null =>
 const asCount = (v: unknown): number | null =>
     typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 10_000_000 ? v : null;
 
-/** One page of the queue (`GET <token>/queue?from=…&count=…&…`). Never throws. */
-export async function fetchQueuePage(base: string, filter: QueueFilter, from: number, count: number,
-    signal?: AbortSignal): Promise<QueuePageResult> {
-    if (typeof fetch !== 'function' || !base) return { ok: false, code: 'failed' };
+/**
+ * The query of one page (`from=…&count=…&branch=…&research=…&state=…&kind=…&known=…&q=…`). `features`: the
+ * research's (`/status.features`); `kind=census` and `known=census` go only to a research with `census`
+ * (an older one refuses the whole page for a word or a parameter it does not know, 400 queue.query).
+ */
+export function queuePageQuery(filter: QueueFilter, from: number, count: number,
+    features?: readonly string[] | null): URLSearchParams {
     const q = new URLSearchParams();
     if (from > 0) q.set('from', String(from));
     q.set('count', String(Math.max(1, Math.min(QUEUE_PAGE_MAX, count))));
     if (filter.branch) q.set('branch', filter.branch);
     if (filter.research) q.set('research', filter.research);
     if (filter.state) q.set('state', filter.state);
+    const census = !!features?.includes(CENSUS_FEATURE);
+    // Only a kind known here: the bridge refuses any other word (400 queue.query).
+    if (filter.kind && (QUEUE_TASK_KINDS as readonly string[]).includes(filter.kind) && (filter.kind !== 'census' || census)) {
+        q.set('kind', filter.kind);
+        // `other` without `known` is every kind the research has beyond the app's first list (spec 065):
+        // census is counted on its own here, so it is left out of `other` too (spec 106).
+        if (filter.kind === 'other' && census) q.set('known', 'census');
+    }
     const query = filter.q ? queueQuery(filter.q) : '';
     if (query) q.set('q', query);
+    return q;
+}
+
+/** One page of the queue (`GET <token>/queue?from=…&count=…&…`; `features`: the research's). Never throws. */
+export async function fetchQueuePage(base: string, filter: QueueFilter, from: number, count: number,
+    signal?: AbortSignal, features?: readonly string[] | null): Promise<QueuePageResult> {
+    if (typeof fetch !== 'function' || !base) return { ok: false, code: 'failed' };
+    const q = queuePageQuery(filter, from, count, features);
+    const query = q.get('q') ?? '';
     const ctl = typeof AbortController === 'function' ? new AbortController() : null;
     const timer = ctl ? setTimeout(() => ctl.abort(), QUEUE_PAGE_TIMEOUT_MS) : null;
     const onAbort = (): void => ctl?.abort();
@@ -169,7 +192,7 @@ export async function fetchQueuePage(base: string, filter: QueueFilter, from: nu
         const elsewhere = query ? sanitizeElsewhere(r.elsewhere) : undefined;
         return {
             ok: true,
-            items: sanitizeQueue(r.items, true, true, QUEUE_PAGE_MAX),
+            items: sanitizeQueue(r.items, true, true, QUEUE_PAGE_MAX, true, holdsSaid(features)),
             total,
             from: asCount(r.from) ?? from,
             next: next !== null && next > from ? next : null,
@@ -192,6 +215,8 @@ export async function fetchQueuePage(base: string, filter: QueueFilter, from: nu
 let listsBase = '';
 /** The queue's print the lists are valid for ('' = not said). */
 let listsRev = '';
+/** The features of the research the lists are read from (its latest status; null: not said). */
+let listsFeatures: readonly string[] | null = null;
 const lists = new Map<string, QueueList>();
 /** What each place on screen shows now (a list's key). */
 const slots = new Map<QueueSlot, string>();
@@ -225,6 +250,7 @@ export function resetQueueLists(): void {
     refreshTimer = null;
     listsBase = '';
     listsRev = '';
+    listsFeatures = null;
 }
 
 /**
@@ -265,7 +291,8 @@ export function readQueuePage(v: unknown): QueuePageResult {
     const elsewhere = sanitizeElsewhere(r.elsewhere);
     return {
         ok: true,
-        items: sanitizeQueue(r.items, true, true, QUEUE_PAGE_MAX),
+        // The main window let through only what its research says (spec 127 holds included).
+        items: sanitizeQueue(r.items, true, true, QUEUE_PAGE_MAX, true, { task: true, archive: true }),
         total,
         from,
         next: next !== null && next > from ? next : null,
@@ -278,7 +305,7 @@ export function readQueuePage(v: unknown): QueuePageResult {
 
 /** One page of a list: from the bridge, or asked of the main window (an aborted read answers `aborted` at once). */
 function readOnePage(base: string, filter: QueueFilter, from: number, count: number, signal: AbortSignal): Promise<QueuePageResult> {
-    if (!remote) return fetchQueuePage(base, filter, from, count, signal);
+    if (!remote) return fetchQueuePage(base, filter, from, count, signal, listsFeatures);
     const r = remote;
     return new Promise<QueuePageResult>((resolve) => {
         const onAbort = (): void => resolve({ ok: false, code: 'aborted' });
@@ -502,10 +529,11 @@ async function readPage(base: string, l: QueueList, from: number, count: number)
  * The queue's print of the latest status. A new one keeps only the lists on
  * screen and reads them again, as far as they were read, after
  * QUEUE_REFRESH_MS (a burst of changes reads once); a list read with this
- * print already stays.
+ * print already stays. `features`: the research's of the same status (what a page may ask, `census`).
  */
-export function noteQueueRev(base: string, rev: string): void {
+export function noteQueueRev(base: string, rev: string, features?: readonly string[] | null): void {
     forBase(base);
+    if (features !== undefined) listsFeatures = features;
     if (!rev || rev === listsRev) return;
     listsRev = rev;
     const shown = new Set(slots.values());

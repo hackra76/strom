@@ -12,7 +12,7 @@ import { yearOf, parseFlexDate, yearFraction } from './dates.js';
 import { eventValueIsOnTag, isPosthumousEvent } from './events.js';
 import { isLivingPerson } from './privacy.js';
 import { shownNameOrEmpty, shownNameFull } from './person-name.js';
-import type { HistoryKind, HistoryScope } from './history.js';
+import { HISTORY_KINDS, type HistoryKind, type HistoryScope } from './history.js';
 import type { DerivedParticipation } from './derived-participations.js';
 
 export interface TimelineEvent {
@@ -51,14 +51,16 @@ export interface TimelineRow {
     /** False for a deceased person without a recorded death date. */
     endKnown: boolean;
     events: TimelineEvent[];
+    /** Local history on the line (spec 121 §6), only with the option on; sorted by year. */
+    local?: TimelineLocalItem[];
 }
 
 export interface TimelineAxis { minYear: number; maxYear: number; }
 
 /**
- * One history event of the focused person on the timeline's history row
- * (DEV symboly-dejin §9, variant 9a): the same events the person card shows
- * (computePersonHistory: hidings, deletions and the origin switches applied).
+ * One regional history event on the timeline's history row (spec 121 §0):
+ * an event of a place where at least one person with a row lived in its year
+ * (a period: in one of its years), not hidden for that person.
  */
 export interface TimelineHistoryItem {
     /** The event's id (the card opens on its row). */
@@ -72,33 +74,90 @@ export interface TimelineHistoryItem {
     scope: HistoryScope;
     /** The event's text in the UI language (the tooltip, the phone's sheet). */
     text: string;
+    /** The region's name in the UI language, only when the row's events come from two regions or more. */
+    region?: string;
+    /** The region's id (the region filter). */
+    regionId?: string;
+    /** The ids of the rows it concerns, in the rows' order. */
+    persons: string[];
 }
 
-/** The history row of the focused person: drawn only with at least one event and a row of that person. */
+/**
+ * A local history event on a person's life line (spec 121 §6): the history of
+ * a place or a finding from the research's records, in the place where the
+ * person lived in its year. Drawn only with the option "on the life lines".
+ */
+export interface TimelineLocalItem {
+    id: string;
+    /** The year of the symbol: the start, or the first year of a period the person lived there. */
+    year: number;
+    /** A period's last year, when it ends after `year`. */
+    year2?: number;
+    kind: HistoryKind;
+    scope: 'place' | 'local';
+    /** The tree's spelling of the place. */
+    place: string;
+    text: string;
+    /** A finding's citation (scope local). */
+    source?: string;
+    /** The person moved there during the period: the symbol is later than its start. */
+    moved?: boolean;
+}
+
+/** The kinds and the region the history row is filtered by (absent: all). */
+export interface TimelineHistoryFilter {
+    kinds?: readonly HistoryKind[];
+    region?: string;
+    /** The region's name in the UI language (the row's label). */
+    regionName?: string;
+}
+
+/**
+ * The history row of the whole timeline (spec 121 §1): drawn while it has an
+ * event of a region, or a person's line has a local one (or a filter leaves
+ * nothing: the row says so).
+ */
 export interface TimelineHistory {
-    personId: string;
-    /** The person's shown name (the row's label). */
-    name: string;
-    /** The person's life span on the axis (the row's tint). */
-    startYear: number;
-    endYear: number;
-    /** Sorted by year (a period by its start); same-year order as given. */
+    /** Sorted by year (a period by its start); same-year order as given. The filter applied. */
     events: TimelineHistoryItem[];
+    /** The focused person's life on the row (its line); absent: the focused person has no row. */
+    focus?: { personId: string; startYear: number; endYear: number };
+    /** How many regions the row's events come from (before the filter). */
+    regions: number;
+    /** How many events the row has before the filter. */
+    total: number;
+    /** The row's events before the filter (trimmed to the rows, sorted): the options' counts. */
+    all: TimelineHistoryItem[];
+    /** The local events on the lines before the kind filter, each once (an event on many lines too); only with the option on. */
+    localEvents?: { id: string; kind: HistoryKind }[];
+    /** The filter in effect (nothing when it filters nothing). */
+    filtered: { kinds?: HistoryKind[]; region?: string; regionName?: string };
 }
 
 export interface TimelineModel {
     axis: TimelineAxis;
     rows: TimelineRow[];
     omittedCount: number;
-    /** The focused person's history row; absent: no row at all (no research, the layer off, no events). */
+    /** The history row; absent: no row at all (no research, the layer off, no events). */
     history?: TimelineHistory;
     /** Shared events of two rows or more, by their first row and year. */
     shared: TimelineSharedMark[];
 }
 
+/** What the UI computed for the history row (src/ui/timeline-history-ui.ts): the model sorts it and trims it to the rows. */
+export interface TimelineHistoryInput {
+    /** The row's events before the filter. */
+    events: readonly TimelineHistoryItem[];
+    /** Local events per person id; only with the option "on the life lines" on. */
+    local?: ReadonlyMap<string, readonly TimelineLocalItem[]>;
+    /** The filter (an unknown region already dropped). */
+    filter?: TimelineHistoryFilter;
+    /** The focused person (only the line of the life on the row). */
+    focusId?: string | null;
+}
+
 export interface TimelineModelOptions {
-    /** The focused person's history events (only that person's: nothing is computed for the others). */
-    history?: { personId: string; events: readonly TimelineHistoryItem[] };
+    history?: TimelineHistoryInput;
 }
 
 /** Round down / up to the enclosing decade so the axis has tidy gridlines. */
@@ -187,16 +246,7 @@ export function computeTimelineModel(
     }
     if (!isFinite(minYear)) { minYear = todayYear; maxYear = todayYear; }
 
-    // The history row: the focused person's events, only while that person has a row.
-    const h = opts.history;
-    const focusRow = h && h.events.length > 0 ? rows.find(r => r.personId === h.personId) : undefined;
-    const history: TimelineHistory | undefined = h && focusRow ? {
-        personId: focusRow.personId,
-        name: focusRow.name,
-        startYear: focusRow.startYear,
-        endYear: focusRow.endYear,
-        events: h.events.map((e, i) => ({ e, i })).sort((a, b) => a.e.year - b.e.year || a.i - b.i).map(x => x.e),
-    } : undefined;
+    const history = opts.history ? timelineHistoryRow(opts.history, rows) : undefined;
 
     return {
         axis: { minYear: floorDecade(minYear), maxYear: ceilDecade(maxYear) },
@@ -205,6 +255,161 @@ export function computeTimelineModel(
         ...(history ? { history } : {}),
         shared,
     };
+}
+
+/**
+ * The history row from what the UI computed (spec 121 §0): only the rows that
+ * are drawn count (a person without a row — no birth year, living under
+ * privacy — concerns nothing), the persons in the rows' order, the region
+ * named only while two regions or more are on the row, the local events put
+ * on their rows (the kind filter applies to them too), then the filter.
+ * Undefined when there is nothing: no event of a region and no local one.
+ */
+function timelineHistoryRow(h: TimelineHistoryInput, rows: TimelineRow[]): TimelineHistory | undefined {
+    const index = new Map(rows.map((r, i) => [r.personId, i]));
+    const trimmed: TimelineHistoryItem[] = [];
+    h.events.forEach(e => {
+        const persons = e.persons.filter(id => index.has(id)).sort((a, b) => index.get(a)! - index.get(b)!);
+        if (persons.length) trimmed.push({ ...e, persons });
+    });
+    const sorted = trimmed.map((e, i) => ({ e, i })).sort((a, b) => a.e.year - b.e.year || a.i - b.i).map(x => x.e);
+    const regions = new Set(sorted.map(e => e.regionId).filter((id): id is string => !!id)).size;
+    if (regions < 2) for (const e of sorted) delete e.region;
+    const kinds = h.filter?.kinds ? new Set(h.filter.kinds) : null;
+    const kindsOn = kinds && HISTORY_KINDS.some(k => !kinds.has(k)) ? kinds : null;
+    // A line's local events before the kind filter keep the row (5d): a filter leaving none says so on it.
+    let anyLocal = false;
+    const localEvents = new Map<string, HistoryKind>();
+    if (h.local) {
+        for (const r of rows) {
+            const own = h.local.get(r.personId) ?? [];
+            for (const e of own) if (!localEvents.has(e.id)) localEvents.set(e.id, e.kind);
+            if (own.length) anyLocal = true;
+            const items = own.filter(e => !kindsOn || kindsOn.has(e.kind));
+            if (items.length) r.local = [...items].sort((a, b) => a.year - b.year);
+        }
+    }
+    if (!sorted.length && !anyLocal) return undefined;
+    const region = h.filter?.region || undefined;
+    const filter: TimelineHistoryFilter = { ...(kindsOn ? { kinds: [...kindsOn] } : {}), ...(region ? { region } : {}) };
+    const focusRow = h.focusId ? rows.find(r => r.personId === h.focusId) : undefined;
+    return {
+        events: filterTimelineHistory(sorted, filter),
+        ...(focusRow ? { focus: { personId: focusRow.personId, startYear: focusRow.startYear, endYear: focusRow.endYear } } : {}),
+        regions,
+        total: sorted.length,
+        all: sorted,
+        ...(h.local ? { localEvents: [...localEvents].map(([id, kind]) => ({ id, kind })) } : {}),
+        filtered: {
+            ...(kindsOn ? { kinds: HISTORY_KINDS.filter(k => kindsOn.has(k)) } : {}),
+            ...(region ? { region, ...(h.filter?.regionName ? { regionName: h.filter.regionName } : {}) } : {}),
+        },
+    };
+}
+
+/**
+ * The history row's events with the filter applied (spec 121 §5): the kinds
+ * chosen, and of a region only its events (the history of a place and a
+ * finding have no region: a region filter leaves them out of the row). Pure,
+ * on the finished list: no new reading of the research's events.
+ */
+export function filterTimelineHistory(events: readonly TimelineHistoryItem[], filter: TimelineHistoryFilter = {}): TimelineHistoryItem[] {
+    const kinds = filter.kinds ? new Set(filter.kinds) : null;
+    const region = filter.region;
+    if (!kinds && !region) return [...events];
+    return events.filter(e => (!kinds || kinds.has(e.kind)) && (!region || e.regionId === region));
+}
+
+/**
+ * What the history row shows (spec 121 §5, §10): its events; a thin row with
+ * the label alone (no event of a region, or the filter leaves none while a
+ * line shows a local one: the option stays reachable); or the empty filter's
+ * sentence with "Clear filter" (a filter leaves nothing on the row or the lines).
+ */
+export function timelineHistoryRowState(h: TimelineHistory, rows: readonly TimelineRow[] = []): 'events' | 'thin' | 'emptyFilter' {
+    if (h.events.length) return 'events';
+    const filtered = !!(h.filtered.kinds || h.filtered.region);
+    const localShown = rows.some(r => (r.local?.length ?? 0) > 0);
+    return filtered && !localShown ? 'emptyFilter' : 'thin';
+}
+
+/** The options' chips (spec 121 §5): a count per kind, per region. */
+export interface TimelineHistoryFacets {
+    /**
+     * The nine kinds in HISTORY_KINDS order: the events on the timeline, each
+     * once (by id) — the row's (of the region chosen) and the lines' local ones
+     * together; a local event on three lines is one.
+     */
+    kinds: { kind: HistoryKind; count: number }[];
+    /** The regions of the row's events of the kinds chosen, the most first (same count: as met). */
+    regions: { id: string; count: number }[];
+}
+
+export function timelineHistoryFacets(h: TimelineHistory): TimelineHistoryFacets {
+    const region = h.filtered.region;
+    const kinds = h.filtered.kinds ? new Set(h.filtered.kinds) : null;
+    const byKind = new Map<HistoryKind, Set<string>>();
+    const addKind = (kind: HistoryKind, id: string): void => {
+        const ids = byKind.get(kind) ?? new Set<string>();
+        ids.add(id);
+        byKind.set(kind, ids);
+    };
+    const byRegion = new Map<string, Set<string>>();
+    for (const e of h.all) {
+        if (!region || e.regionId === region) addKind(e.kind, e.id);
+        if (e.regionId && (!kinds || kinds.has(e.kind))) byRegion.set(e.regionId, (byRegion.get(e.regionId) ?? new Set<string>()).add(e.id));
+    }
+    for (const e of h.localEvents ?? []) addKind(e.kind, e.id);
+    return {
+        kinds: HISTORY_KINDS.map(kind => ({ kind, count: byKind.get(kind)?.size ?? 0 })),
+        regions: [...byRegion].map(([id, ids], at) => ({ id, count: ids.size, at }))
+            .sort((a, b) => b.count - a.count || a.at - b.at).map(({ id, count }) => ({ id, count })),
+    };
+}
+
+/**
+ * How many of the kinds chosen the timeline has (the label "History · 3 kinds";
+ * spec 121 §10: a filter of kinds the timeline does not have says "0 kinds").
+ */
+export function timelineFilterKindCount(h: TimelineHistory): number {
+    if (!h.filtered.kinds) return 0;
+    const on = new Set(timelineHistoryFacets(h).kinds.filter(k => k.count > 0).map(k => k.kind));
+    return h.filtered.kinds.filter(k => on.has(k)).length;
+}
+
+/** The Timeline's history options of a tree as the options change them (settings.ts TimelineHistoryOptions). */
+export interface TimelineHistoryChoice {
+    kinds?: HistoryKind[];
+    region?: string;
+    local: boolean;
+}
+
+/**
+ * A kind's chip clicked (spec 121 §5, like the history detail's facets):
+ * "All" (null) drops the filter; a kind is added or removed; none left or all
+ * nine chosen is no filter.
+ */
+export function toggleTimelineKind(kinds: readonly HistoryKind[] | undefined, kind: HistoryKind | null): HistoryKind[] | undefined {
+    if (!kind) return undefined;
+    const now = kinds ?? [];
+    const next = now.includes(kind) ? now.filter(k => k !== kind) : [...now, kind];
+    const ordered = HISTORY_KINDS.filter(k => next.includes(k));
+    return ordered.length && ordered.length < HISTORY_KINDS.length ? ordered : undefined;
+}
+
+/** "Clear filter" (spec 121 §5, §10): the kinds and the region in one step; the local option stays. */
+export function clearTimelineFilter(o: TimelineHistoryChoice): TimelineHistoryChoice {
+    return { local: o.local };
+}
+
+/**
+ * The option "Local history on the life lines" (spec 121 §5): unavailable
+ * ('off') while Settings switch off both the history of places and the
+ * findings; 'none' when the timeline has no local event; else 'ok'.
+ */
+export function timelineLocalOptionState(origins: { place: boolean; local: boolean }, anyLocal: boolean): 'off' | 'none' | 'ok' {
+    if (!origins.place && !origins.local) return 'off';
+    return anyLocal ? 'ok' : 'none';
 }
 
 /**
@@ -240,10 +445,179 @@ export interface TimelineHistoryCluster {
 }
 
 /**
+ * The kind that stands for a cluster (spec 121 §3): the most frequent one,
+ * on a tie the one that comes first in the cluster's order. Its colour is the
+ * origin of the first event of that kind.
+ */
+export function timelineClusterKind(items: readonly TimelineHistoryItem[]): { kind: HistoryKind; scope: HistoryScope } {
+    const counts = new Map<HistoryKind, { n: number; scope: HistoryScope; at: number }>();
+    items.forEach((e, at) => {
+        const c = counts.get(e.kind);
+        if (c) c.n++;
+        else counts.set(e.kind, { n: 1, scope: e.scope, at });
+    });
+    let best: { kind: HistoryKind; n: number; scope: HistoryScope; at: number } | null = null;
+    for (const [kind, c] of counts) {
+        if (!best || c.n > best.n || (c.n === best.n && c.at < best.at)) best = { kind, ...c };
+    }
+    return best ? { kind: best.kind, scope: best.scope } : { kind: 'other', scope: 'region' };
+}
+
+/**
+ * The kinds of a cluster in the events' order, at most three, and how many
+ * more there are (the cluster's name; like the card's historyClusterKinds).
+ */
+export function timelineClusterKinds(items: readonly TimelineHistoryItem[], max = 3): { kinds: HistoryKind[]; more: number } {
+    const all: HistoryKind[] = [];
+    for (const e of items) if (!all.includes(e.kind)) all.push(e.kind);
+    return { kinds: all.slice(0, max), more: Math.max(0, all.length - max) };
+}
+
+/**
+ * The tracks of the history row's periods (spec 121 §4): in the order given,
+ * a period goes to track 0 when the last period there ended more than 1 px
+ * before it starts, else to track 1 (a third overlap goes to track 1 too).
+ */
+export function timelinePeriodTracks(periods: readonly { x1: number; x2: number }[]): (0 | 1)[] {
+    let end0 = -Infinity;
+    return periods.map(p => {
+        if (end0 < p.x1 - 1) { end0 = p.x2; return 0; }
+        return 1;
+    });
+}
+
+/** Below this many px per year a life line shows its local history as one symbol with the count of all (spec 121 §8). */
+export const LOCAL_DENSE_PX_PER_YEAR = 1.5;
+/** A local symbol closer than this (px) to a dot or a shared mark on its line steps aside (spec 121 §6). */
+export const LOCAL_CLEAR_PX = 10;
+/** How far (px) from that dot or mark the symbol's centre goes. */
+export const LOCAL_STEP_PX = 11;
+
+/** One symbol of local history on a life line: its centre and the events it stands for (the first one's kind). */
+export interface TimelineLocalMark {
+    x: number;
+    items: TimelineLocalItem[];
+}
+
+/** Where a line's local history goes (spec 121 §4, §6, §8). */
+export interface TimelineLocalLayout {
+    marks: TimelineLocalMark[];
+    /** A period's stripe under the bar: from its symbol's year to its end or the bar's end. */
+    periods: { item: TimelineLocalItem; x1: number; x2: number }[];
+}
+
+/**
+ * The centre of a local symbol at `x` on a bar from `barX1` to `barX2`
+ * (spec 121 §6): kept on the bar (never over the living's arrow or the
+ * fading end); closer than 10 px to a dot or a shared mark it goes to
+ * 11 px right of it, or 11 px left when the right would leave the bar (or
+ * meet another dot while the left is free).
+ */
+export function timelineLocalX(x: number, obstacles: readonly number[], barX1: number, barX2: number): number {
+    const cx = Math.min(Math.max(x, barX1), barX2);
+    let near: number | null = null;
+    for (const d of obstacles) {
+        if (Math.abs(cx - d) < LOCAL_CLEAR_PX && (near === null || Math.abs(cx - d) < Math.abs(cx - near))) near = d;
+    }
+    if (near === null) return cx;
+    const right = near + LOCAL_STEP_PX, left = near - LOCAL_STEP_PX;
+    const free = (v: number): boolean => obstacles.every(d => Math.abs(v - d) >= LOCAL_CLEAR_PX);
+    if (right <= barX2 && free(right)) return right;
+    if (left >= barX1 && free(left)) return left;
+    return right <= barX2 ? right : left;
+}
+
+/**
+ * A life line's local history laid out (spec 121 §4, §6, §8): each symbol
+ * stepped aside from the line's dots and shared marks, then grouped like the
+ * history row (an event closer than `gap` px to a group's first one joins it;
+ * the group's symbol is its first event's, where that one stands). Below
+ * 1.5 px per year (a phone's long axis) one symbol at the first event with all
+ * of them. A period also gets a stripe from its symbol's year to its end (at
+ * most the bar's end). `items` sorted by year.
+ */
+export function layoutTimelineLocal(
+    items: readonly TimelineLocalItem[],
+    o: { xOf: (year: number) => number; barX1: number; barX2: number; obstacles: readonly number[]; gap: number; pxPerYear: number },
+): TimelineLocalLayout {
+    if (!items.length) return { marks: [], periods: [] };
+    const clamp = (x: number): number => Math.min(Math.max(x, o.barX1), o.barX2);
+    const periods = items.filter(e => e.year2 !== undefined).map(item => {
+        const x1 = clamp(o.xOf(item.year));
+        return { item, x1, x2: Math.max(x1, clamp(o.xOf(item.year2!))) };
+    });
+    if (o.pxPerYear < LOCAL_DENSE_PX_PER_YEAR) {
+        return { marks: [{ x: timelineLocalX(o.xOf(items[0].year), o.obstacles, o.barX1, o.barX2), items: [...items] }], periods };
+    }
+    const placed = items.map((item, i) => ({ item, i, x: timelineLocalX(o.xOf(item.year), o.obstacles, o.barX1, o.barX2) }))
+        .sort((a, b) => a.x - b.x || a.i - b.i);
+    const marks: TimelineLocalMark[] = [];
+    for (const p of placed) {
+        const last = marks[marks.length - 1];
+        if (last && p.x - last.x < o.gap) last.items.push(p.item);
+        else marks.push({ x: p.x, items: [p.item] });
+    }
+    return { marks, periods };
+}
+
+/**
+ * Whom an event of the history row names in the popover (spec 121 §2): the
+ * persons in the rows' order with the focused person first, at most `max`
+ * of them, and how many more there are ("and 2 more").
+ */
+export function timelineConcernPersons(
+    persons: readonly string[], focusId?: string | null, max = 2,
+): { shown: string[]; more: number } {
+    const ordered = focusId && persons.includes(focusId) ? [focusId, ...persons.filter(id => id !== focusId)] : [...persons];
+    return { shown: ordered.slice(0, max), more: Math.max(0, ordered.length - max) };
+}
+
+/**
+ * The persons a cluster concerns (spec 121 §2, the phone's sheet): every
+ * person one of its events concerns, in the rows' order (`rowOrder`; a person
+ * not in it after the others, as met), the focused person first, each with
+ * the first event of the cluster that concerns them (the card opens on it).
+ */
+export function timelineClusterPersons(
+    items: readonly TimelineHistoryItem[], rowOrder: readonly string[], focusId?: string | null,
+): { personId: string; eventId: string }[] {
+    const first = new Map<string, string>();
+    for (const e of items) for (const id of e.persons) if (!first.has(id)) first.set(id, e.id);
+    const index = new Map(rowOrder.map((id, i) => [id, i]));
+    const met = [...first.keys()];
+    const at = (id: string): number => index.get(id) ?? rowOrder.length + met.indexOf(id);
+    const ids = [...met].sort((a, b) => (a === focusId ? -1 : b === focusId ? 1 : at(a) - at(b)));
+    return ids.map(personId => ({ personId, eventId: first.get(personId)! }));
+}
+
+/**
+ * Where a popover of the history row goes (spec 121 §2, §5), in the window's
+ * pixels: `left` = the anchor's x − 40 clipped into the window (8 px from its
+ * edges), below the row (its bottom + 6 px), above the row (its top − 6 px)
+ * where below has no room; where neither has room, the side with more and a
+ * `maxHeight` (the popover scrolls).
+ */
+export function placeTimelinePop(
+    anchor: { x: number; top: number; bottom: number },
+    size: { width: number; height: number },
+    view: { width: number; height: number; bottomInset?: number },
+    margin = 8,
+): { left: number; top: number; above: boolean; maxHeight: number | null } {
+    const left = Math.max(margin, Math.min(anchor.x - 40, view.width - size.width - margin));
+    const floor = view.height - (view.bottomInset ?? 0) - margin;
+    const below = floor - (anchor.bottom + 6);
+    const above = anchor.top - 6 - margin;
+    if (size.height <= below) return { left, top: anchor.bottom + 6, above: false, maxHeight: null };
+    if (size.height <= above) return { left, top: anchor.top - 6 - size.height, above: true, maxHeight: null };
+    if (below >= above) return { left, top: anchor.bottom + 6, above: false, maxHeight: Math.max(0, below) };
+    return { left, top: margin, above: true, maxHeight: Math.max(0, above) };
+}
+
+/**
  * A cluster's years: "1866", or the first year to the last (a period's end
  * counts) — "1886–1892".
  */
-export function timelineHistoryYears(items: readonly TimelineHistoryItem[]): string {
+export function timelineHistoryYears(items: readonly { year: number; year2?: number }[]): string {
     if (!items.length) return '';
     const from = items[0].year;
     const to = Math.max(...items.map(e => e.year2 ?? e.year));
@@ -256,9 +630,17 @@ export function timelineHistoryYears(items: readonly TimelineHistoryItem[]): str
  * cluster joins it; otherwise it starts a new one. The cluster sits at the
  * mean x of its members. 16 px on a computer, 22 px on a phone (the count
  * badges must not overlap).
+ *
+ * `clearance(n)`, when given, is how far the next cluster's x must be from a
+ * cluster of `n` events for their marks not to touch (its count badge sticks
+ * out to the right): a mean pulled towards its neighbour brings two clusters
+ * closer than `minGap`, and on a dense row (the whole timeline, spec 121 §3)
+ * a badge would cover the next symbol. Such neighbours merge, left to right,
+ * until every pair has room.
  */
 export function clusterTimelineHistory(
     events: readonly TimelineHistoryItem[], xOf: (year: number) => number, minGap: number,
+    clearance?: (count: number) => number,
 ): TimelineHistoryCluster[] {
     const out: { x0: number; xs: number[]; items: TimelineHistoryItem[] }[] = [];
     for (const e of events) {
@@ -267,7 +649,21 @@ export function clusterTimelineHistory(
         if (last && x - last.x0 < minGap) { last.items.push(e); last.xs.push(x); }
         else out.push({ x0: x, xs: [x], items: [e] });
     }
-    return out.map(c => ({ x: c.xs.reduce((a, b) => a + b, 0) / c.xs.length, items: c.items }));
+    const mean = (xs: readonly number[]): number => xs.reduce((a, b) => a + b, 0) / xs.length;
+    if (!clearance) return out.map(c => ({ x: mean(c.xs), items: c.items }));
+    const merged: { xs: number[]; items: TimelineHistoryItem[]; x: number }[] = [];
+    for (const c of out) {
+        let cur = { xs: c.xs, items: c.items, x: mean(c.xs) };
+        let prev = merged[merged.length - 1];
+        while (prev && cur.x - prev.x < clearance(prev.items.length)) {
+            merged.pop();
+            const xs = [...prev.xs, ...cur.xs];
+            cur = { xs, items: [...prev.items, ...cur.items], x: mean(xs) };
+            prev = merged[merged.length - 1];
+        }
+        merged.push(cur);
+    }
+    return merged.map(c => ({ x: c.x, items: c.items }));
 }
 
 // ==================== PERSON LIFELINE (R2) ====================

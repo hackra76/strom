@@ -9,14 +9,15 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-    isEmbeddedEnvelope,
-    generateExportId,
+    
     EmbeddedDataEnvelope,
     StromData,
     PersonId,
     PartnershipId,
-    STROM_DATA_VERSION
 } from '../types.js';
+import { generateExportId } from '../ids.js';
+import { isEmbeddedEnvelope } from '../model-values.js';
+import { STROM_DATA_VERSION } from '../version.js';
 
 describe('generateExportId', () => {
     it('generates unique IDs', () => {
@@ -158,8 +159,8 @@ describe('STROM_DATA_VERSION', () => {
         expect(Number.isInteger(STROM_DATA_VERSION)).toBe(true);
     });
 
-    it('current version is 24', () => {
+    it('current version is 25', () => {
         // This test documents the current version - update when version changes
-        expect(STROM_DATA_VERSION).toBe(24);
+        expect(STROM_DATA_VERSION).toBe(25);
     });
 });

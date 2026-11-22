@@ -1,4 +1,6 @@
 import { test, expect, Page } from '@playwright/test';
+import { openOverview, overview } from './live-directions-bridge';
+import { RUNS, RUN_WORKING, followRuns } from './live-runs-bridge';
 
 /**
  * "Follow the agent in the tree": the ◎ switch keeps the person the agent
@@ -558,7 +560,7 @@ test.describe('follow the agent in the tree', () => {
             await expect(sec).toHaveAttribute('data-ready', 'true');
             // The only line of the tree: its detail right away.
             await sec.getByRole('button', { name: 'Show in tree' }).click();
-            await expect(line).toContainText('Brandvold-Ekhammarsson Lindenau family line');
+            await expect(line).toContainText('Line Brandvold-Ekhammarsson Lindenau');
         };
         /** The two pills, and each of them with the tree's chrome: what overlaps. */
         const clash = (): Promise<string[]> => page.evaluate(() => {
@@ -2027,5 +2029,227 @@ test.describe('follow the agent on the map (spec 043 §5, §6)', () => {
             await expect(page.locator('#places-modal')).toBeVisible();
             expect(errs).toEqual([]);
         });
+    });
+});
+
+/**
+ * Following one of several runs (spec 126 U10 §7): following goes to the
+ * person of the run followed (by default the first one in Now that works),
+ * "Follow this run" in a block of Now and the pill's choice of runs take
+ * another one there at once, its marks in the primary colour, the others in
+ * the accent with their labels ("1", "↑ 2"); paused, the pill names the run
+ * followed; another window of the app follows the main window's choice; a
+ * phone marks the run followed alone and has no choice. Invented data only.
+ */
+test.describe('following one of several runs', () => {
+    const T = new Date('2026-11-21T10:30:00Z');
+    const at = (min: number): string => new Date(T.getTime() + min * 60_000).toISOString();
+    /** The whole queue on Vojtěch the younger (P0004), G0001's run on his father (P0001); G0002 waiting for the limit when asked. */
+    const runsAt = (limitUntil?: string): Record<string, unknown>[] => [
+        ...RUNS.map((r, i) => ({ ...r, since: at(i === 0 ? -50 : -10) })),
+        ...(limitUntil ? [{ id: 'run-2c44', research: 'G0002', agent: 'codex', agentName: 'Codex', since: at(-30), state: 'paused',
+            paused: { until: limitUntil, reason: 'limit' }, session: 'N0143', sessions: 2 }] : []),
+    ];
+    const workingAt = (): Record<string, unknown>[] => RUN_WORKING.map((w, i) => ({ ...w, since: at(i === 0 ? -4 : -2), ...(i === 0 ? { person: 'P0004' } : {}) }));
+    const pill = (page: Page) => page.locator('#live-follow-pill');
+    const block = (page: Page, run: string) => overview(page).locator(`#ov-sec-now .research-overview__run[data-run="${run}"]`);
+    /** The people marked in the fan: worked-on sectors and labels of people it does not draw. */
+    const markedInFan = (page: Page) => page.evaluate(() => [
+        ...[...document.querySelectorAll('#fan-chart .is-working')].map(e => e.getAttribute('data-fan-person')),
+        ...[...document.querySelectorAll('.fan-follow-chip[data-person]')].map(e => e.getAttribute('data-person')),
+    ].sort());
+    /** The labels of the marks in the fan in one colour (sectors' numbers and the labels' numbers). */
+    const fanLabels = (page: Page, tone: string) => page.locator(`#fan-chart .fan-work-num.follow-${tone}, .fan-follow-chip.follow-${tone} .fan-follow-chip-num`);
+
+    async function followTwo(page: Page, o: { size?: { width: number; height: number }; limitUntil?: string } = {}) {
+        await page.clock.install({ time: T });
+        await page.addInitScript(() => {
+            (globalThis as { __LIVE_FOLLOW_MS?: unknown }).__LIVE_FOLLOW_MS = { gap: 300, idle: 60_000, retry: 150 };
+            if (sessionStorage.getItem('follow-seeded')) return;
+            sessionStorage.setItem('follow-seeded', '1');
+            localStorage.setItem('strom-live-follow', '1');
+        });
+        return followRuns(page, { runs: runsAt(o.limitUntil), working: workingAt(), fastReconnect: true, ...(o.size ? { size: o.size } : {}) });
+    }
+
+    test('following goes to the run followed; Follow this run in Now takes the other one there at once, with its colour and label', async ({ page }) => {
+        await followTwo(page);
+        // By default the first run in Now: the whole queue.
+        await expect.poll(() => focusRefn(page)).toBe('P0004');
+        await expect(pill(page)).toHaveClass(/live-follow-pill--pick/);
+        await expect(pill(page).locator('.evidence-pill-label--pick')).toHaveText('Following: Whole queue▾');
+        await expect(pill(page).locator('.evidence-pill-label--pick')).toHaveAttribute('aria-label', 'Followed run: Whole queue, change');
+
+        await openOverview(page);
+        await expect(block(page, 'run-8f2c').locator('.research-overview__followed')).toHaveText('●Followed');
+        await expect(block(page, 'run-8f2c').locator('.research-overview__run-follow')).toHaveCount(0);
+        const g1 = block(page, 'run-1a07');
+        // Follow this run between Show in tree and Stop, with no mark.
+        expect(await g1.locator('.research-overview__run-actions > *').evaluateAll(els => els.map(e => e.className.split(' ').find(c => c.startsWith('research-overview__')))))
+            .toEqual(['research-overview__show-in-tree', 'research-overview__run-follow', 'research-overview__run-stop', 'research-overview__finish']);
+        const followBtn = g1.locator('.research-overview__run-follow');
+        await expect(followBtn).toHaveText('Follow this run');
+        await expect(followBtn.locator('.research-open-mark, .research-ai-badge')).toHaveCount(0);
+        await followBtn.click();
+        await expect.poll(() => focusRefn(page), { timeout: 3000 }).toBe('P0001');
+        await expect(g1.locator('.research-overview__followed')).toHaveText('●Followed');
+        await expect(block(page, 'run-8f2c').locator('.research-overview__run-follow')).toHaveCount(1);
+        await expect(pill(page).locator('.evidence-pill-label--pick')).toHaveText('Following: Kubíčkovi z Dolní Lhoty▾');
+
+        // The fan: both people marked, G0001's run in the primary colour with its label, the queue in the accent.
+        await page.keyboard.press('Escape');
+        await page.evaluate(() => window.Strom.UI.setLiveFollowView('fan'));
+        const both = [await idOf(page, 'P0001'), await idOf(page, 'P0004')].sort();
+        await expect.poll(() => markedInFan(page)).toEqual(both);
+        await expect(fanLabels(page, 'primary')).toHaveText(['↑ 2']);
+        await expect(fanLabels(page, 'accent')).toHaveText(['1']);
+    });
+
+    test('the pill\'s choice: the runs in Now\'s order, the one followed by the selection line, a waiting one grey with its state, Stop following here; paused it names the run', async ({ page }) => {
+        const until = at(180);
+        await followTwo(page, { limitUntil: until });
+        await expect.poll(() => focusRefn(page)).toBe('P0004');
+        const t = await page.evaluate(i => new Intl.DateTimeFormat('en', { hour: '2-digit', minute: '2-digit' }).format(new Date(i)), until);
+        await pill(page).locator('.evidence-pill-label--pick').click();
+        const menu = page.locator('.live-follow-run-menu');
+        await expect(menu).toBeVisible();
+        await expect(menu).toHaveAttribute('role', 'menu');
+        const items = menu.locator('.live-follow-run-menu__item');
+        await expect(items.locator('.live-follow-run-menu__name')).toHaveText(['1 · Whole queue', '↑ 2 · Kubíčkovi z Dolní Lhoty', '↑ 3 · Malí z Horní Vsi']);
+        await expect(items.nth(0)).toHaveAttribute('aria-checked', 'true');
+        await expect(items.nth(1)).toHaveAttribute('aria-checked', 'false');
+        await expect(items.nth(0).locator('.live-follow-run-menu__sub')).toHaveText('Claude · Vojtěch Kubíček');
+        await expect(items.nth(2)).toHaveClass(/is-wait/);
+        await expect(items.nth(2).locator('.live-follow-run-menu__sub')).toHaveText(`waiting for the subscription limit until ${t}`);
+        await expect(menu.locator('.live-follow-run-menu__off')).toHaveText('Stop following here');
+        // Escape closes it, focus back on the label.
+        await page.keyboard.press('Escape');
+        await expect(menu).toHaveCount(0);
+
+        await pill(page).locator('.evidence-pill-label--pick').click();
+        await items.nth(1).click();
+        await expect(menu).toHaveCount(0);
+        await expect.poll(() => focusRefn(page), { timeout: 3000 }).toBe('P0001');
+        await expect(pill(page).locator('.evidence-pill-label--pick')).toHaveText('Following: Kubíčkovi z Dolní Lhoty▾');
+
+        // Paused by hand: the paused pill, the run followed muted after Back to the agent.
+        await page.evaluate(() => window.Strom.UI.pauseLiveFollow());
+        await expect(pill(page)).not.toHaveClass(/live-follow-pill--pick/);
+        await expect(pill(page).locator('.evidence-pill-label')).toHaveText('Following paused');
+        await expect(pill(page).locator('.live-follow-pill__run')).toHaveText('Kubíčkovi z Dolní Lhoty');
+        await page.locator('#live-follow-pill .live-follow-back').click();
+        await expect(pill(page).locator('.evidence-pill-label--pick')).toHaveText('Following: Kubíčkovi z Dolní Lhoty▾');
+
+        // Stop following here: following off, no pill.
+        await pill(page).locator('.evidence-pill-label--pick').click();
+        await menu.locator('.live-follow-run-menu__off').click();
+        await expect(pill(page)).toHaveCount(0);
+        await expect(page.locator('#live-follow')).toHaveAttribute('aria-pressed', 'false');
+    });
+
+    test('another window of the app follows the run the main window follows', async ({ page, context }) => {
+        await followTwo(page);
+        await expect.poll(() => focusRefn(page)).toBe('P0004');
+        const treeId = await page.evaluate(() => window.Strom.DataManager.getCurrentTreeId()!);
+        const sat = await context.newPage();
+        await sat.setViewportSize({ width: 1200, height: 800 });
+        await sat.addInitScript(() => {
+            (globalThis as { __LIVE_FOLLOW_MS?: unknown }).__LIVE_FOLLOW_MS = { gap: 300, idle: 60_000, retry: 150 };
+            sessionStorage.setItem('strom.win.follow.af1a2b3c', 'off');
+        });
+        await sat.goto(`/strom.html?okno=family&tree=${encodeURIComponent(treeId)}&w=af1a2b3c`);
+        await expect.poll(() => focusRefn(sat), { timeout: 10000 }).toBe('P0004');
+        // No choice there (no pill): the main window's choice reaches it.
+        await expect(sat.locator('#live-follow-pill')).toHaveCount(0);
+        await page.evaluate(() => window.Strom.UI.setFollowedRun('run-1a07'));
+        await expect.poll(() => focusRefn(page), { timeout: 3000 }).toBe('P0001');
+        await expect.poll(() => focusRefn(sat), { timeout: 5000 }).toBe('P0001');
+        await sat.close();
+    });
+
+    test('a phone marks the run followed alone; the pill says it without a choice; Now has no Follow this run', async ({ page }) => {
+        await followTwo(page, { size: { width: 390, height: 844 } });
+        await expect.poll(() => focusRefn(page)).toBe('P0004');
+        await expect(pill(page)).toHaveClass(/live-follow-pill--pick/);
+        await expect(pill(page).locator('.evidence-pill-label--pick')).toHaveCount(0);
+        await expect(pill(page).locator('.evidence-pill-label')).toHaveText('Following: Whole queue');
+        await page.evaluate(() => window.Strom.UI.setLiveFollowView('fan'));
+        await expect.poll(() => markedInFan(page)).toEqual([await idOf(page, 'P0004')]);
+        await expect(page.locator('#fan-chart .fan-work-num, .fan-follow-chip-num')).toHaveCount(0);
+        await page.locator('#live-panel .live-panel-toggle').click();
+        await expect(overview(page)).toHaveClass(/research-overview--sheet/);
+        await expect(overview(page).locator('.research-overview__run-follow, .research-overview__followed')).toHaveCount(0);
+    });
+});
+
+test.describe('Back and Forward beside the legends while following (1122 E)', () => {
+    /** Every Back / Forward button on screen against every legend panel on screen: the pairs that overlap. */
+    const clashes = (page: Page) => page.evaluate(() => {
+        const shown = (el: Element): DOMRect | null => {
+            const r = el.getBoundingClientRect();
+            const s = getComputedStyle(el);
+            return r.width && r.height && s.display !== 'none' && s.visibility !== 'hidden' ? r : null;
+        };
+        const out: string[] = [];
+        const legends = [...document.querySelectorAll('#follow-legend, #fan-legend, .fan-legend-chip, .tree-legend')];
+        for (const id of ['focus-back-btn', 'focus-forward-btn']) {
+            const a = shown(document.getElementById(id)!);
+            if (!a) continue;
+            for (const el of legends) {
+                const b = shown(el);
+                if (b && a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom) {
+                    out.push(`${id} × ${el.id || el.className}`);
+                }
+            }
+        }
+        return out;
+    });
+    /** Legends that reach past the top of the window or of the fan's stage. */
+    const cut = (page: Page) => page.evaluate(() => {
+        const stage = document.getElementById('fan-legend')?.parentElement?.getBoundingClientRect();
+        const out: string[] = [];
+        for (const el of document.querySelectorAll('#follow-legend, #fan-legend')) {
+            const r = el.getBoundingClientRect();
+            if (!r.height) continue;
+            const top = el.closest('#map-container') ? 0 : stage?.top ?? 0;
+            if (r.top < top - 0.5) out.push(`${el.id} ${Math.round(r.top)} < ${Math.round(top)}`);
+        }
+        return out;
+    });
+
+    test('the round buttons and the legends never overlap: fan, family, descendants, map at 1440, 1024, 390 and held sideways, cs and de', async ({ page }) => {
+        await stubTiles(page);
+        const bridge = await follow(page, { idle: 60_000, on: true, quick: true, ged: LINE_GED });
+        bridge.features = ['working.place'];
+        bridge.place = 'L0003';
+        await expect.poll(() => focusRefn(page)).toBe('P0012');
+        await seedMapPlaces(page);
+        await page.evaluate(() => window.Strom.UI.setLiveFollowView('fan'));
+        await expect(page.locator('#fan-chart .fan-svg')).toBeVisible();
+        // A trail opens the legend of following (its rows and the trail's switch); the fan by family lines
+        // makes its own card long.
+        for (const p of ['P0001', 'P0002', 'P0012']) { bridge.person = p; await nextStatus(bridge); }
+        await expect(page.locator('#follow-legend[data-view="fan"] .follow-legend-card')).toBeVisible();
+        await page.evaluate(() => window.Strom.TreeRenderer.setFanColorMode('rod'));
+        // Back and Forward both show.
+        await page.evaluate(() => window.Strom.TreeRenderer.goBack());
+        await expect(page.locator('#focus-back-btn')).toBeVisible();
+        await expect(page.locator('#focus-forward-btn')).toBeVisible();
+        const sizes = [{ width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 390, height: 844 }, { width: 844, height: 390 }];
+        for (const lang of ['cs', 'de']) {
+            await page.evaluate((l) => window.Strom.UI.setLanguage(l as never), lang);
+            for (const view of ['fan', 'family', 'descendants', 'map']) {
+                for (const size of sizes) {
+                    await page.setViewportSize(size);
+                    if (view === 'descendants') await page.evaluate(() => window.Strom.UI.setDisplayViewMode('descendants'));
+                    else await page.evaluate((v) => window.Strom.UI.setLiveFollowView(v as never), view);
+                    await expect.poll(() => page.evaluate(() => window.Strom.TreeRenderer.getViewMode())).toBe(view);
+                    if (view === 'fan' && size.width > 1024) await expect(page.locator('#follow-legend .follow-legend-card')).toBeVisible();
+                    const where = `${lang} ${view} ${size.width}×${size.height}`;
+                    await expect.poll(() => clashes(page), { message: where }).toEqual([]);
+                    await expect.poll(() => cut(page), { message: where }).toEqual([]);
+                }
+            }
+        }
     });
 });

@@ -245,7 +245,8 @@ test.describe('Sort with the agent', () => {
         await item.click();
         await expect(sortDialog(page)).toContainText('3 files from the batch Krabice od babičky');
         await sortDialog(page).locator('.mdlg-sort-go').click();
-        expect(material.sorts).toHaveLength(1);
+        // The request reaches the bridge after the click, not with it.
+        await expect.poll(() => material.sorts?.length ?? 0).toBe(1);
         expect([...(material.sorts![0].ids as string[])].sort()).toEqual(['I0001', 'I0002', 'I0003']);
         // B: it works and nothing waits: no ×, Cancel only; the same with and without the filter.
         await expect(strip(page)).toHaveAttribute('data-state', 'B');
@@ -551,6 +552,31 @@ test.describe('Sort with the agent: the progress and the open proposal', () => {
             return { swaps: w.__mspSwaps, same: w.__mspThumbs.every(el => el.isConnected) };
         });
         expect(after).toEqual({ swaps: 0, same: true });
+    });
+});
+
+test.describe('Sort with the agent: previews of the proposal', () => {
+    test.use({ viewport: DESKTOP });
+
+    test('a file whose tile the window never drew has its image in the proposal, asked of the research as its tile would be', async ({ page }) => {
+        // An older batch: its group stays closed in the window, its tiles are not drawn.
+        const older = { id: 'b-11112222', name: 'Old letters', at: '2026-10-01T09:00:00Z' };
+        const material = await setup(page, {
+            batches: [older],
+            files: [materialFile(9, { batch: older.id })],
+            proposals: [...PROPOSALS, { id: 'I0009', title: 'Letter from grandfather', links: [{ type: 'person', ref: 'P0003' }], why: 'A signature', sure: 'high' }],
+        });
+        await openWindow(page);
+        await expect(win(page).locator('[data-key="m:I0009"]')).toHaveCount(0);
+        expect(material.thumbAsks).not.toContain(`${materialSha('I0009')}@256`);
+        await strip(page).locator('[data-sort="sort"]').click();
+        await sortDialog(page).locator('.mdlg-sort-go').click();
+        await strip(page).locator('[data-sort="open"]').click();
+        const row = proposal(page).locator('.msp-row[data-id="I0009"]');
+        await expect(row).toHaveCount(1);
+        await expect(row.locator('.msp-thumb img')).toBeVisible();
+        await expect(row.locator('.msp-thumb')).not.toContainText('JPG');
+        expect(material.thumbAsks).toContain(`${materialSha('I0009')}@256`);
     });
 });
 
@@ -1443,6 +1469,9 @@ test.describe('Sort with the agent: a run of batches as it goes (spec 102 §3)',
         await strip(page).locator('[data-sort="open"]').click();
         await proposal(page).locator('.msp-list .msp-row').first().locator('.msp-accept').click();
         await expect.poll(() => (material.edits ?? []).length).toBeGreaterThan(0);
+        // The edit goes out before the accept ends: the decision is kept (and the tab redrawn) only after the bridge's
+        // writes, so the reload waits for it to show under Done.
+        await expect(proposal(page).locator('.msp-tab[data-tab="done"]')).toHaveText('Done · 1');
 
         await page.reload();
         await expect(page.locator('.person-card').first()).toBeVisible();

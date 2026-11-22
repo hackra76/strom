@@ -5,9 +5,11 @@
  * inline so they travel with the single-file export.
  */
 
-import { Person, StromData, personSourceIds, partnershipSourceIds } from './types.js';
+import { Person, StromData } from './types.js';
+import { personSourceIds, partnershipSourceIds } from './model-values.js';
 import { dataUrlByteSize, dataUrlImageSize, stripPhotos } from './photo.js';
 import { allMedia, personMedia as personMediaOf } from './media.js';
+import { pendingImageOf } from './research-image-refs.js';
 
 /** Longest edge (px) an attached image is downscaled to. */
 export const ATTACHMENT_MAX_SIDE = 1600;
@@ -124,7 +126,8 @@ export interface PersonMedia {
 
 export function personMedia(person: Person, data: StromData): PersonMedia {
     const out: PersonMedia = {
-        photoBytes: person.photo ? dataUrlByteSize(person.photo) : 0,
+        // One on its way (the app's view, spec 116 §5) weighs as the image it stands for.
+        photoBytes: person.photo ? pendingImageOf(person.photo)?.bytes ?? dataUrlByteSize(person.photo) : 0,
         attachments: 0, attachmentBytes: 0, excerpts: 0, excerptBytes: 0,
     };
     for (const att of personMediaOf(data, person.id)) {
@@ -184,34 +187,51 @@ export interface ImageCount {
     photos: number;
     attachments: number;
     excerpts: number;
+    /**
+     * Bytes of the image data the tree carries: each distinct picture once (the
+     * same scan as an attachment and as the excerpts of several sources, or one
+     * photo of several people, is one picture), measured by its data URL — the
+     * preview in the tree, never the size of an original the research keeps.
+     */
     bytes: number;
 }
 
 /** Count photos, attachments and source excerpts with their total payload size. */
 export function countImages(data: StromData): ImageCount {
     const out: ImageCount = { photos: 0, attachments: 0, excerpts: 0, bytes: 0 };
+    const seen = new Set<string>();
+    const weigh = (dataUrl: string | undefined): void => {
+        if (!dataUrl || !dataUrl.startsWith('data:') || seen.has(dataUrl)) return;
+        seen.add(dataUrl);
+        // An image still on its way (spec 116): the size its stand-in says.
+        out.bytes += pendingImageOf(dataUrl)?.bytes ?? dataUrlByteSize(dataUrl);
+    };
+    const portraits = new Set<string>();
     for (const person of Object.values(data.persons)) {
         if (person.photo) {
             out.photos++;
-            out.bytes += dataUrlByteSize(person.photo);
+            weigh(person.photo);
+            portraits.add(person.photo);
         }
     }
     for (const att of allMedia(data)) {
+        // A portrait's own record (data v25) is the same picture: counted once, as the portrait.
+        if (att.dataUrl && portraits.has(att.dataUrl)) continue;
         out.attachments++;
-        out.bytes += att.sizeBytes || dataUrlByteSize(att.dataUrl);
+        weigh(att.dataUrl);
     }
     // The couples' photos count with the photos (spec 107); a portrait's
     // original is an attachment already.
     for (const union of Object.values(data.partnerships ?? {})) {
         if (union.photo) {
             out.photos++;
-            out.bytes += dataUrlByteSize(union.photo);
+            weigh(union.photo);
         }
     }
     for (const src of Object.values(data.sources ?? {})) {
         for (const exc of src.excerpts ?? []) {
             out.excerpts++;
-            out.bytes += exc.sizeBytes || dataUrlByteSize(exc.dataUrl);
+            weigh(exc.dataUrl);
         }
     }
     return out;

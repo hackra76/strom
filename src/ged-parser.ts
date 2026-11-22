@@ -21,14 +21,12 @@ import { stampAddedAt } from './person-lists-data.js';
 import { normalizeSingleParents } from './single-parent.js';
 import {
     FactStatus,
-    parseFactStatus,
     PersonId,
     PartnershipId,
     Person,
     Partnership,
     PartnershipStatus,
     Gender,
-    oppositeGender,
     StromData,
     LifeEvent,
     SourceExcerpt,
@@ -45,11 +43,8 @@ import {
     MaterialKind,
     MediaPlace,
     MediaOriginal,
-    toPersonId,
-    toPartnershipId,
-    generateLifeEventId,
-    generateParticipantId,
-    generateSourceId,
+    
+    
     PlaceGeo,
     PlaceRecord,
     PersonResearch,
@@ -72,9 +67,10 @@ import {
     OriginalIdLine,
     ResearchFactOrigin,
     ResearchFactVerify,
-    uniqueIdSuffix,
     PrimaryName,
 } from './types';
+import { toPersonId, toPartnershipId, generateLifeEventId, generateParticipantId, generateSourceId, uniqueIdSuffix } from './ids.js';
+import { parseFactStatus, oppositeGender } from './model-values.js';
 import { dateSortKey, formatFlexDate, instantLocalDay } from './dates';
 import { gedcomDatePhrase, parseGedcomDate } from './gedcom-date-read';
 import { localAge } from './recorded-age';
@@ -102,14 +98,15 @@ function surnameNoteGroups(noteLines: readonly string[] | null): string[][] {
 import { excerptFromDataUrl } from './excerpts';
 import { unionCitations } from './citation-quality';
 import { cleanSourceEvents } from './citation-order';
-import { imageRefSha, resolveImageFile } from './research-image-refs';
+import { imageRefSha, resolveImageFile, type ImageRef } from './research-image-refs';
 import { normalizeSha256 } from './sha256';
 import { isConfirmDay, isTranscriptMark } from './source-confirm';
 import { ORIGINAL_ONLY_DATA_URL } from './validation';
-import { samePlace } from './media';
+import { samePlace, givePortraitsRecords } from './media';
 import { parseRegion, regionFromStored } from './originals';
 import { parseName, readGedcomName, PRIMARY_NAME_TAG, type GedcomNameParts } from './gedcom-names';
 import { appUnknownIsNoSurname } from './app-version';
+import { lastMarriageSurnameIndex } from './married-suggestion';
 import { researchClaimValue } from './research-claim';
 import {
     addGedcomExtra, addOriginalIds, CITE_TAG, gedcomHtmlText, joinedBlock, NOTED_TAG, notedBlock, notedStructures, type ExtraHolder, withoutCiteLines, mediaDateValue, cleanImportOrigin, cleanOriginalIdLine, cleanOriginalIds, factPartOf, ID_ENTRIES_MAX, ID_LINES_MAX,
@@ -117,7 +114,7 @@ import {
     JOINED_TAG, joinedEventKey, type JoinedMarks, ORIGINAL_ID_TAGS, parseImportMark as readImportMark, sanitizeImports, validExtraBlock,
     factValueSignature,
 } from './import-origin';
-import { FACT_MARK, parsePendingPosition, parseCheckedResult, parseReaders, parseVerifyPending, researchFactRef, researchFamilyRef, sanitizeResearchVerify } from './verify';
+import { FACT_MARK, parsePendingPosition, parseCheckedResult, parseReaders, parseVerifyPending, researchFactRefOf, researchFamilyRef, sanitizeResearchVerify } from './verify';
 
 /** The name parser lives with the rules it shares with the research (gedcom-names.ts). */
 export { parseName };
@@ -261,7 +258,7 @@ function toStory(raw: RawStory | undefined, mapRefs: (refs?: string[]) => string
  * only): conflicting sources, hypotheses, what was searched.
  */
 interface RawResearch {
-    conflicts: { id: string; fact: string; title: string; stat: string; take: string; kind?: string; values: RawResearchValue[]; decision?: RawResearchValue }[];
+    conflicts: { id: string; fact: string; title: string; stat: string; take: string; kind?: string; review?: string; values: RawResearchValue[]; decision?: RawResearchValue }[];
     hypotheses: RawResearchHypothesis[];
     searched: { title: string; date: string; resn: string; at: string }[];
     /** The _STROM_EDGE / _STROM_ISLAND block: its value and the lines under it (level, tag, value). */
@@ -285,6 +282,8 @@ interface RawResearchValue {
     /** 3 _STROM_SIDE / 3 _STROM_RAW under a conflict's value, as written. */
     side?: string;
     raw?: string;
+    /** 3 _STROM_RETRACTED S0042 under a value or the decision: a deleted source it stood on (spec 117 §8). */
+    retracted?: string[];
 }
 
 /** `1 _STROM_HYPO` as written (spec 060, 074). */
@@ -408,13 +407,14 @@ function toResearchOrigin(raw: RawFactOrigin, mapRefs: (refs?: string[]) => stri
  * null when it says nothing valid: `_STROM_CONFIRMED` (a day), `_STROM_VERIFY`
  * (why it waits), `_STROM_CHECKED` with its day, reason and readers.
  */
-function toResearchVerify(raw: RawFactVerify | undefined): ResearchFactVerify | null {
+function toResearchVerify(raw: RawFactVerify | undefined, fact: string): ResearchFactVerify | null {
     if (!raw) return null;
     const checked = raw.checked ? parseCheckedResult(raw.checked.result) : null;
     const readers = raw.checked?.readers !== undefined ? parseReaders(raw.checked.readers) : null;
     const confirmed = raw.confirmed !== undefined ? researchIsoDate(raw.confirmed) : '';
     const position = raw.position !== undefined ? parsePendingPosition(raw.position) : null;
-    const eid = raw.eid !== undefined ? researchFactRef(raw.eid) : null;
+    // A name's id is the research's own shape (`P0012.N`), any other fact's `E0012`.
+    const eid = raw.eid !== undefined ? researchFactRefOf(fact, raw.eid) : null;
     const txt = eid && raw.txt !== undefined && FACT_MARK.test(raw.txt) ? raw.txt.toLowerCase() : null;
     return sanitizeResearchVerify({
         ...(txt ? { txt } : {}),
@@ -430,7 +430,17 @@ function toResearchVerify(raw: RawFactVerify | undefined): ResearchFactVerify | 
                 ...(readers ? { readers } : {}),
             },
         } : {}),
-    });
+    }, fact);
+}
+
+/**
+ * A conflict's mark of review (GEDCOM 2 _STROM_REVIEW, spec 117 §8), as
+ * written: any word kept (one the app does not know reads as a plain "to
+ * review"), nothing that is not one word.
+ */
+function conflictReviewOf(value: string | undefined): string | undefined {
+    const v = value?.trim();
+    return v && /^[A-Za-z][\w.-]{0,59}$/.test(v) ? v : undefined;
 }
 
 /** Whose value a conflict proposes to change (GEDCOM 2 _STROM_KIND import | user); anything else says nothing. */
@@ -444,7 +454,11 @@ function toPersonResearch(raw: RawResearch | undefined, mapRefs: (refs: string[]
     const value = (v: RawResearchValue): ResearchConflictValue => {
         const ids = mapRefs(v.sourceRefs);
         // A batch's source label left in front of the claim goes (researchClaimValue).
-        return { value: researchClaimValue(v.value), ...(ids.length > 0 ? { sourceIds: ids } : {}) };
+        return {
+            value: researchClaimValue(v.value),
+            ...(ids.length > 0 ? { sourceIds: ids } : {}),
+            ...(v.retracted?.length ? { retracted: [...new Set(v.retracted)] } : {}),
+        };
     };
     const sideOf = (v: RawResearchValue): 'user' | 'research' | undefined => {
         const side = v.side?.trim().toLowerCase();
@@ -477,6 +491,7 @@ function toPersonResearch(raw: RawResearch | undefined, mapRefs: (refs: string[]
                 ...(decided && c.decision?.value ? { decision: value(c.decision) } : {}),
                 ...(c.take.trim().toUpperCase() === 'Y' ? { take: true as const } : {}),
                 ...(conflictKindOf(c.kind) ? { kind: conflictKindOf(c.kind)! } : {}),
+                ...(conflictReviewOf(c.review) ? { review: conflictReviewOf(c.review)! } : {}),
             };
         })
         .filter(c => c.values.some(v => v.value));
@@ -1442,6 +1457,8 @@ interface RawSource {
     /** `1 _STROM_FOLIO` / `_STROM_IMAGE` / `_STROM_LOCATOR` (spec 075): with any of them the fields hold, not PAGE. */
     folio?: string;
     image?: string;
+    /** `2 _STROM_DERIVED Y` under `_STROM_IMAGE`: the research found the image from its scans. */
+    imageDerived?: boolean;
     locator?: string;
     /** The record carried any of the `_STROM_FOLIO/_IMAGE/_LOCATOR` lines (its PAGE is composed of them). */
     placeFields?: boolean;
@@ -1622,6 +1639,16 @@ interface GedcomIndividual {
     primaryNameParts: GedcomNameParts;
     variantNameParts: GedcomNameParts[];
     /**
+     * NAME > _STROM_STATUS of the primary name (the fact `name`) and of each
+     * variant (sparse, same index as nameVariants), the research's or the
+     * app's own file only. A variant's counts only as the name after marriage
+     * taken into marriedSurname (marriedNameStatus).
+     */
+    nameStatus?: FactStatus;
+    variantNameStatus?: (FactStatus | undefined)[];
+    /** The status of the name after marriage taken (Person.marriedNameStatus). */
+    marriedNameStatus?: FactStatus;
+    /**
      * _MARNM values in file order (level 1, or level 2 under a NAME), the
      * married surname some programs (Legacy, PAF) write instead of a second
      * NAME with TYPE married.
@@ -1629,6 +1656,12 @@ interface GedcomIndividual {
     marnm: string[];
     /** The surname after marriage (Person.marriedSurname), set after the names are read. */
     marriedSurname?: string;
+    /**
+     * With two or more names after marriage: all of them in file order, the
+     * last the one readMarriedSurname took. The one of the last marriage is
+     * chosen once the families are read (chooseLastMarriageNames, spec 010 K4.1).
+     */
+    marriedNames?: MarriedNameRead[];
     /** The given names of that married name when they are not the person's own (Person.marriedFirstName). */
     marriedFirstName?: string;
     /**
@@ -1857,6 +1890,13 @@ export interface ParsedGedcom {
     surnameMarkers?: { groups: boolean; rejections: boolean };
     /** Header `1 _STROM_LINES`: the file says which lineage corrections there are. */
     lineageMarker?: boolean;
+    /**
+     * Header `1 _STROM_MARRIED_LAST Y` (Strom Research): the file puts each
+     * person's current name after marriage last (by the last marriage, or as
+     * the user chose it), so the last one is taken as it is; without it the
+     * one of the last marriage is chosen (spec 010, K4.1–K4.2).
+     */
+    marriedLast?: boolean;
     /** Header `1 SOUR STROM_RESEARCH`: written by Strom Research. */
     stromResearch?: boolean;
     /** Header `1 _STROM_ASOF`: when the research wrote it (as written). */
@@ -1915,6 +1955,15 @@ export interface GedcomConvertOptions {
      * the browser holds: the attachment then keeps that file.
      */
     images?: ReadonlyMap<string, string>;
+    /**
+     * Images the file names by their hash that are still on their way
+     * (spec 116: the tree shows before they come): a reference to one of
+     * them that `images` lacks becomes its stand-in (pendingImageUrl), so
+     * its record is made as with the image. The caller takes the stand-ins
+     * out before the data are loaded or stored (image-loads.ts
+     * takePendingImages).
+     */
+    pendingImages?: ReadonlyMap<string, ImageRef>;
 }
 
 /** Result of GEDCOM to Strom conversion */
@@ -2136,13 +2185,32 @@ const DECLARED_ENCODINGS: Record<string, GedcomEncoding> = {
     'ISO-8859-2': 'iso-8859-2', 'ISO8859-2': 'iso-8859-2', 'LATIN2': 'iso-8859-2', 'LATIN-2': 'iso-8859-2',
 };
 
-function isValidUtf8(bytes: Uint8Array): boolean {
+/** The text of `bytes` when they are valid UTF-8, else null (decoded once, natively). */
+function strictUtf8(bytes: Uint8Array): string | null {
     try {
-        new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-        return true;
+        return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     } catch {
-        return false;
+        return null;
     }
+}
+
+/**
+ * Whether any byte is outside ASCII. Four bytes at a time: a callback per
+ * byte (Array.some) took about half a second on a 200 MB file with photos.
+ */
+export function hasNonAscii(bytes: Uint8Array): boolean {
+    const n = bytes.length;
+    let i = 0;
+    // Up to a 4-byte boundary of the underlying buffer, then whole words.
+    while (i < n && (bytes.byteOffset + i) % 4 !== 0) if (bytes[i++] >= 0x80) return true;
+    const words = Math.floor((n - i) / 4);
+    if (words > 0) {
+        const view = new Uint32Array(bytes.buffer, bytes.byteOffset + i, words);
+        for (let w = 0; w < words; w++) if (view[w] & 0x80808080) return true;
+        i += words * 4;
+    }
+    while (i < n) if (bytes[i++] >= 0x80) return true;
+    return false;
 }
 
 // Byte classes for telling Windows-1250 (Central Europe) from Windows-1252
@@ -2220,15 +2288,15 @@ function decodeAs(bytes: Uint8Array, encoding: GedcomEncoding): string {
  */
 export function decodeGedcomBytes(buffer: ArrayBuffer, forced?: GedcomEncoding): GedcomDecoding {
     const bytes = new Uint8Array(buffer);
-    const nonAscii = bytes.some(b => b >= 0x80);
+    const nonAscii = hasNonAscii(bytes);
 
     // Peek HEAD for "1 CHAR <value>". NULs are stripped so a BOM-less UTF-16
     // header still matches; latin1 maps every byte so decoding cannot throw.
     const head = new TextDecoder('latin1').decode(bytes.subarray(0, 4096)).replace(/\0/g, '');
     const charMatch = /^\s*1\s+CHAR\s+(.+?)\s*$/m.exec(head);
     const declared = charMatch?.[1] ?? null;
-    const result = (encoding: GedcomEncoding, how: GedcomDecoding['how'], body: Uint8Array = bytes): GedcomDecoding =>
-        ({ text: decodeAs(body, encoding), encoding, declared, how, nonAscii });
+    const result = (encoding: GedcomEncoding, how: GedcomDecoding['how'], body: Uint8Array = bytes, text?: string): GedcomDecoding =>
+        ({ text: text ?? decodeAs(body, encoding), encoding, declared, how, nonAscii });
 
     if (forced) {
         // A forced single-byte or UTF-8 reading must not keep a BOM as text.
@@ -2250,7 +2318,9 @@ export function decodeGedcomBytes(buffer: ArrayBuffer, forced?: GedcomEncoding):
     // UTF-8, ANSI, ASCII, unknown or no CHAR: valid UTF-8 is UTF-8 (a
     // single-byte Central European text is practically never valid UTF-8).
     if (!nonAscii) return result(named ?? 'utf-8', named ? 'declared' : 'content');
-    if (isValidUtf8(bytes)) return result('utf-8', named === 'utf-8' ? 'declared' : 'content');
+    // Valid UTF-8 is decoded once: the strict pass's text is the text.
+    const utf8 = strictUtf8(bytes);
+    if (utf8 !== null) return result('utf-8', named === 'utf-8' ? 'declared' : 'content', bytes, utf8);
     return result(guessSingleByteEncoding(bytes), 'content');
 }
 
@@ -2405,13 +2475,63 @@ const NAME_PART_TAGS = new Map<string, keyof GedcomNameParts>([
  * The surname after marriage of a person whose names are read (after the swap
  * of a married name put first): the LAST NAME with TYPE married in file order
  * takes it, and that name leaves the other spellings (earlier married names
- * stay there); without one, the last _MARNM (level 1 or under a NAME). A
+ * stay there); without one, the last _MARNM (level 1 or under a NAME). With
+ * several, the one of the last marriage is chosen once the families are read
+ * (chooseLastMarriageName; indi.marriedNames keeps them all). A
  * person whose primary name is the married one with no birth name beside it
  * keeps it as the surname, the field stays empty (the birth surname is not
  * known). Another spelling that is just the given name with the married
  * surname (an older Strom's or research's file wrote it so) is dropped too:
  * it would only repeat the field.
  */
+/** The header tag of a file that puts each person's current name after marriage last (ParsedGedcom.marriedLast). */
+export const MARRIED_LAST_TAG = '_STROM_MARRIED_LAST';
+
+/** A name after marriage of a person's file (a NAME with TYPE married, or a _MARNM). */
+interface MarriedNameRead {
+    surname: string;
+    /** Its given names when they are not the person's own (Person.marriedFirstName). */
+    given?: string;
+    /** The NAME as written: one not taken stays among the other spellings so. None for a _MARNM. */
+    text?: string;
+    /** It carries Strom's mark of the name the person goes by. */
+    marked?: boolean;
+    /** Its NAME > _STROM_STATUS (Person.marriedNameStatus when it is the one taken). */
+    status?: FactStatus;
+}
+
+/**
+ * The married surname of a person with several names after marriage (`names`
+ * in file order, the last one taken by readMarriedSurname) becomes the one of
+ * her last marriage (lastMarriageSurnameIndex). The one it replaces stays as
+ * another spelling of the name, as the other names after marriage do; the
+ * chosen one leaves them. The mark of the name the person goes by follows the
+ * names: on the chosen one it is the married surname, on the one replaced it
+ * says nothing any more.
+ */
+function chooseLastMarriageName(data: StromData, person: Person, names: readonly MarriedNameRead[]): void {
+    const at = lastMarriageSurnameIndex(data, person.id, names.map(n => n.surname));
+    if (at < 0 || at === names.length - 1) return;
+    const was = names[names.length - 1];
+    const now = names[at];
+    const spelled = (v: string): string => v.replace(/\//g, ' ').replace(/\s+/g, ' ').trim();
+    const key = (v: string): string => spelled(v).normalize('NFC').toLocaleLowerCase();
+    person.marriedSurname = now.surname;
+    if (now.given) person.marriedFirstName = now.given;
+    else delete person.marriedFirstName;
+    // The status is the chosen name's (none: none).
+    if (now.status) person.marriedNameStatus = now.status;
+    else delete person.marriedNameStatus;
+    const gone = new Set([key(`${now.given || person.firstName} ${now.surname}`), ...(now.text ? [key(now.text)] : [])]);
+    const variants = (person.nameVariants ?? []).filter(v => !gone.has(key(v)));
+    const back = spelled(was.text ?? `${was.given || person.firstName} ${was.surname}`);
+    if (back && !variants.some(v => key(v) === key(back))) variants.push(back);
+    if (variants.length > 0) person.nameVariants = variants;
+    else delete person.nameVariants;
+    if (now.marked) person.primaryName = 'married';
+    else if (person.primaryName === 'married') delete person.primaryName;
+}
+
 function readMarriedSurname(
     indi: GedcomIndividual,
     opts: { fromStrom: boolean; unknownIsNoSurname: boolean },
@@ -2426,27 +2546,40 @@ function readMarriedSurname(
         indi.nameVariants.splice(k, 1);
         indi.variantNameTypes.splice(k, 1);
         indi.variantNameParts.splice(k, 1);
+        indi.variantNameStatus?.splice(k, 1);
         if (indi.primaryMark === undefined || indi.primaryMark < k) return;
         if (indi.primaryMark === k) { markedMarried = true; indi.primaryMark = undefined; }
         else indi.primaryMark--;
     };
-    for (let k = indi.variantNameTypes.length - 1; k >= 0; k--) {
+    // Every name after marriage in file order; the last one is taken here.
+    const names: MarriedNameRead[] = [];
+    let takenAt = -1;
+    for (let k = 0; k < indi.variantNameTypes.length; k++) {
         if (indi.variantNameTypes[k] !== 'married') continue;
         const read = readGedcomName(indi.nameVariants[k], indi.variantNameParts[k], { ...opts, descriptions: false });
         if (!read.lastName) continue;
-        married = read.lastName;
         // Given names of its own ("Jana Kateřina /Nováková/" beside "Jana /…/") stay with it.
-        if (read.firstName && read.firstName !== '?' && read.firstName.trim() !== (indi.firstName ?? '').trim()) marriedGiven = read.firstName.trim();
-        dropVariant(k);
-        break;
+        const given = read.firstName && read.firstName !== '?' && read.firstName.trim() !== (indi.firstName ?? '').trim() ? read.firstName.trim() : '';
+        const status = indi.variantNameStatus?.[k];
+        names.push({ surname: read.lastName, ...(given ? { given } : {}), text: indi.nameVariants[k], ...(indi.primaryMark === k ? { marked: true } : {}),
+            ...(status ? { status } : {}) });
+        takenAt = k;
     }
-    if (!married) {
-        for (let k = indi.marnm.length - 1; k >= 0 && !married; k--) {
-            const v = indi.marnm[k];
-            married = (v.includes('/') ? readGedcomName(v, {}, { ...opts, descriptions: false }).lastName : v.replace(/\s+/g, ' ')).trim();
+    if (takenAt >= 0) {
+        married = names[names.length - 1].surname;
+        marriedGiven = names[names.length - 1].given ?? '';
+        const status = names[names.length - 1].status;
+        if (status) indi.marriedNameStatus = status;
+        dropVariant(takenAt);
+    } else {
+        for (const v of indi.marnm) {
+            const surname = (v.includes('/') ? readGedcomName(v, {}, { ...opts, descriptions: false }).lastName : v.replace(/\s+/g, ' ')).trim();
+            if (surname) names.push({ surname });
         }
+        married = names[names.length - 1]?.surname ?? '';
     }
     if (!married) return;
+    if (names.length > 1) indi.marriedNames = names;
     indi.marriedSurname = married;
     if (marriedGiven) indi.marriedFirstName = marriedGiven;
     // "Marie Nováková" beside the field says nothing more.
@@ -3263,6 +3396,7 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
     const headDirectionBlocks: (RawResearchBlock & { tag: string })[] = [];
     let openHeadDirection: (RawResearchBlock & { tag: string }) | null = null;
     let lineageMarker = false;
+    let marriedLast = false;
     /** The _STROM_CONFLICT / _HYPO / _SEARCHED block being read. */
     let currentResearch: OpenResearch | null = null;
     /** The research's `_STROM_WAS` being read (its `3 _STROM_IMPORT`, `_PART`, `_REF` follow). */
@@ -4046,6 +4180,7 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
                 else if (tag === '_STROM_ASOF') researchAsOf = value.trim();
                 else if (tag === '_STROM_DIRECTIONS') headDirectionsComplete = value.trim().toUpperCase() === 'Y';
                 else if (tag === '_STROM_LINES') lineageMarker = true;
+                else if (tag === MARRIED_LAST_TAG) marriedLast = /^(y|yes)$/i.test(value.trim());
                 openHeadDirection = null;
                 if ((tag === '_STROM_DIRECTION' || tag === '_STROM_BRANCH') && headDirectionBlocks.length < 5000) {
                     openHeadDirection = { tag, value, lines: [] };
@@ -4177,6 +4312,8 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
                 } else if (currentSubTag === IMPORT_TAG && ORIGINAL_ID_TAGS.has(tag) && value.trim()
                     && (src.importIdLines?.length ?? 0) < ID_LINES_MAX) {
                     (src.importIdLines ??= []).push({ tag, value: value.trim() });
+                } else if (currentSubTag === '_STROM_IMAGE' && tag === '_STROM_DERIVED') {
+                    if (value.trim().toUpperCase() === 'Y') src.imageDerived = true;
                 } else if (currentSubTag === '_STROM_IMG_OMITTED' && tag === '_STROM_CLIP') {
                     const mark = value.trim();
                     if (/^[A-Za-z0-9-]{1,32}$/.test(mark) && !src.heldClips?.includes(mark)) {
@@ -4586,6 +4723,7 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
                         else if (tag === 'STAT') c.stat = value;
                         else if (tag === '_STROM_TAKE') c.take = value;
                         else if (tag === '_STROM_KIND') c.kind = value;
+                        else if (tag === '_STROM_REVIEW') c.review = value;
                         else if (tag === 'VAL') c.values.push({ value: value.trim(), sourceRefs: [] });
                         else if (tag === 'DECI') c.decision = { value: value.trim(), sourceRefs: [] };
                     } else if (level === 3) {
@@ -4594,6 +4732,8 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
                         else if (v && tag === 'SOUR' && GED_POINTER.test(value)) v.sourceRefs.push(value);
                         else if (v && open.sub === 'VAL' && tag === '_STROM_SIDE') v.side = value;
                         else if (v && open.sub === 'VAL' && tag === '_STROM_RAW') v.raw = value;
+                        // A deleted source the value or the decision stood on (spec 117 §8): its id, never a pointer.
+                        else if (v && tag === '_STROM_RETRACTED' && /^S\d{1,9}$/.test(value.trim())) (v.retracted ??= []).push(value.trim());
                         else if (v && tag === 'CONC') v.value += value;
                         else if (v && tag === 'CONT') v.value += ' ' + value;
                     }
@@ -4817,6 +4957,13 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
                             else indi.variantNameTypes[currentNameSlot] = type;
                         } else if (tag === 'SOUR' && value) {
                             cite(indi.sourceRefs, value);
+                        } else if (tag === '_STROM_STATUS' && currentNameSlot !== null && (stromResearch || stromApp)) {
+                            // The research's status of the name (066 K6.3), as of a birth: the
+                            // primary name's is the fact `name`'s; a variant's is kept by its
+                            // index for the name after marriage. Another program's file: not read.
+                            const status = parseFactStatus(value);
+                            if (currentNameSlot === -1) indi.nameStatus = status;
+                            else if (status) (indi.variantNameStatus ??= [])[currentNameSlot] = status;
                         } else if (tag === '_MARNM' && value.trim()) {
                             // 2 _MARNM under a NAME: the married surname.
                             indi.marnm.push(value.trim());
@@ -5150,9 +5297,13 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
         if (k < 0) continue;
         const birthName = indi.nameVariants[k];
         const birthParts = indi.variantNameParts[k];
+        const birthStatus = indi.variantNameStatus?.[k];
         indi.nameVariants[k] = indi.name;
         indi.variantNameTypes[k] = indi.primaryNameType;
         indi.variantNameParts[k] = indi.primaryNameParts;
+        // The status goes with its name too.
+        if (indi.nameStatus || birthStatus) (indi.variantNameStatus ??= [])[k] = indi.nameStatus;
+        indi.nameStatus = birthStatus;
         indi.name = birthName;
         indi.primaryNameType = 'birth';
         indi.primaryNameParts = birthParts;
@@ -5419,6 +5570,7 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
         ...(surnameRejections.length > 0 ? { surnameRejections } : {}),
         ...(surnameMarkers.groups || surnameMarkers.rejections ? { surnameMarkers } : {}),
         ...(lineageMarker ? { lineageMarker } : {}),
+        ...(marriedLast ? { marriedLast } : {}),
         ...(stromResearch ? {
             stromResearch,
             ...(researchAsOf ? { researchAsOf } : {}),
@@ -5598,7 +5750,7 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
         const linked = linkedMedia(link);
         if (!linked) return null;
         // An image named by its hash: the image itself, else left out (never a file path).
-        const resolved = imageRefSha(linked.file) ? { ...linked, file: resolveImageFile(linked.file, options.images) } : linked;
+        const resolved = imageRefSha(linked.file) ? { ...linked, file: resolveImageFile(linked.file, options.images, options.pendingImages) } : linked;
         // A file the archive names only (its name and hash, spec 108 §5) that this browser holds (the
         // tree's own attachment, found by its hash): the file itself, as the tree had it.
         const heldFile = resolved.file && !resolved.file.startsWith('data:') && resolved.sha && resolved.stromKind !== 'photo'
@@ -5627,6 +5779,7 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
         if (raw.callNumber) src.callNumber = raw.callNumber;
         if (raw.folio) src.folio = raw.folio;
         if (raw.image) src.image = raw.image;
+        if (raw.image && raw.imageDerived) src.imageDerived = true;
         if (raw.reference) src.reference = raw.reference;
         if (raw.url) src.url = raw.url;
         if (raw.note) src.note = raw.note;
@@ -5671,7 +5824,7 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
             const linked = linkedSourceMedia(link);
             if (!linked) { skipMedia(); continue; }
             // An image named by its hash: the image itself (or left out).
-            const media = imageRefSha(linked.file) ? { ...linked, file: resolveImageFile(linked.file, options.images) } : linked;
+            const media = imageRefSha(linked.file) ? { ...linked, file: resolveImageFile(linked.file, options.images, options.pendingImages) } : linked;
             const exc = media.file.startsWith('data:')
                 ? excerptFromDataUrl(media.file, { caption: media.title, pageUrl: media.pageUrl, clip: media.clip, originalSha: media.sha, orient: media.orient })
                 : null;
@@ -5804,6 +5957,8 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
         if (indi.deathAddress) person.deathAddress = indi.deathAddress;
         if (indi.birthStatus) person.birthStatus = indi.birthStatus;
         if (indi.deathStatus) person.deathStatus = indi.deathStatus;
+        if (indi.nameStatus) person.nameStatus = indi.nameStatus;
+        if (indi.marriedSurname && indi.marriedNameStatus) person.marriedNameStatus = indi.marriedNameStatus;
         const dateForms = keptDateForms(indi.dateForms);
         if (dateForms) person.gedcomDates = dateForms;
         // Facts with no field of their own join the note, labelled, ahead of
@@ -6082,7 +6237,7 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
             : [...read.filter(r => r.media?.primary), ...read.filter(r => !r.media?.primary)];
         for (const { link, media } of candidates) {
             if (!media?.file) continue;
-            const file = imageRefSha(media.file) ? resolveImageFile(media.file, options.images) : media.file;
+            const file = imageRefSha(media.file) ? resolveImageFile(media.file, options.images, options.pendingImages) : media.file;
             if (!file) continue;
             if (file.startsWith('data:')) {
                 if (!SAFE_PHOTO_DATA_URL.test(file)) continue;
@@ -6829,6 +6984,16 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
             ...(lineageOverrides || gedcom.lineageMarker ? { lineageOverrides: lineageOverrides ?? {} } : {}),
     };
 
+    // A person with several names after marriage keeps the one of her last
+    // marriage (spec 010, K4.1), not the last one written; a research's file
+    // that says it puts the current one last is taken as it is (K4.2).
+    if (!gedcom.marriedLast) {
+        for (const [gedId, indi] of validIndividuals) {
+            const pid = personIdMap.get(gedId);
+            if (pid && persons[pid] && indi.marriedNames) chooseLastMarriageName(data, persons[pid], indi.marriedNames);
+        }
+    }
+
     // Where the facts came from (spec 066), only when the caller asks.
     let importId: string | undefined;
     /** Another program's own tags kept for "Back to {prog}", by tag (spec 066 G8). */
@@ -7010,7 +7175,7 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
             if (!raw?.verify) return;
             if (gedcom.stromResearch) {
                 if (holder.researchVerify?.[fact]) return;
-                const v = toResearchVerify(raw.verify);
+                const v = toResearchVerify(raw.verify, fact);
                 if (!v) return;
                 // The value it was confirmed with: a change here ends the confirmation.
                 const value = v.confirmed ? factValueSignature(holder, fact) : '';
@@ -7133,6 +7298,13 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
     // Only valid shares of two copies or more (a copy alone, of a subtree or
     // an edited file, is an ordinary event), roles of persons in the tree.
     cleanEventShares(data);
+
+    // A file the user imports: every portrait is in a record of the tree's
+    // files (data v25), as a tree read from storage has it; the same picture
+    // at several people is one record. A research tree's person with its
+    // REFN keeps the portrait as the archive's file. A GEDCOM read for a
+    // research (no import origin) stays as the research has it.
+    if (origin) givePortraitsRecords(data, typeof data.researchAsOf === 'string');
 
     const result: GedcomConversionResult = {
         externalMedia,

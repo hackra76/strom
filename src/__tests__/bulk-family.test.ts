@@ -15,7 +15,8 @@ import { loadFixture } from '../layout/__tests__/helpers/loadFixture.js';
 import { planShownChildrenFolding, type PipelineInput } from '../layout/pipeline/index.js';
 import { assertNoNodeOverlap, assertValidPositions } from '../layout/__tests__/helpers/assertions.js';
 import { auditGeometry } from '../layout/__tests__/helpers/geometryAudit.js';
-import { DEFAULT_LAYOUT_CONFIG, type PersonId, type StromData } from '../types.js';
+import { type PersonId, type StromData } from '../types.js';
+import { DEFAULT_LAYOUT_CONFIG } from '../layout-config.js';
 import { bulkAddedKeys, bulkBroughtInByParent, bulkKeysShown, bulkNewIds, bulkParents, bulkStepWhole, collectBulkFamily, BULK_TWO_GENERATIONS } from '../bulk-family.js';
 import { syntheticBigFamily } from './helpers/synthetic-big-family.js';
 import { budgetReport, measureAgainstBudget } from './helpers/perf-budget.js';
@@ -291,12 +292,18 @@ describe('children and siblings at once on the fixtures', () => {
         };
         count();
         expect(n).toBeGreaterThan(150);
+        // One count takes about 5 ms: so short that a single preemption on a
+        // loaded machine (the whole suite in parallel workers) outweighs it,
+        // while its calibration run escapes it. Each measured run therefore
+        // repeats the count REPS times next to a calibration of the same
+        // length; the budget is per count
+        const REPS = 5;
         const BUDGET_MS = 10;
-        const m = measureAgainstBudget(count, {
-            budgetMs: BUDGET_MS, calibrationRounds: 2, referenceMs: 11, minPairs: 3, maxPairs: 15, maxWallMs: 20_000,
+        const m = measureAgainstBudget(() => { for (let i = 0; i < REPS; i++) count(); }, {
+            budgetMs: BUDGET_MS * REPS, calibrationRounds: 2 * REPS, referenceMs: 11 * REPS, minPairs: 3, maxPairs: 15, maxWallMs: 30_000,
         });
-        console.log(budgetReport('children and siblings count, 3 000 people, depth 6', m, BUDGET_MS));
-        if (m.judged) expect(m.ms).toBeLessThan(BUDGET_MS);
+        console.log(budgetReport(`children and siblings count, 3 000 people, depth 6, ${REPS} counts`, m, BUDGET_MS * REPS));
+        if (m.judged) expect(m.ms / REPS).toBeLessThan(BUDGET_MS);
     }, 120_000);
 
     for (const autoExpand of [false, true]) {

@@ -6,6 +6,7 @@
 import { DataManager, auditPersonName } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { TreeRenderer } from '../renderer.js';
+import type { FanLook } from '../fan-look.js';
 import { ZoomPan } from '../zoom.js';
 import { TreePreview, TreeCompare } from '../tree-preview.js';
 import {
@@ -18,11 +19,10 @@ import {
     RelationContext,
     StromData,
     TreeId,
-    LAST_FOCUSED,
     LastFocusedMarker,
     BranchMarker,
-    BRANCH_MARKERS
 } from '../types.js';
+import { LAST_FOCUSED, BRANCH_MARKERS } from '../model-values.js';
 import { applyBranchMarkerAttrs } from '../branch-marker-attrs.js';
 import { syncBranchMarkerSetting } from './branch-marker-ui.js';
 import { strings, getCurrentLanguage } from '../strings.js';
@@ -48,7 +48,8 @@ function formatDateTime(iso: string): string {
 }
 import { AppExporter } from '../export.js';
 import { SettingsManager } from '../settings.js';
-import { ThemeMode, LanguageSetting, AppMode, AuditLog, APP_VERSION, SurnameDisplay } from '../types.js';
+import { ThemeMode, LanguageSetting, AppMode, AuditLog, SurnameDisplay } from '../types.js';
+import { APP_VERSION } from '../version.js';
 import { importFromFileUrl } from '../pwa.js';
 import { normalizeCardDensity } from '../card-fields.js';
 import { CryptoSession, isEncrypted, encrypt, decrypt, EncryptedData } from '../crypto.js';
@@ -760,6 +761,16 @@ export const appModeMethods = uiModule({
     toggleFanKekule(enabled: boolean): void {
         SettingsManager.setFanKekule(enabled);
         TreeRenderer.render();
+    },
+
+    /**
+     * Settings › Fan (spec 118 §10): the default look kept on the device at
+     * once; the fan follows only while its current look was the default (a
+     * look changed in the Appearance panel stays).
+     */
+    setFanDefaultLook(field: 'style' | 'rodScope' | 'content' | 'portraits', value: string | boolean): void {
+        TreeRenderer.setFanLookDefault({ [field]: value } as Partial<FanLook>);
+        this.syncFanDefaultSetting();
     },
 
     /** Titles of the name on cards and in lists: the view is drawn again (card names, their widths). */

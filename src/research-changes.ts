@@ -5,14 +5,15 @@
  * Pure: no DOM, no storage.
  */
 
-import { StromData, Person, Partnership, PartnershipId, Source, EventParticipant, PersonId, LifeEvent, Attachment, PlaceGeo, isPrimaryName, personSourceIds } from './types.js';
+import { StromData, Person, Partnership, PartnershipId, Source, EventParticipant, PersonId, LifeEvent, Attachment, PlaceGeo } from './types.js';
+import { isPrimaryName, personSourceIds } from './model-values.js';
 import { isPurePlaceholder } from './single-parent.js';
 import { mediaPersonIds, mediaSourceId, mediaSourceIds, personMediaIndex, placePersonId, placeSourceId, samePlace } from './media.js';
 import { collectPlaces } from './places.js';
 import { factValueSignature, handedConfirmations } from './verify.js';
 import type { FactHolder } from './import-origin.js';
 import { getStringsForLang, SUPPORTED_LANGUAGES } from './strings.js';
-import { sourcePlaceDiffers, sourcePlaceKey } from './source-location.js';
+import { composePage, sourcePlaceDiffers, sourcePlaceKey } from './source-location.js';
 
 export type ChangeKind =
     | 'added' | 'deleted' | 'name' | 'gender' | 'birth' | 'death' | 'marriage' | 'event'
@@ -48,7 +49,7 @@ const BIRTH_FIELDS: (keyof Person)[] = ['birthDate', 'birthPlace', 'birthAddress
 const DEATH_FIELDS: (keyof Person)[] = ['deathDate', 'deathPlace', 'deathCause', 'deathAge', 'deathAddress', 'isDeceased'];
 const CITATION_FIELDS: (keyof Person)[] = ['sourceIds', 'birthSourceIds', 'deathSourceIds'];
 /** Not the user's: the research's own knowledge and statuses, and what the app keeps for itself. */
-const IGNORED_FIELDS = new Set<string>(['research', 'birthStatus', 'deathStatus', 'photoOriginalName', 'photoDate', 'photoOriginal', 'partnerships', 'childIds', 'isLocked',
+const IGNORED_FIELDS = new Set<string>(['research', 'birthStatus', 'deathStatus', 'nameStatus', 'marriedNameStatus', 'photoOriginalName', 'photoDate', 'photoOriginal', 'partnerships', 'childIds', 'isLocked',
     'dismissedMarriedSuggestion', 'importId', 'importedValues', 'importedParents', 'researchOrigins', 'originalIds', 'gedcomExtra', 'alsoChildOf',
     'confirmed', 'researchVerify']);
 const MARRIAGE_FIELDS: (keyof Partnership)[] = ['status', 'startDate', 'startPlace', 'endDate', 'endPlace', 'address', 'ages', 'note'];
@@ -323,6 +324,8 @@ export interface SourceChange {
     deleted?: boolean;
     /** An attachment whose source is in neither version: the row stands for the attachment alone (no link). */
     attachmentOnly?: boolean;
+    /** A deleted one's research id (its REFN in the research's version, S0042): retracted there when deleted in edit mode (spec 117 §4). */
+    refn?: string;
 }
 
 /** A couple's change that the people's rows do not tell. */
@@ -460,7 +463,8 @@ export function diffOther(base: StromData | null, current: StromData): OtherChan
         const b = cs[sid];
         const kinds = new Set<SourceChangeKind>();
         if (!b) {
-            sources.push({ sourceId: sid, title: a.title?.trim() || sid, kinds: ['deleted'], citedBy: { persons: 0 }, deleted: true });
+            const refn = typeof a.refn === 'string' && /^S\d{1,9}$/.test(a.refn.trim()) ? a.refn.trim() : '';
+            sources.push({ sourceId: sid, title: a.title?.trim() || sid, kinds: ['deleted'], citedBy: { persons: 0 }, deleted: true, ...(refn ? { refn } : {}) });
             continue;
         }
         if (!a) {
@@ -478,8 +482,8 @@ export function diffOther(base: StromData | null, current: StromData): OtherChan
             if ([...ea.keys()].some(id => !eb.has(id))) kinds.add('excerptRemoved');
             // Anything else of the entry (the archive, the date, a re-cropped excerpt, the reading…).
             // Not the user's: the record it was in a loaded file, its author and tags as written there.
-            const { title: _t1, transcript: _r1, reference: _p1, callNumber: _c1, folio: _f1, image: _i1, excerpts: ex1, originalIds: _o1, gedcomAuthor: _a1, gedcomText: _x1, gedcomExtra: _g1, ...restA } = a;
-            const { title: _t2, transcript: _r2, reference: _p2, callNumber: _c2, folio: _f2, image: _i2, excerpts: ex2, originalIds: _o2, gedcomAuthor: _a2, gedcomText: _x2, gedcomExtra: _g2, ...restB } = b;
+            const { title: _t1, transcript: _r1, reference: _p1, callNumber: _c1, folio: _f1, image: _i1, imageDerived: _d1, excerpts: ex1, originalIds: _o1, gedcomAuthor: _a1, gedcomText: _x1, gedcomExtra: _g1, ...restA } = a;
+            const { title: _t2, transcript: _r2, reference: _p2, callNumber: _c2, folio: _f2, image: _i2, imageDerived: _d2, excerpts: ex2, originalIds: _o2, gedcomAuthor: _a2, gedcomText: _x2, gedcomExtra: _g2, ...restB } = b;
             const sameExcerpts = (ex1 ?? []).filter(e => eb.has(e.id)).every(e => !differs(e, eb.get(e.id)));
             if (differs(restA, restB) || !sameExcerpts) kinds.add('other');
         }
@@ -572,12 +576,21 @@ export function otherRowCount(o: OtherChanges | null): number {
 /**
  * "What will be sent" cannot tell its list exactly: there is no base to compare with (`persons` null — the copy
  * not read yet, a restore before loading, a send taken back with no copy before it), the caller knows the base
- * moved (`opts.inexact`), or, about to send, nothing it could name although the tree is not where the
- * research's version is. An empty list of people with other rows is exact.
+ * moved (`opts.inexact`), or nothing it could name although the tree is not where the research's version is
+ * ("0 people" with Send would say nothing changed). An empty list of people with other rows is exact, and so is
+ * an empty list of a tree in step with the research (`opts.inStep`: nothing to send, previewNothing).
  */
-export function previewInexact(persons: readonly PersonChange[] | null, other: OtherChanges | null, opts: { confirm?: boolean; inexact?: boolean } = {}): boolean {
+export function previewInexact(persons: readonly PersonChange[] | null, other: OtherChanges | null, opts: { inStep?: boolean; inexact?: boolean } = {}): boolean {
     if (persons === null || opts.inexact) return true;
-    return !!opts.confirm && persons.length === 0 && otherRowCount(other) === 0;
+    return !opts.inStep && persons.length === 0 && otherRowCount(other) === 0;
+}
+
+/**
+ * "What will be sent" has nothing to send: the tree is where the research's version is (`inStep`: just
+ * loaded from it, or the last send written and nothing edited since) and nothing is listed — no Send there.
+ */
+export function previewNothing(persons: readonly PersonChange[] | null, other: OtherChanges | null, inStep: boolean, opts: { inexact?: boolean } = {}): boolean {
+    return inStep && !opts.inexact && persons !== null && persons.length === 0 && otherRowCount(other) === 0;
 }
 
 // ==================== WHAT THE RESEARCH DOES NOT READ ====================
@@ -681,6 +694,38 @@ export function gateMediaChanges(list: readonly PersonChange[], other: OtherChan
     return { list: persons, other: { ...other, sources, couples }, older };
 }
 
+/** A person's kinds that are the tree's own files at the person: written only by a research with `media.app` (spec 108). */
+const PERSON_FILE_KINDS: ReadonlySet<ChangeKind> = new Set<ChangeKind>(['attachment', 'attachmentRemoved', 'attachmentEdited']);
+
+/**
+ * Every one of a person's kinds is a file at the person a research of `w`
+ * does not write (without `photos`, i.e. `media.app`): the row is "app only".
+ */
+export function personAppOnly(kinds: readonly ChangeKind[], w: MediaWrites | null): boolean {
+    return !!w && !w.photos && kinds.length > 0 && kinds.every(k => PERSON_FILE_KINDS.has(k));
+}
+
+/**
+ * The people of a send as a research of `w` writes them: without `photos`
+ * (`media.app`, e.g. research 1.34) the files at a person are not written
+ * there, so they leave the person's row (a row left without a kind goes) and
+ * become an "app only" row of that person (verification of 3.30.0 with
+ * research 1.34, N1). With `media.app` (or not known) nothing changes.
+ */
+export function splitPersonAppOnly(list: readonly PersonChange[], w: MediaWrites | null): { list: PersonChange[]; appOnly: SentOtherRow[] } {
+    if (!w || w.photos) return { list: [...list], appOnly: [] };
+    const out: PersonChange[] = [];
+    const appOnly: SentOtherRow[] = [];
+    for (const ch of list) {
+        const files = ch.deleted ? [] : ch.kinds.filter(k => PERSON_FILE_KINDS.has(k));
+        if (!files.length) { out.push(ch); continue; }
+        appOnly.push({ type: 'person', id: ch.personId, title: ch.name, kinds: [...files], appOnly: true });
+        const kinds = ch.kinds.filter(k => !PERSON_FILE_KINDS.has(k));
+        if (kinds.length) out.push({ ...ch, kinds });
+    }
+    return { list: out, appOnly };
+}
+
 /** A written send's rows beyond the people with a source's files named its evidence (`material.links`). */
 export function docSentRows(rows: readonly SentOtherRow[], links: boolean): SentOtherRow[] {
     if (!links) return [...rows];
@@ -696,10 +741,11 @@ export function docSentRows(rows: readonly SentOtherRow[], links: boolean): Sent
  * (their count). `appOnly`: the research does not read it.
  */
 export interface SentOtherRow {
-    type: 'source' | 'couple' | 'places' | 'variants' | 'lineage';
-    /** The source's id, the partnership's id; '' for a summary. */
+    /** `person`: a person's files a research without `media.app` does not write (always `appOnly`, splitPersonAppOnly). */
+    type: 'source' | 'couple' | 'places' | 'variants' | 'lineage' | 'person';
+    /** The source's id, the partnership's id, the person's id; '' for a summary. */
     id: string;
-    /** The source's title as sent ('' for the others: told from the tree). */
+    /** The source's title as sent, the person's name ('' for the others: told from the tree). */
     title: string;
     kinds: string[];
     p1?: PersonId;
@@ -709,6 +755,10 @@ export interface SentOtherRow {
     surname?: string;
     deleted?: true;
     appOnly?: true;
+    /** A deleted source's research id (S0042), when it had one (spec 117 §4). */
+    refn?: string;
+    /** That source retracted in the research by the write (its `retracted`). */
+    retracted?: true;
 }
 
 /** The rows beyond the people a send carries, in the panel's order. */
@@ -717,7 +767,8 @@ export function sentOtherRows(other: OtherChanges | null, unread: ReadonlySet<st
     const out: SentOtherRow[] = [];
     for (const s of other.sources) {
         out.push({ type: 'source', id: s.sourceId, title: s.title, kinds: [...s.kinds],
-            ...(s.deleted || s.attachmentOnly ? { deleted: true as const } : {}), ...(sourceAppOnly(s.kinds, unread) ? { appOnly: true as const } : {}) });
+            ...(s.deleted || s.attachmentOnly ? { deleted: true as const } : {}), ...(sourceAppOnly(s.kinds, unread) ? { appOnly: true as const } : {}),
+            ...(s.deleted && s.refn ? { refn: s.refn } : {}) });
     }
     for (const c of other.couples) {
         out.push({ type: 'couple', id: c.partnershipId, title: '', kinds: [...c.kinds], p1: c.p1, p2: c.p2,
@@ -743,20 +794,40 @@ export function sentOtherRows(other: OtherChanges | null, unread: ReadonlySet<st
 export function sanitizeSentOtherRow(v: unknown): SentOtherRow | null {
     const r = v as Record<string, unknown> | null;
     if (!r || typeof r !== 'object') return null;
-    const type = r.type === 'source' || r.type === 'couple' || r.type === 'places' || r.type === 'variants' || r.type === 'lineage' ? r.type : null;
+    const type = r.type === 'source' || r.type === 'couple' || r.type === 'places' || r.type === 'variants' || r.type === 'lineage' || r.type === 'person' ? r.type : null;
     if (!type) return null;
     const str = (x: unknown, max: number): string => (typeof x === 'string' ? x.slice(0, max) : '');
     const count = typeof r.count === 'number' && r.count > 0 ? Math.floor(r.count) : undefined;
+    let kinds = Array.isArray(r.kinds) ? r.kinds.filter((k): k is string => typeof k === 'string').slice(0, 12) : [];
+    // A person's row names only its files (told by their labels).
+    if (type === 'person') {
+        kinds = kinds.filter(k => PERSON_FILE_KINDS.has(k as ChangeKind));
+        // Without a person or a file it names nothing.
+        if (typeof r.id !== 'string' || !r.id || !kinds.length) return null;
+    }
     return {
         type, id: str(r.id, 80), title: str(r.title, 300),
-        kinds: Array.isArray(r.kinds) ? r.kinds.filter((k): k is string => typeof k === 'string').slice(0, 12) : [],
+        kinds,
         ...(typeof r.p1 === 'string' ? { p1: r.p1 as PersonId } : {}),
         ...(typeof r.p2 === 'string' ? { p2: r.p2 as PersonId } : {}),
         ...(count ? { count } : {}),
         ...(typeof r.surname === 'string' && r.surname ? { surname: r.surname.slice(0, 120) } : {}),
         ...(r.deleted === true ? { deleted: true as const } : {}),
         ...(r.appOnly === true ? { appOnly: true as const } : {}),
+        ...(type === 'source' && typeof r.refn === 'string' && /^S\d{1,9}$/.test(r.refn) ? { refn: r.refn } : {}),
+        ...(type === 'source' && r.retracted === true ? { retracted: true as const } : {}),
     };
+}
+
+/**
+ * The written rows with the deleted sources the write retracted marked
+ * (`retracted` of its answer, S42 = S0042; spec 117 §4).
+ */
+export function withRetractedRows(rows: readonly SentOtherRow[], retracted: readonly string[]): SentOtherRow[] {
+    const num = (id: string) => String(Number(id.slice(1)));
+    const gone = new Set(retracted.filter(id => /^S\d{1,9}$/.test(id)).map(num));
+    if (!gone.size) return [...rows];
+    return rows.map(r => (r.type === 'source' && r.deleted && r.refn && gone.has(num(r.refn)) ? { ...r, retracted: true as const } : r));
 }
 
 // ==================== WHAT A WRITE WROTE OF THE TREE'S OWN FILES ====================
@@ -1035,6 +1106,12 @@ export interface ValueDiff {
      * it comes as a row with `here` empty, not here.
      */
     filled: ValueChange[];
+    /**
+     * Sources whose place the research's version only adds a number to (an
+     * image or a folio it lacked here, the location otherwise the same): said
+     * as one sentence each, never as citation rows (placeNumberAdded).
+     */
+    numbersAdded: { image: number; folio: number };
 }
 
 const str = (v: unknown): string => typeof v === 'string' ? v.trim() : '';
@@ -1078,13 +1155,38 @@ function citedKey(id: string, sources: Record<string, Source>): string {
 }
 
 /**
+ * What the place of `b` only adds to that of `a`: an image or a folio `a` has
+ * not (each other field the same: the call number, the folio or image both
+ * have), the location otherwise the same — its rest as written, or the page
+ * composed without what was added. Null when `b` changes anything else of the
+ * place, or adds nothing.
+ */
+export function placeNumberAdded(a: Source, b: Source): { image: boolean; folio: boolean } | null {
+    const t = (v: string | undefined): string => (v ?? '').trim();
+    if (t(a.callNumber) !== t(b.callNumber)) return null;
+    const added = { image: false, folio: false };
+    for (const k of ['image', 'folio'] as const) {
+        if (t(a[k]) === t(b[k])) continue;
+        if (t(a[k]) || !t(b[k])) return null;
+        added[k] = true;
+    }
+    if (!added.image && !added.folio) return null;
+    if (t(a.reference) === t(b.reference)) return added;
+    const key = sourcePlaceKey(a);
+    const without = (folio: boolean): string => (composePage({ ...b, ...(added.image ? { image: undefined } : {}),
+        ...(folio && added.folio ? { folio: undefined } : {}) }) ?? '').trim();
+    return without(false) === key || without(true) === key ? added : null;
+}
+
+/**
  * The same source record names another page there (the page of a record's first citation is kept on the
- * record itself, so the research changing it keeps the id).
+ * record itself, so the research changing it keeps the id). A number only added to the place is no other
+ * page (placeNumberAdded: a sentence of the dialog, not a row at every citation).
  */
 function pageMoved(id: string, as: Record<string, Source>, bs: Record<string, Source>): boolean {
     const x = as[id];
     const y = bs[id];
-    return !!x && !!y && sourcePlaceDiffers(x, y);
+    return !!x && !!y && sourcePlaceDiffers(x, y) && !placeNumberAdded(x, y);
 }
 
 /**
@@ -1264,5 +1366,13 @@ export function diffValues(here: StromData, there: StromData): ValueDiff {
     }
     const added = Object.values(tp).filter(p => !p.isPlaceholder && !hp[p.id]);
     addedFacts += added.reduce((n, p) => n + factsOf(p), 0);
-    return { rows, addedPersons: added.length, addedFacts, filled };
+    // Sources the research's version only adds an image or a folio to: counted, one sentence each.
+    const numbersAdded = { image: 0, folio: 0 };
+    for (const [id, a] of Object.entries(hs)) {
+        const b = ts[id];
+        const more = b && sourcePlaceDiffers(a, b) ? placeNumberAdded(a, b) : null;
+        if (more?.image) numbersAdded.image++;
+        if (more?.folio) numbersAdded.folio++;
+    }
+    return { rows, addedPersons: added.length, addedFacts, filled, numbersAdded };
 }

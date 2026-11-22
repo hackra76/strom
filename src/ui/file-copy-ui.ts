@@ -17,7 +17,7 @@ import { TreeId, TreeMetadata } from '../types.js';
 import { formatRelativeDateTime } from '../format.js';
 import { getPersistenceState, settledPersistenceState, PersistenceState, detectPrivateWindow } from '../persistence.js';
 import {
-    hasUnsavedChanges, shouldShowNotice, shouldShowUnsavedIndicator, unsavedTrees, storageAdvice, isIosDevice, browserFamily, StorageAdvice,
+    hasUnsavedChanges, shouldShowNotice, shouldShowUnsavedIndicator, unsavedTrees, unsavedKind, storageAdvice, isIosDevice, browserFamily, StorageAdvice,
 } from '../file-copy.js';
 import { canPromptInstall, promptInstall, isStandaloneDisplay } from '../pwa.js';
 import { appBrowserName, currentAppBrowser, needsTransfer } from '../research-transfer.js';
@@ -25,9 +25,12 @@ import { isPromoAvailable } from '../research-promo.js';
 import { onComputer } from './research-ui.js';
 import { uiModule } from './module.js';
 import { activatedElement, runBusy } from './busy.js';
+import { imagesToAwait } from '../image-loads.js';
+import { imagesBeforeOutput } from './output-images.js';
 import { holdLeave } from './busy-leave.js';
 import { whilePicking } from './file-pick.js';
 import { iconSvg } from '../icons.js';
+import { watchStorageNotices } from './notice-place.js';
 
 /** Last known storage state (refreshed on every check; best-effort until known). */
 let knownState: PersistenceState = 'best-effort';
@@ -55,9 +58,10 @@ function activeTree(): { id: TreeId; meta: TreeMetadata } | null {
     return id && meta ? { id, meta } : null;
 }
 
-/** The notice text, with the device's own advice. */
-function noticeMessage(treeName: string): string {
+/** The notice text, with the device's own advice; `photos`: the research holds the tree but for its photos. */
+function noticeMessage(treeName: string, photos = false): string {
     const s = strings.fileCopy;
+    if (photos) return s.noticePhotos(treeName);
     const advice = currentAdvice();
     return advice === 'install' ? s.noticeInstall(treeName)
         : advice === 'install-menu' ? s.noticeInstallMenu(treeName)
@@ -89,13 +93,15 @@ let quickSaveAnnouncedAt = 0;
 
 /** Whether the "only in browser" state was showing at the last render. */
 let unsavedShown = false;
+/** It was about the photos alone (the research holds the rest, spec 108 K1b.1). */
+let unsavedPhotos = false;
 /** The toolbar pill's brief "Saved to file" after an export. */
 let savedFlashTimer: ReturnType<typeof setTimeout> | null = null;
 /** Re-render when a research's hold on a tree's edits runs out. */
 let holdTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Paint a storage pill (toolbar or storage dialog) in one of its states. */
-function setPillState(el: HTMLElement, state: PillState): void {
+function setPillState(el: HTMLElement, state: PillState, photos = false): void {
     const s = strings.fileCopy;
     el.classList.toggle('is-unsaved', state === 'unsaved');
     el.classList.toggle('is-saved', state === 'saved');
@@ -111,7 +117,8 @@ function setPillState(el: HTMLElement, state: PillState): void {
         el.replaceChildren(icon, label);
     }
     icon.innerHTML = iconSvg(state === 'saved' ? 'file-saved' : state === 'persistent' ? 'lock' : 'alert-triangle');
-    label.textContent = state === 'saved' ? s.savedShort : state === 'persistent' ? s.persistentShort : s.indicatorShort;
+    label.textContent = state === 'saved' ? s.savedShort : state === 'persistent' ? s.persistentShort
+        : photos ? s.photosShort : s.indicatorShort;
 }
 
 /** ≤1024px: the bottom bar's "More" tab carries the state, not the toolbar. */
@@ -130,7 +137,7 @@ export function syncMoreTabLabel(): void {
         tab.removeAttribute('aria-label');
         return;
     }
-    tab.setAttribute('aria-label', strings.fileCopy.moreHint);
+    tab.setAttribute('aria-label', tab.dataset.storagePhotos === '1' ? strings.fileCopy.photosMoreHint : strings.fileCopy.moreHint);
 }
 
 /** Two ring pulses (CSS; none with reduced motion). */
@@ -169,16 +176,23 @@ export const fileCopyMethods = uiModule({
      * research's hold runs out.
      */
     unsavedOutsideResearch(): TreeMetadata[] {
+        return this.unsavedOutsideResearchKind().trees;
+    },
+
+    /** unsavedOutsideResearch, and whether only their photos are unsaved (the research holds the rest). */
+    unsavedOutsideResearchKind(): { trees: TreeMetadata[]; kind: 'photos' | 'changes' } {
         const now = Date.now();
         let next = Infinity;
+        const holds: { photos?: boolean }[] = [];
         const out = unsavedTreeList().filter(t => {
             const hold = this.researchHoldsTree(t.id, now);
             if (hold.until) next = Math.min(next, hold.until);
+            if (!hold.holds) holds.push(hold);
             return !hold.holds;
         });
         if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
         if (next < Infinity) holdTimer = setTimeout(() => { holdTimer = null; this.renderUnsavedIndicator(); }, next - now + 500);
-        return out;
+        return { trees: out, kind: unsavedKind(holds) };
     },
 
     /** What a research holds changed: paint the pill again (once the storage state is known). */
@@ -191,21 +205,29 @@ export const fileCopyMethods = uiModule({
         return unsavedShown;
     },
 
+    /** The state showing is about the photos alone (the "More" sheet names it so). */
+    isUnsavedPhotosOnly(): boolean {
+        return unsavedShown && unsavedPhotos;
+    },
+
     renderUnsavedIndicator(): void {
+        const unsaved = this.unsavedOutsideResearchKind();
         const show = shouldShowUnsavedIndicator({
             state: knownState,
-            unsavedCount: this.unsavedOutsideResearch().length,
+            unsavedCount: unsaved.trees.length,
             viewMode: DataManager.isViewMode(),
         });
         unsavedShown = show;
+        unsavedPhotos = show && unsaved.kind === 'photos';
+        const title = unsavedPhotos ? strings.fileCopy.photosTitle : strings.fileCopy.indicatorTitle;
         const el = document.getElementById('unsaved-copy-indicator');
         if (el) {
             if (show) {
                 if (savedFlashTimer) { clearTimeout(savedFlashTimer); savedFlashTimer = null; }
                 el.classList.remove('is-fading');
-                setPillState(el, 'unsaved');
-                el.title = `${strings.fileCopy.indicatorTitle} (${this.shortcutHint('save')})`;
-                el.setAttribute('aria-label', strings.fileCopy.indicatorTitle);
+                setPillState(el, 'unsaved', unsavedPhotos);
+                el.title = `${title} (${this.shortcutHint('save')})`;
+                el.setAttribute('aria-label', title);
                 el.style.display = 'inline-flex';
             } else if (!savedFlashTimer) {
                 el.style.display = 'none';
@@ -217,6 +239,7 @@ export const fileCopyMethods = uiModule({
         const more = document.getElementById('bb-view-more');
         if (more) {
             more.dataset.storage = show ? '1' : '';
+            more.dataset.storagePhotos = unsavedPhotos ? '1' : '';
             syncMoreTabLabel();
         }
     },
@@ -277,19 +300,20 @@ export const fileCopyMethods = uiModule({
     renderFileCopyNotice(): void {
         const tree = activeTree();
         const fresh = tree ? TreeManager.getTreeMetadata(tree.id) : null;
+        const hold = fresh ? this.researchHoldsTree(fresh.id) : null;
         const show = !!fresh && shouldShowNotice({
             state: knownState,
             info: fresh,
             personCount: personCount(),
             viewMode: DataManager.isViewMode(),
             enabled: SettingsManager.isFileCopyRemindersEnabled(),
-        }) && !this.researchHoldsTree(fresh.id).holds;
+        }) && !hold?.holds;
         const existing = document.getElementById('file-copy-notice');
         if (!show || !fresh) {
             existing?.remove();
             return;
         }
-        const message = noticeMessage(fresh.name);
+        const message = noticeMessage(fresh.name, hold?.photos === true);
         if (existing) {
             const text = existing.querySelector('.file-copy-notice-text');
             if (text) text.textContent = message;
@@ -333,6 +357,8 @@ export const fileCopyMethods = uiModule({
         });
         el.append(icon, body, close);
         document.body.appendChild(el);
+        // In the Table view it stands below the table's controls (P1a).
+        watchStorageNotices();
         requestAnimationFrame(() => el.classList.add('show'));
     },
 
@@ -370,6 +396,17 @@ export const fileCopyMethods = uiModule({
      * "Try again". The shortcut (no button) says only the toast.
      */
     runQuickSave(origin: HTMLElement | null, make: () => Promise<string | null>, again: () => void): void {
+        // The tree's photos still on their way: the copy waits for them (spec 116 §8), its button says so.
+        const waits = imagesToAwait();
+        void imagesBeforeOutput(strings.photos.out.backup, { el: origin }).then(async (go) => {
+            if (go === 'cancelled') return;
+            // The tree as stored (its photos stored once they all came) is what goes into the file.
+            if (waits) await TreeManager.flush();
+            this.runQuickSaveNow(origin, make, again);
+        });
+    },
+
+    runQuickSaveNow(origin: HTMLElement | null, make: () => Promise<string | null>, again: () => void): void {
         const save = async (): Promise<void> => {
             const release = holdLeave('export');
             try {
@@ -469,7 +506,7 @@ export const fileCopyMethods = uiModule({
         pill.className = 'storage-status-state';
         const chip = document.createElement('span');
         chip.className = 'storage-pill';
-        setPillState(chip, state);
+        setPillState(chip, state, state === 'unsaved' && this.isUnsavedPhotosOnly());
         pill.appendChild(chip);
         const nodes: HTMLElement[] = [pill];
 
@@ -547,9 +584,11 @@ export const fileCopyMethods = uiModule({
         if (!tree || DataManager.isViewMode()) return null;
         const s = strings.fileCopy;
         const { meta } = tree;
-        if (!meta.fileCopyAt) return s.copyNever(meta.name);
+        // The research holds the tree but for its photos: the sentence says what is only here.
+        const photos = hasUnsavedChanges(meta) && this.researchHoldsTree(tree.id).photos === true;
+        if (!meta.fileCopyAt) return s.copyNever(meta.name) + (photos ? ` ${s.copyPhotosNever}` : '');
         const when = formatRelativeDateTime(Date.parse(meta.fileCopyAt), getCurrentLanguage());
-        return s.copyAt(meta.name, when) + ' ' + (hasUnsavedChanges(meta) ? s.copyChanged : s.copyUpToDate);
+        return s.copyAt(meta.name, when) + ' ' + (photos ? s.copyPhotosSince : hasUnsavedChanges(meta) ? s.copyChanged : s.copyUpToDate);
     },
 
     storageStateSentence(): string {

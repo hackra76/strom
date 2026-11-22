@@ -1,7 +1,7 @@
 import { test, expect, Page } from '@playwright/test';
 import { card } from './helpers.js';
 import {
-    BRIDGE, BRIDGE2, UUID, HEAD, NEW_HEAD, block, dot, editJan, fakeBridge, links, openResearch, openResearchMenu, poll, pollUntilStuck, researchGed, FakeBridge, acceptLoad,
+    BRIDGE, BRIDGE2, UUID, HEAD, NEW_HEAD, block, dot, editJan, fakeBridge, links, openResearch, openResearchMenu, pauseClock, poll, pollUntilStuck, researchGed, FakeBridge, acceptLoad,
 } from './research-bridge.js';
 
 /**
@@ -1703,6 +1703,10 @@ test.describe('the research as an archive', () => {
         const where = page.locator('#research-tree-settings-modal #research-mode-where');
         await page.evaluate(() => window.Strom.UI.researchActionTreeSettings());
         await expect(where).toHaveText('The research is switched to a Strom archive in the research: Settings → “Research, or only a Strom archive”. Open the research, opens in the research');
+        // From the click on, the page's time moves only by the steps below: the open's working look comes 120 ms
+        // after the click, on the button drawn again if it is there by then (else in a toast); a busy machine
+        // reopening the dialog later would find the state gone to the toast.
+        await pauseClock(page);
         await where.locator('#research-mode-where-open').click();
         await expect(page.locator('#research-tree-settings-modal')).toHaveCount(0);
         expect(await links(page)).toEqual([`strom-research://open?tree=${UUID}`]);
@@ -1713,6 +1717,7 @@ test.describe('the research as an archive', () => {
         // A person's next step, not the second click of a double click (the same link within 400 ms hands nothing over).
         // The button drawn again shows the first open's "Opening the research…" until its 10 s limit (no proof
         // comes from this bridge): the limit passes on the page's clock.
+        await page.clock.runFor(150);
         await expect(where.locator('#research-mode-where-open')).toHaveAttribute('aria-busy', 'true');
         await page.clock.fastForward(10_500);
         await expect(where.locator('#research-mode-where-open')).not.toHaveAttribute('aria-busy', 'true');
@@ -2629,4 +2634,55 @@ test.describe('the research not running, on tablet and phone (audit 017 a-D6)', 
         await poll(page);
         await expect(moreCount(page)).toBeHidden();
     });
+});
+
+test('following the research: Add to list in the person menu, a Table row and Lists of people; its undo goes; nothing waits to be sent, nothing goes (N2)', async ({ page }) => {
+    const bridge = await autoTree(page, {}, MIDDAY);
+    await page.route(`${BRIDGE}/events`, () => new Promise<void>(() => { /* never answers */ }));
+    await page.evaluate(base => window.Strom.UI.startLiveFollow(base, { follow: true }), BRIDGE);
+    await expect(page.locator('#live-panel')).toBeVisible();
+    expect(await page.evaluate(() => window.Strom.DataManager.isLiveFollowing())).toBe(true);
+    const posts = bridge.posts.length;
+    const jan = await page.evaluate(() => window.Strom.DataManager.getAllPersons().find(p => p.firstName === 'Jan')!.id);
+    const listIds = () => page.evaluate(() => {
+        const l = window.Strom.DataManager.getPersonLists().find(x => x.name === 'Letters to write');
+        return l ? window.Strom.DataManager.getPersonListIds(l.id) : null;
+    });
+
+    // Lists of people: no "read only", New list… offered.
+    await page.evaluate(() => window.Strom.UI.showPersonLists());
+    const lists = page.locator('#person-lists-modal');
+    await expect(lists.locator('.pl-head')).toBeVisible();
+    await expect(lists.locator('.pl-ro')).toHaveCount(0);
+    await expect(lists.locator('.pl-new').first()).toBeVisible();
+    await lists.locator('.pl-close').click();
+    await page.evaluate(() => window.Strom.DataManager.createPersonList({ name: 'Letters to write', dynamic: false }));
+
+    // The person menu: Add to list ›, and Undo on its toast takes it back.
+    await card(page, 'Jan').click();
+    await page.locator('.context-menu [data-menu="add-to-list"]').click();
+    await page.locator('.context-submenu [data-action^="list-toggle:"]').click();
+    const added = page.locator('.undo-toast', { hasText: 'Jan Fíšek added to “Letters to write”.' });
+    await expect(added).toBeVisible();
+    expect(await listIds()).toEqual([jan]);
+    await added.locator('.undo-toast-btn').click();
+    await expect.poll(listIds).toEqual([]);
+    await expect(page.locator('.toast', { hasText: 'locked' })).toHaveCount(0);
+    // The undone toast is gone before the Table's own toast is looked for.
+    await expect(added).toHaveCount(0);
+
+    // A Table row's menu.
+    await page.locator('#view-mode-table').click();
+    await page.locator(`#table-container .tv-body .tv-row[data-key="p:${jan}"] .tv-name`).click({ button: 'right' });
+    await page.locator('.tv-menu .tv-menu-item', { hasText: 'Add to list' }).click();
+    await page.locator('.tv-menu .tv-menu-item', { hasText: 'Letters to write' }).click();
+    await expect(page.locator('.undo-toast', { hasText: 'Jan Fíšek added to “Letters to write”.' })).toBeVisible();
+    expect(await listIds()).toEqual([jan]);
+
+    // Nothing for the research: no edit counted, nothing sent after the quiet time.
+    const auto = await page.evaluate((id) => JSON.parse(localStorage.getItem(`strom-research-auto:${id}`) ?? '{}'), await treeId(page));
+    expect(auto.edits).toBeUndefined();
+    expect(auto.unsentSince).toBeUndefined();
+    await page.clock.fastForward(QUIET + 1000);
+    expect(bridge.posts.length).toBe(posts);
 });

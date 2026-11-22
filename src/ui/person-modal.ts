@@ -16,26 +16,25 @@ import {
     PartnershipId,
     PartnershipStatus,
     Gender,
-    GENDERS,
-    isGender,
+    
     LifeEvent,
     Story,
     RelationType,
     RelationContext,
     StromData,
     TreeId,
-    LAST_FOCUSED,
     LastFocusedMarker,
     PortraitCrop,
     PortraitSource
 } from '../types.js';
+import { GENDERS, isGender, LAST_FOCUSED } from '../model-values.js';
 import { coupleEventLabel, newestLifeEvent } from '../events.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { storyFactText } from '../story-sources.js';
 import { isLivingPerson, inferBirthUpperBounds } from '../privacy.js';
 import { dataUrlByteSize } from '../photo.js';
 import { openPortraitEditor } from './portrait-editor.js';
-import { PendingPortrait, PortraitOrigin, portraitCropOf, portraitOriginOf, portraitOriginImage, canEditPortrait } from './portrait-actions-ui.js';
+import { PendingPortrait, PortraitFileLink, PortraitOrigin, portraitCropOf, portraitOriginOf, portraitOriginImage, canEditPortrait, linkPortraitFile, portraitLinkImage } from './portrait-actions-ui.js';
 import { personInitials } from '../initials.js';
 import { shownName, nameHtml } from '../person-name.js';
 import { parseGedcom, convertToStrom, GedcomConversionResult } from '../ged-parser.js';
@@ -52,7 +51,8 @@ import { PersonPicker } from '../person-picker.js';
 import { AppExporter } from '../export.js';
 import { SettingsManager } from '../settings.js';
 import { lifelineChips, setLifelineChip, newLifelineCard } from '../lifeline-view.js';
-import { ThemeMode, LanguageSetting, AppMode, AuditLog, MediaOriginal, personSourceIds, isPrimaryName } from '../types.js';
+import { ThemeMode, LanguageSetting, AppMode, AuditLog, MediaOriginal } from '../types.js';
+import { personSourceIds, isPrimaryName } from '../model-values.js';
 import { CryptoSession, isEncrypted, encrypt, decrypt, EncryptedData } from '../crypto.js';
 import { validateTreeData, ValidationResult as TreeValidationResult, ValidationIssue } from '../validation.js';
 import * as CrossTree from '../cross-tree.js';
@@ -74,6 +74,13 @@ import { storyWithDraft } from './story-compare-ui.js';
 import { offeredDetails, resetDetailGroup, renderAgeCheck, ageBirthDate, eventDetailLine } from './event-details-ui.js';
 import { bindDeceasedAutoTick } from './deceased-autotick.js';
 import { TreeEditLock } from './tree-edit-lock.js';
+import { IMAGES_ARRIVED_EVENT, IMAGES_STATE_EVENT, imageLoads, type ImagesArrivedDetail } from '../image-loads.js';
+import { setImgState, type ImgState } from './image-slot.js';
+import { busySpinHtml } from './busy.js';
+import {
+    openPhotoModel, setModelPhoto, photoModelState, photoArrived, photoFollowsData, photoSaveFields, photoSaved,
+    photoChanged, canRecropPhoto, personPhotoKey,
+} from './person-photo-model.js';
 
 /**
  * Delete person sits in the footer, except on a phone (T24): there the footer
@@ -184,7 +191,8 @@ export const personModalMethods = uiModule({
         if (residenceClear) { residenceClear.value = ''; residenceClear.readOnly = false; }
         this.fillStoryFields(null);
         this.pendingPortrait = null;
-        this.setPhotoPreview(undefined);
+        this.photoModel = openPhotoModel(null, undefined);
+        this.showPhotoModel();
 
         // Header LAST — it reads the name inputs and the photo preview, so it
         // must run after they are reset, or it shows the previous person.
@@ -358,6 +366,7 @@ export const personModalMethods = uiModule({
             ctxEl.textContent = [modeTitle, summary].filter(Boolean).join(' · ');
             ctxEl.style.display = ctxEl.textContent ? '' : 'none';
         }
+        this.updatePortraitOffer();
         this.bindLivePersonModalName();
         this.updatePersonModalName();
         this.updatePersonModalRod(person);
@@ -422,7 +431,7 @@ export const personModalMethods = uiModule({
             + ` aria-label="${esc(R.menu)}" title="${esc(R.menu)}">⋯</button>`
             + `<div class="pm-rod-menu" role="menu" aria-label="${esc(R.menu)}" hidden>`
             // 026 §7, 1102 §3.2: Show in tree · Family line page · Family page (…) · Family book… · Pages for selected people… · Edit… · Start…
-            + item('show', getSelectedRod() === value.row.rodId ? strings.rodView.whole : R.showInTree) + item('page', strings.familyPages.rodPage) + famHtml + item('book', R.book)
+            + item('show', getSelectedRod() === value.row.rodId ? strings.selection.clear : R.showInTree) + item('page', strings.familyPages.rodPage) + famHtml + item('book', R.book)
             + item('selpages', strings.familyPages.selPersonsAction)
             + item('edit', R.edit, locked) + item('split', R.split, locked)
             + (locked ? `<p class="pm-rod-menu-note">${esc(hint)}</p>` : '')
@@ -603,13 +612,16 @@ export const personModalMethods = uiModule({
         for (const g of GENDERS) avatar.classList.toggle(g, g === gender);
         const first = (document.getElementById('input-firstname') as HTMLInputElement | null)?.value.trim() || '';
         const last = (document.getElementById('input-lastname') as HTMLInputElement | null)?.value.trim() || '';
-        const photo = (document.querySelector('#photo-preview img') as HTMLImageElement | null)?.getAttribute('src');
+        const photo = this.photoModel.value;
         if (photo) {
             avatar.innerHTML = `<img src="${this.escapeHtml(photo)}" alt="">`;
         } else {
             const initials = personInitials(first, last);
             avatar.innerHTML = `<span class="pm-avatar-initials">${this.escapeHtml(initials || '?')}</span>`;
         }
+        // The same state as the preview while a photo is on its way (one that did not come: calm, as without one).
+        const state = photoModelState(this.photoModel);
+        setImgState(avatar, state === 'loading' || state === 'refresh' ? state : 'none');
     },
 
     /** Fill the small copper section summaries from the person's data. */
@@ -933,9 +945,11 @@ export const personModalMethods = uiModule({
 
         this.fillStoryFields(person);
 
-        // Photo preview
+        // Photo preview: the portrait as a value of its own (a photo still on its way shows as such, spec 116 I2).
         this.pendingPortrait = null;
-        this.setPhotoPreview(person.photo);
+        this.photoModel = openPhotoModel(person.id, person.photo);
+        this.wirePersonModalImages();
+        this.showPhotoModel();
 
         // Header LAST — it reads the name inputs and the photo preview, so it
         // must run after they are filled, or it shows the PREVIOUS person.
@@ -1334,23 +1348,178 @@ export const personModalMethods = uiModule({
         hint.appendChild(btn);
     },
 
-    /** Update the modal's photo preview, remove button and size label. */
-    setPhotoPreview(dataUrl: string | undefined): void {
+    /** The dialog's portrait (photoModel) in the preview, in the state the evidence gives it; `arrived`: it just came (fades in). */
+    showPhotoModel(arrived = false): void {
+        this.setPhotoPreview(this.photoModel.value, arrived ? 'loaded' : photoModelState(this.photoModel));
+    },
+
+    /**
+     * Update the modal's photo preview, its buttons, size label and the
+     * sentence of a photo still on its way (spec 116 §4.1): loading (the
+     * initials under the veil), refresh (the stored one under it), failed
+     * (with Try again; a kept older photo works as always), loaded (the one
+     * that came, fading in). Edit crop and Remove wait while it comes.
+     * The preview only shows: Save takes the portrait from photoModel.
+     */
+    setPhotoPreview(dataUrl: string | undefined, state: ImgState = 'none'): void {
         const preview = document.getElementById('photo-preview');
         const removeBtn = document.getElementById('photo-remove-btn');
         const sizeEl = document.getElementById('photo-size');
+        const waiting = state === 'loading' || state === 'refresh';
         if (preview) {
-            // Note: this slot's <img> IS the person's photo when saving, so
-            // nothing decorative may be put here — it would be saved as theirs.
-            preview.innerHTML = dataUrl ? `<img src="${this.escapeHtml(dataUrl)}" alt="">` : '';
+            preview.dataset.look = state === 'loaded' ? 'none' : state;
+            if (state === 'loaded' && dataUrl) {
+                setImgState(preview, 'loaded', dataUrl);
+            } else {
+                const initials = () => {
+                    const value = (id: string) => (document.getElementById(id) as HTMLInputElement | null)?.value.trim() || '';
+                    return personInitials(value('input-firstname'), value('input-lastname')) || '?';
+                };
+                preview.innerHTML = dataUrl ? `<img src="${this.escapeHtml(dataUrl)}" alt="">`
+                    : state === 'loading' || state === 'failed' ? `<span class="pm-avatar-initials">${this.escapeHtml(initials())}</span>` : '';
+                // A kept older photo whose newer one did not come shows as it is (the sentence says it).
+                setImgState(preview, state === 'failed' && dataUrl ? 'none' : state === 'loaded' ? 'none' : state);
+            }
         }
-        if (removeBtn) removeBtn.style.display = dataUrl ? '' : 'none';
+        const shown = !!dataUrl && !waiting;
+        if (removeBtn) removeBtn.style.display = shown ? '' : 'none';
         // "Edit crop" only beside a portrait (spec 107 §2).
         const recropBtn = document.getElementById('photo-recrop-btn');
-        if (recropBtn) recropBtn.style.display = dataUrl ? '' : 'none';
-        if (sizeEl) sizeEl.textContent = dataUrl ? `${Math.round(dataUrlByteSize(dataUrl) / 1024)} kB` : '';
+        if (recropBtn) recropBtn.style.display = shown ? '' : 'none';
+        if (sizeEl) sizeEl.textContent = shown && dataUrl ? `${Math.round(dataUrlByteSize(dataUrl) / 1024)} kB` : '';
+        this.renderPhotoState(state, !!dataUrl);
         // Mirror the photo into the header avatar (falls back to initials).
         this.updateHeaderAvatar();
+        this.updatePortraitOffer();
+    },
+
+    /**
+     * "Portrait from a photo…" (spec 107 §2): a person without a portrait
+     * who has a photo to offer now gets the link beside the header's context,
+     * the header's circle and the empty preview as buttons into the picker.
+     * A person without such photos (or with a portrait) keeps them quiet.
+     */
+    updatePortraitOffer(): void {
+        const id = this.currentId;
+        const offer = !!id && !this.photoModel.value && canEditPortrait(id)
+            && this.portraitPickerModel(id).shown.length > 0;
+        const label = strings.portrait.fromPhoto;
+        const link = document.getElementById('pm-portrait-link');
+        const sep = document.getElementById('pm-portrait-sep');
+        const ctx = document.getElementById('modal-title');
+        if (link) link.hidden = !offer;
+        const ctxShown = !!ctx?.textContent && ctx.style.display !== 'none';
+        if (sep) sep.hidden = !offer || !ctxShown;
+        const row = link?.parentElement;
+        if (row) row.hidden = !offer && !ctxShown;
+        const avatar = document.getElementById('pm-avatar') as HTMLButtonElement | null;
+        if (avatar) {
+            avatar.disabled = !offer;
+            if (offer) {
+                avatar.setAttribute('aria-label', label);
+                avatar.title = label;
+            } else {
+                avatar.removeAttribute('aria-label');
+                avatar.removeAttribute('title');
+            }
+            // Without the offer only a picture (as the circle was before).
+            if (offer) avatar.removeAttribute('aria-hidden');
+            else avatar.setAttribute('aria-hidden', 'true');
+        }
+        // The empty preview of the photo section: a button into the picker too.
+        const preview = document.getElementById('photo-preview');
+        if (preview) {
+            const pick = offer && !preview.querySelector('img, .pm-avatar-initials');
+            preview.classList.toggle('is-pick', pick);
+            if (pick) {
+                preview.setAttribute('role', 'button');
+                preview.tabIndex = 0;
+                preview.setAttribute('aria-label', strings.labels.photoChoose);
+                preview.setAttribute('aria-haspopup', 'dialog');
+            } else {
+                preview.removeAttribute('role');
+                preview.removeAttribute('tabindex');
+                preview.removeAttribute('aria-label');
+                preview.removeAttribute('aria-haspopup');
+            }
+        }
+    },
+
+    /** The empty preview chosen (a click, Enter, Space): the picker under it. */
+    photoPreviewPick(e: Event): void {
+        const preview = e.currentTarget as HTMLElement | null;
+        if (!preview?.classList.contains('is-pick')) return;
+        if (e instanceof KeyboardEvent) {
+            if (e.key !== 'Enter' && e.key !== ' ') return;
+            e.preventDefault();
+        }
+        this.choosePersonPhoto(preview);
+    },
+
+    /** The sentence under the photo's buttons: on its way (spinner), or did not come with Try again (neutral, §2). */
+    renderPhotoState(state: ImgState, hasPhoto: boolean): void {
+        const actions = document.querySelector('#person-modal .photo-actions');
+        if (!actions) return;
+        actions.querySelectorAll('.photo-state').forEach(el => el.remove());
+        const p = strings.photos;
+        if (state === 'loading' || state === 'refresh') {
+            const line = document.createElement('span');
+            line.className = 'busy-st photo-state';
+            line.setAttribute('role', 'status');
+            line.innerHTML = `${busySpinHtml(12)}${this.escapeHtml(state === 'refresh' ? p.loadingNew : p.loading)}`;
+            actions.appendChild(line);
+        } else if (state === 'failed') {
+            const key = this.photoModel.key;
+            const line = document.createElement('div');
+            line.className = 'busy-msg photo-state';
+            line.setAttribute('role', 'status');
+            line.innerHTML = `<span>${this.escapeHtml(hasPhoto ? p.failedNew : p.failed)}</span>`
+                + `<button type="button" class="link">${this.escapeHtml(strings.busy.retry)}</button>`;
+            line.querySelector('button')!.addEventListener('click', () => { if (key) imageLoads.retry([key]); });
+            actions.appendChild(line);
+        }
+    },
+
+    /**
+     * Images that come after the tree while the person dialog is open (spec
+     * 116 §4.1): the portrait not changed in the dialog takes the one that
+     * came (the typed fields stay as they are); a change of its state (did
+     * not come, Try again) shows at once.
+     */
+    wirePersonModalImages(): void {
+        if (this.personModalImagesWired || typeof window === 'undefined') return;
+        this.personModalImagesWired = true;
+        // The dialog in use (also while the relationships panel is over it: it comes back as it was left).
+        const open = (): boolean => !!this.currentId && !!this.personModalSnapshot && this.photoModel.key === personPhotoKey(this.currentId);
+        window.addEventListener(IMAGES_ARRIVED_EVENT, (e) => {
+            const keys = (e as CustomEvent<ImagesArrivedDetail>).detail?.keys ?? [];
+            const key = this.photoModel.key;
+            if (!open() || !key || !keys.includes(key)) return;
+            const person = DataManager.getPerson(this.currentId!);
+            if (photoArrived(this.photoModel, keys, person?.photo)) {
+                // Not a change made in the dialog: the snapshot follows, so leaving asks nothing.
+                if (this.personModalSnapshot) this.personModalSnapshot.photo = this.photoModel.value ?? '';
+                this.showPhotoModel(true);
+            } else this.showPhotoModel();
+        });
+        window.addEventListener(IMAGES_STATE_EVENT, () => {
+            if (!open() || !this.photoModel.key || this.photoModel.touched) return;
+            // Drawn again only when its look changes (did not come, asked again).
+            if (document.getElementById('photo-preview')?.dataset.look !== photoModelState(this.photoModel)) this.showPhotoModel();
+        });
+    },
+
+    /**
+     * "Choose photo": the photos of the person a portrait can be cut from
+     * (spec 107 "Portrait from a photo"), or straight the file picker when
+     * there are none (and for a person not saved yet).
+     */
+    choosePersonPhoto(anchor: HTMLElement): void {
+        if (this.currentId) {
+            this.openPortraitPicker(this.currentId, anchor, { where: 'dialog' });
+            return;
+        }
+        (document.getElementById('input-photo') as HTMLInputElement | null)?.click();
     },
 
     /**
@@ -1397,6 +1566,11 @@ export const personModalMethods = uiModule({
     /** Save the pending portrait's original as the person's attachment (a new file); the source for updatePerson. */
     attachPendingPortrait(personId: PersonId, pending: PendingPortrait | null): { photoSource?: PortraitSource } {
         if (!pending) return {};
+        // A research's picture: the tree's file at the person now, in Save's step (1121).
+        if (pending.link) {
+            const origin = linkPortraitFile(personId, pending.link);
+            return origin ? { photoSource: { ...origin, ...pending.crop } } : {};
+        }
         if (pending.origin) {
             // Cut from what the tree has: only while it is still there.
             const person = DataManager.getPerson(personId);
@@ -1424,10 +1598,20 @@ export const personModalMethods = uiModule({
      * the finished square, "Choose the photo again…" opening the file picker.
      */
     async recropPersonPhoto(): Promise<void> {
-        const photo = (document.querySelector('#photo-preview img') as HTMLImageElement | null)?.getAttribute('src') || undefined;
+        const photo = this.photoModel.value;
         if (!photo) return;
+        // Not over a photo still on its way (the button is hidden then, spec 116 §4.3).
+        if (!canRecropPhoto(this.photoModel)) {
+            this.showToast(strings.photos.recropWait);
+            return;
+        }
         if (this.currentId && !canEditPortrait(this.currentId)) return;
         const pending = this.pendingPortraitFor(photo);
+        const linked = pending?.link ? portraitLinkImage(pending.link) : null;
+        if (pending?.link && linked) {
+            await this.portraitIntoPersonModal({ source: linked, initial: pending.crop, link: pending.link });
+            return;
+        }
         if (pending?.original) {
             await this.portraitIntoPersonModal({ source: pending.original, initial: pending.crop, original: pending.original, fileName: pending.fileName,
                 ...(pending.file ? { file: pending.file } : {}), ...(pending.originalMeta ? { originalMeta: pending.originalMeta } : {}) });
@@ -1468,8 +1652,10 @@ export const personModalMethods = uiModule({
         /** A recrop of a new file still waiting for Save: the file and its original's identity (spec 108 K2.4). */
         file?: Blob;
         originalMeta?: MediaOriginal;
+        /** A research's picture: it becomes the tree's file at the person on Save (1121). */
+        link?: PortraitFileLink;
     }): Promise<void> {
-        const current = (document.querySelector('#photo-preview img') as HTMLImageElement | null)?.getAttribute('src') || undefined;
+        const current = this.photoModel.value;
         let result: Awaited<ReturnType<typeof openPortraitEditor>>;
         try {
             result = await openPortraitEditor({
@@ -1485,9 +1671,12 @@ export const personModalMethods = uiModule({
         }
         const step = result?.steps[0];
         if (!result || !step) return;
-        this.setPhotoPreview(step.photo);
+        // The person's own choice: Save writes it, and a photo on its way no longer comes over it (spec 116 I2).
+        setModelPhoto(this.photoModel, step.photo);
+        this.showPhotoModel();
         const original = result.original ?? opts.original;
         const pending: PendingPortrait | null = opts.squareOnly ? null
+            : opts.link ? { photo: step.photo, crop: step.crop, link: opts.link }
             : opts.origin ? { photo: step.photo, crop: step.crop, origin: opts.origin }
             : original ? { photo: step.photo, crop: step.crop, original, fileName: opts.fileName ?? '' }
             : null;
@@ -1504,7 +1693,8 @@ export const personModalMethods = uiModule({
     },
 
     removePersonPhoto(): void {
-        this.setPhotoPreview(undefined);
+        setModelPhoto(this.photoModel, undefined);
+        this.showPhotoModel();
         // The Portrait tag leaves the source attachment (spec 107 §4).
         this.renderAttachmentsList();
     },
@@ -1844,9 +2034,10 @@ export const personModalMethods = uiModule({
         // forever (review S2).
         const deceasedChecked = (document.getElementById('input-is-deceased') as HTMLInputElement)?.checked || false;
         const deceasedToggled = !!this.personModalSnapshot && deceasedChecked !== this.personModalSnapshot.deceased;
-        // Current photo from the preview (data URL) or none.
-        const photoImg = document.querySelector('#photo-preview img') as HTMLImageElement | null;
-        const photo = photoImg?.getAttribute('src') || undefined;
+        // The dialog's portrait (never what the preview shows): written only when changed here, so a
+        // photo still on its way is neither emptied nor overwritten with the older one (spec 116 I2).
+        const photo = this.photoModel.value;
+        const photoFields = photoSaveFields(this.photoModel);
         // A portrait from the editor: its original goes to the attachments, the portrait names it.
         const pendingPortrait = this.pendingPortraitFor(photo);
         this.pendingPortrait = null;
@@ -1901,7 +2092,7 @@ export const personModalMethods = uiModule({
                     // A death date implies deceased; otherwise only a toggle speaks.
                     ...(deathDate ? { isDeceased: undefined }
                         : deceasedToggled ? { isDeceased: deceasedChecked } : {}),
-                    photo,
+                    ...photoFields,
                     ...this.attachPendingPortrait(id, pendingPortrait),
                     story: this.collectStory(DataManager.getPerson(id)?.story)
                 });
@@ -1927,7 +2118,7 @@ export const personModalMethods = uiModule({
                 });
                 // Update with extended info if provided
                 if (birthDate || birthPlace || deathDate || deathPlace || notes || refn || question
-                    || photo || story || nameVariants.length > 0 || (deceasedChecked && !deathDate)
+                    || photoFields.photo || story || nameVariants.length > 0 || (deceasedChecked && !deathDate)
                     || Object.values(details).some(Boolean)) {
                     DataManager.updatePerson(created.id, {
                         birthDate,
@@ -1941,7 +2132,7 @@ export const personModalMethods = uiModule({
                         question,
                         // Ticked while adding = known to be deceased (was ignored).
                         ...(deceasedChecked && !deathDate ? { isDeceased: true } : {}),
-                        photo,
+                        ...photoFields,
                         ...this.attachPendingPortrait(created.id, pendingPortrait),
                         story
                     });
@@ -1958,6 +2149,7 @@ export const personModalMethods = uiModule({
             // which is where relatives get added. Non-blocking, auto-dismisses.
             createdFirstId = newPerson.id;
         }
+        photoSaved(this.photoModel);
 
         this.forceCloseModal();
         TreeRenderer.render();
@@ -2063,6 +2255,7 @@ export const personModalMethods = uiModule({
     forceCloseModal(): void {
         document.querySelectorAll('#person-modal .pm-window-conflict').forEach(n => n.remove());
         this.closePersonModalRodMenu();
+        this.closePortraitPicker(false, 'dialog');
         this.closeResearchConflictPanel({ focus: false });
         this.closeLifelineHistoryPopups();
         this.dropLifelineHistoryToastLift();
@@ -2100,8 +2293,6 @@ export const personModalMethods = uiModule({
         const residence = (document.getElementById('input-residence') as HTMLInputElement | null)?.value || '';
         const nameVariants = (document.getElementById('input-name-variants') as HTMLInputElement | null)?.value || '';
         const deceased = (document.getElementById('input-is-deceased') as HTMLInputElement | null)?.checked ?? false;
-        const photo = (document.querySelector('#photo-preview img') as HTMLImageElement | null)?.getAttribute('src') || '';
-
         const story = this.storySnapshot();
 
         return firstName !== s.firstName || lastName !== s.lastName || gender !== s.gender
@@ -2109,7 +2300,7 @@ export const personModalMethods = uiModule({
             || deathDate !== s.deathDate || deathPlace !== s.deathPlace
             || notes !== s.notes || refn !== s.refn || question !== s.question
             || occupation !== s.occupation || residence !== s.residence
-            || nameVariants !== s.nameVariants || deceased !== s.deceased || photo !== s.photo
+            || nameVariants !== s.nameVariants || deceased !== s.deceased || photoChanged(this.photoModel, s.photo)
             || story.storyTitle !== s.storyTitle || story.storyText !== s.storyText
             || this.personDetailsSnapshot() !== s.details
             // A suggestion hidden with × is kept only by saving.
@@ -2155,6 +2346,11 @@ export const personModalMethods = uiModule({
         const primaryNow = person.marriedSurname?.trim() && isPrimaryName(person.primaryName) ? person.primaryName : undefined;
         if (this.primaryNameDraft === this.primaryNameInitial) this.primaryNameDraft = primaryNow;
         this.primaryNameInitial = primaryNow;
+        // A portrait not changed in the dialog follows the data too.
+        if (photoFollowsData(this.photoModel, person.photo)) {
+            snap.photo = this.photoModel.value ?? '';
+            this.showPhotoModel();
+        }
         this.syncGenderSegment();
         this.refreshMarriedSurname();
         this.updateBirthEstimate(person);

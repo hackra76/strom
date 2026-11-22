@@ -18,10 +18,11 @@ import type { Gender, Person, PersonId, PersonList, PersonListRule, PersonListSo
 import { buildLineages, rodLabels, selection, type LineageIndex, type RodId } from './lineage.js';
 import { assignGenerations } from './generations.js';
 import { parseFlexDate } from './dates.js';
+import { imageLoads } from './image-loads.js';
 import { personEvidence, unionsByPerson } from './evidence-level.js';
 import { shownName } from './person-name.js';
 import { getCurrentLanguage, strings, type Language } from './strings.js';
-import { personLineRole, researchLinesOf } from './ui/table-view/table-research.js';
+import { inLine, researchLinesOf } from './ui/table-view/table-research.js';
 import { buildTableModel, rowsOf, type TableModel } from './ui/table-view/table-model.js';
 import { filterRows, sortRows, type FilterItem, type TableFilter } from './ui/table-view/table-filter.js';
 import { ADDED30_DAYS, addedTime, personListsOf } from './person-lists-data.js';
@@ -131,8 +132,7 @@ export function rulePersonIds(index: LineageIndex, rule: PersonListRule, env: Li
             if (lines.source === 'none') break;
             for (const p of Object.values(data.persons)) {
                 if (!p || p.isPlaceholder) continue;
-                const role = personLineRole(lines, p);
-                if (role?.kind === 'line' && role.line.id === rule.directionId) push(p.id);
+                if (inLine(lines, p, rule.directionId)) push(p.id);
             }
             break;
         }
@@ -359,7 +359,8 @@ export function listSummary(index: LineageIndex, list: PersonList, env: ListEnv 
             if (s.birthMin === null || y < s.birthMin) s.birthMin = y;
             if (s.birthMax === null || y > s.birthMax) s.birthMax = y;
         }
-        if (p.photo) s.withPhoto++;
+        // A portrait on its way is the person's photo (spec 116 §5).
+        if (p.photo || imageLoads.onItsWay(`person:${p.id}:photo`)) s.withPhoto++;
         if ((personEvidence(p, data, unions)?.sources ?? 0) > 0) s.withCitation++; else s.noCite++;
         if (p.story?.text?.trim()) s.withStory++;
         if (!done.has(id)) left++;

@@ -18,7 +18,7 @@
  */
 
 import { strings } from '../strings.js';
-import { setResearchOpenLabel } from './research-open-mark.js';
+import { setResearchOpenLabel, researchBridgeAgentLabel } from './research-open-mark.js';
 import { watchToasts, whenFree } from '../toast-slot.js';
 
 /** How a message shows (UI.showToast). */
@@ -28,13 +28,16 @@ export interface ToastOptions {
     closable?: boolean;
     kind?: string;
     /**
-     * `research`: the action opens the research's terminal (its mark); `ai`: an agent works there too.
+     * `research`: the action opens the research's terminal (its mark); `ai`: an agent works there too (without
+     * `research`: an agent works through the bridge, no terminal — the AI badge alone).
      * `work` (§4, "Undo" and its kin): the toast stays, says the work (the one spinner and `work.label`) and its
      * end (✓ for 4 s, or the error with "Try again" and ✕, not closing by itself); `run` gives that end.
      */
     action?: ToastAction;
-    /** A second action beside `action` (e.g. "Export GEDCOM" beside "Try again"). */
-    more?: { label: string; run: () => void };
+    /** A second action beside `action` (e.g. "Export GEDCOM" beside "Try again"); `research`/`ai` as with `action`. */
+    more?: { label: string; run: () => void; research?: boolean; ai?: boolean };
+    /** A third one after them (an output's "Cancel" beside "Try again" and "Continue without", spec 116 §8). */
+    third?: { label: string; run: () => void };
     hold?: boolean;
     /** A notice to be read: it stands 3 s at least before a newer toast takes its place (round 7 §53). */
     notice?: boolean;
@@ -123,7 +126,7 @@ function fillToast(toast: HTMLElement, message: string, opts: ToastOptions, onAc
     } else {
         toast.appendChild(document.createTextNode(message));
     }
-    const acts = [opts.action, opts.more].filter((a): a is NonNullable<ToastOptions['action']> => !!a);
+    const acts = [opts.action, opts.more, opts.third].filter((a): a is NonNullable<ToastOptions['action']> => !!a);
     if (acts.length) {
         // In the group of actions: an "Undo" or "↩ Back" riding along joins it, the group wraps whole
         const actions = document.createElement('span');
@@ -134,6 +137,8 @@ function fillToast(toast: HTMLElement, message: string, opts: ToastOptions, onAc
             act.type = 'button';
             act.className = 'toast-action';
             if (research) setResearchOpenLabel(act, label, { ai });
+            // An agent working through the bridge, no terminal: the AI badge alone.
+            else if (ai) act.innerHTML = researchBridgeAgentLabel(label);
             else act.textContent = label;
             const work = 'work' in a ? (a as ToastAction).work : undefined;
             act.onclick = work ? () => { void workInToast(toast, a as ToastAction, work, opts); } : () => {
@@ -144,6 +149,9 @@ function fillToast(toast: HTMLElement, message: string, opts: ToastOptions, onAc
             actions.appendChild(act);
         }
         toast.appendChild(actions);
+        // Three actions (an output's "Try again · Continue without N photos · Cancel", spec 116 §8) do not fit
+        // beside the sentence: the group goes under it, so the sentence keeps the toast's width.
+        if (acts.length >= 3) toast.classList.add('toast--actions-below');
     }
     if (opts.closable) {
         const close = document.createElement('button');
@@ -399,8 +407,13 @@ export interface ProgressToastHandle {
     update(step: ProgressStep & { title?: string }): void;
     /** Done: a summary with ✓ for 4 s (`role=status`); without a summary it just goes. */
     done(summary?: string): void;
-    /** It failed: the words as an alert (a title over them), ✕ and the actions; it does not go by itself. */
-    fail(text: string, action?: { label: string; run: () => void }, extra?: { title?: string; more?: { label: string; run: () => void }; neutral?: boolean }): void;
+    /**
+     * It failed: the words as an alert (a title over them), ✕ and the actions; it does not go by itself.
+     * `third`: a third action (its own "Cancel"), and no ✕ then (spec 116 §8).
+     */
+    fail(text: string, action?: { label: string; run: () => void }, extra?: {
+        title?: string; more?: { label: string; run: () => void }; third?: { label: string; run: () => void }; neutral?: boolean;
+    }): void;
     /** It goes now. */
     close(): void;
 }
@@ -533,8 +546,9 @@ export function showProgressToast(opts: LongOpts, first: ProgressStep = {}): Pro
             if (ended && !toast.isConnected) return;
             finish();
             // A neutral end (a question, not an error) is said politely, without the error's alert.
-            fillToast(toast, text, { alert: !extra?.neutral, closable: true, kind: 'progress', ...(action ? { action } : {}),
-                ...(extra?.title ? { title: extra.title } : {}), ...(extra?.more ? { more: extra.more } : {}) });
+            fillToast(toast, text, { alert: !extra?.neutral, closable: !extra?.third, kind: 'progress', ...(action ? { action } : {}),
+                ...(extra?.title ? { title: extra.title } : {}), ...(extra?.more ? { more: extra.more } : {}),
+                ...(extra?.third ? { third: extra.third } : {}) });
         },
         close() {
             finish();

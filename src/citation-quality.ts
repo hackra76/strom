@@ -10,8 +10,9 @@
  */
 
 import {
-    CitationMain, CitationQuay, PARTNERSHIP_CITATION_FIELDS, PERSON_CITATION_FIELDS, Source, StromData,
+    CitationMain, CitationQuay, Source, StromData,
 } from './types.js';
+import { PARTNERSHIP_CITATION_FIELDS, PERSON_CITATION_FIELDS } from './model-values.js';
 import { sourcePlaceDiffers, sourcePlaceKey } from './source-location.js';
 import { SUPPORTED_LANGUAGES } from './strings.js';
 import { citeLines, withoutCiteLines } from './import-origin.js';
@@ -254,7 +255,7 @@ export function remapCitations(data: StromData, remap: ReadonlyMap<string, strin
  * — or was changed by hand since — and is never joined.
  */
 const DERIVED_FIELDS = new Set([
-    'id', 'title', 'repository', 'callNumber', 'folio', 'image', 'reference', 'url', 'note', 'quality',
+    'id', 'title', 'repository', 'callNumber', 'folio', 'image', 'imageDerived', 'reference', 'url', 'note', 'quality',
     'recordDate', 'importId', 'originalIds', 'gedcomExtra', 'gedcomAuthor',
 ]);
 

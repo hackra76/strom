@@ -4,6 +4,7 @@
  */
 
 import { rewriteStorySources, storySourceIds } from './story-sources.js';
+import { applyImageFills, imageLoads, type FieldKey, type ImageFill } from './image-loads.js';
 import { CitationRef, citationFact, cleanTreeSourceEvents } from './citation-order.js';
 import {
     CitationHolder, citationMainOf, cleanCitationMain, cleanCitationQuay, cleanTreeCitationQuay, joinQualityOnlySources, putCitationMain, setCitationQuality, unionCitations,
@@ -18,32 +19,26 @@ import {
     StromData,
     NewPersonData,
     TreeId,
-    generatePersonId,
-    generateLifeEventId,
+    
     LifeEvent,
     CoupleEvent,
-    partnershipParticipants,
-    generateSourceId,
-    generateParticipantId,
+    
     ParticipantRole,
     EventParticipant,
     Source,
-    generateAttachmentId,
     Attachment,
     MediaPlace,
     MediaBy,
     MaterialKind,
     ParentChildRelType,
-    generatePartnershipId,
-    LAST_FOCUSED,
+    
     LastFocusedMarker,
     TableView,
     PersonList,
     PersonListRule,
     PersonListSort,
-    STROM_DATA_VERSION, PERSON_CITATION_FIELDS, PARTNERSHIP_CITATION_FIELDS, PersonCitationField, isGender, oppositeGender, isPrimaryName, PrimaryName, mergedPrimaryName,
+    PersonCitationField, PrimaryName, 
     EmbeddedDataEnvelope,
-    isEmbeddedEnvelope,
     FamilyWizardSpec,
     FamilyWizardMember,
     PlaceGeo,
@@ -52,6 +47,9 @@ import {
     QualityDismissal,
     SurnameRejection,
 } from './types.js';
+import { generatePersonId, generateLifeEventId, generateSourceId, generateParticipantId, generateAttachmentId, generatePartnershipId } from './ids.js';
+import { partnershipParticipants, LAST_FOCUSED, PERSON_CITATION_FIELDS, PARTNERSHIP_CITATION_FIELDS, isGender, oppositeGender, isPrimaryName, mergedPrimaryName, isEmbeddedEnvelope } from './model-values.js';
+import { STROM_DATA_VERSION } from './version.js';
 import { convertLegacyCensusEvents, isCoupleEventType } from './events.js';
 import { sanitizeGedcomDates } from './gedcom-date-form.js';
 import { strings, getCurrentLanguage, getStringsForLang, SUPPORTED_LANGUAGES } from './strings.js';
@@ -71,7 +69,7 @@ import { createSnapshot, getSnapshotPayload, SnapshotReason, hasAutoSnapshotOnDa
 import { ValidationIssue, stripUnsafeMediaDataUrls, cleanPortraitSources, isSafePhotoDataUrl, translateValidationType } from './validation.js';
 import { isPortraitSourceShape } from './photo.js';
 import { cloneTreeData } from './clone.js';
-import { sanitizeMediaRecords, moveLegacyAttachments, pruneMedia, findMedia, treeMedia, personMedia, mediaOf, mediaAt, placeKey as mediaPlaceKey, putMedia, dropMediaPlaces, deleteMedia, placePersonId } from './media.js';
+import { sanitizeMediaRecords, moveLegacyAttachments, givePortraitsRecords, pruneMedia, findMedia, treeMedia, personMedia, mediaOf, mediaAt, placeKey as mediaPlaceKey, putMedia, dropMediaPlaces, deleteMedia, placePersonId } from './media.js';
 import { UndoManager, type UndoMark } from './undo.js';
 import { applyLivingPrivacy, applyContentOptions, resolveContentOptions, ContentOptions, PrivacyMode } from './privacy.js';
 import { safeFileName } from './filenames.js';
@@ -152,8 +150,10 @@ export interface WindowEditSink {
      * An undoable mutation was committed here (already applied to this copy);
      * `label` names the step, `context` is what the editor said about it
      * (runWithEditContext: what to bring back if the main window refuses it).
+     * `listsOnly`: the step changed only the lists of people (N2: taken while
+     * the main window follows a research).
      */
-    edit(label: string, context?: unknown): void;
+    edit(label: string, context?: unknown, listsOnly?: boolean): void;
     /** Undo / redo run in the main window, from its history. */
     undo(): void;
     redo(): void;
@@ -161,6 +161,8 @@ export interface WindowEditSink {
     canRedo(): boolean;
     /** The copy may not be edited (the main window follows a research, the tree is locked there, or it is closed). */
     readOnly(): boolean;
+    /** The lists of people may not be changed here (as readOnly, but open while the main window follows a research, N2). */
+    listsReadOnly?(): boolean;
     /** A staged dialog ended (committed or rolled back): data held back meanwhile may come in. */
     sessionEnded(): void;
 }
@@ -389,6 +391,10 @@ export function migrateData(data: unknown): StromData {
     // else (data:text/html…) from a crafted file is dropped before it can be
     // stored or rendered. After the sources are in: excerpts live there.
     stripUnsafeMediaDataUrls(result);
+    // v25: every portrait is in a record of the tree's files (a tree of v24
+    // and older kept one made from a file only on its person). Once, by the
+    // stored version: a record deleted afterwards stays deleted.
+    if (typeof d.version === 'number' && d.version < 25) givePortraitsRecords(result, typeof d.researchAsOf === 'string');
     // v23 (spec 107): only portrait sources whose original is still there.
     cleanPortraitSources(result);
 
@@ -503,6 +509,9 @@ export async function storedTreeForExport(treeId: TreeId): Promise<StromData | n
  * DataManager.isLocked). The UI never offers one; this only guarantees that
  * an overlooked path cannot change the unsaved stand-in tree.
  */
+/** Fired on `window` when the open tree starts or stops following a live research (read-only meanwhile). */
+export const LIVE_FOLLOW_EVENT = 'strom:live-follow';
+
 export class DataLockedError extends Error {
     constructor() {
         super('Local data is locked; unlock it before editing');
@@ -525,6 +534,8 @@ class DataManagerClass {
     private pendingBefore: StromData | null = null;
     /** The research base of `pendingBefore` (it goes on the undo step with it). */
     private pendingBase: ResearchBase | null = null;
+    /** The mutation being committed changes only lists of people (an undo step allowed while following a research). */
+    private pendingListsOnly = false;
     /** True while a batch (multiple mutations → one undo step) is in progress. */
     private batchActive = false;
     /** Nesting depth of beginBatch/commitBatch (a batch may run inside a batch). */
@@ -777,7 +788,10 @@ class DataManagerClass {
 
     /** Mark the tree that follows a live research (null = none). */
     setLiveTree(treeId: TreeId | null): void {
+        const changed = this.liveTreeId !== treeId;
         this.liveTreeId = treeId;
+        // Open dialogs that write the tree say at once that it became read-only, or writable again.
+        if (changed && typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(LIVE_FOLLOW_EVENT));
     }
 
     /** The tree that follows a live research, if any. */
@@ -1398,6 +1412,82 @@ class DataManagerClass {
     }
 
     /**
+     * Images that came after the tree (spec 116, image-loads.ts) put into
+     * the open tree `treeId` by `apply`: no undo step and no edit of the
+     * user's; not stored here (storeArrivedImages, once they all came).
+     * Null when `treeId` is not the open tree (or it cannot be changed).
+     */
+    applyImageArrivals<T>(treeId: TreeId, apply: (data: StromData) => T): T | null {
+        if (this.currentTreeId !== treeId || this.isReadOnly() || this.windowSink) return null;
+        const out = apply(this.data);
+        this.revision++;
+        this.contentRevision++;
+        return out;
+    }
+
+    /**
+     * Images that came put into the open tree `treeId` (applyImageFills, as
+     * applyImageArrivals) and into the other states of it the user can come
+     * back to: the undo and redo steps recorded since the load began, the
+     * state an open dialog or batch would go back to — going back never
+     * brings the older image or none again (spec 116, I2/I3). The keys
+     * written; null when `treeId` is not the open tree.
+     */
+    writeArrivedImages(treeId: TreeId, fills: readonly ImageFill[]): FieldKey[] | null {
+        const written = this.applyImageArrivals(treeId, d => applyImageFills(d, fills));
+        if (!written?.length) return written;
+        const keys = new Set(written);
+        const done = fills.filter(f => keys.has(f.entry.key));
+        const patch = (d: StromData): void => { if (d !== this.data) applyImageFills(d, done); };
+        const h = this.imageHistory;
+        if (h && h.treeId === treeId) {
+            UndoManager.setActiveTree(treeId);
+            UndoManager.patchHistory(h.since, patch);
+        }
+        if (this.pendingBefore) patch(this.pendingBefore);
+        if (this.editSession && this.editSession.treeId === treeId) patch(this.editSession.before);
+        return written;
+    }
+
+    /**
+     * A load of images into the open tree `treeId` begins (spec 116, I3):
+     * the images go into the history recorded from now on (`from: 'all'`:
+     * into all of it — images noted with the stored tree, asked again).
+     * An undo back over this point (to the state before the research's
+     * version came) ends the load.
+     */
+    noteImageLoadStart(treeId: TreeId, from: 'now' | 'all' = 'now'): void {
+        if (this.currentTreeId !== treeId) return;
+        UndoManager.setActiveTree(treeId);
+        this.imageHistory = { treeId, since: from === 'all' ? -Infinity : UndoManager.historyStamp() };
+    }
+
+    /** Where the history takes the images of the current load (noteImageLoadStart). */
+    private imageHistory: { treeId: TreeId; since: number } | null = null;
+
+    /** Images came while a staged dialog held the saves: stored when it ends (also when it is thrown away). */
+    private imagesUnstored = false;
+
+    /** Store the open tree `treeId` with the images that came (one save after them all). */
+    storeArrivedImages(treeId: TreeId): void {
+        if (this.currentTreeId !== treeId) return;
+        if (this.editSession) this.imagesUnstored = true;
+        this.save('content');
+    }
+
+    /**
+     * The data of tree `treeId` were replaced as a whole (a load, a backup
+     * restored, an undo back over a research's version): the images still on
+     * their way go nowhere, and what was noted for them goes (spec 116).
+     */
+    private imagesReplaced(treeId: TreeId | null): void {
+        imageLoads.onDataReplaced(treeId);
+        if (!treeId) return;
+        if (this.imageHistory?.treeId === treeId) this.imageHistory = null;
+        TreeManager.setPendingImages(treeId, null);
+    }
+
+    /**
      * Data revision: bumped on every change of the open tree's data (each
      * mutation ends in save()), so derived caches (the table view's rows and
      * cells) know when to rebuild. A swapped data object is caught by identity.
@@ -1530,14 +1620,29 @@ class DataManagerClass {
      * work stands here (the last focus, the default person and view) stays
      * this window's: the satellite's copy may hold an older one.
      */
-    applyWindowEdit(json: string, label: string): boolean {
+    applyWindowEdit(json: string, label: string, listsOnly = false): boolean {
         if (this.windowSink || this.isReadOnly() || !this.currentTreeId) return false;
-        if (this.isTreeLocked() || this.editSession || this.batchActive) return false;
+        if (this.editSession || this.batchActive) return false;
+        if (listsOnly ? this.listsReadOnly() : this.isTreeLocked()) return false;
         let next: StromData;
         try {
             next = migrateData(JSON.parse(json) as StromData);
         } catch {
             return false;
+        }
+        if (listsOnly) {
+            // A change of the lists of people alone (N2): only the lists are taken
+            // from the satellite's copy, also while this window follows a research.
+            this.beginMutation();
+            this.pendingListsOnly = true;
+            if (next.personLists?.length) this.data.personLists = next.personLists; else delete this.data.personLists;
+            if (next.personListsDropped?.length) this.data.personListsDropped = next.personListsDropped; else delete this.data.personListsDropped;
+            this.commitMutation(label, true);
+            AuditLogManager.log(this.currentTreeId, 'window.edit', label);
+            if (typeof window !== 'undefined') {
+                window.dispatchEvent(new CustomEvent<DataChangedDetail>('strom:data-changed', { detail: { source: 'window' } }));
+            }
+            return true;
         }
         for (const key of WINDOW_STATE_KEYS) {
             if (this.data[key] === undefined) delete next[key];
@@ -1580,6 +1685,8 @@ class DataManagerClass {
      * mutation methods. During a batch this defers to commitBatch (no push/save).
      */
     private commitMutation(description: string, silent = false, mark?: UndoMark, toast?: MutationToast): void {
+        const listsOnly = this.pendingListsOnly;
+        this.pendingListsOnly = false;
         // The files' places name only what is still in the tree (a person, couple, event or source deleted).
         pruneMedia(this.data);
         if (this.batchActive) {
@@ -1592,7 +1699,7 @@ class DataManagerClass {
             this.pendingBefore = null;
             this.save();
             this.noteUserChange();
-            this.windowSink.edit(description, this.windowEditContext ?? undefined);
+            this.windowSink.edit(description, this.windowEditContext ?? undefined, listsOnly);
             this.onUndoRedoChanged?.();
             if (!silent) this.onMutationCommitted?.(description, toast);
             return;
@@ -1601,7 +1708,7 @@ class DataManagerClass {
         if (this.pendingBefore) {
             // Auto-backup the FIRST mutation of the day (state before it).
             this.maybeAutoSnapshot(this.pendingBefore, this.pendingBase);
-            UndoManager.push({ data: this.pendingBefore, description, base: this.pendingBase, ...(mark ? { mark } : {}) });
+            UndoManager.push({ data: this.pendingBefore, description, base: this.pendingBase, ...(mark ? { mark } : {}), ...(listsOnly ? { listsOnly } : {}) });
             this.pendingBefore = null;
         }
         this.save();
@@ -1749,7 +1856,12 @@ class DataManagerClass {
         }
         AuditLogManager.flushHold();
         this.batchDepth = 1;   // an operation left unbalanced must not keep it open
+        const unstored = this.imagesUnstored;
+        this.imagesUnstored = false;
+        const rev = this.revision;
         this.commitBatch(description, false);
+        // Nothing changed in the dialog (no save of its own): the images that came are stored.
+        if (unstored && this.revision === rev) this.save('content');
         this.windowSink?.sessionEnded();
     }
 
@@ -1764,7 +1876,11 @@ class DataManagerClass {
         this.editSession = null;
         this.resetBatchState();
         AuditLogManager.dropHold();
+        const unstored = this.imagesUnstored;
+        this.imagesUnstored = false;
         if (this.currentTreeId !== s.treeId || JSON.stringify(this.data) === JSON.stringify(s.before)) {
+            // Images that came meanwhile are in both: stored now (the session held the save).
+            if (unstored && this.currentTreeId === s.treeId) this.save('content');
             this.windowSink?.sessionEnded();
             return false;
         }
@@ -1797,7 +1913,14 @@ class DataManagerClass {
         // first edit after every reload does not replace the day's backup
         // with a later state.
         const research = TreeManager.backupResearchBase(treeId, base);
-        void hasAutoSnapshotOnDay(treeId, now)
+        // Images of the tree still on their way: the backup waits for them, and has those that came (spec 116, I5).
+        const load = imageLoads.current();
+        const waiting = load && load.treeId === treeId && !load.isAborted() && load.snapshot().phase === 'running' ? load : null;
+        const ready = waiting
+            ? waiting.whenIdle().then(() => { applyImageFills(before, waiting.fillsWritten()); })
+            : Promise.resolve();
+        void ready
+            .then(() => hasAutoSnapshotOnDay(treeId, now))
             .then(exists => exists ? undefined : createSnapshot(treeId, before, 'auto', now, research))
             .catch(() => {});
     }
@@ -1864,6 +1987,7 @@ class DataManagerClass {
             migrated = unknownSex;
         }
         TreeManager.restoreResearchBase(this.currentTreeId, restoredBase);
+        this.imagesReplaced(this.currentTreeId);
         this.data = migrated;
         this.commitMutation(strings.undo.restoreBackup, true);
         AuditLogManager.log(this.currentTreeId, 'data.load', strings.auditLog.restoredBackup);
@@ -1899,10 +2023,13 @@ class DataManagerClass {
         // A staged dialog is open: its own Save/Discard settle the data.
         if (this.editSession) return null;
         // A locked tree is read-only — undo would rewrite it (review S21).
-        if (this.isTreeLocked()) return null;
+        if (this.undoLocked('undo')) return null;
         UndoManager.setActiveTree(this.currentTreeId);
         const restored = UndoManager.undo(cloneTreeData(this.data), TreeManager.researchBaseOf(this.currentTreeId));
         if (!restored) return null;
+        // Back to before the research's version whose images still come: they go nowhere now.
+        const h = this.imageHistory;
+        if (h && h.treeId === this.currentTreeId && (restored.seq ?? 0) <= h.since) this.imagesReplaced(this.currentTreeId);
         this.applyRestoredData(restored.data, restored.base);
         AuditLogManager.log(this.currentTreeId, 'undo', strings.auditLog.undoAction(restored.description));
         return { description: restored.description };
@@ -1917,13 +2044,27 @@ class DataManagerClass {
         if (this.isReadOnly() || !this.currentTreeId) return null;
         // A staged dialog is open: its own Save/Discard settle the data.
         if (this.editSession) return null;
-        if (this.isTreeLocked()) return null;
+        if (this.undoLocked('redo')) return null;
         UndoManager.setActiveTree(this.currentTreeId);
         const restored = UndoManager.redo(cloneTreeData(this.data), TreeManager.researchBaseOf(this.currentTreeId));
         if (!restored) return null;
         this.applyRestoredData(restored.data, restored.base);
         AuditLogManager.log(this.currentTreeId, 'redo', strings.auditLog.redoAction(restored.description));
         return { description: restored.description };
+    }
+
+    /**
+     * A locked tree takes no undo or redo (it would rewrite the tree), except
+     * a step of its lists of people while the lock is only that it follows a
+     * research: the research never has the lists, and a version it sends
+     * clears the history, so the step's state is the research's version now.
+     */
+    undoLocked(which: 'undo' | 'redo'): boolean {
+        if (!this.isTreeLocked()) return false;
+        // A satellite window: the main window's history, as its status says.
+        if (this.windowSink) return !(which === 'undo' ? this.windowSink.canUndo() : this.windowSink.canRedo());
+        UndoManager.setActiveTree(this.currentTreeId);
+        return !UndoManager.peekListsOnly(which) || this.listsReadOnly();
     }
 
     /** Swap in restored data and persist it, without recording a new undo step. */
@@ -2145,9 +2286,19 @@ class DataManagerClass {
         return index;
     }
 
-    /** Lists cannot be changed (Q1): a read-only or locked tree, a live research's tree, a newer app's data, another window's read-only copy. */
+    /**
+     * Lists cannot be changed (Q1): a read-only or locked tree, a newer app's
+     * data; in a satellite window as the main window says (its lists open
+     * while it follows a research, N2). A tree that follows a research
+     * keeps its lists open (N2): they are the tree's own, the research never
+     * has them nor sends them back (keepPersonListData).
+     */
     listsReadOnly(): boolean {
-        return this.isReadOnly() || this.isTreeLocked();
+        if (this.isReadOnly()) return true;
+        // A satellite window (spec 079): as the main window says.
+        if (this.windowSink) return this.windowSink.listsReadOnly?.() ?? this.windowSink.readOnly();
+        if (!this.isTreeLocked()) return false;
+        return !this.isLiveFollowing() || TreeManager.getActiveTreeMetadata()?.isLocked === true;
     }
 
     /** The tree's lists, the ready-made "Added in the last 30 days" first while it is not stored. */
@@ -2178,6 +2329,7 @@ class DataManagerClass {
     /** Stores a changed list (the ready-made one is stored the first time it changes) in one undo step. */
     private storePersonList(list: PersonList, description: string, silent: boolean, toast?: MutationToast, audit = false): void {
         this.beginMutation();
+        this.pendingListsOnly = true;
         const stored = this.data.personLists ?? [];
         const at = stored.findIndex(l => l.id === list.id);
         const copy = structuredClone(list);
@@ -2269,6 +2421,7 @@ class DataManagerClass {
         if (list.builtin && !this.data.personListsDropped?.includes(list.builtin)) {
             this.data.personListsDropped = [...(this.data.personListsDropped ?? []), list.builtin];
         }
+        this.pendingListsOnly = true;
         this.commitMutation(strings.lists.undo.delete(name), false, undefined, { text: strings.lists.toast.deleted(name) });
         if (this.currentTreeId) AuditLogManager.log(this.currentTreeId, 'personList.delete', strings.lists.audit.deleted(name));
         return true;
@@ -2851,6 +3004,8 @@ class DataManagerClass {
 
         const lastNameBefore = person.lastName ?? '';
         const firstNameBefore = person.firstName;
+        const marriedBefore = person.marriedSurname?.trim() ?? '';
+        const marriedFirstBefore = person.marriedFirstName?.trim() ?? '';
         if (updates.firstName !== undefined) person.firstName = updates.firstName;
         if (updates.lastName !== undefined) person.lastName = updates.lastName;
         // A placeholder that got a real name — first OR last — is a person now
@@ -2906,6 +3061,31 @@ class DataManagerClass {
         if (updates.nameVariants !== undefined) {
             const kept = updates.nameVariants.map(v => v.trim()).filter(Boolean);
             person.nameVariants = kept.length > 0 ? kept : undefined;
+        }
+        // A married surname changed for another one (an earlier marriage's
+        // name made the current one, spec 010 K4.2) keeps the one it replaces
+        // as another spelling of the name: nothing the research has is lost.
+        // The one chosen leaves the spellings: the field holds it now.
+        const marriedNow = person.marriedSurname?.trim() ?? '';
+        if (marriedNow && surnameKey(marriedBefore) !== surnameKey(marriedNow)) {
+            // Given names of the married name went with the one replaced.
+            if (marriedBefore) delete person.marriedFirstName;
+            const key = (v: string): string => v.replace(/\s+/g, ' ').trim().normalize('NFC').toLocaleLowerCase();
+            const chosen = key(`${person.marriedFirstName?.trim() || person.firstName || ''} ${marriedNow}`);
+            let variants = (person.nameVariants ?? []).filter(v => key(v) !== chosen);
+            const spelled = `${marriedFirstBefore || firstNameBefore || ''} ${marriedBefore}`.replace(/\s+/g, ' ').trim();
+            if (marriedBefore && !variants.some(v => key(v) === key(spelled))) variants = [...variants, spelled];
+            person.nameVariants = variants.length > 0 ? variants : undefined;
+        }
+        // The research's status of the married name belongs to the value its file
+        // gave (066 K6.3): that name written otherwise here (its surname, or the
+        // given names it is written with), or taken away, ends it, as a change of
+        // a value ends its confirmation.
+        if (person.marriedNameStatus) {
+            const marriedName = (first: string | undefined, surname: string): string => `${first ?? ''}\u001f${surname}`;
+            const was = marriedName(marriedFirstBefore || firstNameBefore, marriedBefore);
+            const now = marriedName(person.marriedFirstName?.trim() || person.firstName, marriedNow);
+            if (!marriedNow || now !== was) delete person.marriedNameStatus;
         }
         // The narrative: an empty text means there is none.
         if ('story' in updates) {
@@ -3448,6 +3628,8 @@ class DataManagerClass {
         if (updates.title !== undefined && !updates.title.trim()) return false;
 
         this.beginMutation();
+        // An image changed by hand is no longer the one the research found from its scans.
+        if ('image' in updates && (updates.image ?? '').trim() !== (src.image ?? '').trim()) updates = { ...updates, imageDerived: undefined };
         Object.assign(src, updates);
         // Explicit undefined = field emptied (see updateLifeEvent).
         dropUndefinedKeys(src);
@@ -4400,10 +4582,11 @@ class DataManagerClass {
      * Take a person off several files in one undo step (spec 102 §8, the
      * selection's Remove a person…): every place of the files at that person.
      * A file left without a place goes from the tree as §3's × does (kept by
-     * an archive it stays there; otherwise it is deleted, O1). Returns the ids
-     * changed.
+     * an archive it stays there; otherwise it is deleted, O1). `silent`: no
+     * Undo toast of its own (the caller's toast undoes it with its other
+     * part). Returns the ids changed.
      */
-    removeMediaPerson(ids: readonly string[], personId: PersonId, opts: { toast?: string } = {}): string[] {
+    removeMediaPerson(ids: readonly string[], personId: PersonId, opts: { toast?: string; silent?: boolean } = {}): string[] {
         const atts = [...new Set(ids)].map(id => findMedia(this.data, id))
             .filter((a): a is Attachment => !!a && this.mediaEditable(a) && a.places.some(p => placePersonId(p) === personId));
         if (!atts.length) return [];
@@ -4415,7 +4598,7 @@ class DataManagerClass {
         for (const id of gone) this.forgetMediaLinks(id);
         const name = person ? (`${person.firstName} ${person.lastName}`.trim() || personId) : personId;
         const label = strings.undo.mediaPersonRemove(name, atts.length);
-        this.commitMutation(label, false, undefined, opts.toast ? { text: opts.toast } : undefined);
+        this.commitMutation(label, !!opts.silent, undefined, opts.toast ? { text: opts.toast } : undefined);
         AuditLogManager.log(this.currentTreeId, 'attachment.remove', label);
         return atts.map(a => a.id);
     }
@@ -5245,6 +5428,8 @@ class DataManagerClass {
         this.rollbackEditSession();   // whole-data replacement ends a staged dialog
         // Undo choke point (see clearData) — an accidental import-over is
         // now one Ctrl+Z away instead of silently corrupting the stack.
+        // Images still on their way into the data replaced go nowhere (spec 116).
+        this.imagesReplaced(this.currentTreeId);
         this.beginMutation();
         this.data = migrateData(newData);
         this.commitMutation(strings.undo.loadedData, true);
@@ -5273,6 +5458,7 @@ class DataManagerClass {
         if (this.isReadOnly() || !this.currentTreeId) return false;
         // The tree shown until now: the drawing goes from it to the new one (spec 055).
         const previous = this.data;
+        this.imagesReplaced(treeId);
         this.data = migrateData(newData);
         this.save();
         UndoManager.setActiveTree(this.currentTreeId);

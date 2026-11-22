@@ -45,6 +45,9 @@ import {
     WindowHeadAction, windowHeadMenu, dragCarriesFiles,
 } from '../materials-overview.js';
 import { materialThumbs, ThumbSnapshot } from '../material-thumbs.js';
+import { imageLoads } from '../image-loads.js';
+import { setTileState, waitingTileHtml } from './image-slot.js';
+import { materialImageWait } from './materials-ui.js';
 import {
     MaterialsOpenOptions, MaterialActionCtx, fileNameBreakParts, materialShortDate, materialStaleTime, materialTileLetters, materialItemSha, treeAttachmentsKey,
 } from './materials-ui.js';
@@ -54,12 +57,16 @@ import type { SortStripState } from '../material-sort.js';
 import { isPhoneBar } from '../breakpoints.js';
 import { researchBridgeActionLabel } from './research-open-mark.js';
 import { barHtml } from './prog-bar.js';
-import { deletableFiles } from '../material-delete.js';
+import { selectionDeletable, treeFileSource, withoutTreeFiles } from '../material-delete.js';
+import { formatBytesShort } from './originals-ui.js';
 import { closeHeadMenu, openHeadMenu, SEP, type MenuEntry } from './table-view/table-headmenu.js';
 
 const MODAL_ID = 'materials-modal';
 const VIEW_KEY = 'strom.materials.view';
 const THUMB_PX = 256;
+/** The tiles' sizes as drawn (a grid's tile, a list row's): "Not loaded" under the glyph only on the grid's (spec 116 §5). */
+const MW_TILE_PX = 120;
+const MW_SMALL_TILE_PX = 36;
 const SEARCH_DEBOUNCE_MS = 150;
 const LONG_PRESS_MS = 500;
 /** Rows drawn above and below the view (px). */
@@ -139,7 +146,7 @@ function writeListPrefs(sort: ListSort | null, filters: OverviewFilters): void {
 /** The window's model: the research's archive with the tree's files, or the tree's own files alone. */
 type WindowModel = 'archive' | 'app';
 
-type PopKind = 'person' | 'kind' | 'batch' | 'sheet' | 'batchMenu' | 'folderMenu' | 'selMenu' | 'headMenu' | 'where';
+type PopKind = 'person' | 'kind' | 'batch' | 'sheet' | 'batchMenu' | 'folderMenu' | 'selMenu' | 'headMenu' | 'itemMenu' | 'where';
 
 /** A batch's reading: done, stopped (its menu closed, the window gone) or refused with the research's error. */
 type BatchLoad = { ok: true } | { ok: false; stopped: true } | { ok: false; error: MaterialError; stopped?: undefined };
@@ -190,6 +197,8 @@ interface Win {
     pop: HTMLElement | null;
     popKind: PopKind | null;
     popAnchor: HTMLElement | null;
+    /** The family tree file whose menu is open (`itemMenu`). */
+    popItem?: string;
     popKey: ((e: KeyboardEvent) => void) | null;
     popOutside: ((e: MouseEvent) => void) | null;
     /** The menu item reading its batch's files before its action (B88). */
@@ -220,7 +229,7 @@ interface SelAction {
 }
 
 function capsKey(caps: MaterialCaps, base: string | null): string {
-    return `${caps.list}|${caps.assign}|${caps.thumb}|${caps.bridgeUp}|${caps.openLinks !== false}|${caps.links}|${caps.edit}|${caps.uses}|${caps.sort}|${caps.sortRun}|${caps.sourceOf}|${caps.left}|${caps.sameAs}|${caps.delete}|${caps.mediaApp}|${base ?? ''}`;
+    return `${caps.list}|${caps.assign}|${caps.thumb}|${caps.bridgeUp}|${caps.openLinks !== false}|${caps.links}|${caps.edit}|${caps.uses}|${caps.sort}|${caps.sortRun}|${caps.sourceOf}|${caps.left}|${caps.sameAs}|${caps.delete}|${!!caps.trees}|${caps.mediaApp}|${base ?? ''}`;
 }
 
 let win: Win | null = null;
@@ -234,7 +243,8 @@ const alive = (gen: number): Win | null => (win && win.gen === gen ? win : null)
  * yet left out; else their PersonId) and how many places it is used in.
  */
 export function treeRecords(byRefn: boolean): TreeRecord[] {
-    const data = DataManager.getData();
+    // The files still on their way are the tree's too: their tiles wait for them (spec 116 §5).
+    const data = imageLoads.view(DataManager.getData());
     const uses = mediaUsesIndex(data);
     const key = (id: PersonId): string | null => (byRefn ? researchPersonRef(DataManager.getPerson(id)?.refn) : id);
     // With an archive a file taken out of the tree stays with it (Hidden · Removed from the tree, spec 102 §9).
@@ -435,7 +445,7 @@ export const materialsWindowMethods = uiModule({
     materialsSelection(): MaterialItem[] {
         const w = win;
         if (!w) return [];
-        return w.items.filter(i => w.selected.has(i.key));
+        return w.items.filter(i => w.selected.has(i.key) && !this.mwWaits(i));
     },
 
     /** The remembered list or the bridge changed: redraw (quietly), ask again once the bridge runs. */
@@ -481,7 +491,7 @@ export const materialsWindowMethods = uiModule({
         w.loading = true;
         w.loadError = null;
         try {
-            const head = await fetchMaterial(base, { files0: true });
+            const head = await fetchMaterial(base, { files0: true, trees: ctx.caps.trees });
             if (!alive(gen)) return;
             if (!head.ok) {
                 w.loadError = head.error;
@@ -494,7 +504,7 @@ export const materialsWindowMethods = uiModule({
                 await this.mwLoadBatch(id);
                 if (!alive(gen)) return;
             }
-            const all = await fetchMaterial(base, {});
+            const all = await fetchMaterial(base, { trees: ctx.caps.trees });
             if (!alive(gen)) return;
             if (all.ok) await saveMaterialList(w.treeId, all.value, { kind: 'all' });
         } finally {
@@ -527,7 +537,7 @@ export const materialsWindowMethods = uiModule({
         if (!reading) {
             reading = (async (): Promise<BatchLoad> => {
                 try {
-                    const answer = await fetchMaterial(base, { batch: id }, { signal: opts.signal, timeoutMs: opts.timeoutMs });
+                    const answer = await fetchMaterial(base, { batch: id, trees: ctx.caps.trees }, { signal: opts.signal, timeoutMs: opts.timeoutMs });
                     if (!alive(gen)) return { ok: false, stopped: true };
                     if (!answer.ok) return opts.signal?.aborted ? { ok: false, stopped: true } : { ok: false, error: answer.error };
                     w.loadedBatches.add(id);
@@ -591,6 +601,8 @@ export const materialsWindowMethods = uiModule({
             cols,
             tileRow,
             restoreExtra: 26,
+            // Two more lines under a family tree file: "File of a source · Family tree file · 184 kB" whole (spec 117 §5, 5a).
+            treeExtra: compact ? 0 : 30,
             listRow: coarse ? 56 : 48,
             group: coarse ? 60 : 56,
             folder: coarse ? 44 : 36,
@@ -627,7 +639,7 @@ export const materialsWindowMethods = uiModule({
         // A research without assigning never sends hidden files; "Show hidden" is not offered.
         if (!ctx.caps.assign) w.filters.showHidden = false;
         this.mwSortMarks();
-        w.summary = overviewSummary(w.items, list, !!rec?.full, model === 'app');
+        w.summary = overviewSummary(w.items, list, !!rec?.full);
         // "Not assigned by the agent" is offered only while there is such a file: its filter goes with the last one.
         if (!w.summary.left) w.filters.left = false;
         w.groups = overviewGroups({
@@ -726,7 +738,7 @@ export const materialsWindowMethods = uiModule({
             ? `<span class="mw-chip sel-opt is-active"><button type="button" class="mw-chip-main" data-mw="${act}"${popup ? ' aria-haspopup="dialog"' : ''}>${esc(active)}</button><button type="button" class="mw-chip-x" data-mw="clear-${act}" aria-label="${esc(`${m.removeFilter}: ${active}`)}">×</button></span>`
             : `<button type="button" class="mw-chip sel-opt" data-mw="${act}" aria-haspopup="dialog">${esc(label)} <span aria-hidden="true">▾</span></button>`;
         const personName = f.person ? nameWithoutYears(w.names.get(f.person) ?? f.person) : '';
-        const kindLabel = (k: KindFilter) => (k === 'none' ? m.kindNone : m.kind[k] ?? k);
+        const kindLabel = (k: KindFilter) => (k === 'none' ? m.kindNone : k === 'tree' ? m.kindTrees : m.kind[k] ?? k);
         const batchName = f.batch ? (w.list?.batches.find(b => b.id === f.batch)?.name ?? f.batch) : '';
         const count = activeFilterCount(f);
         const toggle = (act: string, label: string, on: boolean) =>
@@ -1077,6 +1089,8 @@ export const materialsWindowMethods = uiModule({
     /** The people line under a tile ('' for a tree attachment without anyone). */
     mwPersons(item: MaterialItem): { text: string; none: boolean } {
         const w = win!;
+        // A family tree file (spec 117 §5): no people, its kind and size instead (mwTreeFileLine).
+        if (item.tree) return { text: '', none: false };
         if (itemWithoutPerson(item)) return { text: strings.materials.noPerson, none: true };
         // The file of a source (spec 102 §7): its own people, then those the source cites.
         if (item.sourceOf?.length) {
@@ -1098,20 +1112,41 @@ export const materialsWindowMethods = uiModule({
             ? `<span class="mw-intree">${esc(m.inTreeTag)}</span>` : '';
         const places = item.uses ? `<span class="mw-places" aria-label="${esc(m.places(item.uses))}" title="${esc(m.places(item.uses))}">${item.uses.toLocaleString(getCurrentLanguage())}</span>` : '';
         const marks = `${label}${inTree}${places}${check}`;
+        const letters = `<span class="mw-type">${esc(materialTileLetters(item))}</span>`;
+        const px = small ? MW_SMALL_TILE_PX : MW_TILE_PX;
+        // A file of the tree on its way after the tree, or one that did not come (spec 116 §5).
+        const waits = waitingTileHtml(materialImageWait(item), { tag: 'span', cls, px, content: letters, extra: marks });
+        if (waits) return waits;
         if (att && !att.originalOnly && att.mimeType.startsWith('image/') && att.dataUrl) {
             return `<span class="${cls} has-thumb"><img src="${esc(att.dataUrl)}" alt="" loading="lazy">${marks}</span>`;
         }
         const sha = materialItemSha(item);
-        const letters = `<span class="mw-type">${esc(materialTileLetters(item))}</span>`;
         const lazy = !!sha && item.origin !== 'tree' && ['image', 'pdf'].includes(materialType(item.mime, item.name));
         if (!lazy || !sha) return `<span class="${cls}">${letters}${marks}</span>`;
-        const ready = materialThumbs().urlOf(sha, THUMB_PX);
+        const thumbs = materialThumbs();
+        // A preview that did not come says so; one asked for now waits under the veil (spec 116 §5).
+        if (thumbs.isBroken(sha, THUMB_PX)) return waitingTileHtml('failed', { tag: 'span', cls, px, extra: marks });
+        const ready = thumbs.urlOf(sha, THUMB_PX);
         const img = ready ? `<img src="${esc(ready)}" alt="">` : letters;
-        return `<span class="${cls}${ready ? ' has-thumb' : ''}"${ready ? '' : ` data-sha="${esc(sha)}" data-group="${esc(group.key)}" data-item="${esc(item.key)}"`}>${img}${marks}</span>`;
+        const veil = !ready && thumbs.isWaiting(sha, THUMB_PX) ? ' data-img-state="loading"' : '';
+        return `<span class="${cls}${ready ? ' has-thumb' : ''}"${ready ? '' : ` data-sha="${esc(sha)}" data-group="${esc(group.key)}" data-item="${esc(item.key)}"`}${veil}>${img}${marks}</span>`;
+    },
+
+    /** A family tree file's quiet line: "Family tree file · 184 kB" (spec 117 §5). */
+    mwTreeFileLine(item: MaterialItem): string {
+        const bytes = item.bytes ?? item.file?.bytes;
+        return [strings.materials.treeFile, bytes ? formatBytesShort(bytes) : ''].filter(Boolean).join(' · ');
+    },
+
+    /** "the file of the source {title}" of a family tree file a live source was made of, else ''. */
+    mwTreeFileOf(item: MaterialItem): string {
+        const of = treeFileSource(item);
+        return of ? strings.materials.treeFileOf(of.title ?? of.source) : '';
     },
 
     mwAriaLabel(item: MaterialItem): string {
         const m = strings.materials;
+        if (item.tree) return [item.title, this.mwTreeFileLine(item), this.mwTreeFileOf(item)].filter(Boolean).join(', ');
         const persons = this.mwPersons(item).text;
         const hidden = item.hidden ? m.hiddenLabel[item.hidden.reason ?? 'none'] ?? m.hiddenLabel.none : '';
         const tag = item.agentLeft ? m.agentSort.tagLeft : item.copyOf ? m.agentSort.tagCopy : this.mwSourceOfTag(item);
@@ -1132,9 +1167,17 @@ export const materialsWindowMethods = uiModule({
         return `<div class="mw-tile${selected ? ' is-selected' : ''}${item.hidden ? ' is-hidden' : ''}" role="gridcell" tabindex="-1" data-key="${esc(item.key)}" aria-label="${esc(this.mwAriaLabel(item))}"${w.selecting ? ` aria-selected="${selected}"` : ''}>
             ${this.mwThumbHtml(item, group, false)}
             <span class="mw-tile-title" title="${esc(item.title)}">${fileNameBreakParts(item.title).map(esc).join('<wbr>')}</span>
-            <span class="mw-tile-persons${persons.none ? ' is-none' : ''}">${this.mwSortTagHtml(item)}${this.mwSourceOfTagHtml(item)}${esc(persons.text)}</span>
+            ${item.tree ? this.mwTreeTilePersonsHtml(item) : `<span class="mw-tile-persons${persons.none ? ' is-none' : ''}">${this.mwSortTagHtml(item)}${this.mwSourceOfTagHtml(item)}${esc(persons.text)}</span>`}
             ${this.mwRestoreHtml(item)}
         </div>`;
+    },
+
+    /** A family tree file's line under its tile: the tag "File of a source" with a live one, then its kind and size (5a). */
+    mwTreeTilePersonsHtml(item: MaterialItem): string {
+        const line = this.mwTreeFileLine(item);
+        const title = [line, this.mwTreeFileOf(item)].filter(Boolean).join(' · ');
+        // The size whole on the line it wraps to ("184 kB", not "184" and "kB").
+        return `<span class="mw-tile-persons is-tree" title="${esc(title)}">${this.mwSourceOfTagHtml(item)}${esc(line.replace(/(\d) (?=\S+$)/, '$1\u00a0'))}</span>`;
     },
 
     /**
@@ -1147,7 +1190,7 @@ export const materialsWindowMethods = uiModule({
         const m = strings.materials;
         const persons = this.mwPersons(item);
         const selected = w.selected.has(item.key);
-        const kind = item.hidden ? `${materialKindLabel(item)} · ${m.hiddenLabel[item.hidden.reason ?? 'none'] ?? m.hiddenLabel.none}` : (item.kind ? materialKindLabel(item) : '');
+        const kind = item.hidden ? `${materialKindLabel(item)} · ${m.hiddenLabel[item.hidden.reason ?? 'none'] ?? m.hiddenLabel.none}` : (item.kind || item.tree ? materialKindLabel(item) : '');
         const date = item.date ? materialDateForInput(item.date) : '';
         const inTree = w.model === 'archive'
             ? `<span class="mw-li-intree">${itemInTree(item) ? `<span class="mw-intree-tag">${esc(m.inTreeTag)}</span>` : `<span class="is-none">${esc(m.onlyArchiveShort)}</span>`}</span>`
@@ -1159,15 +1202,22 @@ export const materialsWindowMethods = uiModule({
             ${this.mwThumbHtml(item, group, true)}
             <span class="mw-li-name">
                 <span class="mw-li-title" title="${esc(item.title)}">${esc(item.title)}</span>
-                ${item.titled ? `<span class="mw-li-file" title="${esc(item.name)}">${esc(item.name)}</span>` : `<span class="mw-li-file is-untitled">${esc(m.untitled)}</span>`}
+                ${item.tree ? this.mwTreeListFileHtml(item) : item.titled ? `<span class="mw-li-file" title="${esc(item.name)}">${esc(item.name)}</span>` : `<span class="mw-li-file is-untitled">${esc(m.untitled)}</span>`}
             </span>
             <span class="mw-li-kind" title="${esc(kind)}">${esc(kind)}</span>
             <span class="mw-li-date">${esc(date)}</span>
-            <span class="mw-li-persons${persons.none ? ' is-none' : ''}">${this.mwSortTagHtml(item)}${this.mwSourceOfTagHtml(item, 'mw-li-srctag')}${esc(persons.text)}</span>
+            <span class="mw-li-persons${persons.none ? ' is-none' : ''}${item.tree ? ' is-tree' : ''}">${this.mwSortTagHtml(item)}${this.mwSourceOfTagHtml(item, 'mw-li-srctag')}${item.tree ? `<span class="mw-li-treeline">${esc(this.mwTreeFileLine(item))}</span>` : esc(persons.text)}</span>
             ${this.mwListSourceHtml(item)}
             ${inTree}
             <span class="mw-li-used">${used}</span>
         </div>`;
+    },
+
+    /** A family tree file's name and size under its title in a list row (5c: "talvanen.ged · 62 kB"). */
+    mwTreeListFileHtml(item: MaterialItem): string {
+        const bytes = item.bytes ?? item.file?.bytes;
+        const text = [item.name, bytes ? formatBytesShort(bytes) : ''].filter(Boolean).join(' · ');
+        return `<span class="mw-li-file" title="${esc(text)}">${esc(text)}</span>`;
     },
 
     /** The tag "File of a source" before the people (spec 102 §7; in a list row only on a phone, where the Source column is not). */
@@ -1308,18 +1358,28 @@ export const materialsWindowMethods = uiModule({
         if (!w || !sha || el.classList.contains('has-thumb')) return;
         const item = w.items.find(i => i.key === el.dataset.item);
         const group = w.groups.find(g => g.key === el.dataset.group);
-        materialThumbs().want(
+        const thumbs = materialThumbs();
+        const px = el.closest('.mw-li') ? MW_SMALL_TILE_PX : MW_TILE_PX;
+        thumbs.want(
             { sha, px: THUMB_PX, mime: item?.mime, name: item?.file?.name ?? item?.title, bytes: item?.bytes, where: group ? this.mwGroupName(group) : '' },
             url => {
-                if (!url || !el.isConnected) return;
+                if (!el.isConnected) return;
                 const type = el.querySelector('.mw-type');
+                if (!url) {
+                    // Did not come: "Not loaded"; no preview to be had: the letters stay, calm (spec 116 §5).
+                    setTileState(el, thumbs.isBroken(sha, THUMB_PX) ? 'failed' : 'none', px, type);
+                    if (thumbs.isBroken(sha, THUMB_PX)) el.removeAttribute('data-sha');
+                    return;
+                }
                 const img = document.createElement('img');
                 img.src = url;
                 img.alt = '';
                 if (type) type.replaceWith(img); else el.prepend(img);
                 el.classList.add('has-thumb');
+                el.removeAttribute('data-img-state');
             },
             () => el.isConnected && el.dataset.vis === '1',
+            () => { if (el.isConnected) setTileState(el, 'loading', px); },
         );
     },
 
@@ -1427,11 +1487,16 @@ export const materialsWindowMethods = uiModule({
         return { label: strings.materials.selectBatch(ofBatch.length), keys: ofBatch.map(i => i.key) };
     },
 
+    /** A file of the tree still on its way (or not come): shown, opened, never selected nor acted on (spec 116 §5). */
+    mwWaits(item: MaterialItem | null | undefined): boolean {
+        return !!item && materialImageWait(item) !== 'none';
+    },
+
     mwToggleSelect(key: string, on?: boolean): void {
         const w = win;
         if (!w) return;
         w.selecting = true;
-        const next = on ?? !w.selected.has(key);
+        const next = (on ?? !w.selected.has(key)) && !this.mwWaits(this.mwItem(key));
         if (next) w.selected.add(key); else w.selected.delete(key);
         w.anchor = key;
         this.mwSelectionChanged();
@@ -1441,7 +1506,7 @@ export const materialsWindowMethods = uiModule({
         const w = win;
         if (!w) return;
         w.selecting = true;
-        for (const k of keys) w.selected.add(k);
+        for (const k of keys) if (!this.mwWaits(this.mwItem(k))) w.selected.add(k);
         this.mwSelectionChanged();
     },
 
@@ -1456,12 +1521,22 @@ export const materialsWindowMethods = uiModule({
      * Archive writes (assign, hide) act on the research's files only; Title… /
      * Kind… / Date… on the files that can change here.
      */
-    mwSelActions(items: MaterialItem[]): SelAction[] {
+    mwSelActions(selection: MaterialItem[]): SelAction[] {
         const ctx = this.materialsWindowContext();
         const m = strings.materials;
         if (!ctx) return [];
-        const n = items.length;
         const readOnly = DataManager.isReadOnly();
+        const deleteAction = (): SelAction[] => {
+            if (!ctx.caps.delete || readOnly) return [];
+            const files = selectionDeletable(selection).length;
+            const why = !ctx.caps.bridgeUp ? m.actionsWhenRunning : !selection.length ? m.nothingSelected : !files ? m.selUnchanged(selection.length)
+                : files > DELETE_MAX_FILES ? m.del.tooMany(DELETE_MAX_FILES) : null;
+            return [{ id: 'sel-delete', label: m.del.forever, why }];
+        };
+        // Only family tree files selected (spec 117 §5): Delete permanently… alone; else they are left out of every action.
+        if (selection.length && selection.every(i => i.tree)) return deleteAction();
+        const items = withoutTreeFiles(selection);
+        const n = items.length;
         const archive = items.filter(i => i.origin !== 'tree');
         const editable = items.filter(i => this.bulkEditable(i, ctx)).length;
         const editWhy = !n ? m.nothingSelected : editable ? null : readOnly ? strings.materials.treeReadOnly : archive.length && !ctx.caps.bridgeUp ? m.actionsWhenRunning : m.selUnchanged(n);
@@ -1500,12 +1575,33 @@ export const materialsWindowMethods = uiModule({
         }
         // Delete permanently… (spec 102 §9): the last one, behind `material.delete`, never in a tree that is read only.
         if (ctx.caps.delete && !readOnly) {
-            const files = deletableFiles(items).length;
+            const files = selectionDeletable(items).length;
             const why = !ctx.caps.bridgeUp ? m.actionsWhenRunning : !n ? m.nothingSelected : !files ? m.skippedTree(n)
                 : files > DELETE_MAX_FILES ? m.del.tooMany(DELETE_MAX_FILES) : null;
             out.push({ id: 'sel-delete', label: m.del.forever, why });
         }
         return out;
+    },
+
+    /** A family tree file's menu by its tile (5a): Details, a divider, Delete permanently…. */
+    mwFillItemMenu(pop: HTMLElement): void {
+        const item = win?.popItem ? this.mwItem(win.popItem) : null;
+        if (!item) return;
+        const acts = this.mwTreeFileActions(item);
+        pop.innerHTML = acts.map(a => {
+            const danger = a.id === 'delete';
+            const divider = danger ? '<div class="materials-item-menu-divider" role="separator"></div>' : '';
+            const off = a.why ? ` aria-disabled="true" title="${esc(a.why)}"` : '';
+            return `${divider}<button type="button" role="menuitem" class="materials-item-menu-row${danger ? ' is-danger' : ''}" data-action="${a.id}"${off}>${esc(a.label)}</button>`;
+        }).join('');
+        pop.querySelectorAll<HTMLButtonElement>('[data-action]').forEach(btn => btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (btn.getAttribute('aria-disabled') === 'true') return;
+            const back = win?.popAnchor;
+            this.mwClosePop();
+            back?.focus();
+            acts.find(a => a.id === btn.dataset.action)?.run();
+        }));
     },
 
     /** The selection's ⋯: the actions not in the bar. */
@@ -1534,7 +1630,16 @@ export const materialsWindowMethods = uiModule({
     mwSelAction(id: string): void {
         const w = win;
         if (!w) return;
-        const items = this.mwOrdered(this.materialsSelection());
+        const selection = this.mwOrdered(this.materialsSelection());
+        // Family tree files only ever go with Delete permanently… (spec 117 §5).
+        if (id === 'sel-delete') {
+            const files = selectionDeletable(selection);
+            const opts = { ctx: { selection: true, where: 'window' as const } };
+            // One family tree file alone: its own way (with a live source, the two-part dialog, spec 117 §7).
+            void (files.length === 1 && files[0].tree ? this.openTreeFileDelete(files[0], opts) : this.openDeleteDialog(files, opts));
+            return;
+        }
+        const items = withoutTreeFiles(selection);
         const end = () => { if (alive(w.gen)) this.clearMaterialsSelection(); };
         switch (id) {
             case 'sel-review': this.mwReview(items); return;
@@ -1544,7 +1649,6 @@ export const materialsWindowMethods = uiModule({
             case 'sel-kind': this.openBulkEditDialog('kind', items, { done: end, refused: r => this.mwShowRefused(r) }); return;
             case 'sel-date': this.openBulkEditDialog('date', items, { done: end, refused: r => this.mwShowRefused(r) }); return;
             case 'sel-remove': void this.openRemoveManyFromTreeDialog(items).then(ok => { if (ok) end(); }); return;
-            case 'sel-delete': void this.openDeleteDialog(items, { ctx: { selection: true, where: 'window' } }); return;
             case 'sel-remove-person':
                 this.openSelRemovePersonDialog(items, {
                     done: end,
@@ -1632,6 +1736,54 @@ export const materialsWindowMethods = uiModule({
         return win?.items.find(i => i.key === key) ?? null;
     },
 
+    /**
+     * A click or Enter on a tile: a family tree file shows its menu (Details, Delete permanently…;
+     * spec 117 §5), any other file opens.
+     */
+    mwActivateItem(key: string, anchor: HTMLElement | null): void {
+        const item = this.mwItem(key);
+        if (item?.tree && anchor) this.mwTreeFileMenu(item, anchor);
+        else this.mwOpenItem(key);
+    },
+
+    /** A family tree file's menu (spec 117 §5): a menu by the tile, a list from below on a phone or touch (5d, 5e). */
+    mwTreeFileMenu(item: MaterialItem, anchor: HTMLElement): void {
+        const w = win;
+        if (!w) return;
+        const rows = this.mwTreeFileActions(item);
+        if (isPhoneBar() || media('(pointer: coarse)')) {
+            this.mwClosePop();
+            const open = rows.find(r => r.id === 'open');
+            const del = rows.find(r => r.id === 'delete');
+            this.presentMenuSheet(item.title, [
+                ...(open ? [{ rows: [{ label: open.label, id: 'mw-tree-open', run: open.run }] }] : []),
+                ...(del ? [{ divider: true, rows: [{
+                    label: del.label, id: 'mw-tree-delete', danger: true, run: del.run,
+                    ...(del.why ? { disabled: true, why: del.why } : {}),
+                }] }] : []),
+            ], { subtitle: [this.mwTreeFileLine(item), this.mwTreeFileOf(item)].filter(Boolean).join(' · ') });
+            return;
+        }
+        w.popItem = item.key;
+        this.mwOpenPop('itemMenu', anchor);
+    },
+
+    /** A family tree file's actions: Details, and Delete permanently… behind `material.delete` in a tree that can change. */
+    mwTreeFileActions(item: MaterialItem): { id: 'open' | 'delete'; label: string; why: string | null; run: () => void }[] {
+        const ctx = this.materialsWindowContext();
+        const m = strings.materials;
+        const out: { id: 'open' | 'delete'; label: string; why: string | null; run: () => void }[] = [
+            { id: 'open', label: m.treeDetails, why: null, run: () => this.mwOpenItem(item.key) },
+        ];
+        if (ctx?.caps.delete && !DataManager.isReadOnly()) {
+            out.push({
+                id: 'delete', label: m.del.forever, why: ctx.caps.bridgeUp ? null : m.actionsWhenRunning,
+                run: () => { void this.openTreeFileDelete(item, { ctx: { where: 'window' } }); },
+            });
+        }
+        return out;
+    },
+
     /** Open an item with its group's items around it (the viewer's ‹ ›). */
     mwOpenItem(key: string): void {
         const w = win;
@@ -1643,7 +1795,11 @@ export const materialsWindowMethods = uiModule({
         const index = items.findIndex(i => i.key === key);
         if (index < 0) return;
         const personName = w.filters.person ? nameWithoutYears(w.names.get(w.filters.person) ?? w.filters.person) : '';
-        this.openMaterialItems(items, index, { where: 'window', label: personName ? strings.materials.ctxPerson(personName) : group ? this.mwGroupName(group) : '' });
+        // The window filtered to a person: Use as portrait… is for them (1121).
+        const who = w.filters.person;
+        const personId = !who ? null : DataManager.getPerson(who as PersonId)?.id
+            ?? DataManager.getAllPersons().find(p => researchPersonRef(p.refn) === who)?.id ?? null;
+        this.openMaterialItems(items, index, { where: 'window', label: personName ? strings.materials.ctxPerson(personName) : group ? this.mwGroupName(group) : '', personId });
     },
 
     mwRun(id: MaterialActionId, items: MaterialItem[], ctx: MaterialActionCtx): void {
@@ -1684,7 +1840,7 @@ export const materialsWindowMethods = uiModule({
         const w = win;
         if (!w) return [];
         this.mwRebuild();
-        return w.items.filter(i => i.batch?.id === batch.id && !i.hidden
+        return w.items.filter(i => i.batch?.id === batch.id && !i.hidden && !this.mwWaits(i)
             && (folderLabel === undefined || inMaterialFolder(i.path, folderLabel)));
     },
 
@@ -1749,7 +1905,7 @@ export const materialsWindowMethods = uiModule({
         const m = strings.materials;
         const pop = document.createElement('div');
         pop.className = `mw-pop mw-pop-${kind}`;
-        const menu = kind === 'batchMenu' || kind === 'folderMenu' || kind === 'selMenu' || kind === 'headMenu';
+        const menu = kind === 'batchMenu' || kind === 'folderMenu' || kind === 'selMenu' || kind === 'headMenu' || kind === 'itemMenu';
         pop.setAttribute('role', menu ? 'menu' : 'dialog');
         if (!menu) pop.setAttribute('aria-label', kind === 'where' ? m.whereTitle : kind === 'sheet' ? m.filtersTitle : kind === 'person' ? m.fPerson : kind === 'kind' ? m.fKind : m.fBatch);
         w.overlay.appendChild(pop);
@@ -1758,6 +1914,7 @@ export const materialsWindowMethods = uiModule({
         w.popAnchor = anchor;
         anchor.setAttribute('aria-expanded', 'true');
         if (kind === 'selMenu') this.mwFillSelMenu(pop);
+        else if (kind === 'itemMenu') this.mwFillItemMenu(pop);
         else if (kind === 'headMenu') this.mwFillHeadMenu(pop);
         else if (menu) this.mwFillMenu(pop, data);
         else if (kind === 'where') this.mwFillWhere(pop);
@@ -1971,6 +2128,12 @@ export const materialsWindowMethods = uiModule({
     },
 
     /** The filter popovers (wide) and the filters sheet (≤ 1024). */
+    /** The Kind filter's rows: "Family tree files" only while there is one (or it is ticked, to be unticked; spec 117 §5). */
+    mwKindRows(): KindFilter[] {
+        const w = win!;
+        return w.items.some(i => i.tree) || w.filters.kinds.includes('tree') ? [...KIND_FILTERS, 'tree'] : KIND_FILTERS;
+    },
+
     mwFillFilters(pop: HTMLElement, kind: PopKind): void {
         const w = win!;
         const ctx = this.materialsWindowContext();
@@ -1990,7 +2153,7 @@ export const materialsWindowMethods = uiModule({
         if (kind === 'kind' || sheet) {
             parts.push(`<div class="mw-pop-section" role="group" aria-label="${esc(m.fKind)}">
                 ${sheet ? `<div class="mw-pop-title">${esc(m.fKind)}</div>` : ''}
-                ${KIND_FILTERS.map(k => `<label class="mw-check-row"><input type="checkbox" data-pop="kind" value="${k}"${f.kinds.includes(k) ? ' checked' : ''}> ${esc(k === 'none' ? m.kindNone : m.kind[k] ?? k)}</label>`).join('')}
+                ${this.mwKindRows().map(k => `<label class="mw-check-row"><input type="checkbox" data-pop="kind" value="${k}"${f.kinds.includes(k) ? ' checked' : ''}> ${esc(k === 'none' ? m.kindNone : k === 'tree' ? m.kindTrees : m.kind[k] ?? k)}</label>`).join('')}
             </div>`);
         }
         if (kind === 'batch' || (sheet && w.model === 'archive')) {
@@ -2386,7 +2549,7 @@ export const materialsWindowMethods = uiModule({
             this.mwToggleSelect(key);
             return;
         }
-        this.mwOpenItem(key);
+        this.mwActivateItem(key, cell);
     },
 
     mwKeydown(e: KeyboardEvent): void {
@@ -2426,7 +2589,7 @@ export const materialsWindowMethods = uiModule({
             case 'ArrowUp': vertical(-1); break;
             case 'Home': move(0); break;
             case 'End': move(order.length - 1); break;
-            case 'Enter': e.preventDefault(); this.mwOpenItem(key); break;
+            case 'Enter': e.preventDefault(); this.mwActivateItem(key, cell); break;
             case ' ':
                 if (!this.mwCanSelect()) return;
                 e.preventDefault();

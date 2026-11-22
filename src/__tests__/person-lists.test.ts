@@ -32,7 +32,8 @@ import { buildLineages } from '../lineage.js';
 import { setLanguage, strings } from '../strings.js';
 import { syntheticTree } from './helpers/synthetic-tree.js';
 import { budgetReport, measureAgainstBudget } from './helpers/perf-budget.js';
-import { STROM_DATA_VERSION, type Partnership, type PartnershipId, type Person, type PersonId, type PersonList, type StromData, type TreeId } from '../types.js';
+import { type Partnership, type PartnershipId, type Person, type PersonId, type PersonList, type ResearchPlace, type StromData, type TreeId } from '../types.js';
+import { STROM_DATA_VERSION } from '../version.js';
 
 const id = (s: string) => s as PersonId;
 const uid = (s: string) => s as PartnershipId;
@@ -143,13 +144,20 @@ describe('stored lists (data version 22)', () => {
     });
 
     it('a GEDCOM export carries neither the lists nor the dates added', () => {
-        const d = family();
-        d.persons[id('ada')].addedAt = '2026-11-01T08:00:00.000Z';
-        d.personLists = [fixed({ name: 'Archive request', personIds: [id('ada')] })];
-        const { content } = exportToGedcom(d, 'T');
-        expect(content).not.toContain('Archive request');
-        expect(content).not.toContain('2026-11-01');
-        expect(content).not.toMatch(/1 NOV 2026/);
+        // A fixed clock: the export's own date (HEAD DATE) must not be read as the date added.
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('2026-06-15T10:30:00Z'));
+        try {
+            const d = family();
+            d.persons[id('ada')].addedAt = '2026-11-01T08:00:00.000Z';
+            d.personLists = [fixed({ name: 'Archive request', personIds: [id('ada')] })];
+            const { content } = exportToGedcom(d, 'T');
+            expect(content).not.toContain('Archive request');
+            expect(content).not.toContain('2026-11-01');
+            expect(content).not.toMatch(/(^|\D)1 NOV 2026/m);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
 
@@ -204,6 +212,44 @@ describe('who is in a list', () => {
         expect(listPersonIds(ix, l)).toEqual(['konst', 'ada']);
         expect(ruleLabel(l.rule, ix)).toBe('Research line: G1 Ostrovid line');
         expect(ruleBroken(ix, { kind: 'line', directionId: 'G9' })).toEqual({ kind: 'line' });
+    });
+
+    it('a research line: a person also in a done line belongs to the line not done', () => {
+        const d = family();
+        d.researchDirections = { complete: true, lines: [{ id: 'G1', name: 'Ostrovid line', state: 'active' }, { id: 'G2', name: 'Other', state: 'done' }], branches: [] };
+        const at: [string, string, ResearchPlace[]][] = [
+            ['konst', 'P1', [{ role: 'line', line: 'G2' }, { role: 'line', line: 'G1' }]],
+            ['ada', 'P2', [{ role: 'line', line: 'G1' }]],
+            ['emil', 'P3', [{ role: 'line', line: 'G2' }]],
+        ];
+        for (const [pid, refn, places] of at) {
+            d.persons[id(pid)].refn = refn;
+            d.persons[id(pid)].research = { places } as Person['research'];
+        }
+        const ix = buildLineages(d);
+        const rule = (directionId: string) => ({ ...fixed(), dynamic: true, sort: 'old' as const, rule: { kind: 'line' as const, directionId } });
+        expect(listPersonIds(ix, rule('G1'))).toEqual(['konst', 'ada']);
+        // Konstantin stands in the ended G2 as well: a list of G2 keeps him (membership is any place in the line).
+        expect(listPersonIds(ix, rule('G2'))).toEqual(['konst', 'emil']);
+    });
+
+    it('a research line: a person of a narrower line nested in it is in it too', () => {
+        const d = family();
+        d.researchDirections = { complete: true, lines: [{ id: 'G1', name: 'Ostrovid line', state: 'active' }, { id: 'G2', name: 'Konstantin\'s ancestors', state: 'active' }], branches: [] };
+        const at: [string, string, ResearchPlace[]][] = [
+            // The narrower G2 first, as the research lists the places.
+            ['konst', 'P1', [{ role: 'line', line: 'G2' }, { role: 'line', line: 'G1' }]],
+            ['ada', 'P2', [{ role: 'line', line: 'G1' }]],
+            ['emil', 'P3', [{ role: 'line', line: 'G2' }]],
+        ];
+        for (const [pid, refn, places] of at) {
+            d.persons[id(pid)].refn = refn;
+            d.persons[id(pid)].research = { places } as Person['research'];
+        }
+        const ix = buildLineages(d);
+        const rule = (directionId: string) => ({ ...fixed(), dynamic: true, sort: 'old' as const, rule: { kind: 'line' as const, directionId } });
+        expect(listPersonIds(ix, rule('G1'))).toEqual(['konst', 'ada']);
+        expect(listPersonIds(ix, rule('G2'))).toEqual(['konst', 'emil']);
     });
 
     it('a Table filter: the rows it passes in its order; for unions both partners', () => {
@@ -554,6 +600,51 @@ describe('DataManager', () => {
         vi.spyOn(TreeManager, 'getActiveTreeMetadata').mockReturnValue({ isLocked: true } as never);
         expect(DataManager.listsReadOnly()).toBe(true);
         expect(DataManager.deletePersonList(ADDED30_ID)).toBe(false);
+    });
+
+    it('a tree that follows a research keeps its lists open, their steps undone and redone; other steps wait (N2)', () => {
+        const before = DataManager.createPersonList({ name: 'Before', dynamic: false })!;
+        DataManager.setPersonListSort(before.id, 'name');
+        // A step of the tree itself, done before following.
+        DataManager.updatePerson(id('ada'), { firstName: 'Adela' });
+        DataManager.setLiveTree(TREE);
+        try {
+            expect(DataManager.isTreeLocked()).toBe(true);
+            expect(DataManager.listsReadOnly()).toBe(false);
+            const l = DataManager.createPersonList({ name: 'Archive visit', dynamic: false })!;
+            expect(DataManager.addPersonsToList(l.id, [id('ada'), id('emil')])).toBe(true);
+            expect(toasts[toasts.length - 1]?.toast?.text).toBe('2 people added to “Archive visit”.');
+            expect(DataManager.undoLocked('undo')).toBe(false);
+            expect(DataManager.undo()?.description).toBe('changing the list: Archive visit');
+            expect(DataManager.getPersonListIds(l.id)).toEqual([]);
+            expect(DataManager.undoLocked('redo')).toBe(false);
+            expect(DataManager.redo()).not.toBeNull();
+            expect(DataManager.getPersonListIds(l.id)).toEqual(['ada', 'emil']);
+            DataManager.undo();
+            DataManager.undo();
+            expect(DataManager.getPersonList(l.id)).toBeUndefined();
+            // The step of the tree under them waits until following ends: the tree stays the research's.
+            expect(DataManager.undoLocked('undo')).toBe(true);
+            expect(DataManager.undo()).toBeNull();
+            expect(DataManager.getPerson(id('ada'))?.firstName).toBe('Adela');
+            // Locked for another reason too: the lists are closed as well.
+            vi.spyOn(TreeManager, 'getActiveTreeMetadata').mockReturnValue({ isLocked: true } as never);
+            expect(DataManager.listsReadOnly()).toBe(true);
+            expect(DataManager.createPersonList({ name: 'Y', dynamic: false })).toBeNull();
+        } finally {
+            DataManager.setLiveTree(null);
+        }
+        vi.spyOn(TreeManager, 'getActiveTreeMetadata').mockReturnValue(null);
+        expect(DataManager.undoLocked('undo')).toBe(false);
+    });
+
+    it('another window\'s copy of a followed tree keeps the lists closed (its edits go to the main window)', () => {
+        const sink: WindowEditSink = {
+            edit: () => {}, undo: () => {}, redo: () => {}, canUndo: () => false, canRedo: () => false,
+            readOnly: () => true, sessionEnded: () => {},
+        } as WindowEditSink;
+        DataManager.setWindowSink(sink);
+        expect(DataManager.listsReadOnly()).toBe(true);
     });
 
     it('another window sends its list edits to the main window', () => {

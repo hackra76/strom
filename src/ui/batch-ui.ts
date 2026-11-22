@@ -14,11 +14,13 @@ import { strings, getCurrentLanguage } from '../strings.js';
 import { PersonId } from '../types.js';
 import { sha256OfBlob } from '../sha256.js';
 import { originalTargets, mediaReplyId } from '../originals.js';
-import { parseLiveBridge, withAppVersion, researchSchemeUrl, sanitizeLiveStatus, BATCH_KEPT_FEATURE, researchLinkMark } from '../research-link.js';
+import { parseLiveBridge, withAppVersion, researchSchemeUrl, sanitizeLiveStatus, BATCH_KEPT_FEATURE, INTAKE_AUTO_FEATURE, researchLinkMark } from '../research-link.js';
 import { storedResearchBridge, announcedResearchScheme } from '../research-device.js';
 import {
     BatchSkip, BatchFolder, batchSkip, batchLimitsOf, batchOverLimit, batchEstimate, batchDefaultName, batchTree,
     batchFolderFiles, newBatchId, batchPathHeader, isZip, UnfinishedBatch, sanitizeUnfinishedBatch,
+    MEDIA_QUEUED_FEATURE, MEDIA_KNOWN_FEATURE, MediaKnownState, batchKnownChunk, parseMediaKnown, parseBatchDoneFiles, batchSorting,
+    batchCloseWaitMs, CLOSE_RETRY_DEFAULT_MS, CLOSE_RETRY_TOTAL_MS,
 } from '../batch.js';
 import { mediaCodesOn, mediaRefusalText } from '../media-refusal.js';
 import { isWriteHeldCode, joinSaid, writeHeldOfRefusal } from '../research-write-held.js';
@@ -36,6 +38,8 @@ const UNFINISHED_KEY = 'strom-batch:';
 const MAX_ROWS = 400;
 const ASK_TIMEOUT_MS = 5000;
 const PUT_MIN_TIMEOUT_MS = 60_000;
+/** `POST /media/known` for a part of the batch: one ask instead of one per file (an index lookup, quick). */
+const KNOWN_TIMEOUT_MS = 30_000;
 
 /** The ask was given up for no answer in time (fetchWithTimeout aborted it). */
 function isTimeout(err: unknown): boolean {
@@ -54,7 +58,14 @@ interface Item {
 
 type Step = 'pick' | 'check' | 'send' | 'progress' | 'done';
 
-interface DoneReply { inputs: number; known: number; refused: number; tasks: number }
+/** `batch/<id>/done`: counts, and with `intake.auto` (spec 130) whether this batch is sorted by tasks (`sort`) and the setting (`auto`). */
+interface DoneReply { inputs: number; known: number; refused: number; tasks: number; sort?: boolean; auto?: boolean }
+
+/**
+ * What came of one `batch/<id>/done`: closed (its reply), nothing there to close (`none`: no file of it came),
+ * its address turned down (`down`), held by the research (`held`), or not closed — asked again after `again` ms.
+ */
+type CloseOutcome = DoneReply | 'none' | 'down' | 'held' | { again: number };
 
 interface Run {
     id: string;
@@ -75,6 +86,17 @@ interface Run {
     skipped: number;
     /** Files skipped before sending (GET said the research has them): never in the batch, counted here. */
     skippedAsked: number;
+    /**
+     * Files the bridge took to write with the batch's close (202 of `media.queued`, or `media/known` said
+     * they wait in its queue): sha → path. Neither received nor known yet: `batch/done` says what became of each.
+     */
+    queued: Map<string, string>;
+    /** The hash of each file of the queue by its index (made once: for `media/known` and its PUT). */
+    shaOf: Map<number, string>;
+    /** Indexes of the queue `media/known` was asked for (answered or not: not asked again). */
+    knownAsked: Set<number>;
+    /** What `media/known` said of a hash (absent: not said — the file is asked on its own as before). */
+    knownOf: Map<string, MediaKnownState>;
     refused: { path: string; why: string }[];
     current: string;
     paused: boolean;
@@ -92,6 +114,14 @@ interface Run {
     pauseAsked: boolean;
     /** Who waits for the loop to reach a pause or its end (the states of Pause and Cancel). */
     waits: (() => void)[];
+    /** The close failed and is asked again shortly: the batch is not done yet (W136). */
+    closeWait: boolean;
+    /** Paused because the closes kept failing: Continue closes it again. */
+    closeFailed: boolean;
+    /** The run ended (cancelled) with the batch not closed: remembered unfinished, never said done. */
+    unclosed: boolean;
+    /** What the toast of a hidden window last said of a close not done ('' nothing yet). */
+    closeSaid: '' | 'soon' | 'continue';
 }
 
 let st: {
@@ -146,11 +176,6 @@ function writeUnfinished(treeId: string, rec: UnfinishedBatch | null): void {
         if (rec) localStorage.setItem(UNFINISHED_KEY + treeId, JSON.stringify(rec));
         else localStorage.removeItem(UNFINISHED_KEY + treeId);
     } catch { /* not remembered: a closed tab starts anew */ }
-}
-
-function retryAfterMs(value: string | null): number {
-    const n = Number(value);
-    return Number.isFinite(n) && n > 0 ? Math.min(60_000, Math.max(1000, n * 1000)) : 5000;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
@@ -473,8 +498,10 @@ export const batchMethods = uiModule({
             try { return new Intl.NumberFormat(getCurrentLanguage(), { style: 'currency', currency: cur, maximumFractionDigits: n < 10 ? 2 : 0 }).format(n); }
             catch { return `${n} ${cur}`; }
         };
-        const info = stored
-            ? `<p class="material-box"><span class="research-not-retroactive-icon" aria-hidden="true">i</span><span>${esc(archive ? b.archiveInfo : b.storedInfo)}</span></p>`
+        // Not sorted by itself (spec 130 K1.3): no agent opens the files, nothing is spent by the sending.
+        const waits = !stored && this.researchIntakeSorting(link.researchId) === 'manual';
+        const info = stored || waits
+            ? `<p class="material-box"><span class="research-not-retroactive-icon" aria-hidden="true">i</span><span>${esc(archive ? b.archiveInfo : stored ? b.storedInfo : b.waitInfo)}</span></p>`
             : `<div class="batch-confirm-block"><div class="batch-confirm-label">${esc(b.privacyTitle)}</div><p>${esc(b.privacy)}</p></div>
                <div class="batch-confirm-block"><div class="batch-confirm-label">${esc(b.costTitle)}</div>${est
                     ? `<div class="batch-cost-row"><span>${esc(b.costSort)}</span><strong>${esc(smallBatch ? b.atMost(money(est.amount, est.currency)) : b.about(money(est.amount, est.currency)))}</strong></div><p class="batch-cost-note">${esc(b.costNote)}</p>`
@@ -507,16 +534,17 @@ export const batchMethods = uiModule({
                 <ul>${r.refused.slice(0, 200).map(x => `<li>${esc(`${x.path}: ${x.why}`)}</li>`).join('')}</ul>
             </details>` : '';
         return `
-                <div class="modal-content batch-content batch-progress${r.paused ? ' is-paused' : ''}">
-                    <div class="batch-progress-title">${r.paused ? '' : '<i class="busy-spin s12" aria-hidden="true"></i>'}${esc(r.paused ? b.paused : b.progressTitle)}</div>
+                <div class="modal-content batch-content batch-progress${r.paused ? ' is-paused' : ''}${r.closeWait || r.closeFailed ? ' is-closing' : ''}">
+                    <div class="batch-progress-title">${r.paused ? '' : '<i class="busy-spin s12" aria-hidden="true"></i>'}${esc(r.paused ? b.paused : r.closeWait ? b.closingTitle : b.progressTitle)}</div>
                     <div class="batch-progress-sub">${esc(b.progressSub(r.name, research))}</div>
                     <div class="prog batch-prog">
                         <div class="prog-line batch-progress-count" role="status"><span>${esc(b.progressSize(formatBytesShort(r.doneBytes), formatBytesShort(r.totalBytes)))}</span>
                             <strong class="prog-k">${esc(b.progressCount(done, r.total))}</strong></div>
                         ${barHtml(share, { paused: r.paused })}
                     </div>
-                    ${r.paused ? `<p class="batch-paused-note">${esc(r.held || (r.lost ? b.bridgeLost : b.pausedNote))}${r.held && r.heldSeal && this.activeResearchLink('seal')
+                    ${r.paused ? `<p class="batch-paused-note">${esc(r.held || (r.closeFailed ? `${this.batchCloseWhat(r)} ${b.closeAgainContinue}` : r.lost ? b.bridgeLost : b.pausedNote))}${r.held && r.heldSeal && this.activeResearchLink('seal')
                         ? ` <button type="button" class="link-button" data-act="seal">${this.researchSyncActionLabel('sealTakeOver', strings.sync.held.sealButton)}</button>` : ''}</p>`
+                        : r.closeWait ? `<p class="batch-paused-note batch-close-wait" role="status">${esc(`${this.batchCloseWhat(r)} ${b.closeAgainSoon}`)}</p>`
                         : cur ? `<p class="batch-now">${esc(b.now(cur.path, formatBytesShort(cur.size)))}</p>` : ''}
                     ${r.skipped + r.skippedAsked ? `<p class="batch-skipped">${esc(b.skipped)} · ${r.skipped + r.skippedAsked}</p>` : ''}
                     ${refused}
@@ -546,6 +574,12 @@ export const batchMethods = uiModule({
         const open = link && this.researchLinkAvailable('open') ? researchSchemeUrl('open', { tree: link.researchId }, announcedResearchScheme()) : null;
         // Materials shown in the app: the batch opens there; the research's own overview stays a link on the left.
         const materials = this.materialsListOn();
+        // Sorted by the research itself, or waiting in Materials for Sort with the agent… (spec 130 K1.2, K2.2, K5.1).
+        const status = link ? this.researchStatusOf(link.researchId) : null;
+        const sorting = batchSorting(!!status?.features?.includes(INTAKE_AUTO_FEATURE), status?.intake?.auto, r.result);
+        const sortBlock = materials && sorting !== 'auto' ? this.batchSortHtml(received) : '';
+        const text = materials && stored ? b.doneTextMaterials : archive ? b.doneTextArchive : stored ? b.doneTextStored
+            : sorting === 'auto' ? b.doneTextAuto : sorting === 'manual' ? (sortBlock ? b.doneTextUnsorted : b.doneTextUnsortedLater) : b.doneText;
         return `
                 <div class="modal-content batch-content batch-done">
                     <h3 class="batch-confirm-title">✓ ${esc(archive ? b.doneTitleArchive(r.name) : b.doneTitle(r.name))}</h3>
@@ -553,8 +587,8 @@ export const batchMethods = uiModule({
                     ${known ? `<div class="batch-done-row"><span>${esc(archive ? b.alreadyHadArchive : b.alreadyHad)}</span><strong>${known}</strong></div>` : ''}
                     ${refusedRow}
                     ${!stored && r.result?.tasks ? `<div class="batch-done-row"><span>${esc(b.tasks)}</span><strong>${r.result.tasks}</strong></div>` : ''}
-                    <p class="batch-done-text">${esc(materials && stored ? b.doneTextMaterials : archive ? b.doneTextArchive : stored ? b.doneTextStored : b.doneText)}</p>
-                    ${materials ? this.batchSortHtml(received) : ''}
+                    <p class="batch-done-text">${esc(text)}</p>
+                    ${sortBlock}
                     ${open && !materials ? `<button type="button" class="research-sync-link" data-act="open-research">${researchActionLabel(b.openInResearch, researchLinkMark('open'))}</button>` : ''}
                 </div>
                 <div class="buttons batch-footer">${materials ? `
@@ -634,6 +668,8 @@ export const batchMethods = uiModule({
                     const r = run;
                     if (!r || r.paused || r.pauseAsked) break;
                     r.pauseAsked = true;
+                    // Waiting to close the batch again: the pause comes now, not after the wait.
+                    if (r.closeWait) r.resume?.();
                     void runBusy(el, () => runReached(r, () => r.paused || r.finished), { label: strings.busy.pausing, kind: 'local' });
                     break;
                 }
@@ -783,9 +819,10 @@ export const batchMethods = uiModule({
             id: resume?.id ?? newBatchId(), treeId: link.treeId, researchId: link.researchId, base: bridge.base,
             name: s.name.trim() || strings.batch.defaultName(new Date().toLocaleDateString(getCurrentLanguage())),
             person, personId: s.personId, note: s.note.trim(), queue, index: 0, total: queue.length,
-            totalBytes: queue.reduce((sum, i) => sum + i.size, 0), doneBytes: 0, received: 0, skipped: 0, skippedAsked: 0, refused: [],
+            totalBytes: queue.reduce((sum, i) => sum + i.size, 0), doneBytes: 0, received: 0, skipped: 0, skippedAsked: 0,
+            queued: new Map(), shaOf: new Map(), knownAsked: new Set(), knownOf: new Map(), refused: [],
             current: '', paused: false, lost: false, held: '', heldSeal: false, cancelled: false, finished: false, hidden: false, result: null, resume: null,
-            pauseAsked: false, waits: [],
+            pauseAsked: false, waits: [], closeWait: false, closeFailed: false, unclosed: false, closeSaid: '',
         };
         s.step = 'progress';
         window.addEventListener('beforeunload', onLeave);
@@ -817,6 +854,8 @@ export const batchMethods = uiModule({
                 r.paused = true;
             }
             if (r.paused) {
+                // The research's changes held while it sent: read now, not after a pause that may last.
+                this.liveReleaseHeld();
                 draw(true);
                 wakeRun(r);
                 await new Promise<void>(resolve => { r.resume = resolve; });
@@ -837,18 +876,63 @@ export const batchMethods = uiModule({
         }
         // Closed with what came (cancelled too: what was sent stays and is sorted). Its address turned
         // down meanwhile (a new token, N37): paused like a file, Continue closes it at the new one.
+        // A close that fails is no end (W136): the files may still wait in the bridge's queue — closed
+        // again after the research's `retry`, for a while, then paused; never said done until it passes.
+        let failingSince = 0;
         for (;;) {
             const closed = await this.batchClose(r);
-            if ((closed !== 'down' && closed !== 'held') || r.cancelled) { r.result = closed === 'down' || closed === 'held' ? null : closed; break; }
+            if (closed === 'none') { r.result = null; break; }
+            if (typeof closed === 'object' && !('again' in closed)) { r.result = closed; break; }
+            if (r.cancelled) { r.unclosed = true; break; }
+            if (typeof closed === 'object') {
+                failingSince ||= Date.now();
+                if (!r.pauseAsked && Date.now() - failingSince + closed.again <= CLOSE_RETRY_TOTAL_MS) {
+                    r.closeWait = true;
+                    this.batchSayNotClosed(r, 'soon');
+                    draw(true);
+                    await new Promise<void>(resolve => {
+                        const timer = setTimeout(resolve, closed.again);
+                        r.resume = () => { clearTimeout(timer); resolve(); };
+                    });
+                    r.resume = null;
+                    if (r.cancelled) {
+                        // Cancelled while it waited: one close more (what was sent is closed if it can be), no more waiting.
+                        const last = await this.batchClose(r);
+                        if (typeof last === 'object' && !('again' in last)) { r.result = last; break; }
+                        if (last === 'none') { r.result = null; break; }
+                        r.unclosed = true;
+                        break;
+                    }
+                    // Pause asked while it waited: paused now, Continue closes it again.
+                    if (!r.pauseAsked) continue;
+                }
+                r.closeFailed = true;
+            }
+            r.closeWait = false;
+            r.pauseAsked = false;
             r.paused = true;
             r.lost = closed === 'down';
+            if (r.closeFailed) this.batchSayNotClosed(r, 'continue');
             draw(true);
             wakeRun(r);
             await new Promise<void>(resolve => { r.resume = resolve; });
             r.resume = null;
+            failingSince = 0;
         }
+        r.closeWait = false;
+        r.closeFailed = false;
         r.finished = true;
+        // The followed research's changes held while the batch went: its tree read once now.
+        this.liveReleaseHeld();
         window.removeEventListener('beforeunload', onLeave);
+        if (r.unclosed) {
+            // Not closed: the batch stays remembered unfinished (the same folder chosen again closes it), no summary.
+            this.closeBatchDialog();
+            this.showToast(`${strings.batch.notClosed(r.name)} ${this.batchCloseWhat(r)}`, 8000, { closable: true });
+            wakeRun(r);
+            this.refreshResearchSyncUi();
+            return;
+        }
         writeUnfinished(r.treeId, null);
         // The Materials window open under it says the batch in its strip and reads the list again (spec 102 §8).
         this.materialsBatchAdded(r.result?.inputs ?? r.received);
@@ -868,16 +952,26 @@ export const batchMethods = uiModule({
 
     /** One file: asked whether the research has it (not a ZIP), else sent with the batch's headers. */
     async batchSendOne(r: Run, item: Item): Promise<'ok' | 'again' | 'down' | 'held'> {
-        let sha: string;
-        try {
-            sha = await sha256OfBlob(item.file);
-        } catch {
-            r.refused.push({ path: item.path, why: strings.material.whyUnreadable });
-            return 'ok';
+        const features = this.researchStatusOf(r.researchId)?.features ?? [];
+        const zip = isZip(item.path);
+        // A bridge that says what it has of many files: asked once for the next part of the batch, not per file.
+        if (!zip && features.includes(MEDIA_KNOWN_FEATURE) && !r.knownAsked.has(r.index)) await this.batchAskKnown(r);
+        let sha = r.shaOf.get(r.index);
+        if (!sha) {
+            try {
+                sha = await sha256OfBlob(item.file);
+            } catch {
+                r.refused.push({ path: item.path, why: strings.material.whyUnreadable });
+                return 'ok';
+            }
+            r.shaOf.set(r.index, sha);
         }
         const url = `${r.base}/media/${sha}`;
-        const zip = isZip(item.path);
-        if (!zip) {
+        const said = zip ? undefined : r.knownOf.get(sha);
+        if (said === 'has') { r.skippedAsked++; return 'ok'; }
+        // Already came and waits in the bridge's queue (another window, an attempt before): never sent again.
+        if (said === 'queued') { r.queued.set(sha, item.path); return 'ok'; }
+        if (!zip && said === undefined) {
             try {
                 const res = await fetchWithTimeout(url, ASK_TIMEOUT_MS);
                 if (res.ok && mediaReplyId(await res.json().catch(() => null))) { r.skippedAsked++; return 'ok'; }
@@ -895,7 +989,11 @@ export const batchMethods = uiModule({
             ...(r.person ? { 'X-Strom-Person': r.person } : {}),
             ...(zip ? { 'X-Strom-Zip': '1' } : {}),
         };
-        const headBefore = await this.researchHeadBeforeWrite(r.researchId);
+        // A bridge that writes a batch as it is closed: the file is only taken now (202), nothing is written
+        // yet, so no head is asked before it nor taken after it — `batch/done` says what became of it.
+        const later = features.includes(MEDIA_QUEUED_FEATURE);
+        if (later) headers.Prefer = 'respond-async';
+        const headBefore = later ? '' : await this.researchHeadBeforeWrite(r.researchId);
         const ctl = typeof AbortController === 'function' ? new AbortController() : null;
         const timer = ctl ? setTimeout(() => ctl.abort(), Math.max(PUT_MIN_TIMEOUT_MS, item.size / 2000)) : null;
         try {
@@ -903,6 +1001,10 @@ export const batchMethods = uiModule({
                 method: 'PUT', mode: 'cors', credentials: 'omit', cache: 'no-store', headers, body: item.file, signal: ctl?.signal,
             });
             const body = await res.json().catch(() => null) as Record<string, unknown> | null;
+            if (res.status === 202) {
+                r.queued.set(sha, item.path);
+                return 'ok';
+            }
             if (res.ok) {
                 // The research's new head is this write's own (a file, not the tree): the tree stays in step with it.
                 this.researchTakeOwnWriteHead(r.researchId, headBefore, body?.head, body?.parent);
@@ -918,8 +1020,10 @@ export const batchMethods = uiModule({
                 else r.received++;
                 return 'ok';
             }
+            // Busy or a file held a moment by another program (`media.held`, W136): the body's `retry`
+            // (Retry-After is not exposed across origins), else the header, else the default.
             if (res.status === 503) {
-                await sleep(retryAfterMs(res.headers.get('Retry-After')));
+                await sleep(batchCloseWaitMs(body, res.headers.get('Retry-After')));
                 return 'again';
             }
             // Held by the research (sealed elsewhere, files not downloaded, a full disk): never a new batch, never again by itself.
@@ -938,6 +1042,40 @@ export const batchMethods = uiModule({
             return 'ok';
         } catch {
             return 'down';
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    },
+
+    /**
+     * `POST /media/known` for the next part of the batch (media.known): its files hashed, one ask, what the
+     * research has of each kept (`knownOf`). No answer, or not one: those files are asked one by one as before.
+     */
+    async batchAskKnown(r: Run): Promise<void> {
+        const part = batchKnownChunk(r.queue, r.index, i => r.knownAsked.has(i));
+        const shas: string[] = [];
+        for (const i of part) {
+            r.knownAsked.add(i);
+            let sha = r.shaOf.get(i);
+            if (!sha) {
+                // Unreadable: its own turn says so.
+                try { sha = await sha256OfBlob(r.queue[i].file); } catch { continue; }
+                r.shaOf.set(i, sha);
+            }
+            shas.push(sha);
+        }
+        if (shas.length === 0) return;
+        const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+        const timer = ctl ? setTimeout(() => ctl.abort(), KNOWN_TIMEOUT_MS) : null;
+        try {
+            const res = await fetch(withAppVersion(`${r.base}/media/known`), {
+                method: 'POST', mode: 'cors', credentials: 'omit', cache: 'no-store',
+                headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: JSON.stringify({ shas: [...new Set(shas)] }), signal: ctl?.signal,
+            });
+            const said = res.ok ? parseMediaKnown(await res.json().catch(() => null), shas) : null;
+            for (const [sha, state] of said ?? []) r.knownOf.set(sha, state);
+        } catch {
+            // Asked one by one then (a bridge gone pauses there, as before).
         } finally {
             if (timer) clearTimeout(timer);
         }
@@ -984,31 +1122,84 @@ export const batchMethods = uiModule({
         }
     },
 
-    /** `POST /batch/<id>/done`: the research closes the batch and makes its tasks ('down': its address turned down). */
-    async batchClose(r: Run): Promise<DoneReply | null | 'down' | 'held'> {
-        const body = JSON.stringify({ name: r.name, files: r.received + r.skipped + r.skippedAsked + r.refused.length,
+    /**
+     * `POST /batch/<id>/done`, once: the research closes the batch and makes its tasks. Not closed (W136:
+     * busy, an error, no answer, a reply that is no JSON) is never taken for done — asked again after the
+     * research's `retry`; a 404 `batch.none` (no file of it came) has nothing to close.
+     */
+    async batchClose(r: Run): Promise<CloseOutcome> {
+        const body = JSON.stringify({ name: r.name, files: r.received + r.skipped + r.skippedAsked + r.queued.size + r.refused.length,
             ...(r.person ? { person: r.person } : {}), ...(r.note ? { note: r.note } : {}) });
-        for (let attempt = 0; attempt < 4; attempt++) {
-            const headBefore = await this.researchHeadBeforeWrite(r.researchId);
-            try {
-                const res = await fetch(withAppVersion(`${r.base}/batch/${encodeURIComponent(r.id)}/done`), {
-                    method: 'POST', mode: 'cors', credentials: 'omit', cache: 'no-store',
-                    headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body,
-                });
-                if (res.status === 503) { await sleep(retryAfterMs(res.headers.get('Retry-After'))); continue; }
-                if (!res.ok) {
-                    if (this.batchHeld(r, res.status, await res.clone().json().catch(() => null))) return 'held';
-                    return await this.batchAddressGone(r, res.status) ? 'down' : null;
-                }
-                const j = await res.json().catch(() => null) as Record<string, unknown> | null;
-                this.researchTakeOwnWriteHead(r.researchId, headBefore, j?.head, j?.parent);
-                const n = (v: unknown): number => (typeof v === 'number' && v >= 0 ? Math.floor(v) : 0);
-                return j ? { inputs: n(j.inputs), known: n(j.known), refused: n(j.refused), tasks: Array.isArray(j.tasks) ? j.tasks.length : 0 } : null;
-            } catch {
-                return null;
-            }
+        const headBefore = await this.researchHeadBeforeWrite(r.researchId);
+        let res: Response;
+        try {
+            res = await fetch(withAppVersion(`${r.base}/batch/${encodeURIComponent(r.id)}/done`), {
+                method: 'POST', mode: 'cors', credentials: 'omit', cache: 'no-store',
+                headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body,
+            });
+        } catch {
+            return { again: CLOSE_RETRY_DEFAULT_MS };
         }
-        return null;
+        const j = await res.json().catch(() => null) as Record<string, unknown> | null;
+        if (!res.ok) {
+            if (this.batchHeld(r, res.status, j)) return 'held';
+            if (res.status === 404 && j?.code === 'batch.none') return 'none';
+            if (await this.batchAddressGone(r, res.status)) return 'down';
+            return { again: batchCloseWaitMs(j, res.headers.get('Retry-After')) };
+        }
+        if (!j || typeof j !== 'object') return { again: CLOSE_RETRY_DEFAULT_MS };
+        this.researchTakeOwnWriteHead(r.researchId, headBefore, j.head, j.parent);
+        this.batchTakeDoneFiles(r, j.files);
+        const n = (v: unknown): number => (typeof v === 'number' && v >= 0 ? Math.floor(v) : 0);
+        return { inputs: n(j.inputs), known: n(j.known), refused: n(j.refused), tasks: Array.isArray(j.tasks) ? j.tasks.length : 0,
+            ...(typeof j.sort === 'boolean' ? { sort: j.sort } : {}), ...(typeof j.auto === 'boolean' ? { auto: j.auto } : {}) };
+    },
+
+    /** What a batch not closed yet means: its files wait in the bridge's queue (media.queued), or they are in and only the close is missing. */
+    batchCloseWhat(r: Run): string {
+        const queued = r.queued.size > 0 || !!this.researchStatusOf(r.researchId)?.features?.includes(MEDIA_QUEUED_FEATURE);
+        return queued ? strings.batch.closeWaitQueued : strings.batch.closeWaitOpen;
+    },
+
+    /** The window hidden: a toast says the batch is not closed yet (once for each state), with Show. */
+    batchSayNotClosed(r: Run, what: 'soon' | 'continue'): void {
+        if (!(r.hidden || !document.getElementById(DIALOG_ID)) || r.closeSaid === what) return;
+        r.closeSaid = what;
+        const b = strings.batch;
+        this.showToast(`${b.notClosed(r.name)} ${this.batchCloseWhat(r)} ${what === 'soon' ? b.closeAgainSoon : b.closeAgainContinue}`, 8000, {
+            closable: true, action: { label: b.show, run: () => { r.hidden = false; this.openBatchOverlay(); this.renderBatchDialog(); } },
+        });
+    },
+
+    /**
+     * Whether the followed research `researchId` has its changes held now: a batch of this page goes to it
+     * through a bridge that writes it as it is closed (media.queued) — one read of its tree after the close,
+     * not one per change meanwhile. An older bridge: each change read as it comes, as before.
+     */
+    batchHoldsLive(researchId: string): boolean {
+        const r = run;
+        if (!r || r.finished || r.paused || r.researchId.toLowerCase() !== researchId.toLowerCase()) return false;
+        return !!this.researchStatusOf(r.researchId)?.features?.includes(MEDIA_QUEUED_FEATURE);
+    },
+
+    /**
+     * What became of the files the bridge took to write at the close (`batch/done` → `files`, media.queued):
+     * each queued file received, known or refused (said in the app's language as a refused PUT is). Files
+     * answered at once (200) are counted already and left as they are.
+     */
+    batchTakeDoneFiles(r: Run, files: unknown): void {
+        for (const f of parseBatchDoneFiles(files)) {
+            const path = r.queued.get(f.sha);
+            if (path === undefined) continue;
+            r.queued.delete(f.sha);
+            if (f.zip) {
+                r.received += f.zip.inputs;
+                r.skipped += f.zip.known;
+                for (const z of f.zip.refused) r.refused.push({ path: z.path || path, why: this.batchRefusalText(r, z, '') });
+            } else if (f.input) r.received++;
+            else if (f.known) r.skipped++;
+            else if (f.refused) r.refused.push({ path: f.path || path, why: this.batchRefusalText(r, f.refused, f.refused.code || '') });
+        }
     },
 
     resumeBatchRun(): void {
@@ -1020,6 +1211,7 @@ export const batchMethods = uiModule({
         run.paused = false;
         run.pauseAsked = false;
         run.lost = false;
+        run.closeFailed = false;
         run.held = '';
         run.heldSeal = false;
         run.resume?.();
@@ -1029,7 +1221,7 @@ export const batchMethods = uiModule({
     async cancelBatchRun(): Promise<void> {
         const r = run;
         if (!r) return;
-        const ok = await this.showConfirm(strings.batch.cancelConfirm(r.received), strings.batch.cancel, { confirmLabel: strings.batch.cancel, variant: 'danger' });
+        const ok = await this.showConfirm(strings.batch.cancelConfirm(r.received + r.queued.size), strings.batch.cancel, { confirmLabel: strings.batch.cancel, variant: 'danger' });
         if (!ok) return;
         r.cancelled = true;
         r.paused = false;
@@ -1078,6 +1270,9 @@ export const batchMethods = uiModule({
             + `<span class="research-sync-line2-text">${esc(text)}</span>${links}</div>`;
         const btn = (label: string, call: string): string =>
             `<button type="button" class="research-sync-link" role="menuitem" onclick="window.Strom.UI.${call}">${esc(label)}</button>`;
+        if (run && !run.finished && run.treeId === link.treeId && (run.closeWait || run.closeFailed)) {
+            return line(b.notClosed(run.name), btn(b.show, 'showBatchDialog()'), run.closeFailed);
+        }
         if (run && !run.finished && run.treeId === link.treeId) {
             return line(`${b.sendingTitle(run.name)} · ${b.sendingSub(run.index, run.total)}`, btn(b.show, 'showBatchDialog()'));
         }

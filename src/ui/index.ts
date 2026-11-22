@@ -19,12 +19,12 @@ import {
     RelationContext,
     StromData,
     TreeId,
-    LAST_FOCUSED,
     LastFocusedMarker,
     PlaceGeo,
     EventParticipant,
     Source
 } from '../types.js';
+import { LAST_FOCUSED } from '../model-values.js';
 import { strings } from '../strings.js';
 import { parseGedcom, convertToStrom, GedcomConversionResult, GedcomDecoding } from '../ged-parser.js';
 import {
@@ -52,6 +52,8 @@ import { bottomSheetMethods } from './bottom-sheet.js';
 
 import { personModalMethods } from './person-modal.js';
 import { portraitActionsMethods, PendingPortrait } from './portrait-actions-ui.js';
+import { portraitPickerMethods } from './portrait-picker-ui.js';
+import { openPhotoModel, type PhotoModel } from './person-photo-model.js';
 import { unionPhotoMethods } from './union-photo-ui.js';
 import { personEventsMethods } from './person-events.js';
 import { sharedEventMethods } from './shared-event-ui.js';
@@ -101,6 +103,7 @@ import { materialDetailsMethods } from './material-details-ui.js';
 import { materialUsesMethods } from './material-uses-ui.js';
 import { materialAttachMethods } from './material-attach-ui.js';
 import { materialDeleteMethods } from './material-delete-ui.js';
+import { sourceRetractMethods } from './source-retract-ui.js';
 import { materialBulkMethods } from './material-bulk-ui.js';
 import { sourceDocsMethods } from './source-docs-ui.js';
 import { researchUpdateMethods } from './research-update-ui.js';
@@ -115,6 +118,10 @@ import { readSourceMethods } from './read-source-ui.js';
 import { readHistoryMethods } from './read-history-ui.js';
 import { evidenceUiMethods } from './evidence-ui.js';
 import { rodViewMethods } from './rod-view.js';
+import { selectionPickerMethods } from './selection-picker-ui.js';
+import { mapScopeMethods } from './map-scope-ui.js';
+import { scopeSegMethods } from './scope-seg-ui.js';
+import { timelineScopeMethods } from './timeline-scope-ui.js';
 import { treeOverviewMethods } from './tree-overview.js';
 import { personListsMethods } from './person-lists-ui.js';
 import { personListNewMethods } from './person-list-new-ui.js';
@@ -151,6 +158,7 @@ import { genLabelsMethods } from './gen-labels.js';
 import { anniversariesUiMethods } from './anniversaries-ui.js';
 import { slideshowMethods } from './slideshow.js';
 import { mapMethods, MapScope } from './map-ui.js';
+import type { ViewScope } from '../view-scope.js';
 import { mapPathMethods } from './map-path-ui.js';
 import { mapLinesLegendMethods } from './map-lines-legend-ui.js';
 import type { LineMode } from '../map-lines.js';
@@ -162,6 +170,7 @@ import { placesIdentifyMethods } from './places-identify-ui.js';
 import { placeMenuMethods } from './place-menu-ui.js';
 import { placesFindMethods } from './places-find-ui.js';
 import { waitingPlacesMethods } from './waiting-places-ui.js';
+import { waitingAsideMethods } from './waiting-aside-ui.js';
 import type { PlaceStateFilter } from '../place-identity.js';
 import type { PlacesSort } from '../places.js';
 import { splitMethods } from './split-ui.js';
@@ -204,6 +213,7 @@ import { researchLoadMethods } from './research-load-ui.js';
 import { tourMethods, TourStepDef } from './tour.js';
 import { releaseNotesMethods } from './release-notes-ui.js';
 import { helpMethods } from './help-ui.js';
+import { setUIGetter } from '../ui-ref.js';
 
 export class UIClass {
     currentId: PersonId | null = null;
@@ -335,6 +345,17 @@ export class UIClass {
      * portrait's source on Save (spec 107 §1, §2, §4); dropped on the next open.
      */
     pendingPortrait: PendingPortrait | null = null;
+    /**
+     * Person modal: its portrait as a value of its own (spec 116 I2) — never
+     * read from the preview; Save writes it only when changed in the dialog.
+     */
+    photoModel: PhotoModel = openPhotoModel(null, undefined);
+    /** Person modal: listening to images that come after the tree (once). */
+    personModalImagesWired: boolean = false;
+    /** Relationships panel: couple's photos changed in its session — no longer waited for once it is saved. */
+    relPhotoDrops: Set<import('../image-loads.js').FieldKey> = new Set();
+    /** Relationships panel: listening to images that come after the tree (once). */
+    relImagesWired: boolean = false;
 
     // Debounce timer for the live search filter/highlight.
     searchFilterTimer: ReturnType<typeof setTimeout> | null = null;
@@ -382,6 +403,8 @@ export class UIClass {
     citationFactChoice = false;
     /** Excerpts staged in the source editor (saved with the form, one undo step). */
     excerptDrafts: ExcerptDraft[] = [];
+    /** The crops of the edited source on their way when the editor opened (spec 116 §5): Save keeps those that came. */
+    excerptsWaitingAtOpen: Set<string> = new Set();
     /** Reliability picked in the source editor (QUAY 1–3, 0 kept from import). */
     sourceQualityDraft: number | undefined = undefined;
     /** The source as it was when the editor opened (Transcription verified, the research's reading). */
@@ -435,6 +458,9 @@ export class UIClass {
 
     // Map view. mapCenter null = not framed yet (the next draw fits the places).
     mapScope: MapScope = 'view';
+    /** The Timeline's and the Table's scope (spec 098 §11.0, src/ui/scope-seg-ui.ts). */
+    timelineScope: ViewScope = 'view';
+    tableScope: ViewScope = 'tree';
     mapCenter: PlaceGeo | null = null;
     mapZoom = 5;
     /**
@@ -633,6 +659,10 @@ type PortraitActionsMethods = typeof portraitActionsMethods;
 export interface UIClass extends PortraitActionsMethods {}
 Object.assign(UIClass.prototype, portraitActionsMethods);
 
+type PortraitPickerMethods = typeof portraitPickerMethods;
+export interface UIClass extends PortraitPickerMethods {}
+Object.assign(UIClass.prototype, portraitPickerMethods);
+
 type UnionPhotoMethods = typeof unionPhotoMethods;
 export interface UIClass extends UnionPhotoMethods {}
 Object.assign(UIClass.prototype, unionPhotoMethods);
@@ -818,6 +848,10 @@ type MaterialDeleteMethods = typeof materialDeleteMethods;
 export interface UIClass extends MaterialDeleteMethods {}
 Object.assign(UIClass.prototype, materialDeleteMethods);
 
+type SourceRetractMethods = typeof sourceRetractMethods;
+export interface UIClass extends SourceRetractMethods {}
+Object.assign(UIClass.prototype, sourceRetractMethods);
+
 type MaterialBulkMethods = typeof materialBulkMethods;
 export interface UIClass extends MaterialBulkMethods {}
 Object.assign(UIClass.prototype, materialBulkMethods);
@@ -921,6 +955,18 @@ Object.assign(UIClass.prototype, evidenceUiMethods);
 type RodViewMethods = typeof rodViewMethods;
 export interface UIClass extends RodViewMethods {}
 Object.assign(UIClass.prototype, rodViewMethods);
+type SelectionPickerMethods = typeof selectionPickerMethods;
+export interface UIClass extends SelectionPickerMethods {}
+Object.assign(UIClass.prototype, selectionPickerMethods);
+type MapScopeMethods = typeof mapScopeMethods;
+export interface UIClass extends MapScopeMethods {}
+Object.assign(UIClass.prototype, mapScopeMethods);
+type ScopeSegMethods = typeof scopeSegMethods;
+export interface UIClass extends ScopeSegMethods {}
+Object.assign(UIClass.prototype, scopeSegMethods);
+type TimelineScopeMethods = typeof timelineScopeMethods;
+export interface UIClass extends TimelineScopeMethods {}
+Object.assign(UIClass.prototype, timelineScopeMethods);
 type TreeOverviewMethods = typeof treeOverviewMethods;
 export interface UIClass extends TreeOverviewMethods {}
 Object.assign(UIClass.prototype, treeOverviewMethods);
@@ -1102,6 +1148,10 @@ type WaitingPlacesMethods = typeof waitingPlacesMethods;
 export interface UIClass extends WaitingPlacesMethods {}
 Object.assign(UIClass.prototype, waitingPlacesMethods);
 
+type WaitingAsideMethods = typeof waitingAsideMethods;
+export interface UIClass extends WaitingAsideMethods {}
+Object.assign(UIClass.prototype, waitingAsideMethods);
+
 type SplitMethods = typeof splitMethods;
 export interface UIClass extends SplitMethods {}
 Object.assign(UIClass.prototype, splitMethods);
@@ -1205,3 +1255,6 @@ export interface UIClass extends HelpMethods {}
 Object.assign(UIClass.prototype, helpMethods);
 
 export const UI = new UIClass();
+
+// The modules that UI itself depends on reach it through getUI() (src/ui-ref.ts).
+setUIGetter(() => UI);

@@ -1,5 +1,6 @@
 import { test, expect, Page } from '@playwright/test';
 import { openApp, seedTree, seedSetting } from './helpers.js';
+import { chooseMapWholeTree } from './map-scope-helpers.js';
 
 /**
  * Kinds of places on the map and town points (spec 031 §1–§3). Like the rest
@@ -22,7 +23,7 @@ async function stubTiles(page: Page): Promise<void> {
 /** Open the map on the whole tree once a tree is in place. */
 async function openMap(page: Page): Promise<void> {
     await page.evaluate(() => window.Strom.UI.setDisplayViewMode('map'));
-    await page.locator('.map-scope button', { hasText: /^(Whole tree|Ganzer Stammbaum)$/ }).click();
+    await chooseMapWholeTree(page);
     await expect(page.locator('.map-marker').first()).toBeVisible();
     await page.evaluate(() => {
         window.Strom.UI.dismissUndoToast();
@@ -156,6 +157,16 @@ test.describe('kinds on a phone', () => {
         await expect(btn).toBeVisible();
         await expect(btn).toContainText('Kinds: all');
         await expect(btn).toHaveAttribute('aria-expanded', 'false');
+        // Touch targets of 44 px: zoom ±, fit, Over time, the scope and Kinds (mobile review 5a, point 2).
+        for (const sel of ['.map-zoom-in', '.map-zoom-out', '.map-fit', '.map-time-toggle', '.map-scope-btn', '.map-kinds-btn']) {
+            const b = (await page.locator(`#map-container ${sel}`).boundingBox())!;
+            expect(b.height, sel).toBeGreaterThanOrEqual(44);
+            expect(b.width, sel).toBeGreaterThanOrEqual(44);
+        }
+        // The corner's buttons stay apart from the controls' column.
+        const tl = (await page.locator('#map-container .map-topleft').boundingBox())!;
+        const ctl = (await page.locator('#map-container .map-controls').boundingBox())!;
+        expect(tl.x + tl.width).toBeLessThanOrEqual(ctl.x);
 
         await btn.tap();
         const menu = page.locator('.map-kinds-menu');

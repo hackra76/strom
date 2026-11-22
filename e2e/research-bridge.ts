@@ -86,6 +86,15 @@ export interface FakeBridge {
     seen?: string[];
     /** Every `POST /batch/<id>/done`: the batch and its body. */
     batchDone?: { id: string; body: Record<string, unknown> }[];
+    /**
+     * Files taken with `Prefer: respond-async` (202, `media.queued` in `features`, Strom Research 1.36), by hash:
+     * written with their batch's close, which says in `files` what became of each.
+     */
+    mediaQueued?: Map<string, { batch: string; path: string }>;
+    /** A queued file the close refuses (its `files[].refused`), by hash. */
+    queuedRefuse?: Map<string, { code: string; why: string }>;
+    /** Every `POST /media/known` (`media.known` in `features`): the hashes asked. */
+    knownAsks?: string[][];
     /** Batches it reports in `/status.batches`. */
     batches?: unknown[];
     /** A file it has, sent again with a person or a note: it adds them to its input (`added`, Strom Research 1.12). */
@@ -114,6 +123,18 @@ export interface FakeBridge {
      * `hypotheses.link` (the terminal confirms; a test does it by changing `decide`); `reply` answers instead.
      */
     hypotheses?: { decide?: string; writes: Record<string, unknown>[]; reply?: { status: number; body: unknown }; link?: string };
+    /**
+     * Census records (spec 106): `/status.census` (`census`, sent as it is — a test may break it; the app reads it
+     * only with `census` in `features`), every `POST /census` body (`posts`). A valid `{on}` is written and said
+     * back with `held` = `heldOff` while off (0 on); `replies` answer instead, first first (a refusal, a 200 of its own).
+     */
+    census?: FakeCensus;
+    /**
+     * Batches sorted by the agent by themselves (spec 130, `intake.auto` in `features`): `/status.intake` (`intake`,
+     * sent as it is; unset: not said, as an archive), every `POST /intake` body (`posts`); a valid `{auto}` is written
+     * and said back, `replies` answer instead. A batch's close says `auto` / `sort` and its tasks only when on.
+     */
+    intake?: FakeIntake;
     /** Stuck (SIGSTOP): `/status` never answers. */
     statusHang?: boolean;
     /**
@@ -188,10 +209,41 @@ export interface FakeBridge {
     /** Splitting older locations (spec 075 §5): `GET/POST /sources/split`, `/sources/split/undo` with `sources.split` in `features`. */
     sourcesSplit?: FakeSourcesSplit;
     /**
+     * Deleting a source in the research (spec 117): `POST /source/retract` (dry run and confirmed deletion) and
+     * `POST /source/restore` with `source.retract` in `features` (without it: 404 without a body, a bridge without the route).
+     */
+    sourceRetract?: FakeSourceRetract;
+    /**
      * "Research on" (spec 064): `/status.live` and `POST /live {"idleMinutes"}` with `live.idle` in `features`,
      * `POST /live {"do": "stop"}` with `live.stop` (202, then the bridge is down).
      */
     live?: FakeLive;
+}
+
+/** Census records of the fake bridge (spec 106 §2.1–2.2). */
+export interface FakeCensus {
+    census: unknown;
+    /** The census tasks set aside while census is off (`held` after a write that switched it off). */
+    heldOff: number;
+    posts: unknown[];
+    replies: { status: number; body: unknown }[];
+}
+
+/** The research's setting of sorting closed batches (spec 130). */
+export interface FakeIntake {
+    intake?: unknown;
+    posts: unknown[];
+    replies: { status: number; body: unknown }[];
+}
+
+/** A research that sorts closed batches by itself (`auto`) or not (off, the default). */
+export function fakeIntake(auto: boolean): FakeIntake {
+    return { intake: { auto }, posts: [], replies: [] };
+}
+
+/** A research's census records: off with `held` tasks set aside (on: `held` 0). */
+export function fakeCensus(on: boolean, held = 0): FakeCensus {
+    return { census: { on, held: on ? 0 : held }, heldOff: held, posts: [], replies: [] };
 }
 
 /** The bridge's live choice and what was posted to `/live` (ZADANI_VYZKUM vyzkum-zapnuty, "Odpověď výzkumu"). */
@@ -472,6 +524,107 @@ function serveSourcesConfirm(b: FakeBridge, method: string, url: URL, posted: st
     const tags = [`1 _STROM_READ ${s.read}`, ...(s.conf ? [`2 _CONF ${s.conf}`] : []), `2 _TXT ${s.txt}`].join('\n');
     b.treeGed = b.treeGed.replace(new RegExp(`(0 @${id}@ SOUR[\\s\\S]*?)1 _STROM_READ \\S+(?:\\n2 _(?:CONF|TXT) \\S+)*`), `$1${tags}`);
     return { status: 200, body: { ...said(), head, parent } };
+}
+
+/** A queued answer of `/source/*` (instead of the research's own): for the next dry run, deletion or restore. */
+export interface FakeSourceRetractReply {
+    on: 'dry' | 'retract' | 'restore';
+    status: number;
+    body?: unknown;
+    /** No answer at all (the connection refused). */
+    abort?: boolean;
+}
+
+/**
+ * The research's side of deleting a source (ZADANI_VYZKUM smazani-pramene, contract U3): its list of impacts
+ * per source (`impacts`, the bridge's raw JSON), what was asked (`asks`), answers queued instead (`replies`),
+ * an answer held until released (`hold`). A confirmed deletion takes the source's record and its citations
+ * out of the tree's file and moves the head; Undo puts the file as it was back (a new head).
+ */
+export interface FakeSourceRetract {
+    impacts: Record<string, Record<string, unknown>>;
+    asks: { on: 'dry' | 'retract' | 'restore'; body: Record<string, unknown> }[];
+    replies: FakeSourceRetractReply[];
+    hold?: Promise<void> | null;
+    /** The confirmations given (the last one of each preview holds). */
+    confirms?: string[];
+    /** The tree's file before each deletion, by the source. */
+    before?: Record<string, string>;
+    /** Undo's `skipped` (default: none). */
+    skipped?: unknown[];
+}
+
+export function fakeSourceRetract(init: Partial<FakeSourceRetract> = {}): FakeSourceRetract {
+    return { impacts: {}, asks: [], replies: [], ...init };
+}
+
+/** The tree's file without a source: its record and every citation of it (with the citation's own lines). */
+export function gedWithoutSource(ged: string, xref: string): string {
+    const out: string[] = [];
+    let skip = -1;
+    for (const line of ged.split('\n')) {
+        const level = Number(line.split(' ', 1)[0]);
+        if (skip >= 0 && level > skip) continue;
+        skip = -1;
+        if (line === `0 @${xref}@ SOUR` || new RegExp(`^\\d+ SOUR @${xref}@$`).test(line)) {
+            skip = level;
+            continue;
+        }
+        out.push(line);
+    }
+    return out.join('\n');
+}
+
+/** `POST /source/retract` and `/source/restore` as the research answers them (null: not one of them). */
+async function serveSourceRetract(b: FakeBridge, method: string, url: URL, posted: string | null): Promise<{ status: number; body: unknown; abort?: boolean } | null> {
+    const sr = b.sourceRetract;
+    const rest = url.pathname.replace(/^\/[^/]+/, '');
+    if (rest !== '/source/retract' && rest !== '/source/restore') return null;
+    if (!sr || method !== 'POST' || !(b.features ?? []).includes('source.retract')) return { status: 404, body: '' };
+    let body: Record<string, unknown> = {};
+    try { body = JSON.parse(posted ?? '{}'); } catch { /* keep empty */ }
+    const on = rest === '/source/restore' ? 'restore' : body.dryRun === true ? 'dry' : 'retract';
+    sr.asks.push({ on, body });
+    if (sr.hold) await sr.hold;
+    const at = sr.replies.findIndex(r => r.on === on);
+    if (at >= 0) {
+        const reply = sr.replies.splice(at, 1)[0];
+        return { status: reply.status, body: reply.body ?? {}, ...(reply.abort ? { abort: true } : {}) };
+    }
+    const ids = Array.isArray(body.sources) ? body.sources.map(String) : [];
+    if (!ids.length || ids.some(id => !/^S\d+$/.test(id))) return { status: 400, body: { error: 'Bad request.', code: 'source.body' } };
+    const xrefOf = (id: string) => new RegExp(`0 @([^@]+)@ SOUR\\n(?:[1-9].*\\n)*?1 REFN ${id}\\b`).exec(b.treeGed)?.[1] ?? null;
+    if (on === 'restore') {
+        const before = ids.map(id => sr.before?.[id]).find(Boolean);
+        if (!before) return { status: 409, body: { error: 'Not retracted.', code: 'source.notRetracted', params: { id: ids[0] } } };
+        for (const id of ids) delete sr.before![id];
+        const parent = b.head;
+        b.treeGed = before;
+        const head = moveHead(b);
+        return { status: 200, body: { restored: ids, citations: 3, skipped: sr.skipped ?? [], head, parent } };
+    }
+    const missing = ids.find(id => !xrefOf(id));
+    if (missing) {
+        return sr.before?.[missing]
+            ? { status: 409, body: { error: 'Already retracted.', code: 'source.retracted', params: { id: missing } } }
+            : { status: 404, body: { error: 'No such source.', code: 'source.unknown', params: { id: missing } } };
+    }
+    const impacts = ids.map(id => sr.impacts[id] ?? { id, title: id, counts: {} });
+    if (on === 'dry') {
+        const confirm = `c${(sr.confirms ??= []).length + 1}-${ids.join('.')}`;
+        sr.confirms.push(confirm);
+        return { status: 200, body: { dryRun: true, sources: ids, impacts, confirm } };
+    }
+    if (typeof body.confirm !== 'string' || body.confirm !== sr.confirms?.[sr.confirms.length - 1]) {
+        return { status: 400, body: { error: 'The confirmation does not hold.', code: 'source.body' } };
+    }
+    const parent = b.head;
+    for (const id of ids) {
+        (sr.before ??= {})[id] = b.treeGed;
+        b.treeGed = gedWithoutSource(b.treeGed, xrefOf(id)!);
+    }
+    const head = moveHead(b);
+    return { status: 200, body: { sources: ids, retracted: ids, impacts, head, parent } };
 }
 
 /** The research's split of older locations (spec 075 §5, ZADANI_VYZKUM citace-pole, Odpověď výzkumu D). */
@@ -1359,7 +1512,8 @@ export interface FakeMaterialFile {
     source?: string;
     here?: boolean;
     title?: string;
-    kind?: 'photo' | 'document' | 'record' | 'other';
+    /** `tree`: a family tree file (spec 117 §5), listed only to `trees=1` behind `material.trees`. */
+    kind?: 'photo' | 'document' | 'record' | 'other' | 'tree';
     date?: string;
     hidden?: { at?: string; by?: string; reason?: 'unrelated' | 'duplicate' };
     /** Where the research uses it (`material.uses`); `of`: the sources it is the file of (`material.sourceOf`). */
@@ -1454,6 +1608,17 @@ export interface FakeMaterial {
     deleteImpacts?: Record<string, Record<string, unknown>>;
     /** Right before the next confirmation, the research changes: these impacts replace the ones of their files (409 `material.delete-changed`). */
     deleteChangeOnce?: Record<string, Record<string, unknown>>;
+    /**
+     * What deleting a source with its family tree file leaves behind (`retractSources`, spec 117 §7): S… → its
+     * impact as `/source/retract` lists it (default: its title from the file's `uses.of`, no citations).
+     */
+    deleteSourceImpacts?: Record<string, Record<string, unknown>>;
+    /** Right before the next confirmation, these source impacts replace theirs (409 `material.delete-changed` with `sourceImpacts`). */
+    deleteSourceChangeOnce?: Record<string, Record<string, unknown>>;
+    /** The next confirmation is refused with this answer instead (e.g. 500 `material.failed`): nothing is deleted. */
+    deleteFailOnce?: { status: number; body: unknown };
+    /** Sources deleted with their files so far (a second deletion of one: 409 `source.retracted`). */
+    deleteRetracted?: string[];
 }
 
 /**
@@ -1738,11 +1903,15 @@ function serveMaterial(b: FakeBridge, method: string, url: URL, postData: string
         const person = q.get('person');
         const batch = q.get('batch');
         const filesParam = q.get('files');
+        const treesParam = q.get('trees');
         if ((person !== null && !PERSON_REF.test(person)) || (batch !== null && !batch.trim())
-            || (filesParam !== null && filesParam !== '0' && filesParam !== '1')) {
+            || (filesParam !== null && filesParam !== '0' && filesParam !== '1')
+            || (treesParam !== null && treesParam !== '0' && treesParam !== '1')) {
             return refusal(400, 'material.query');
         }
-        let files = m.files;
+        // Family tree files (spec 117 §5) only to `trees=1` of a research with `material.trees`.
+        const trees = treesParam === '1' && features.includes('material.trees');
+        let files = trees ? m.files : m.files.filter(f => f.kind !== 'tree');
         if (person) files = files.filter(f => concerns(f, person));
         if (batch) files = files.filter(f => f.batch === batch);
         const batches = m.batches
@@ -1775,17 +1944,37 @@ function serveMaterial(b: FakeBridge, method: string, url: URL, postData: string
         const files = (ids as string[]).map(id => m.files.find(f => f.id === id));
         const missing = (ids as string[]).find((_, i) => !files[i]);
         if (missing) return refusal(404, 'material.file', { id: missing });
+        // A family tree file a live source was made of (spec 117 §7): that source in `blockedBy`, deleted only with it.
+        const liveOf = (f: FakeMaterialFile) => f.kind === 'tree'
+            ? (f.uses?.of ?? []).filter(o => o.via === 'input' && typeof o.source === 'string').map(o => o.source as string) : [];
         const impacts = () => (files as FakeMaterialFile[]).map(f => ({
             id: f.id, name: f.name, sha: f.sha, sources: [], excerpts: 0, people: f.persons, links: 0, tasks: [], bytes: 'deleted', sameAs: [],
+            ...(liveOf(f).length ? { blockedBy: liveOf(f) } : {}),
             ...(m.deleteImpacts?.[f.id] ?? {}),
         }));
         const signed = (deleteConfirms.get(b) ?? new Map<string, string>());
         deleteConfirms.set(b, signed);
+        // The sources deleted first (spec 117 §7, research U3): only those of `blockedBy`, each standing in the tree.
+        const retract = body.retractSources === undefined ? [] : body.retractSources;
+        if (!Array.isArray(retract) || retract.length > 50 || !retract.every(x => typeof x === 'string' && /^S\d+$/.test(x))) return refusal(400, 'material.body');
+        const blocked = new Set((files as FakeMaterialFile[]).flatMap(liveOf));
+        if ((retract as string[]).some(x => !blocked.has(x))) return refusal(400, 'material.body');
+        const xrefOf = (id: string) => new RegExp(`0 @([^@]+)@ SOUR\\n(?:[1-9].*\\n)*?1 REFN ${id}\\b`).exec(b.treeGed)?.[1] ?? null;
+        for (const id of retract as string[]) {
+            if (xrefOf(id)) continue;
+            return (m.deleteRetracted ?? []).includes(id)
+                ? { status: 409, body: { error: 'Already retracted.', code: 'source.retracted', text: 'retracted', params: { id } } }
+                : { status: 404, body: { error: 'No such source.', code: 'source.unknown', text: 'unknown', params: { id } } };
+        }
+        const titleOf = (id: string) => (files as FakeMaterialFile[]).flatMap(f => f.uses?.of ?? []).find(o => o.source === id)?.title ?? id;
+        const sourceImpacts = () => (retract as string[]).map(id => ({ id, title: titleOf(id), counts: {}, ...(m.deleteSourceImpacts?.[id] ?? {}) }));
+        const both = retract.length ? { retractSources: retract } : {};
         if (body.dryRun === true) {
             const confirm = `confirm-${signed.size + 1}`;
             const list = impacts();
-            signed.set(confirm, JSON.stringify({ ids, list }));
-            return { status: 200, body: { files: ids, dryRun: true, impacts: list, confirm } };
+            const srcList = retract.length ? sourceImpacts() : undefined;
+            signed.set(confirm, JSON.stringify({ ids, list, srcList }));
+            return { status: 200, body: { files: ids, ...both, dryRun: true, impacts: list, ...(srcList ? { sourceImpacts: srcList } : {}), confirm } };
         }
         const was = signed.get(body.confirm as string);
         if (!was || JSON.stringify((JSON.parse(was) as { ids: unknown }).ids) !== JSON.stringify(ids)) return refusal(400, 'material.body');
@@ -1793,13 +1982,36 @@ function serveMaterial(b: FakeBridge, method: string, url: URL, postData: string
             m.deleteImpacts = { ...(m.deleteImpacts ?? {}), ...m.deleteChangeOnce };
             delete m.deleteChangeOnce;
         }
+        if (m.deleteSourceChangeOnce) {
+            m.deleteSourceImpacts = { ...(m.deleteSourceImpacts ?? {}), ...m.deleteSourceChangeOnce };
+            delete m.deleteSourceChangeOnce;
+        }
         const list = impacts();
-        if (JSON.stringify((JSON.parse(was) as { list: unknown }).list) !== JSON.stringify(list)) {
-            return { status: 409, body: { error: 'changed', code: 'material.delete-changed', text: 'changed', impacts: list } };
+        const srcList = retract.length ? sourceImpacts() : undefined;
+        const signedFor = JSON.parse(was) as { list: unknown; srcList?: unknown };
+        if (JSON.stringify(signedFor.list) !== JSON.stringify(list) || JSON.stringify(signedFor.srcList) !== JSON.stringify(srcList)) {
+            return { status: 409, body: { error: 'changed', code: 'material.delete-changed', text: 'changed', impacts: list, ...(srcList ? { sourceImpacts: srcList } : {}) } };
+        }
+        const live = [...blocked].filter(x => !(retract as string[]).includes(x));
+        if (live.length) {
+            return { status: 409, body: { error: 'source-live', code: 'material.source-live', text: 'source-live', params: { sources: live.join(',') }, sources: live } };
+        }
+        if (m.deleteFailOnce) {
+            // The research's write is whole (R7): a failure anywhere writes nothing.
+            const fail = m.deleteFailOnce;
+            delete m.deleteFailOnce;
+            return fail;
         }
         signed.delete(body.confirm as string);
         m.files = m.files.filter(f => !(ids as string[]).includes(f.id));
-        return { status: 200, body: { files: ids, deleted: ids, impacts: list, ...commitWrite(b) } };
+        for (const id of retract as string[]) {
+            b.treeGed = gedWithoutSource(b.treeGed, xrefOf(id)!);
+            (m.deleteRetracted ??= []).push(id);
+        }
+        return {
+            status: 200,
+            body: { files: ids, deleted: ids, ...(retract.length ? { retracted: retract } : {}), impacts: list, ...(srcList ? { sourceImpacts: srcList } : {}), ...commitWrite(b) },
+        };
     }
     if (rest === '/material/edit') {
         (m.edits ??= []).push(body);
@@ -1973,6 +2185,17 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
             const code = b.tokenRefusal ?? 404;
             return code === 404 ? route.fulfill({ status: 404, headers: cors, body: '' }) : json(code, { error: 'unknown token' });
         }
+        if (method === 'POST' && url.pathname.endsWith('/media/known') && (b.features ?? []).includes('media.known')) {
+            let shas: string[] = [];
+            try { shas = (JSON.parse(route.request().postData() ?? '{}') as { shas: string[] }).shas ?? []; } catch { /* none */ }
+            (b.knownAsks ??= []).push(shas);
+            const known: Record<string, unknown> = {};
+            for (const sha of shas) {
+                const id = b.mediaKnown.get(sha);
+                known[sha] = id ? { id, kind: 'input', mime: 'image/jpeg', bytes: 10, here: true } : b.mediaQueued?.has(sha) ? { queued: true } : null;
+            }
+            return json(200, { known });
+        }
         const media = /\/media\/([0-9a-f]{64})$/.exec(url.pathname);
         if (media) {
             const sha = media[1];
@@ -1994,10 +2217,19 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
                         ? { added: { persons: h['x-strom-person'] ? [h['x-strom-person']] : [], note: !!h['x-strom-note'] } } : {};
                     return json(200, { known: prior, kind: 'input', ...added });
                 }
+                const h = route.request().headers();
+                if ((b.features ?? []).includes('media.queued') && /respond-async/.test(h['prefer'] ?? '') && h['x-strom-batch']) {
+                    (b.mediaQueued ??= new Map()).set(sha, { batch: h['x-strom-batch'], path: decodeURIComponent(h['x-strom-path'] ?? '') });
+                    return route.fulfill({ status: 202, headers: { ...cors, 'content-type': 'application/json', 'preference-applied': 'respond-async' },
+                        body: JSON.stringify({ sha, bytes: body?.length ?? 0, queued: true, batch: h['x-strom-batch'] }) });
+                }
                 const id = `I${String(100 + b.mediaPuts.length).padStart(4, '0')}`;
                 b.mediaKnown.set(sha, id);
+                // A task for the agent comes of it, unless the research sorts only on request (spec 130 K1.3:
+                // `intake.auto` off, or not said, which is off).
+                const sorts = !(b.features ?? []).includes('intake.auto') || (b.intake?.intake as { auto?: unknown } | undefined)?.auto === true;
                 // With the family's material on (spec 017), a new file is a commit, as in the research.
-                return json(200, { input: id, ...(b.material ? commitWrite(b) : {}) });
+                return json(200, { input: id, ...(sorts ? { task: `T${id.slice(1)}` } : {}), ...(b.material ? commitWrite(b) : {}) });
             }
             if (url.searchParams.get('file') === '1') {
                 const file = b.mediaFiles.get(sha);
@@ -2026,6 +2258,11 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
         if (hyp) return json(hyp.status, hyp.body);
         const conf = serveSourcesConfirm(b, method, url, route.request().postData());
         if (conf) return json(conf.status, conf.body);
+        const retract = await serveSourceRetract(b, method, url, route.request().postData());
+        if (retract) {
+            if (retract.abort) return route.abort('connectionrefused');
+            return retract.body === '' ? route.fulfill({ status: retract.status, headers: cors, body: '' }) : json(retract.status, retract.body);
+        }
         const split = await serveSourcesSplit(b, method, url, route.request().postData());
         if (split) return json(split.status, split.body);
         const qual = serveQuality(b, method, url, route.request().postData());
@@ -2172,6 +2409,36 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
             b.books.books = { ...b.books.books, settings: set };
             return json(200, { books: { settings: set }, head: b.head, parent: b.head });
         }
+        // Census records (spec 106 §2.2): `{"on": bool}` exactly, written for this tree; the same value again writes nothing.
+        if (b.census && method === 'POST' && /\/census$/.test(url.pathname) && b.features?.includes('census')) {
+            let body: unknown = null;
+            try { body = JSON.parse(route.request().postData() ?? ''); } catch { /* not JSON */ }
+            b.census.posts.push(body);
+            const said = b.census.replies.shift();
+            if (said) return json(said.status, said.body);
+            const r = body && typeof body === 'object' ? body as Record<string, unknown> : null;
+            if (!r || Object.keys(r).length !== 1 || typeof r.on !== 'boolean') {
+                return json(400, { error: 'Not a body /census takes.', code: 'census.body' });
+            }
+            const was = (b.census.census as { on?: unknown } | null)?.on;
+            b.census.census = { on: r.on, held: r.on ? 0 : b.census.heldOff };
+            return json(200, { census: b.census.census, ...(was === r.on ? { head: b.head, parent: b.head } : commitWrite(b)) });
+        }
+        // Sorting of closed batches (spec 130): `{"auto": bool}` exactly; the same value again writes nothing.
+        if (b.intake && method === 'POST' && /\/intake$/.test(url.pathname) && b.features?.includes('intake.auto')) {
+            let body: unknown = null;
+            try { body = JSON.parse(route.request().postData() ?? ''); } catch { /* not JSON */ }
+            b.intake.posts.push(body);
+            const said = b.intake.replies.shift();
+            if (said) return json(said.status, said.body);
+            const r = body && typeof body === 'object' ? body as Record<string, unknown> : null;
+            if (!r || Object.keys(r).length !== 1 || typeof r.auto !== 'boolean') {
+                return json(400, { error: 'Not a body /intake takes.', code: 'intake.body' });
+            }
+            const was = (b.intake.intake as { auto?: unknown } | undefined)?.auto;
+            b.intake.intake = { auto: r.auto };
+            return json(200, { intake: b.intake.intake, ...(was === r.auto ? { head: b.head, parent: b.head } : commitWrite(b)) });
+        }
         // A heavy part apart (research 1.26.0, `status.parts`): its rev and its fields as the full status has them.
         const partPath = /\/status\/([A-Za-z]+)$/.exec(url.pathname);
         if (partPath && method === 'GET' && b.features?.includes('status.parts')) {
@@ -2217,6 +2484,8 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
                 } : {}),
                 ...(b.quality ? { quality: { rev: b.quality.rev } } : {}),
                 ...(b.hypotheses?.decide !== undefined ? { hypotheses: { decide: b.hypotheses.decide } } : {}),
+                ...(b.census ? { census: b.census.census } : {}),
+                ...(b.intake?.intake !== undefined ? { intake: b.intake.intake } : {}),
                 ...(b.live ? { live: { idleMinutes: b.live.idleMinutes, idleChoices: b.live.idleChoices ?? [0, 120] } } : {}),
                 ...(b.handoffs ? { handoffs: b.handoffs } : {}),
                 ...(b.statusExtra ?? {}),
@@ -2285,7 +2554,24 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
                     mat.files.push(materialFile(n, { batch: id, path: p.headers['x-strom-path'], name: (p.headers['x-strom-path'] ?? `scan-${n}.jpg`).split('/').pop()! }));
                 });
             }
-            return json(200, { batch: done[1], name: body.name, inputs: files, known: 0, refused: 0, nested: [], tasks: files ? ['T0101'] : [], head: b.head,
+            // Its queued files written with the close: what became of each (media.queued).
+            const queued = [...(b.mediaQueued ?? new Map<string, { batch: string; path: string }>())].filter(([, q]) => q.batch === decodeURIComponent(done[1]));
+            const taken = queued.map(([sha, q], i) => {
+                b.mediaQueued!.delete(sha);
+                const no = b.queuedRefuse?.get(sha);
+                if (no) return { sha, path: q.path, batch: q.batch, refused: no };
+                const id = `I${String(300 + i).padStart(4, '0')}`;
+                b.mediaKnown.set(sha, id);
+                return { sha, path: q.path, batch: q.batch, input: id };
+            });
+            const refusedQueued = taken.filter(t => 'refused' in t).length;
+            // Sorting by tasks only when the research's setting is on (spec 130); `sort` of the body decides for this batch.
+            const intakeOn = (b.features ?? []).includes('intake.auto');
+            const auto = (b.intake?.intake as { auto?: unknown } | undefined)?.auto === true;
+            const sort = typeof body.sort === 'boolean' ? body.sort : auto;
+            return json(200, { batch: done[1], name: body.name, inputs: files - refusedQueued, known: 0, refused: refusedQueued, nested: [],
+                tasks: files && (!intakeOn || sort) ? ['T0101'] : [], head: b.head, ...(intakeOn ? { auto, sort } : {}),
+                ...(queued.length || (b.features ?? []).includes('media.queued') ? { files: taken } : {}),
                 ...(b.material?.writeParent ? { parent: b.head } : {}) });
         }
         const ph = b.phone;
@@ -2403,6 +2689,20 @@ function partRev(value: unknown): string {
 }
 
 export const poll = (page: Page) => page.evaluate(() => window.Strom.UI.pollResearchBridge());
+
+/** Freeze the page's clock (installed before the app loaded): from here on time moves only by runFor. */
+export async function pauseClock(page: Page): Promise<void> {
+    // A jump into the page's past is refused (its time ran on meanwhile); the clock stands still after the first try.
+    for (let tries = 1; ; tries++) {
+        const now = await page.evaluate(() => Date.now());
+        try {
+            await page.clock.pauseAt(now + 1);
+            return;
+        } catch (e) {
+            if (tries >= 3) throw e;
+        }
+    }
+}
 
 /**
  * A stuck bridge (`statusHang`) is said as one only after three asks in a row without an answer

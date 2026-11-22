@@ -16,6 +16,7 @@ import { PERSON_PAGE_VIZ_LIGHT_TOKENS } from './person-page-viz-css.js';
 import { PAGE_SET_SEARCH_JS } from './family-pages-search.js';
 import { rodTimelineScript } from './rod-timeline-wire.js';
 import { SEL_DARK_DECLS } from './ui/sel-css.js';
+import { HISTORY_KINDS } from './history.js';
 
 /** The lineage bars' colour (light / dark), next to the person page's tokens. */
 const LIGHT_EXTRA = '--rod-bar: #9fb8a6; --sp-frame: #d0c6b2; --tint: #f1ece1; --hist: #f3e3cf;';
@@ -248,7 +249,7 @@ button.sp-clip { margin: 0; padding: 0; border: 0; background: none; font: inher
 }
 @media (pointer: coarse) {
   .sp-anc-sum { min-height: 44px; }
-  .sp-sel-n > .pp-link, .sp-anc-n > .pp-link { display: inline-flex; align-items: center; min-height: 44px; }
+  .sp-sel-n > .pp-link, .sp-anc-n > .pp-link { display: inline-flex; align-items: center; min-height: 44px; padding-block: 0; margin-block: 0; }
   .sp-sel-row, .sp-anc-row { padding: 2px 0; }
 }
 /* The whole tree (spec 026 P3 §1, §2.3): its introduction, the choice of a line, "Other families". */
@@ -348,6 +349,7 @@ button.sp-clip { margin: 0; padding: 0; border: 0; background: none; font: inher
   .sp-rodpick-q, .sp-rods-f .sp-q, .sp-fbar .sp-q { height: 44px; }
   .sp-fbar-home { min-height: 44px; line-height: 44px; }
   .sp-ofam-names > span, .sp-ofam-p > .pp-link:first-child { display: inline-flex; align-items: center; min-height: 44px; }
+  .sp-ofam-p > .pp-link:first-child { padding-block: 0; margin-block: 0; }
 }
 /* The file's bar (§3.1): the name, the search, Index and Map of places; on a phone the magnifier and Menu. */
 .sp-fbar { position: sticky; top: 0; z-index: 30; background: var(--surface); border-bottom: 1px solid var(--border); }
@@ -480,15 +482,14 @@ html.sp-lb-open { overflow: hidden; }
 .sp-cardw > .sp-card-tl { position: absolute; right: 18px; bottom: 16px; font-size: 14px; line-height: 21px; }
 .sp-tl { display: flex; flex-direction: column; gap: 28px; }
 .sp-tl-ctl { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
-.sp-tl-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.sp-tl-chip { display: inline-flex; align-items: center; gap: 6px; min-height: 34px; margin: 0; padding: 0 12px; border: 1px solid var(--primary); border-radius: var(--sel-r, 4px); background: var(--tint, var(--surface-2)); font: inherit; font-size: 13.5px; color: var(--text); cursor: pointer; }
-.sp-tl-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--primary); }
-.sp-tl-chip[data-tl-k="hist"] .sp-tl-dot { background: var(--accent-text); }
-.sp-tl-chip[aria-pressed="false"] { border-color: var(--sp-frame, var(--border)); background: transparent; color: var(--text-light); }
-.sp-tl-chip[aria-pressed="false"] .sp-tl-dot { background: var(--sp-frame, var(--border)); }
-.sp-tl-sym { display: inline-block; min-width: 1em; font-size: 15px; font-weight: 700; line-height: 1; text-align: center; color: var(--primary); }
+.sp-tl-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.sp-tl-chips-lab { margin-right: 4px; font-size: 12.5px; color: var(--text-light); }
+/* The chips are .sel-opt options (src/ui/sel-css.ts, "Linka"): the frame, the surface and the chosen one's dark frame. */
+.sp-tl-chip { display: inline-flex; align-items: center; gap: 6px; min-height: 34px; margin: 0; padding: 0 12px; font: inherit; font-size: 13.5px; cursor: pointer; }
+.sp-tl-chip .hist-kind-svg { flex: 0 0 auto; color: var(--hist-text); }
+.sp-tl-sym { display: inline-block; min-width: 1em; font-size: 15px; font-weight: 700; line-height: 1; text-align: center; }
 .sp-tl-chip[data-tl-k="birth"] .sp-tl-sym { position: relative; top: .2em; font-size: 17px; }
-.sp-tl-chip[aria-pressed="false"] .sp-tl-sym { color: var(--text-faint); }
+.sp-tl-chip[aria-pressed="false"] .sp-tl-sym, .sp-tl-chip[data-tl-k][aria-pressed="false"] .hist-kind-svg { color: var(--text-faint); }
 .sp-tl-chip:focus-visible, .sp-tl-c > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .sp-tl-chart { display: grid; grid-template-columns: 150px minmax(0, 1fr); column-gap: 10px; font-size: 13px; }
 .sp-tl-labs, .sp-tl-plot { display: flex; flex-direction: column; min-width: 0; }
@@ -504,6 +505,10 @@ html.sp-lb-open { overflow: hidden; }
 .sp-tl-bar--gen { background: var(--rod-bar); }
 .sp-tl-bar--pl { background: var(--accent-text); }
 .sp-tl-band { position: absolute; top: 22px; bottom: 0; min-width: 3px; background: var(--hist, var(--surface-2)); opacity: .85; }
+/* 121 §9: the kind's symbol on top of a band; a place's own history as a symbol on the place's row. */
+.sp-tl-bandsym { position: absolute; top: 4px; display: flex; transform: translateX(-50%); color: var(--hist-text); }
+.sp-tl-locsym { position: absolute; top: 2px; box-sizing: border-box; display: flex; align-items: center; justify-content: center; width: 18px; height: 18px; transform: translateX(-50%); border: 1px solid currentColor; border-radius: var(--r-tag); background: var(--surface); color: var(--hist-place-text); }
+.sp-tl-locsym.is-local { color: var(--hist-local-text); }
 .sp-tl-note { margin: 4px 0 0; font-size: 12.5px; color: var(--text-light); }
 .sp-tl-ev { gap: 0; }
 .sp-tl-ev > .sp-h2 { margin-bottom: 6px; }
@@ -520,18 +525,23 @@ html.sp-lb-open { overflow: hidden; }
 .sp-tl-b { position: relative; display: flex; flex-direction: column; padding: 6px 8px 6px 14px; border-left: 2px solid var(--divider); font-size: 14px; line-height: 1.4; min-width: 0; overflow-wrap: anywhere; }
 .sp-tl-b::before { content: ""; position: absolute; left: -5px; top: 12px; width: 8px; height: 8px; border-radius: 50%; background: var(--primary); }
 .sp-tl-row--hist .sp-tl-b::before { background: var(--accent-text); }
-.sp-tl-k { font-size: 12px; font-weight: 600; color: var(--text-light); }
-.sp-tl-row--hist .sp-tl-k { color: var(--accent-text); }
+.sp-tl-k { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; color: var(--text-light); }
+.sp-tl-k .hist-kind-svg { flex: 0 0 auto; }
+.sp-tl-row--hist .sp-tl-k { color: var(--hist-text); }
+.sp-tl-row--hist.is-place .sp-tl-k { color: var(--hist-place-text); }
+.sp-tl-row--hist.is-local .sp-tl-k { color: var(--hist-local-text); }
 .sp-tl-pl { color: var(--text-light); }
 @media screen {
   .sp-tl[data-off~="birth"] .sp-tl-row[data-k="birth"], .sp-tl[data-off~="marriage"] .sp-tl-row[data-k="marriage"],
   .sp-tl[data-off~="death"] .sp-tl-row[data-k="death"], .sp-tl[data-off~="move"] .sp-tl-row[data-k="move"],
   .sp-tl[data-off~="hist"] .sp-tl-row[data-k="hist"], .sp-tl[data-off~="hist"] .sp-tl-band, .sp-tl[data-off~="hist"] .sp-tl-note,
+  .sp-tl[data-off~="hist"] .sp-tl-bandsym, .sp-tl[data-off~="hist"] .sp-tl-locsym, .sp-tl[data-off~="hist"] .sp-tl-hkrow,
   .sp-tl-c.sp-tl-none { display: none; }
+  ${HISTORY_KINDS.map(k => `.sp-tl[data-hk-off~="${k}"] [data-hk="${k}"]`).join(', ')} { display: none; }
 }
 @media (pointer: coarse) {
   .sp-tl-chip, .sp-tl-seg button { min-height: 44px; }
-  .sp-tl-go .pp-link, .sp-card-tl { display: inline-flex; align-items: center; min-height: 44px; }
+  .sp-tl-go .pp-link, .sp-card-tl { display: inline-flex; align-items: center; min-height: 44px; padding-block: 0; margin-block: 0; }
   .sp-cardw > .sp-card-tl { bottom: 4px; right: 10px; padding: 0 8px; }
 }
 @media (max-width: 640px) {
@@ -541,6 +551,7 @@ html.sp-lb-open { overflow: hidden; }
   .sp-tl-pln { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; max-height: 32px; overflow: hidden; overflow-wrap: anywhere; }
   .sp-tl-r--pl { height: 32px; }
   .sp-tl-r--pl > .sp-tl-bar { top: 12px; }
+  .sp-tl-locsym { top: 8px; width: 16px; height: 16px; }
   .sp-tl-row { grid-template-columns: 44px minmax(0, 1fr); column-gap: 8px; }
   .sp-tl-y { padding-left: 2px; }
 }
@@ -591,6 +602,10 @@ export function ensureFamilyPagesAppCss(doc: Document = document): void {
 
 export const FAMILY_PAGES_APP_CSS = FAMILY_PAGES_BODY_CSS.replace(PRINT_ROOT_CSS, '') + `
 .sp-app { max-width: 960px; margin: 0 auto; padding: 24px 32px 40px; }
+/* An image still on its way, or that did not come (spec 116 §5): the window only, a file never has one. */
+.sp-img-wait { display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.sp-portrait.sp-img-wait { border-radius: var(--r-md, 6px); }
+.sp-clip-img.sp-img-wait { box-sizing: border-box; background-color: var(--surface-2); }
 /* The app's window shows full data; a living person's tag tells what the saved file protects (§3.3, §9.3). */
 .sp-living { font-size: 12px; font-weight: 400; color: var(--text-faint); white-space: nowrap; }
 .sp-app button.pp-link, .sp-app button.sp-crumb, .sp-app button.sp-crumb-back, .sp-app button.sp-toc-a {
@@ -614,7 +629,14 @@ export const FAMILY_PAGES_APP_CSS = FAMILY_PAGES_BODY_CSS.replace(PRINT_ROOT_CSS
   .sp-app .sp-crumbs > .sp-crumb-back { display: inline-flex; }
 }
 @media (max-width: 1024px) and (max-height: 500px) and (orientation: landscape) { .sp-app { padding: 12px 24px 24px; } }
-@media (pointer: coarse) { .sp-app .sp-crumbs button { min-height: 44px; } }
+@media (pointer: coarse) {
+  .sp-app .sp-crumbs button { min-height: 44px; }
+  /* The links in the text as on the person page (5 px more above and below, the lines unmoved);
+     the links already 44 px tall keep their size. */
+  .sp-app button.pp-link { padding-block: 5px; margin-block: -5px; }
+  .sp-app .sp-sel-n > button.pp-link, .sp-app .sp-anc-n > button.pp-link, .sp-app .sp-ofam-p > button.pp-link:first-child,
+  .sp-app .sp-tl-go button.pp-link, .sp-app button.pp-link.sp-card-tl { padding-block: 0; margin-block: 0; }
+}
 .sp-appset .sp-fbar button.sp-fbar-home, .sp-appset .sp-fbar button.sp-fbar-a, .sp-appset button.sp-menu-a, .sp-app button.sp-tab, .sp-app button.sp-letter {
   font: inherit; background: none; margin: 0; cursor: pointer; text-align: inherit;
 }

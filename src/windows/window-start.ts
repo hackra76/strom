@@ -21,6 +21,7 @@ import { recordReloadPoint } from '../resume-view.js';
 import { openForwardedLink, type ForwardedLink, type LinkOpenerDeps } from './window-link.js';
 import { SecondTab, renderSecondTab, removeSecondTabScreen } from './second-tab.js';
 import { DataManager } from '../data.js';
+import { decodeSelectionRef } from '../view-selection-ref.js';
 import { TreeManager } from '../tree-manager.js';
 import { TreeRenderer } from '../renderer.js';
 import { ZoomPan } from '../zoom.js';
@@ -36,12 +37,14 @@ import { cardInView, wireMainSelection, wireSatelliteSelection, type MainFocusDe
 import { hideWindowNotice, showWindowNotice } from '../ui/window-notice.js';
 import { windowAgentFollow } from './agent-follow-state.js';
 import { setTableResearchForward, TABLE_BUBBLE_ACTION } from './window-table-research.js';
+import { setShowOnMapForward } from './window-show-on-map.js';
+import { adoptWindowSelection, getSelection } from '../ui/view-selection-ui.js';
 import { SettingsManager } from '../settings.js';
 import type { MapKind } from '../places.js';
 import type { SatelliteKind } from './window-role.js';
 import {
-    applyViewStateAfterDraw, applyViewStateBeforeDraw, captureViewState, chooseWindowStart, parseMainFocus, parseViewState,
-    readStoredWindowState, storedWindowStateJson, windowStateKey,
+    applyViewStateAfterDraw, applyViewStateBeforeDraw, captureViewState, carriedSelectionOf, chooseWindowStart, parseMainFocus, parseViewState,
+    readStoredWindowState, storedWindowStateJson, windowStateKey, withCarriedSelection, type CarriedSelection,
     type StoredWindowState, type ViewStateSource, type ViewStateTarget, type ViewWindowState,
 } from './view-window-state.js';
 
@@ -122,6 +125,12 @@ export function startMainWindow(): WindowRegistry {
         openChanged: (open) => UI.overviewWindowOpenChanged(open),
     });
     wireAgentMain(registry);
+    // "On the map" of a satellite (spec 098 §6): its selection on this window's map, in the same tree only.
+    registry.setShowOnMapHandler((ref, treeId) => {
+        if (treeId && treeId !== DataManager.getCurrentTreeId()) return;
+        const sel = decodeSelectionRef(ref);
+        if (sel) UI.showSelectionOnMap(sel);
+    });
     registry.setResearchActionHandler((action, args) => {
         if (action === PERSON_MENU_ACTION) {
             runSatelliteResearchRow(args, { items: researchItems, run: (personId, a) => UI.runPersonMenuAction(personId as PersonId, a) });
@@ -246,6 +255,11 @@ export function startSatelliteSelection(client: SatelliteClient): void {
             client.researchAction(TABLE_BUBBLE_ACTION, args);
             if (focusMain) void client.requestMainFocus();
         },
+    });
+    // "On the map" (spec 098 §6): the main window shows the selection on its map and comes forward.
+    setShowOnMapForward({
+        mainOpen: () => client.connection === 'connected',
+        send: (ref) => { client.showOnMap(ref); void client.requestMainFocus(); },
     });
 }
 
@@ -443,6 +457,7 @@ const appViewStateSource: ViewStateSource = {
         descGenerations: TreeRenderer.getFanDescGenerations(),
         shape: TreeRenderer.getFanShape(),
         colorMode: TreeRenderer.getFanColorMode(),
+        ...TreeRenderer.getFanLook(),
     }),
     map: () => ({
         scope: UI.mapScope,
@@ -464,7 +479,7 @@ const appViewStateTarget: ViewStateTarget = {
     setFullFamilies: (on) => TreeRenderer.setDescendantsFullFamilies(on),
     setFan: (fan) => TreeRenderer.setWindowFan(fan),
     setMap: (m) => {
-        UI.mapScope = m.scope;
+        UI.applyMapScopeFromWindow(m.scope);
         UI.mapCenter = m.center ? { lat: m.center.lat, lon: m.center.lon } : null;
         UI.mapZoom = m.zoom;
         // The kinds are this device's: the same here unless changed meanwhile (a satellite keeps them in its memory).
@@ -485,14 +500,34 @@ const appViewStateTarget: ViewStateTarget = {
  * is carried over"; the main window's ⧉ and a satellite's alike).
  */
 export function windowStartState(kind: SatelliteKind): unknown {
-    if (kind !== 'table') return captureAppViewState(kind);
+    if (kind !== 'table') return withWindowSelection(kind, captureAppViewState(kind));
     const state = UI.tableWindowState();
     // From another view: the person selected here is the selected row there.
     if (TreeRenderer.getViewMode() !== 'table' && state.rowType === 'persons') {
         const focus = TreeRenderer.getFocusPersonId();
         if (focus) state.selected = `p:${focus}`;
     }
-    return state;
+    return withWindowSelection(kind, state);
+}
+
+/** This window's selection with "Hide others" and the views' scopes of the open tree (spec 098 §7, §11.0). */
+function windowSelectionNow(): CarriedSelection {
+    return {
+        selection: getSelection(),
+        mapScope: UI.mapScopeNow(),
+        timelineScope: UI.viewScopeNow('timeline'),
+        tableScope: UI.viewScopeNow('table'),
+    };
+}
+
+/**
+ * A starting state of a window of a tree's view with this window's
+ * selection and map scope beside it (spec 098 §7); the overview's window
+ * has neither.
+ */
+export function withWindowSelection(kind: SatelliteKind, state: unknown): unknown {
+    if (kind === 'overview') return state;
+    return withCarriedSelection(state, windowSelectionNow());
 }
 
 /** The main window's state of its views for a new window of `kind` (undefined: the Table's is table-ui's). */
@@ -516,11 +551,14 @@ export function captureAppViewState(kind: SatelliteKind): ViewWindowState | unde
  */
 export function wireSatelliteViewStart(client: SatelliteClient, kept: StoredWindowState | null = null): () => void {
     let init: ViewWindowState | null = null;
+    let initSelection: CarriedSelection | null = null;
     let first = true;
     let afterDraw: ViewWindowState | null = null;
     let drawnTree: string | null = null;
     client.on('init', ({ kind, state }) => {
-        if (first) init = parseViewState(kind, state);
+        if (!first) return;
+        init = parseViewState(kind, state);
+        initSelection = carriedSelectionOf(state);
     });
     client.on('tree', ({ treeId }) => {
         if (treeId === drawnTree) return;
@@ -535,12 +573,27 @@ export function wireSatelliteViewStart(client: SatelliteClient, kept: StoredWind
     return () => {
         const treeId = DataManager.getCurrentTreeId();
         let state: ViewWindowState | null = null;
+        let carried: CarriedSelection | null = null;
         if (first) {
             first = false;
             // The main window switched trees meanwhile: its state was another tree's.
-            if (init) state = client.requestedTreeId && treeId !== client.requestedTreeId ? null : init;
-            else if (kept && kept.tree === treeId) state = parseViewState(kept.kind, kept.state);
+            const sameTree = !client.requestedTreeId || treeId === client.requestedTreeId;
+            if (init || initSelection) {
+                state = sameTree ? init : null;
+                carried = sameTree ? initSelection : null;
+            } else if (kept && kept.tree === treeId) {
+                state = parseViewState(kept.kind, kept.state);
+                carried = carriedSelectionOf(kept.state);
+            }
             init = null;
+            initSelection = null;
+        }
+        // The selection and the map's scope first: the map's scope Selection needs the selection (§7).
+        if (carried) {
+            adoptWindowSelection(carried.selection);
+            UI.applyMapScopeFromWindow(carried.mapScope);
+            if (carried.timelineScope) UI.applyViewScopeFromWindow('timeline', carried.timelineScope);
+            if (carried.tableScope) UI.applyViewScopeFromWindow('table', carried.tableScope);
         }
         const start = chooseWindowStart(state, parseMainFocus(client.mainFocus), appViewStateTarget.hasPerson);
         if (start.focus) appViewStateTarget.setFocus(start.focus.personId, start.focus.depthUp, start.focus.depthDown);
@@ -573,7 +626,7 @@ export function keepSatelliteState(client: SatelliteClient): void {
         const kind = client.kind;
         let json: string | null = null;
         try {
-            const state = kind === 'table' ? UI.tableWindowState() : captureAppViewState(kind);
+            const state = withWindowSelection(kind, kind === 'table' ? UI.tableWindowState() : captureAppViewState(kind));
             json = storedWindowStateJson(client.treeId, kind, state);
         } catch (err) {
             console.warn('Window state not kept', err);

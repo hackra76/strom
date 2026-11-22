@@ -14,13 +14,14 @@
  */
 
 import { strings } from '../../strings.js';
-import type { TableView, TableViewRowType } from '../../types.js';
+import type { ResearchLine, TableView, TableViewRowType } from '../../types.js';
 import { sanitizeTableView } from '../../table-views-data.js';
 import { columnById, DEFAULT_VIEWS, type SortSpec } from './table-columns.js';
 import { ROW_TYPES, type RowType } from './table-model.js';
 import type { FilterItem } from './table-filter.js';
 import { defaultUnionCollapse } from './table-subrows.js';
 import { groupKeysOf } from './table-group.js';
+import { lineOffered } from './table-research.js';
 import {
     applyColumnSetup, columnSetupOf, defaultTypeState, type ColumnSetup, type RowTypeState, type TableState,
 } from './table-state.js';
@@ -100,8 +101,8 @@ const RESEARCH_PREFIX = 'r:';
 export interface ResearchViewOffer {
     /** A research tree: the view Research (its overview). */
     overview: boolean;
-    /** The research's lines in its order: a view each, and Off the lines. */
-    lines: readonly { id: string; name: string }[];
+    /** The research's lines in its order: a view each (not an ended one), and Off the lines. */
+    lines: readonly { id: string; name: string; state?: ResearchLine['state'] }[];
     /** Exchange with research (a research tree that can change). */
     exchange: boolean;
 }
@@ -127,7 +128,7 @@ export function researchViewIds(): string[] {
     const o = researchViewOffer;
     if (!o.overview) return [];
     const out = [`${RESEARCH_PREFIX}research`];
-    for (const l of o.lines) out.push(`${RESEARCH_PREFIX}line:${l.id}`);
+    for (const l of o.lines) if (lineOffered(l)) out.push(`${RESEARCH_PREFIX}line:${l.id}`);
     if (o.lines.length) out.push(`${RESEARCH_PREFIX}offLine`);
     if (o.exchange) out.push(`${RESEARCH_PREFIX}exchange`);
     return out;
@@ -255,7 +256,6 @@ export function applyView(view: TableView, st: RowTypeState): void {
     st.sort = view.sort.map(toSpec);
     st.unions = type === 'persons' && view.unions ? { collapsed: view.unions.collapsed, except: [...view.unions.except] } : defaultUnionCollapse();
     st.revealedUnions = [];
-    st.scope = type !== 'sources' && view.scope?.listId ? view.scope.listId : null;
     st.group = type !== 'sources' && view.group && groupKeysOf(type).includes(view.group.by)
         ? { by: view.group.by, collapsed: [...view.group.collapsed] } : null;
 }
@@ -269,16 +269,36 @@ export function viewFromState(type: RowType, st: RowTypeState, id: string, name:
         filter: { op: 'and', items: structuredClone(st.filter.items) as unknown as Record<string, unknown>[] },
         sort: st.sort.map(fromSpec),
         ...(type === 'persons' ? { unions: { collapsed: st.unions.collapsed, except: [...st.unions.except].sort() } } : {}),
-        ...(type !== 'sources' && st.scope ? { scope: { listId: st.scope } } : {}),
+        // The scope belongs to the window (the shared switch, spec 098 §11c), not to a view: a view no longer keeps one.
         ...(type !== 'sources' && st.group ? { group: { by: st.group.by, collapsed: [...st.group.collapsed].sort() } } : {}),
         updated: now,
     };
 }
 
+/**
+ * The sort a view keeps from a state: a list's order (# first, spec 098
+ * §11c) comes from the scope, not from the view, so it stands for the view's
+ * own sort (`viewSort`); a # further down is dropped.
+ */
+export function sortForView(sort: readonly SortSpec[], viewSort: readonly SortSpec[]): SortSpec[] {
+    if (sort[0]?.col === 'num') return viewSort.map(x => ({ ...x }));
+    return sort.filter(x => x.col !== 'num').map(x => ({ ...x }));
+}
+
+/** The sort a view opens with. */
+export function viewSortOf(view: TableView): SortSpec[] {
+    return view.sort.map(toSpec);
+}
+
+/** The state as a view keeps it (`view`: the open one): a list's order stands for the view's own sort (sortForView). */
+export function stateForView(st: RowTypeState, view: TableView): RowTypeState {
+    return st.sort.some(x => x.col === 'num') ? { ...st, sort: sortForView(st.sort, viewSortOf(view)) } : st;
+}
+
 /** What makes two states the same view: everything a view keeps, nothing else. */
 function stateKey(type: RowType, st: RowTypeState): string {
     const v = viewFromState(type, st, '', '', '');
-    return JSON.stringify([v.columns, v.pinned, [...v.collapsedGroups].sort(), v.coverageRow, v.filter.items, v.sort, v.unions ?? null, v.scope?.listId ?? null, v.group ?? null]);
+    return JSON.stringify([v.columns, v.pinned, [...v.collapsedGroups].sort(), v.coverageRow, v.filter.items, v.sort, v.unions ?? null, v.group ?? null]);
 }
 
 /** The state a view opens to, compared the same way (unknown columns dropped, as the table drops them). */
@@ -292,7 +312,8 @@ function viewKey(view: TableView): string {
 /** The row type's state differs from its open view (§9.3 "● changed"). */
 export function viewChanged(view: TableView, st: RowTypeState): boolean {
     if (!isShownRowType(view.rowType)) return false;
-    return stateKey(view.rowType, st) !== viewKey(view);
+    // The list's order the scope gives (# ↑, spec 098 §11c) does not change the view.
+    return stateKey(view.rowType, stateForView(st, view)) !== viewKey(view);
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +357,12 @@ export interface StoredTableWork {
     work: Partial<Record<RowType, TableView>>;
     /** Unsaved states of views not open now, by view id (absent when none). */
     drafts?: Record<string, TableView>;
+    /**
+     * Written since the Table took the shared scope switch (spec 098 §11c):
+     * its views carry no list of their own any more. Without it, the list a
+     * stored state was narrowed to is taken over once (TableState.legacyScope).
+     */
+    sharedScope?: true;
 }
 
 export function workStorageKey(treeId: string): string {
@@ -367,6 +394,7 @@ export function readTableWork(treeId: string): StoredTableWork | null {
             if (w) work[t] = w;
         }
         const out: StoredTableWork = { rowType, open, work };
+        if (v.sharedScope === true) out.sharedScope = true;
         if (v.drafts && typeof v.drafts === 'object' && !Array.isArray(v.drafts)) {
             const drafts: Record<string, TableView> = {};
             for (const [id, d] of Object.entries(v.drafts)) {
@@ -420,6 +448,8 @@ export function restoreTableState(state: TableState, work: StoredTableWork | nul
         applyView(view, st);
         const w = work?.work[t];
         if (w && found) applyDraft(w, t, st);
+        // The list the Table was narrowed to before the shared switch (spec 098 §11c): taken over once, then no longer stored.
+        if (work && !work.sharedScope && t !== 'sources' && !state.legacyScope) state.legacyScope = (w && found ? w.scope?.listId : view.scope?.listId) ?? null;
     }
     state.drafts = {};
     for (const [id, d] of Object.entries(work?.drafts ?? {})) {
@@ -466,7 +496,7 @@ export function switchView(state: TableState, id: string, stored: readonly Table
     const curId = state.open[t];
     if (curId !== id) {
         const cur = findView(curId, stored);
-        if (cur && viewChanged(cur, st)) state.drafts[curId] = viewFromState(t, st, curId, cur.name, '');
+        if (cur && viewChanged(cur, st)) state.drafts[curId] = viewFromState(t, stateForView(st, cur), curId, cur.name, '');
         else delete state.drafts[curId];
         applyView(view, st);
         const draft = state.drafts[id];
@@ -493,12 +523,12 @@ export function discardViewChanges(state: TableState, stored: readonly TableView
 
 /** What the tree's table keeps in localStorage now (§9.1). */
 export function tableWorkOf(state: TableState, stored: readonly TableView[] | undefined): StoredTableWork {
-    const work: StoredTableWork = { rowType: state.rowType, open: {}, work: {} };
+    const work: StoredTableWork = { rowType: state.rowType, open: {}, work: {}, sharedScope: true };
     for (const t of ROW_TYPES) {
         const view = openViewOf(state, t, stored);
         work.open[t] = view.id;
         const st = state.types[t];
-        if (viewChanged(view, st)) work.work[t] = viewFromState(t, st, view.id, view.name, '');
+        if (viewChanged(view, st)) work.work[t] = viewFromState(t, stateForView(st, view), view.id, view.name, '');
     }
     const drafts: Record<string, TableView> = {};
     for (const [id, d] of Object.entries(state.drafts)) {

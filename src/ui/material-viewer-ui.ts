@@ -12,6 +12,9 @@
  * See src/ui/module.ts for the composition pattern.
  */
 
+import { isPendingImageUrl } from '../research-image-refs.js';
+import { imageLoads } from '../image-loads.js';
+import { materialImageWait } from './materials-ui.js';
 import { mediaPersonId, treeMedia } from '../media.js';
 import { setResearchOpenLabel } from './research-open-mark.js';
 import { DataManager } from '../data.js';
@@ -23,11 +26,10 @@ import { announcedResearchScheme } from '../research-device.js';
 import {
     MaterialItem, cachedMaterialList, materialFileItem, materialType, materialKindLabel, materialFolder,
     materialFromKey, fileExt, fileUrl, thumbUrl, materialSystemLink, getCachedThumb, researchMakesThumb,
-    batchFolderLabel, materialDate, isPortraitCandidate, attachmentItem,
+    batchFolderLabel, materialDate, attachmentItem,
 } from '../materials.js';
 import { iconSvg } from '../icons.js';
 import { detailsKeys, materialDetailsEdit, materialDetailsFields, materialDetailsOf } from './material-details-ui.js';
-import { canEditPortrait } from './portrait-actions-ui.js';
 import { attachmentResizeState, pdfBlobFromDataUrl } from '../attachments.js';
 import { formatBytesShort } from './originals-ui.js';
 import { openViewerList, closeImageViewer, viewerListOpen, viewerListIndex, redrawViewerList, relayoutViewer, goViewerList, ViewerSlots } from './image-viewer.js';
@@ -58,6 +60,8 @@ interface ViewerState {
     usesOpen: boolean;
     /** Go through (spec 102 §8c): the files saved, the shown file's unsaved change (saved when going on). */
     review: { saved: Set<string>; pending: (() => Promise<void>) | null; index: number } | null;
+    /** The stage waits for a file of the tree still on its way (spec 116 §5): its coming draws the stage again. */
+    stageWaits?: boolean;
 }
 
 /**
@@ -179,12 +183,13 @@ function isViewableImage(item: MaterialItem): boolean {
 /** The attachment's own image (a data URL), when it has one. */
 function attachmentImage(item: MaterialItem): string | null {
     const att = item.attachment;
-    return att && !att.originalOnly && att.mimeType.startsWith('image/') && att.dataUrl ? att.dataUrl : null;
+    // A stand-in of a file still on its way is never an image to show (spec 116 §5).
+    return att && !att.originalOnly && att.mimeType.startsWith('image/') && att.dataUrl && !isPendingImageUrl(att.dataUrl) ? att.dataUrl : null;
 }
 
 export function attachmentPdf(item: MaterialItem): { dataUrl: string; mimeType: string } | null {
     const att = item.attachment;
-    return att && !att.originalOnly && att.dataUrl && att.mimeType === 'application/pdf' ? { dataUrl: att.dataUrl, mimeType: att.mimeType } : null;
+    return att && !att.originalOnly && att.dataUrl && !isPendingImageUrl(att.dataUrl) && att.mimeType === 'application/pdf' ? { dataUrl: att.dataUrl, mimeType: att.mimeType } : null;
 }
 
 export function openPdfBlob(pdf: { dataUrl: string; mimeType: string }): boolean {
@@ -366,7 +371,9 @@ export const materialViewerMethods = uiModule({
         const key = treeAttachmentsKey();
         if (key === viewer.drawnAttachments) return;
         viewer.drawnAttachments = key;
-        redrawKeepingDraft(viewer);
+        // The shown file was on its way: it came (its image) or did not (Try again) — the stage too.
+        if (viewer.stageWaits) redrawViewerList({ stage: true });
+        else redrawKeepingDraft(viewer);
     },
 
     /** The item as it is now (the remembered list changed after an action; an attachment may be gone). */
@@ -374,7 +381,8 @@ export const materialViewerMethods = uiModule({
         let attachment = item.attachment;
         // The tree's file as it is now (its title, kind or date may have changed).
         if (attachment) {
-            const now = DataManager.getMedia(attachment.id);
+            // A file still on its way is the tree's too (spec 116 §5: the view's record, its stand-in).
+            const now = DataManager.getMedia(attachment.id) ?? imageLoads.view(DataManager.getData()).media?.[attachment.id];
             attachment = now?.places.length ? now : undefined;
         }
         if (!item.file) return attachment ? { ...attachmentItem(attachment, item.persons), ...(item.uses !== undefined ? { uses: item.uses } : {}) } : item;
@@ -580,6 +588,20 @@ export const materialViewerMethods = uiModule({
         const start: CardButton[] = startUrl ? [{ label: strings.sync.startResearch, run: () => this.researchSyncAction('startResearch'), primary: true, research: this.researchSyncActionMark('startResearch') !== 'none' }] : [];
         const fallback = () => slots.card(viewerCard(letters, m.openSystemText(ext), openSystem));
 
+        // A file of the tree still on its way (spec 116 §5, as §4.4): "Loading the photo…", or not come with Try again.
+        const waits = materialImageWait(item);
+        st.stageWaits = waits !== 'none';
+        if (waits === 'loading' || waits === 'failed') {
+            const id = item.attachment?.id;
+            slots.wait(waits, waits === 'failed' && id ? () => imageLoads.retry([`media:${id}`]) : undefined);
+            return;
+        }
+
+        // A family tree file (spec 117 §5): no preview, its letters and its kind.
+        if (item.tree) {
+            slots.card(viewerCard(letters, m.treeFile, []));
+            return;
+        }
         // Only in the tree: its own copy.
         if (!inArchive) {
             if (attImage) slots.image(attImage, null, fallback);
@@ -767,7 +789,7 @@ export const materialViewerMethods = uiModule({
         }
         if (agent && inArchive) {
             if (item.state === 'processed') field(m.f.state, m.agentDone);
-            else if (item.state === 'new') field(m.f.state, m.agentWaiting);
+            else if (item.state === 'new') field(m.f.state, ctx ? this.materialWaitingLabel(ctx.researchId) : m.agentWaiting);
         }
         if (fields.childElementCount) body.appendChild(fields);
 
@@ -827,11 +849,13 @@ export const materialViewerMethods = uiModule({
         };
         // Link to… (spec 102 §4): the tree's file in the tree; material outside it needs the bridge (Q2).
         const inTree = !!item.attachment?.places?.length;
-        const canAttach = inTree ? DataManager.canEditMedia(item.attachment!.id) : inArchive && !!ctx?.caps.assign && !item.removedId && !DataManager.isReadOnly();
-        if (canAttach) action(m.attach, () => this.openAttachDialog([item], { personId: this.materialContextPerson() }), { primary: true, write: !inTree, id: 'attach' });
+        // A family tree file (spec 117 §5): Delete permanently… is its only action.
+        const canAttach = item.tree ? false : inTree ? DataManager.canEditMedia(item.attachment!.id) : inArchive && !!ctx?.caps.assign && !item.removedId && !DataManager.isReadOnly();
+        // The person the materials were opened for (their card, the window filtered to them) is chosen at the start (1121).
+        if (canAttach) action(m.attach, () => this.openAttachDialog([item], { personId: st.ctx.personId ?? this.materialContextPerson() }), { primary: true, write: !inTree, id: 'attach' });
         // Create a source from this file… (spec 102 §5): the second action, the same conditions as Link to….
         if (canAttach && this.canEditSources()) action(m.makeSource, () => void this.makeSourceFromMaterial(item, { personId: this.materialContextPerson() }), { write: !inTree, id: 'makeSource' });
-        if (inArchive) {
+        if (inArchive && !item.tree) {
             if (item.removedId && item.hidden) {
                 // Taken out of the tree: back with its places (the tree's own write).
                 if (!DataManager.isReadOnly()) action(m.restore, () => this.restoreRemovedMaterials([item]), { id: 'restore' });
@@ -847,14 +871,21 @@ export const materialViewerMethods = uiModule({
         } else if (item.attachment) {
             const att = item.attachment;
             if (att.dataUrl && !att.originalOnly) download(att.dataUrl, att.name);
-            const owner = attachmentOwner(att.id);
-            // Use as portrait (spec 107 §4): the tree's own write, so it does not wait for the research's bridge.
-            if (owner && isPortraitCandidate(att) && !isPortraitSource && canEditPortrait(owner.id)) {
-                const ownerId = owner.id;
-                action(m.useAsPortrait, () => {
-                    closeImageViewer();
-                    void this.useAttachmentAsPortrait(ownerId, att.id);
-                }, { id: 'useAsPortrait' });
+        }
+        // Use as portrait (spec 107 §4): the tree's file for its owner (the tree's own write); a research's picture
+        // for the person the materials were opened for (1121), over the bridge unless the tree has the file.
+        const portrait = item.origin === 'tree'
+            ? (item.attachment ? this.materialPortraitOffer(item, attachmentOwner(item.attachment.id)?.id ?? null, ctx?.caps ?? null) : null)
+            : this.materialPortraitOffer(item, st.ctx.personId ?? this.materialContextPerson(), ctx?.caps ?? null);
+        if (portrait && !isPortraitSource && !this.materialPortraitShown(item, portrait.personId)) {
+            const forId = portrait.personId;
+            action(m.useAsPortrait, () => {
+                closeImageViewer();
+                void this.useMaterialAsPortrait(forId, item);
+            }, { id: 'useAsPortrait', write: portrait.bridge });
+            // Opened for that person: right after the first action, among those a phone's collapsed sheet shows (1121).
+            if (forId === (st.ctx.personId ?? this.materialContextPerson()) && actions.childElementCount > 2) {
+                actions.insertBefore(actions.lastElementChild!, actions.children[1]);
             }
         }
         if (inTree && DataManager.canEditMedia(item.attachment!.id)) {
@@ -862,12 +893,18 @@ export const materialViewerMethods = uiModule({
         }
         // Delete permanently… (spec 102 §9): the last action, behind `material.delete`, never in a tree that is read only.
         if (inArchive && ctx?.caps.delete && !DataManager.isReadOnly()) {
-            action(m.del.forever, () => void this.openDeleteDialog([item], { leave: () => closeImageViewer(), ctx: { where: 'viewer' } }), { danger: true, write: true, id: 'delete' });
+            const leave = { leave: () => closeImageViewer(), ctx: { where: 'viewer' as const } };
+            action(m.del.forever, () => void (item.tree ? this.openTreeFileDelete(item, leave) : this.openDeleteDialog([item], leave)), { danger: true, write: true, id: 'delete' });
         }
         if ((writes || edit === 'off') && !up) foot.appendChild(h('p', 'mv-off', m.actionsWhenRunning));
         if (actions.childElementCount) foot.appendChild(actions);
 
         panel.append(head, body, h('div', 'mv-gap'), more);
+        // A file still on its way: its details only, no actions until it comes (spec 116 §5).
+        if (materialImageWait(item) !== 'none') {
+            head.querySelector('.mv-edit')?.remove();
+            return;
+        }
         if (foot.childElementCount) panel.appendChild(foot);
     },
 

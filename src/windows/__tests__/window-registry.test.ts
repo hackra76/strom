@@ -12,9 +12,11 @@ import { DataManager } from '../../data.js';
 import { TreeManager } from '../../tree-manager.js';
 import { AuditLogManager } from '../../audit-log.js';
 import { UndoManager } from '../../undo.js';
-import { LAST_FOCUSED, type StromData, type TreeId, type Person } from '../../types.js';
+import { type StromData, type TreeId, type Person } from '../../types.js';
+import { LAST_FOCUSED } from '../../model-values.js';
 import { WindowBus, createMemoryHub, type WindowMessage } from '../window-bus.js';
 import { WindowRegistry, dataManagerHost, PATCH_INTERVAL_MS } from '../window-registry.js';
+import { IMAGES_ARRIVED_EVENT } from '../../image-loads.js';
 
 const last = <T>(xs: T[]): T | undefined => xs[xs.length - 1];
 
@@ -234,6 +236,31 @@ describe('edits from a satellite', () => {
         expect(last(sat.of('edit-result'))).toMatchObject({ ok: false, reason: 'read-only' });
         expect(DataManager.getAllPersons()).toHaveLength(1);
         expect(last(sat.of('status'))).toMatchObject({ live: true, readOnly: true });
+    });
+
+    it('while following a research a satellite\'s change of the lists alone is taken: only the lists, a list\'s step undone (N2)', async () => {
+        const sat = await connect();
+        DataManager.setLiveTree(TREE);
+        const copy = treeOf(last(sat.of('tree'))!.json);
+        const list = { id: 'pl_1', name: 'Picked', dynamic: false, personIds: Object.keys(copy.persons), created: '2026-11-12T10:00:00.000Z', updated: '2026-11-12T10:00:00.000Z' };
+        // Anything else in the copy (a person renamed) is not taken with the lists.
+        const pid = Object.keys(copy.persons)[0];
+        const edited = { ...copy, personLists: [list], persons: { ...copy.persons, [pid]: { ...copy.persons[pid as never], firstName: 'Jiná' } } };
+        sat.bus.post({ type: 'edit', windowId: sat.id, editId: 'e4', treeId: TREE, baseRevision: registry.revision, json: JSON.stringify(edited), label: 'Add to list', listsOnly: true });
+        await settle(PATCH_INTERVAL_MS);
+        expect(last(sat.of('edit-result'))).toMatchObject({ ok: true });
+        expect(DataManager.getPersonLists().map(l => l.name)).toContain('Picked');
+        expect(DataManager.getAllPersons()[0].firstName).toBe('Zdislava');
+        expect(last(sat.of('status'))).toMatchObject({ live: true, readOnly: true, listsOpen: true, undoOpen: true });
+        // The same edit without the mark is refused, as any other.
+        sat.bus.post({ type: 'edit', windowId: sat.id, editId: 'e5', treeId: TREE, baseRevision: registry.revision, json: JSON.stringify(edited), label: 'x' });
+        await settle();
+        expect(last(sat.of('edit-result'))).toMatchObject({ ok: false, reason: 'read-only' });
+        // Undo from the satellite takes the list's step back.
+        sat.bus.post({ type: 'undo' });
+        await settle(PATCH_INTERVAL_MS);
+        expect(DataManager.getPersonLists().map(l => l.name)).not.toContain('Picked');
+        DataManager.setLiveTree(null);
     });
 
     it('undo from a satellite runs here; the result reaches the windows as a patch', async () => {
@@ -471,5 +498,37 @@ describe('the fan\'s family-line colours (spec 114 §3)', () => {
         fan2.bus.post({ type: 'hello', windowId: id2, kind: 'fan', treeId: TREE });
         await settle();
         expect(fan2.of('fan-rod-colors')).toHaveLength(0);
+    });
+});
+
+describe('images that came after the tree (spec 116, I6)', () => {
+    it('reach the satellites as a patch, like a change of the data: nothing stored, no undo step', async () => {
+        registry.stop();
+        vi.stubGlobal('window', new EventTarget());
+        try {
+            registry = new WindowRegistry({
+                bus: new WindowBus('main-img', hub.channel()),
+                host: dataManagerHost({ treeName: () => treeName, treeExists: () => true, focusSelf: () => {}, hasFocus: () => true }),
+                openWindow: () => fakeWindow() as unknown as Window,
+                geometry: () => null,
+            });
+            registry.start();
+            const sat = await connect();
+            await settle(PATCH_INTERVAL_MS);
+            const before = sat.of('patch').length;
+            saveSpy.mockClear();
+            const id = DataManager.getAllPersons()[0].id;
+            const url = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2Q==';
+            DataManager.applyImageArrivals(TREE, d => { d.persons[id].photo = url; });
+            window.dispatchEvent(new CustomEvent(IMAGES_ARRIVED_EVENT, { detail: { treeId: TREE, seq: 1, keys: [`person:${id}:photo`] } }));
+            await settle(PATCH_INTERVAL_MS);
+            expect(sat.of('patch').length).toBe(before + 1);
+            expect(treeOf(last(sat.of('patch'))!.json).persons[id].photo).toBe(url);
+            expect(saveSpy).not.toHaveBeenCalled();
+            expect(UndoManager.canUndo()).toBe(false);
+        } finally {
+            registry.stop();
+            vi.unstubAllGlobals();
+        }
     });
 });

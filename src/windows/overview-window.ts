@@ -24,7 +24,8 @@
 
 import type { TreeId } from '../types.js';
 import type { LiveSession, OverviewViewing } from '../ui/research-ui.js';
-import { RESEARCH_LINK_ACTIONS, type ResearchLinkAction } from '../research-link.js';
+import { QUEUE_TASK_KINDS, RESEARCH_LINK_ACTIONS, imageNumber, type QueueTaskKind, type ResearchLinkAction } from '../research-link.js';
+import type { AsideDo } from '../research-aside.js';
 import { sanitizeTaskOrderWas, type TaskOrderWas } from '../research-directions-write.js';
 import { queueQuery, type QueueFilter } from '../research-queue-pages.js';
 
@@ -76,8 +77,8 @@ export interface OverviewExtras {
     agentless: boolean;
     /** No agent known to work now (agentless, or its mode not known yet). */
     noAgent: boolean;
-    /** ◎ following in the tree and the view it runs in. */
-    follow: { on: boolean; view: 'family' | 'fan' | 'map' | null };
+    /** ◎ following in the tree and the view it runs in; the run followed (spec 126 U10 §7; absent or null: none). */
+    follow: { on: boolean; view: 'family' | 'fan' | 'map' | null; run?: string | null };
     lines: OverviewLinesState;
     /** Hypotheses asked of the research and waiting for its answer, and the list of proposals accepted at once. */
     hypotheses: { pending: Record<string, unknown>; batch: unknown | null };
@@ -94,6 +95,8 @@ export interface OverviewExtras {
     offLineSettings?: boolean;
     /** "Work on the queue…" starting (waiting buttons 3a, 3b) as the main window has it; absent or null: none. */
     queueStart?: { phase: 'starting' | 'silent'; startedAt: number } | null;
+    /** Every start of the research's work (spec 126 U10): the general run's (scope 'queue') and the directions' runs (their ids). */
+    runStarts?: Array<{ scope: string; view: { phase: 'starting' | 'silent'; startedAt: number } }>;
     /** "Follow live" starting in the main window (waiting buttons §11.2): its step; absent or null: none. */
     followStart?: 'connect' | 'tree' | null;
     /** Rows of "Awaiting action" whose file the main window writes for this window now (§11.2); absent: none. */
@@ -111,6 +114,8 @@ export interface OverviewVerifyState {
     waiting: number;
     stop: boolean;
     bulk: boolean;
+    /** "Show in the queue" beside the waiting facts (`queue.kind`); absent: not offered. */
+    queue?: boolean;
 }
 
 /** A highlight of people in the main window's tree (evidence-ui's group: `changed`, `direction`, `direction-found`, …). */
@@ -315,11 +320,15 @@ export type OverviewAction =
     | { action: 'offline-settings'; args?: Record<string, never> }
     /** Settings… of "Faster by downloading" (spec 105 §3): Research for this tree at Books. */
     | { action: 'books-settings'; args?: Record<string, never> }
+    /** "Settings ›" beside the most runs at once reached (spec 126 U10): Research for this tree at that setting. */
+    | { action: 'runs-settings'; args?: Record<string, never> }
     // ---- in the main window, it stays where it is ----
     /** A row hovered: its card lit up in the main window's tree (null: none). */
     | { action: 'hover-person'; args: { personId: string | null } }
     /** Stop of the tree's "Verifying": the research drops what it has not begun to verify. */
     | { action: 'verify-stop'; args?: Record<string, never> }
+    /** Stop of one run (spec 126 U10 §4): it finishes its task and takes no next one. Answers `{ ok }` or `{ ok: false, text }`. */
+    | { action: 'run-stop'; args: { run: string } }
     /** The main window's highlight of `kind` ends (the changes' filter left none of its people to show). */
     | { action: 'highlight-end'; args: { kind: string } }
     /** Follow live from the overview (it stays open, followed). */
@@ -330,6 +339,8 @@ export type OverviewAction =
     | { action: 'follow-tree'; args: { on: boolean } }
     /** "Follow in: Family / Fan / Map". */
     | { action: 'follow-view'; args: { view: 'family' | 'fan' | 'map' } }
+    /** Follow this run (spec 126 U10 §7): its people take the primary colour, following goes to it. */
+    | { action: 'follow-run'; args: { run: string } }
     /** Turn on (the research not running): the switch as today. */
     | { action: 'turn-on'; args?: Record<string, never> }
     /** A line selected for the queue and the tree's light ('all': none). */
@@ -357,6 +368,11 @@ export type OverviewAction =
     | { action: 'waiting-audit'; args: { itemId: string; do: 'keep' | 'unkeep' | 'preview' | 'unfix' } | { itemId: string; do: 'fix'; expect: string } }
     /** A file picked in the window for a task. */
     | { action: 'waiting-file'; args: { itemId: string; file: File } }
+    /**
+     * A file of a book's inbox set aside (`inbox.aside`): its answer written by the main window through its
+     * bridge (answered: AsideOutcome; the main window says it in its toast).
+     */
+    | { action: 'waiting-aside'; args: { itemId: string; do: AsideDo; image?: number } }
     /** Ask the research (its terminal) to decide a hypothesis of "Awaiting action". */
     | { action: 'hypothesis-ask'; args: { hypothesisId: string; do: 'decide' | 'abandon' | 'keep-open'; variant?: string } }
     /** "Accept proposals (n)". */
@@ -382,10 +398,10 @@ export type OverviewActionArgs<T extends OverviewActionId> = Extract<OverviewAct
 
 export const OVERVIEW_ACTION_IDS = [
     'show-person', 'show-people', 'show-direction', 'direction-found', 'person-research', 'tree-overview', 'waiting-places', 'waiting-group-note',
-    'waiting-images', 'line-edit', 'line-new', 'verify-bulk', 'offline-settings', 'books-settings',
-    'hover-person', 'verify-stop', 'highlight-end', 'follow-live', 'stop-follow', 'follow-tree', 'follow-view', 'turn-on',
+    'waiting-images', 'line-edit', 'line-new', 'verify-bulk', 'offline-settings', 'books-settings', 'runs-settings',
+    'hover-person', 'verify-stop', 'run-stop', 'highlight-end', 'follow-live', 'stop-follow', 'follow-tree', 'follow-view', 'follow-run', 'turn-on',
     'line-select', 'line-state', 'line-move', 'line-retry',
-    'waiting-answer', 'waiting-sent', 'waiting-unsent', 'waiting-group-sent', 'waiting-retry', 'waiting-file', 'waiting-audit',
+    'waiting-answer', 'waiting-sent', 'waiting-unsent', 'waiting-group-sent', 'waiting-retry', 'waiting-file', 'waiting-audit', 'waiting-aside',
     'hypothesis-ask', 'hypotheses-accept', 'answer-task', 'research-link',
     'queue-list', 'queue-order',
 ] as const satisfies readonly OverviewActionId[];
@@ -393,7 +409,7 @@ export const OVERVIEW_ACTION_IDS = [
 /** Actions whose result shows in the main window: the overview window asks it to the front after them. */
 export const OVERVIEW_ACTIONS_TO_MAIN: ReadonlySet<OverviewActionId> = new Set<OverviewActionId>([
     'show-person', 'show-people', 'show-direction', 'direction-found', 'person-research', 'tree-overview', 'waiting-places', 'waiting-group-note',
-    'waiting-images', 'line-edit', 'line-new', 'verify-bulk', 'offline-settings', 'books-settings',
+    'waiting-images', 'line-edit', 'line-new', 'verify-bulk', 'offline-settings', 'books-settings', 'runs-settings',
 ]);
 
 const str = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
@@ -408,6 +424,7 @@ function queueFilter(v: unknown): QueueFilter | null {
     if (f.branch !== undefined) { if (!str(f.branch)) return null; out.branch = f.branch; }
     if (f.research !== undefined) { if (!str(f.research)) return null; out.research = f.research; }
     if (f.state !== undefined) { if (f.state !== 'next' && f.state !== 'parked') return null; out.state = f.state; }
+    if (f.kind !== undefined) { if (!(QUEUE_TASK_KINDS as readonly unknown[]).includes(f.kind)) return null; out.kind = f.kind as QueueTaskKind; }
     if (f.q !== undefined) {
         // A searched text as the bridge takes it (trimmed, at most 100 characters); an empty one: the queue's pages.
         if (typeof f.q !== 'string') return null;
@@ -461,6 +478,7 @@ export function readOverviewAction(action: unknown, args: unknown): OverviewActi
         case 'verify-bulk':
         case 'offline-settings':
         case 'books-settings':
+        case 'runs-settings':
         case 'verify-stop':
         case 'follow-live':
         case 'stop-follow':
@@ -475,6 +493,9 @@ export function readOverviewAction(action: unknown, args: unknown): OverviewActi
             if (a.files !== undefined && !(Array.isArray(a.files) && a.files.every(isFile))) return null;
             return { action, args: { itemId: a.itemId, ...(a.files ? { files: a.files as File[] } : {}) } };
         }
+        case 'run-stop':
+        case 'follow-run':
+            return str(a.run) ? { action, args: { run: a.run } } as OverviewAction : null;
         case 'highlight-end':
             return str(a.kind) ? { action, args: { kind: a.kind } } : null;
         case 'hover-person':
@@ -508,6 +529,12 @@ export function readOverviewAction(action: unknown, args: unknown): OverviewActi
             if (!str(a.itemId)) return null;
             if (a.do === 'fix') return str(a.expect) && a.expect.length <= 120 ? { action, args: { itemId: a.itemId, do: 'fix', expect: a.expect } } : null;
             return a.do === 'keep' || a.do === 'unkeep' || a.do === 'preview' || a.do === 'unfix' ? { action, args: { itemId: a.itemId, do: a.do } } : null;
+        case 'waiting-aside': {
+            if (!str(a.itemId) || (a.do !== 'discard' && a.do !== 'take' && a.do !== 'image')) return null;
+            if (a.do !== 'image') return a.image === undefined ? { action, args: { itemId: a.itemId, do: a.do } } : null;
+            const n = imageNumber(a.image);
+            return n !== null && a.image === n ? { action, args: { itemId: a.itemId, do: 'image', image: n } } : null;
+        }
         case 'waiting-file':
             return str(a.itemId) && isFile(a.file) ? { action, args: { itemId: a.itemId, file: a.file } } : null;
         case 'hypothesis-ask': {

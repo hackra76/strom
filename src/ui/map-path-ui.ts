@@ -26,6 +26,7 @@
 import { DataManager } from '../data.js';
 import { TreeRenderer } from '../renderer.js';
 import { strings } from '../strings.js';
+import { selectionIds } from './view-selection-ui.js';
 import { PersonId, PlaceGeo } from '../types.js';
 import { collectPlaces, groupTownPoints, knownStreets } from '../places.js';
 import { MQ_MOBILE, MQ_PHONE_LANDSCAPE } from '../breakpoints.js';
@@ -38,7 +39,7 @@ import {
 } from '../map-lines.js';
 import { LINE_FOCUS_DIM, lineStyle, lineSwatch, pointFill, pointSize, lineColorVar } from '../map-line-colors.js';
 import { uiModule } from './module.js';
-import { declutterMapLabels, type MapScope } from './map-ui.js';
+import { declutterMapLabels, MAP_DIM, type MapScope } from './map-ui.js';
 
 /** The legend's width (drawn by the legend part): 300, from 1280 px 320 — the framing keeps clear of it. */
 export const LEGEND_WIDTH = { base: 300, wide: 320, wideFrom: 1280 } as const;
@@ -47,6 +48,8 @@ export const LEGEND_WIDTH = { base: 300, wide: 320, wideFrom: 1280 } as const;
 let locateCache: { rev: number; data: object; places: object | undefined; locate: PathLocate; display: Map<string, string> } | null = null;
 /** Path models by person, for the same tree state as locateCache. */
 let modelCache = new Map<PersonId, PathModel>();
+/** The models within the selection's people (the map's scope Selection), for that set of people. */
+let selModelCache: { ids: ReadonlySet<PersonId>; models: Map<PersonId, PathModel> } | null = null;
 /** The open picker, its host and what opened it. */
 let picker: { ui: PathPersonPicker; host: HTMLElement; anchor: 'bar' | 'chip' } | null = null;
 let pickerOutsideBound = false;
@@ -83,11 +86,26 @@ export const mapPathMethods = uiModule({
     mapPathOn(): boolean {
         if (!this.mapTimeOn || !this.mapPathTarget) return false;
         const p = DataManager.getPerson(this.mapPathTarget);
-        return !!p && !p.isPlaceholder;
+        return !!p && !p.isPlaceholder && !this.mapPathOutside();
     },
 
-    /** The scope the map applies: with the path the whole tree (the chosen scope is kept for later). */
+    /**
+     * The path's person is outside the selection with the scope Selection
+     * (spec 098 §4): the chip stays, dimmed, the path is not drawn.
+     */
+    mapPathOutside(): boolean {
+        if (!this.mapTimeOn || !this.mapPathTarget || this.mapScope !== 'sel') return false;
+        const ids = selectionIds();
+        return !!ids && !ids.has(this.mapPathTarget);
+    },
+
+    /**
+     * The scope the map applies: with the path the whole tree (the chosen
+     * scope is kept for later), except the scope Selection, which the path
+     * keeps to.
+     */
     mapEffectiveScope(): MapScope {
+        if (this.mapScope === 'sel') return 'sel';
         return this.mapPathOn() ? 'tree' : this.mapScope;
     },
 
@@ -110,16 +128,24 @@ export const mapPathMethods = uiModule({
         const locate: PathLocate = key => pointOf.get(spellings.keyOf.get(key) ?? key) ?? null;
         locateCache = { rev, data, places: data.places, locate, display };
         modelCache = new Map();
+        selModelCache = null;
         return locateCache;
     },
 
     /** The path model of a person (cached for the tree's state). */
     mapPathModelOf(id: PersonId): PathModel {
         const { locate } = this.mapPathLocate();
-        let model = modelCache.get(id);
+        // The scope Selection keeps the path to the selection's people (spec 098 §4).
+        const persons = this.mapScope === 'sel' ? selectionIds() : null;
+        let cache = modelCache;
+        if (persons) {
+            if (selModelCache?.ids !== persons) selModelCache = { ids: persons, models: new Map() };
+            cache = selModelCache.models;
+        }
+        let model = cache.get(id);
         if (!model) {
-            model = buildPathModel(DataManager.getData(), id, { locate });
-            modelCache.set(id, model);
+            model = buildPathModel(DataManager.getData(), id, persons ? { locate, persons } : { locate });
+            cache.set(id, model);
         }
         return model;
     },
@@ -200,6 +226,7 @@ export const mapPathMethods = uiModule({
             mode: 'path',
             container: inner,
             recentId: TreeRenderer.getFocusPersonId(),
+            ...(this.mapScope === 'sel' ? { persons: this.mapScopeSelectionPersons() } : {}),
             selectedId: this.mapPathOn() ? this.mapPathTarget : null,
             onMapCount: id => this.mapPathCount(id),
             onSelect: id => this.setMapPathTarget(id),
@@ -341,15 +368,24 @@ export const mapPathMethods = uiModule({
     renderMapPathChip(): void {
         const container = document.getElementById('map-container');
         const chip = container?.querySelector('.map-path-chip') as HTMLElement | null;
-        const scope = container?.querySelector('.map-scope') as HTMLElement | null;
-        const on = this.mapPathOn();
-        if (scope) scope.hidden = on;
+        const outside = this.mapPathOutside();
+        const on = this.mapPathOn() || outside;
+        // The scope steps aside for the path, except Selection: the path keeps to it (spec 098 §4).
+        this.renderMapScope();
         if (!chip) return;
         chip.hidden = !on;
+        chip.classList.toggle('is-outside', outside);
         if (!on) return;
         const name = this.mapPathName();
         const strong = chip.querySelector('.map-path-chip-name') as HTMLElement | null;
-        if (strong) { strong.textContent = name; strong.title = name; }
+        if (strong) { strong.textContent = name; strong.title = outside ? `${name} · ${strings.map.outside}` : name; }
+        let tag = chip.querySelector<HTMLElement>('.map-path-chip-out');
+        if (outside && !tag) {
+            tag = document.createElement('span');
+            tag.className = 'map-path-chip-out';
+            strong?.after(tag);
+        }
+        if (tag) { tag.textContent = outside ? ` · ${strings.map.outside}` : ''; tag.hidden = !outside; }
     },
 
     /**
@@ -419,6 +455,8 @@ export const mapPathMethods = uiModule({
         const focus = colors ? this.mapPathFocusClass() : null;
         const esc = (t: string): string => this.escapeHtml(t);
         const { display } = this.mapPathLocate();
+        // The window's selection highlighted (spec 098 §11d): lines and points of people outside it dimmed.
+        const hl = this.mapHighlightIds();
 
         // Lines.
         const { segs, total } = pathSegments(model, year, mode, geo => visible(at(geo)));
@@ -431,7 +469,8 @@ export const mapPathMethods = uiModule({
             const a = at(s.from), b = at(s.to);
             const bw = bow(a, b, bowSide(`${s.fromKey}->${s.toKey}`));
             const st = lineStyle(s.cls, { age: s.age, colors, focus });
-            const op = st.opacity.toFixed(3);
+            const out = !!hl && !s.childIds.some(id => hl.has(id));
+            const op = (st.opacity * (out ? MAP_DIM : 1)).toFixed(3);
             casing.push(`<path d="${bw.d}" fill="none" stroke="${st.casing}" stroke-width="${st.casingWidth}" stroke-linecap="round" opacity="${op}"/>`);
             strokes.push(`<path class="map-path-line" data-cls="${s.cls}" d="${bw.d}" fill="none" stroke="${st.stroke}" stroke-width="${st.width}"`
                 + `${st.dash ? ` stroke-dasharray="${st.dash}"` : ''} stroke-linecap="${st.cap}" opacity="${op}"/>`);
@@ -459,9 +498,10 @@ export const mapPathMethods = uiModule({
             const size = pointSize(colors ? p.classes.length : 1, p.fresh);
             const fill = pointFill(p.classes, colors);
             const dim = focus && !p.classes.includes(focus) ? LINE_FOCUS_DIM.point : 1;
+            const out = !!hl && !p.personIds.some(id => hl.has(id));
             const name = display.get(p.key) ?? '';
-            html.push(`<button type="button" class="map-marker map-path-point${p.fresh ? ' is-fresh' : ''}" data-key="${esc(p.key)}" data-classes="${p.classes.join(' ')}"`
-                + ` aria-label="${esc(name)}" style="left:${Math.round(xy.x)}px; top:${Math.round(xy.y)}px;${dim < 1 ? ` opacity:${dim};` : ''}">`
+            html.push(`<button type="button" class="map-marker map-path-point${p.fresh ? ' is-fresh' : ''}${out ? ' evidence-dim' : ''}" data-key="${esc(p.key)}" data-classes="${p.classes.join(' ')}"`
+                + ` aria-label="${esc(name)}" style="left:${Math.round(xy.x)}px; top:${Math.round(xy.y)}px;${dim < 1 ? ` opacity:${out ? +(dim * MAP_DIM).toFixed(3) : dim};` : ''}">`
                 + `<span class="map-marker-dot map-path-dot" style="width:${size}px; height:${size}px; background:${fill};"></span>`
                 + `<span class="map-marker-label">${esc(name)}</span></button>`);
         }

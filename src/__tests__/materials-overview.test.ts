@@ -150,7 +150,21 @@ describe('summary', () => {
     it('counts files, batches, files without a person and hidden ones', () => {
         const l = sample();
         expect(overviewSummary(overviewItems(l, [rec(att('t'), ['P1'])]), l, true))
-            .toMatchObject({ files: 7, batches: 2, noPerson: 3, hidden: 1 });
+            .toMatchObject({ files: 8, batches: 2, noPerson: 3, hidden: 1 });
+    });
+
+    it('beside an older research the header counts every tile: a portrait it does not keep too (verification of 3.30.0, N6)', () => {
+        // Research 1.34: the attachment sent from the app is its file (joined), one file only in the archive;
+        // a portrait from a new file has no original there and stays the tree's own.
+        const original = { sha256: sha(1), name: 'letter.png', mimeType: 'image/png', bytes: 1 };
+        const l = list([file(1, { name: 'letter.png', persons: ['P0001'] }), file(2, { name: 'wedding-1908.jpg' })]);
+        const items = overviewItems(l, [
+            rec(att('letter', { original, places: [{ personId: 'p1' as never }] }), ['P0001']),
+            rec(att('portrait', { places: [{ personId: 'p1' as never }] }), ['P0001']),
+        ]);
+        const tiles = items.filter(i => passesFilters(i, filters()));
+        expect(tiles.map(i => i.key)).toEqual(['m:I0001', 'm:I0002', 'a:portrait']);
+        expect(overviewSummary(items, l, true)).toMatchObject({ files: tiles.length, noPerson: 1, inTree: 2, onlyArchive: 1 });
     });
 
     it('takes the batches’ own counts while their files are not known', () => {
@@ -293,9 +307,7 @@ describe('groups of a tree without an archive (spec 102 §1)', () => {
             rec(att('b4', { places: [{ personId: 'p2' as never }] }), []),
         ]);
         expect(tree.filter(itemWithoutPerson).map(i => i.key)).toEqual(['a:b2', 'a:b3']);
-        expect(overviewSummary(tree, null, true, true)).toMatchObject({ files: 4, batches: 0, noPerson: 2, hidden: 0 });
-        // With an archive the tree's own files stay out of the archive's counts.
-        expect(overviewSummary(tree, null, true).files).toBe(0);
+        expect(overviewSummary(tree, null, true)).toMatchObject({ files: 4, batches: 0, noPerson: 2, hidden: 0 });
     });
 
     it('the person filter and the search apply by person too', () => {
@@ -331,6 +343,12 @@ describe('rows of the virtual list', () => {
         expect(layout.order.map(i => i.key)).toEqual(['m:I0004', 'm:I0001', 'm:I0002']);
         expect(layout.rowOf.get('m:I0002')).toBe(5);
         expect(layout.rows[5].top).toBe(60 + 120 + 30 + 30 + 30);
+        // A row with a family tree file has room for its tag, kind and size (spec 117 §5).
+        const treeItems = items.map(x => (x.key === 'm:I0004' ? { ...x, tree: true } : x));
+        const treeGroups = overviewGroups({ items: treeItems, list: l, filters: filters({ showHidden: true }), mode: 'batch', batchLoaded: () => true });
+        const tree = overviewRows(treeGroups, k => open.has(k), { ...METRICS, treeExtra: 30 });
+        expect(tree.rows[1].height).toBe(150);
+        expect(overviewRows(groups, k => open.has(k), { ...METRICS, treeExtra: 30 }).rows[1].height).toBe(120);
     });
 
     it('a list: one row per item', () => {
@@ -464,6 +482,42 @@ describe('preview queue', () => {
         expect(asked).toHaveLength(2);
     });
 
+    it('spec 116 §5: a preview that did not come is told from one not to be had; the tile asked for waits under the veil', async () => {
+        const gate: ((r: MaterialResult<Blob>) => void)[] = [];
+        const { deps } = fakeDeps(() => new Promise(resolve => gate.push(resolve)));
+        const q = new MaterialThumbQueue(deps);
+        q.setEnv(ENV);
+        const queued: number[] = [];
+        const got: (string | null)[] = [];
+        q.want({ sha: sha(1), px: 256, mime: 'image/jpeg' }, url => got.push(url), undefined, () => queued.push(1));
+        q.want({ sha: sha(2), px: 256, mime: 'image/bmp' }, url => got.push(url), undefined, () => queued.push(2));
+        // A second tile of the same preview joins the wait, under the veil too.
+        q.want({ sha: sha(1), px: 256, mime: 'image/jpeg' }, url => got.push(url), undefined, () => queued.push(3));
+        await tick();
+        expect([...queued].sort()).toEqual([1, 2, 3]);
+        expect(q.isWaiting(sha(1), 256)).toBe(true);
+        gate[0]({ ok: false, error: { kind: 'unknown', status: 500 } });
+        gate[1]({ ok: false, error: { kind: 'type', status: 415 } });
+        await tick(); await tick();
+        expect(got).toEqual([null, null, null]);
+        expect(q.isWaiting(sha(1), 256)).toBe(false);
+        // An error: "Not loaded"; a type without a preview: its letters, calm.
+        expect(q.isBroken(sha(1), 256)).toBe(true);
+        expect(q.isBroken(sha(2), 256)).toBe(false);
+        // A preview in the cache is never under the veil.
+        const cached = fakeDeps(ok);
+        cached.cache.set(`${sha(4)}@256`, new Blob(['x']));
+        const q2 = new MaterialThumbQueue(cached.deps);
+        q2.setEnv(ENV);
+        const veiled: number[] = [];
+        q2.want({ sha: sha(4), px: 256, mime: 'image/jpeg' }, () => undefined, undefined, () => veiled.push(4));
+        await tick();
+        expect(veiled).toEqual([]);
+        // The window opened again: asked anew.
+        q.resetFailures();
+        expect(q.isBroken(sha(1), 256)).toBe(false);
+    });
+
     it('a busy research (503) is waited for, then asked again', async () => {
         let busy = true;
         const { deps, asked, sleeps, gates } = fakeDeps(() => (busy ? { ok: false, error: { kind: 'busy', status: 503, retry: 2 } } : ok()));
@@ -550,6 +604,10 @@ describe('review filters, counts and the list sort (spec 102 §8)', () => {
         const items = both();
         const pick = (f: Partial<OverviewFilters>) => items.filter(i => passesFilters(i, filters(f))).map(i => i.key).sort();
         expect(items.filter(itemInTree).map(i => i.key).sort()).toEqual(['a:t', 'm:I0001']);
+        // A family tree file a live source in the tree was made of has no place in the tree itself (spec 117 §5, 5a).
+        const treeFile = { ...items.find(i => i.key === 'm:I0002')!, tree: true, sourceOf: [{ inTree: true }] } as unknown as typeof items[number];
+        expect(itemInTree(treeFile)).toBe(false);
+        expect(itemInTree({ ...treeFile, tree: false })).toBe(true);
         expect(pick({ where: 'tree' })).toEqual(['a:t', 'm:I0001']);
         expect(pick({ where: 'archive' })).toEqual(['m:I0002', 'm:I0003']);
         expect(pick({ noSource: true })).toEqual(['a:t', 'm:I0002', 'm:I0003']);

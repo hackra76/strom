@@ -25,7 +25,9 @@
 import { allMedia, mediaSourceIds, personMediaIndex, placeKey as mediaPlaceKey, placePartnershipId, treeMedia } from './media.js';
 import { researchHeaderLines, ResearchHeaderInfo, TitlesInGedcom } from './research-link.js';
 import { isPurePlaceholder } from './single-parent.js';
-import { APP_VERSION, StromData, Person, Partnership, CoupleEvent, EventParticipant, Source, PersonId, OriginalIds, PartnershipId, LifeEventType, LifeEvent, ParticipantRole, PlaceGeo, Story, ParentChildRelType, MediaOriginal, Attachment, MaterialKind, MediaPlace, AlsoChildOf, FactStatus, ResearchFactOrigin, ResearchFactWas, coupleSides } from './types.js';
+import { StromData, Person, Partnership, CoupleEvent, EventParticipant, Source, PersonId, OriginalIds, PartnershipId, LifeEventType, LifeEvent, ParticipantRole, PlaceGeo, Story, ParentChildRelType, MediaOriginal, Attachment, MaterialKind, MediaPlace, AlsoChildOf, FactStatus, ResearchFactOrigin, ResearchFactWas } from './types.js';
+import { coupleSides } from './model-values.js';
+import { APP_VERSION } from './version.js';
 import { normalizeSha256 } from './sha256.js';
 import { sourceReadState } from './source-confirm.js';
 import { regionHeader, regionToStored } from './originals.js';
@@ -1063,6 +1065,18 @@ export function backSourceRecordCount(data: StromData, backTo: string | undefine
     }).length;
 }
 
+/**
+ * The research header with only the deleted sources the file really lacks
+ * (spec 117 §4): one still in the tree under its research id (S42 = S0042),
+ * e.g. brought back by Undo or by a merge, is not said deleted.
+ */
+function withDeletedSourcesMissing(research: ResearchHeaderInfo | undefined, data: StromData): ResearchHeaderInfo | undefined {
+    if (!research?.deletedSources?.length) return research;
+    const num = (ref: unknown) => typeof ref === 'string' && /^S\d{1,9}$/i.test(ref.trim()) ? String(Number(ref.trim().slice(1))) : '';
+    const present = new Set(Object.values(data.sources ?? {}).map(s => num(s.refn)).filter(Boolean));
+    return { ...research, deletedSources: research.deletedSources.filter(id => num(id) && !present.has(num(id))) };
+}
+
 export function exportToGedcom(data: StromData, treeName?: string, options: GedcomExportOptions = {}): GedcomExportResult {
     // Before the content options: a family link stays even without the notes.
     const alsoChild = alsoChildLinks(data);
@@ -1368,7 +1382,7 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
     lines.push('2 VERS 5.5.1');
     lines.push('2 FORM LINEAGE-LINKED');
     lines.push('1 CHAR UTF-8');
-    lines.push(...researchHeaderLines(options.research));
+    lines.push(...researchHeaderLines(withDeletedSourcesMissing(options.research, data)));
     lines.push(STROM_SEX_U_LINE);
 
     // The files the tree's facts came from (spec 066): one record per loaded
@@ -1687,6 +1701,8 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         // one; none without a choice or a married surname.
         const married = person.marriedSurname?.trim();
         if (married && person.primaryName === 'birth') lines.push(`2 ${PRIMARY_NAME_TAG} Y`);
+        // The research's status of the name, back as it came (066 K6.3).
+        pushStatus(lines, person.nameStatus);
         pushFactImport(person, 'name');
         pushFactOrigin(person, 'name');
         // The surname after marriage as the name she had after it, right
@@ -1703,6 +1719,7 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
                 if (!married.includes(',')) pushWrapped(lines, 2, 'SURN', married);
             }
             if (person.primaryName === 'married') lines.push(`2 ${PRIMARY_NAME_TAG} Y`);
+            pushStatus(lines, person.marriedNameStatus);
         }
         // Other spellings as further NAME lines — the first one above stays the
         // primary, which is what every reader expects.
@@ -1899,6 +1916,8 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             pushMedia(person.photo, person.photoOriginalName ?? '', 'photo', undefined, undefined, undefined, undefined, person.photoDate);
         }
         for (const att of mediaByPerson.get(personId) ?? []) {
+            // The portrait's own record (data v25): written once, as the portrait above.
+            if (person.photo && att.dataUrl === person.photo) continue;
             if (att.places.some(p => atOwner(p, q => 'personId' in q && q.personId === personId))) pushMediaSlot(att, 1, 'person');
         }
 
@@ -2343,7 +2362,11 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         // The place field by field, for a Strom app and a research that read them (an empty one is not written).
         if (options.sourceFields !== false && !options.backTo && hasEntryFields(source)) {
             if (source.folio?.trim()) pushWrapped(lines, 1, '_STROM_FOLIO', source.folio.trim());
-            if (source.image?.trim()) pushWrapped(lines, 1, '_STROM_IMAGE', source.image.trim());
+            if (source.image?.trim()) {
+                pushWrapped(lines, 1, '_STROM_IMAGE', source.image.trim());
+                // The research's own image (found from its scans) stays its own on the way back.
+                if (source.imageDerived) lines.push('2 _STROM_DERIVED Y');
+            }
             if (source.reference?.trim()) pushLongValue(lines, 1, '_STROM_LOCATOR', source.reference);
         }
         if (source.refn) pushWrapped(lines, 1, 'REFN', source.refn);

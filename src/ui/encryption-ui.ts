@@ -4,6 +4,8 @@
  */
 
 import { runBusy, isBusy, busyStep } from './busy.js';
+import { imagesToAwait } from '../image-loads.js';
+import { imagesBeforeOutput } from './output-images.js';
 import { holdLeave } from './busy-leave.js';
 import { allMedia, hasTreeMedia, mediaSourceIds } from '../media.js';
 import { DataManager, auditPersonName, storedTreeForExport } from '../data.js';
@@ -21,9 +23,9 @@ import {
     RelationContext,
     StromData,
     TreeId,
-    LAST_FOCUSED,
     LastFocusedMarker
 } from '../types.js';
+import { LAST_FOCUSED } from '../model-values.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { PrivacyMode, ContentOptions, ContentPreset, CONTENT_PRESETS, matchContentPreset, applyContentOptions, applyLivingPrivacy } from '../privacy.js';
 import { totalPhotoBytes } from '../photo.js';
@@ -41,7 +43,8 @@ import {
 import { PersonPicker } from '../person-picker.js';
 import { AppExporter } from '../export.js';
 import { SettingsManager } from '../settings.js';
-import { ThemeMode, LanguageSetting, AppMode, AuditLog, PERSON_CITATION_FIELDS } from '../types.js';
+import { ThemeMode, LanguageSetting, AppMode, AuditLog } from '../types.js';
+import { PERSON_CITATION_FIELDS } from '../model-values.js';
 import { CryptoSession, isEncrypted, encrypt, decrypt, EncryptedData, isCryptoAvailable } from '../crypto.js';
 import { cryptoErrorText, cryptoFailureText, resetPasswordError, requireCrypto } from '../crypto-errors.js';
 import { validateTreeData, ValidationResult as TreeValidationResult, ValidationIssue } from '../validation.js';
@@ -49,6 +52,7 @@ import * as CrossTree from '../cross-tree.js';
 import { AuditLogManager } from '../audit-log.js';
 import { uiModule } from './module.js';
 import { overviewChanged } from '../windows/overview-window.js';
+import { watchStorageNotices } from './notice-place.js';
 
 /** A button on a storage notice. */
 interface NoticeAction { label: string; run: () => void; /** A quiet text link instead of a button. */ link?: boolean }
@@ -62,6 +66,8 @@ let exportQuick = false;
 let exportFormat: ExportFormat = 'json';
 /** The export takes every tree (only the current one is measured; the others may hold sources). */
 let exportAllTrees = false;
+/** The one tree the dialog exports (null: the open one, or every tree). */
+let exportTreeIdFor: TreeId | null = null;
 /**
  * The one tree exported when it is not the open one (the tree manager's export
  * of another tree): the estimate and the privacy note are its own, read from
@@ -602,6 +608,8 @@ export const encryptionUiMethods = uiModule({
         close.addEventListener('click', () => el.remove());
         el.appendChild(close);
         document.body.appendChild(el);
+        // In the Table view it stands below the table's controls (P1a).
+        watchStorageNotices();
         requestAnimationFrame(() => el.classList.add('show'));
     },
 
@@ -1000,6 +1008,7 @@ export const encryptionUiMethods = uiModule({
         const quick = options.quick;
         exportQuick = !!quick;
         exportAllTrees = !!options.allTrees;
+        exportTreeIdFor = options.treeId ?? null;
         const format = options.format ?? 'json';
         exportFormat = format;
         const e = strings.encryption;
@@ -1284,8 +1293,18 @@ export const encryptionUiMethods = uiModule({
             close();
             if (file) this.showToast(backup ? strings.busy.backupSaved(file) : strings.busy.fileSaved(file), 4000);
         };
+        if (btn && isBusy(btn)) return;
+        // The tree's photos still on their way: the file waits for them (spec 116 §8); a CSV has none.
+        if (exportFormat !== 'csv') {
+            const treeId = exportAllTrees ? undefined : exportTreeIdFor ?? DataManager.getCurrentTreeId();
+            const waits = imagesToAwait(treeId);
+            const title = exportFormat === 'gedcom' ? strings.photos.out.gedcom : strings.photos.out.backup;
+            if (await imagesBeforeOutput(title, { el: btn, treeId }) === 'cancelled') return;
+            if (this.exportPasswordCallback !== callback) return;
+            // The tree as stored (its photos stored once they all came) is what goes into the file.
+            if (waits) await TreeManager.flush();
+        }
         if (!btn || isBusy(btn)) {
-            if (btn && isBusy(btn)) return;
             saved(await work());
             return;
         }

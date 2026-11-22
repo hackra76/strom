@@ -8,10 +8,11 @@ import { describe, it, expect } from 'vitest';
 import {
     buildFanModel, buildFanSvg, buildFanPosterSvg, fanPosterGeometry, FanModel, FOCUS_R, RING_W, ancestorRingRadii,
 } from '../fan-chart.js';
-import { FAN_PALETTES, fanLineColor } from '../fan-colors.js';
+import { FAN_PALETTES, fanLineColor, fanPalette } from '../fan-colors.js';
 import { estimateFanMeasure as estimate, fanScreenSizes } from '../fan-labels.js';
 import { StromData, Person, PersonId, Gender, Partnership, PartnershipId } from '../types.js';
-import { calibrationWorkload, machineFactor, normalizedMs } from './helpers/perf-budget.js';
+import { calibrationWorkload, machineFactor, normalizedMs, measureAgainstBudget, budgetReport } from './helpers/perf-budget.js';
+import type { FanPortrait } from '../fan-chart.js';
 
 function person(id: string, gender: Gender = 'male', parentIds: string[] = [], o: Partial<Person> = {}): Person {
     return {
@@ -153,6 +154,37 @@ describe('buildFanSvg', () => {
         const svg = buildFanSvg(model, { ...svgOpts, ppu: 1.2, measure: estimate });
         expect(svg).toContain('<textPath');
         expect(svg).toContain('Maximilián Bartoloměj Kratochvílovský');
+    });
+
+    it('"Hide others" (098 §11b): the sectors of the others empty dashed outlines in their places, the focus as always', () => {
+        const d = data([
+            person('me', 'male', ['f', 'm']),
+            person('f', 'male', ['ff', 'fm'], { birthDate: '1900', deathDate: '1970' }),
+            person('m', 'female', ['mf'], { birthDate: '1905', deathDate: '1980' }),
+            person('ff', 'male'), person('fm', 'female'), person('mf', 'male'),
+        ]);
+        const model = buildFanModel(d, 'me' as PersonId, 3)!;
+        const all = buildFanSvg(model, { ...svgOpts, ppu: 3, measure: estimate });
+        const kept = buildFanSvg(model, { ...svgOpts, ppu: 3, measure: estimate, keepOnly: new Set(['m', 'mf'] as PersonId[]) });
+        // The mother's side as before (same shape), the father's side empty outlines without people.
+        const pathOf = (svg: string, key: string) => new RegExp(`data-fan-key="${key}"[^>]*>(?:<[^>]+>)*?<path class="fan-fill[^"]*" d="([^"]+)"`).exec(svg)?.[1];
+        expect(pathOf(kept, 'a3')).toBe(pathOf(all, 'a3'));
+        expect(pathOf(kept, 'a6')).toBe(pathOf(all, 'a6'));
+        expect(kept).toContain('data-fan-person="me"');
+        expect(kept).toContain('data-fan-person="m"');
+        expect(kept).not.toContain('data-fan-person="f"');
+        expect(kept).not.toContain('data-fan-person="ff"');
+        expect(kept).not.toContain('1900–1970');
+        const off = [...kept.matchAll(/<g class="fan-sector fan-sector--off" data-fan-off="(a\d+)" aria-hidden="true" pointer-events="none"><path class="fan-empty-edge" d="([^"]+)"/g)];
+        expect(off.map(m => m[1]).sort()).toEqual(['a2', 'a4', 'a5', 'a8', 'a9', 'a10', 'a11'].sort());
+        // The outline stands where the father's sector stood.
+        expect(off.find(m => m[1] === 'a2')![2]).toBe(pathOf(all, 'a2'));
+        // No "+" over a hidden person; the kept mother's missing parent keeps it.
+        expect(kept).not.toContain('data-fan-add="f"');
+        expect(kept).not.toContain('data-fan-add="ff"');
+        expect(kept).toContain('data-fan-add="m"');
+        // Not editable: the outlines still get their colour.
+        expect(buildFanSvg(model, { ...svgOpts, editable: false, keepOnly: new Set(['m'] as PersonId[]) })).toContain('.fan-empty-edge{stroke:');
     });
 
     it('escapes person names', () => {
@@ -353,6 +385,27 @@ describe('labels of wide short sectors on a phone (1101)', () => {
         const disc = svg.match(/<g class="fan-focus[^]*?<\/g>/)![0];
         expect(disc).toMatch(/>Johann</);
         expect(disc).not.toContain('…');
+    });
+
+    it('a long given name in the focus disc stays inside the disc on a phone, whole in the title (P1b, 3.30.0)', () => {
+        const d = withUnions([
+            person('me', 'male', [], { firstName: 'Wendelin Bonifatius', lastName: 'Haselbrunner-Quellenstein' }), person('w', 'female'),
+            person('c1', 'female'),
+        ], [union('u1', 'me', 'w', ['c1'])]);
+        for (const [shape, ppu] of [['half', 0.45], ['two', 0.45], ['half', 0.35]] as const) {
+            const m = buildFanModel(d, 'me' as PersonId, { generations: 3, shape, descGenerations: 2 })!;
+            const svg = buildFanSvg(m, { ...svgOpts, editable: false, ppu, measure: estimate, sizes: fanScreenSizes(true) });
+            const disc = svg.match(/<g class="fan-focus[^]*?<\/g>/)![0];
+            const rows = [...disc.matchAll(/<text[^>]*font-size="([\d.]+)"[^>]*>([^<]*)<\/text>/g)].map(x => ({ fs: Number(x[1]) * ppu, text: x[2] }));
+            expect(rows.length, `${shape} @${ppu}`).toBeGreaterThan(0);
+            // The disc's text box: 1.7 radii less 6 px, as the ladder measures it.
+            for (const r of rows) expect(estimate(r.text, r.fs, true), `${shape} @${ppu}: "${r.text}"`).toBeLessThanOrEqual(56 * 1.7 * ppu - 6);
+            expect(rows[0].text).toMatch(/^Wen/);
+            // A cut word ends the text (no second cut row).
+            expect(rows.filter(r => r.text.endsWith('…')).length).toBeLessThanOrEqual(1);
+            if (rows.length > 1) expect(rows[0].text.endsWith('…')).toBe(false);
+            expect(disc).toMatch(/<title>[^<]*Wendelin Bonifatius Haselbrunner-Quellenstein/);
+        }
     });
 
     it('a sector whose own box holds the name keeps that direction', () => {
@@ -655,5 +708,239 @@ describe('fan poster (spec 029 §9)', () => {
             expect(g.hasContent(cx - 5, cy + m.Rd * s + 25, 10, 10)).toBe(false); // below them
             expect(g.hasContent(cx + m.R * s - 30, cy + m.Rd * s + 5, 20, 20)).toBe(false);
         }
+    });
+});
+
+describe('styles of the drawing (spec 118 §4)', () => {
+    const d = data([
+        person('me', 'male', ['f', 'm']),
+        person('f', 'male', ['ff', 'fm']), person('m', 'female', ['mf', 'mm']),
+        person('ff'), person('fm', 'female'), person('mf'), person('mm', 'female'),
+    ]);
+    const model = buildFanModel(d, 'me' as PersonId, 4)!;
+    const draw = (o: Record<string, unknown> = {}) => buildFanSvg(model, { ...svgOpts, uid: 'st', measure: estimate, ...o });
+
+    it('draws the default as the colour style: the screen palettes, the sans face, no patterns', () => {
+        for (const mode of ['gender', 'line', 'rod'] as const) {
+            const svg = draw({ colorMode: mode });
+            expect(draw({ colorMode: mode, style: 'color' })).toBe(svg);
+            expect(svg).toContain('data-fan-style="color"');
+            expect(svg).toContain(`font-family="'Instrument Sans'`);
+            expect(svg).not.toContain('<pattern id="stp-');
+            expect(svg).not.toContain('fan-pat');
+            expect(svg).toContain(`#st .fan-years,#st .fan-kekule{fill:${FAN_PALETTES.light.text}}`);
+        }
+    });
+
+    it('draws the antique style in Strom Serif with its own palettes', () => {
+        const svg = draw({ style: 'antique' });
+        expect(svg).toContain('data-fan-style="antique"');
+        expect(svg).toContain(`font-family="'Strom Serif', Georgia, serif"`);
+        expect(svg).toContain(`fill:${fanPalette('light', 'antique').male}`);
+        expect(svg).toContain(`fill:${fanPalette('dark', 'antique').female}`);
+    });
+
+    it('black and white: the patterns once each in <defs> (at most 8), a halo for the names, the outline in the text colour', () => {
+        const gender = draw({ style: 'mono' });
+        expect(gender.match(/<pattern id="stp-/g)).toEqual(['<pattern id="stp-']);
+        expect(gender).toContain('fill="url(#stp-dot)"');
+        expect(gender).toContain('paint-order:stroke');
+        expect(gender).toContain(`#st .fan-pat-ink{stroke:${fanPalette('light', 'mono').text}`);
+        const rod = draw({ style: 'mono', colorMode: 'rod' });
+        const pats = rod.match(/<pattern id="stp-[a-z0-9]+"/g) ?? [];
+        expect(pats.length).toBeGreaterThan(0);
+        expect(pats.length).toBeLessThanOrEqual(8);
+        expect(new Set(pats).size).toBe(pats.length);
+        const hl = buildFanSvg(model, {
+            ...svgOpts, uid: 'st', measure: estimate, style: 'mono', embedStyles: true, theme: 'light',
+            highlight: { rodId: 'r' as never, hit: new Set(['f' as PersonId]) },
+        });
+        expect(hl).toContain(`.fan-hl-edge{fill:none;stroke:${fanPalette('light', 'mono').text}`);
+    });
+
+    it('the poster takes the style: the print palette, pattern swatches in the legend, the antique face', () => {
+        const mono = buildFanPosterSvg(model, { ...svgOpts, measure: estimate, style: 'mono' }, {});
+        expect(mono).toContain('fanposter-lp-dot');
+        const antique = buildFanPosterSvg(model, { ...svgOpts, measure: estimate, style: 'antique' }, {});
+        expect(antique).toContain(`class="fan-poster-legend" font-family="'Strom Serif', Georgia, serif"`);
+    });
+});
+
+// ==================== spec 118 §5, §6: content of the sectors and portraits ====================
+
+describe('content of the sectors (spec 118 §5)', () => {
+    const placed = (gens: number) => {
+        const d = pedigree(gens);
+        for (const p of Object.values(d.persons)) {
+            p.birthDate = `${p.birthDate}-11-22`;
+            p.birthPlace = 'Kessenau, okres Dolní Lhota';
+            p.deathPlace = 'Tálov';
+        }
+        return d;
+    };
+
+    it("the default drawing is the 'years' drawing, unchanged", () => {
+        const m = buildFanModel(placed(4), 'a1' as PersonId, { generations: 4, shape: 'two', descGenerations: 2 })!;
+        const o = { ...svgOpts, uid: 'cy', measure: estimate, ppu: 2 };
+        expect(buildFanSvg(m, { ...o, content: 'years' })).toBe(buildFanSvg(m, o));
+        expect(buildFanSvg(m, o)).not.toContain('Kessenau');
+    });
+
+    it("'places' writes dates and places in the inner rings and the centre; 'names' no dates at all", () => {
+        const m = buildFanModel(placed(4), 'a1' as PersonId, { generations: 4, shape: 'half' })!;
+        const o = { ...svgOpts, uid: 'cp', measure: estimate, ppu: 3 };
+        const places = buildFanSvg(m, { ...o, content: 'places' });
+        const parent = places.match(/<g class="fan-sector[^"]*" data-fan-key="a2"[^]*?<\/g>/)![0];
+        expect(parent).toContain('Kessenau');
+        expect(parent).toContain('Tálov');
+        const focus = places.match(/<g class="fan-focus[^]*?<\/g>/)![0];
+        expect(focus).toContain('Kessenau');
+        const names = buildFanSvg(m, { ...o, content: 'names' });
+        expect(names).not.toContain('class="fan-years"');
+        // One pixel more for the names (13 → 14 px in the parents' ring at this scale).
+        const fs = (svg: string, key: string) => Number(svg.match(new RegExp(`data-fan-key="${key}"[^]*?class="fan-name" font-size="([0-9.]+)"`))![1]) * 3;
+        expect(fs(names, 'a2')).toBeCloseTo(fs(buildFanSvg(m, o), 'a2') + 1, 1);
+    });
+
+    it('the poster writes the places too', () => {
+        const m = buildFanModel(placed(3), 'a1' as PersonId, { generations: 3, shape: 'half' })!;
+        expect(buildFanPosterSvg(m, { ...svgOpts, measure: estimate, content: 'places' }, {})).toContain('Kessenau');
+        expect(buildFanPosterSvg(m, { ...svgOpts, measure: estimate }, {})).not.toContain('Kessenau');
+    });
+
+    it('ten rings of a full circle with dates and places within the time budget (scaled by the machine speed)', () => {
+        const d = placed(10);
+        const CALIBRATION_ROUNDS = 4;
+        const REFERENCE_MS = 22; // as the ten-ring test above
+        const BUDGET_MS = 250;
+        const run = () => buildFanSvg(buildFanModel(d, 'a1' as PersonId, { generations: 10, shape: 'full' })!, {
+            esc, editable: false, addParentLabel: '', ppu: 1.5, measure: estimate, content: 'places',
+        });
+        expect(run()).toContain('Kessenau');
+        const m = measureAgainstBudget(run, { budgetMs: BUDGET_MS, calibrationRounds: CALIBRATION_ROUNDS, referenceMs: REFERENCE_MS, maxPairs: 6 });
+        console.log(budgetReport('fan 10 rings full, places', m, BUDGET_MS));
+        if (m.judged) expect(m.ms).toBeLessThan(BUDGET_MS);
+    }, 30_000);
+});
+
+describe('portraits (spec 118 §6)', () => {
+    const PHOTO = 'data:image/png;base64,iVBORw0KGgo=';
+    const withPhotos = (gens: number) => {
+        const d = pedigree(gens);
+        for (const p of Object.values(d.persons)) p.photo = PHOTO;
+        return d;
+    };
+    const photoOf = (p: Person): FanPortrait | null => (p.photo ? { href: p.photo } : null);
+    const sectorOf2 = (svg: string, key: string) => svg.match(new RegExp(`<g class="fan-(?:sector|focus)[^"]*" data-fan-key="${key}"[^]*?</g>(?=<g class="fan-|<a |</svg>|<g class="fan-hl)`))?.[0] ?? '';
+    const images = (svg: string) => (svg.match(/<image /g) ?? []).length;
+
+    it('only in the centre and the rings 1–2 (at most 7 photos)', () => {
+        const m = buildFanModel(withPhotos(5), 'a1' as PersonId, { generations: 5, shape: 'half' })!;
+        const svg = buildFanSvg(m, { ...svgOpts, uid: 'pt', measure: estimate, ppu: 2, portrait: photoOf });
+        expect(images(svg)).toBe(7);
+        for (const key of ['f', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7']) expect(sectorOf2(svg, key), key).toContain('<image ');
+        for (const key of ['a8', 'a15', 'a16', 'a31']) expect(sectorOf2(svg, key), key).not.toContain('<image ');
+        // Round: clipped by a circle, the photo's ring in the surface colour.
+        expect(svg).toContain('clip-path="url(#ptc0)"');
+        expect(svg).toContain('preserveAspectRatio="xMidYMid slice"');
+        expect(svg).toMatch(/\.fan-photo-ring\{stroke:/);
+    });
+
+    it('the photo rules only where a portrait is drawn: without one the drawing (and the person page) stays as it was', () => {
+        const m = buildFanModel(withPhotos(5), 'a1' as PersonId, { generations: 5, shape: 'half' })!;
+        expect(buildFanSvg(m, { ...svgOpts, uid: 'pn', measure: estimate, ppu: 2 })).not.toContain('fan-photo');
+        expect(buildFanSvg(m, { ...svgOpts, uid: 'pn', measure: estimate, ppu: 2, portrait: () => null })).not.toContain('fan-photo');
+    });
+
+    it('two-way: the centre and the ancestors only, never the descendants', () => {
+        const d = withPhotos(3);
+        d.persons['k1' as PersonId] = person('k1', 'male', ['a1'], { photo: PHOTO });
+        d.persons['a1' as PersonId].childIds = ['k1' as PersonId];
+        const m = buildFanModel(d, 'a1' as PersonId, { generations: 3, shape: 'two', descGenerations: 1 })!;
+        const svg = buildFanSvg(m, { ...svgOpts, uid: 'pw', measure: estimate, ppu: 2, portrait: photoOf });
+        expect(m.desc.some(s => s.person?.id === 'k1')).toBe(true);
+        expect(images(svg)).toBe(7);
+        expect(svg.match(/<g class="fan-sector[^"]*fan-desc[^]*?<\/g>/)![0]).not.toContain('<image ');
+    });
+
+    it('none for a protected living person, none without a photo: the sector as without portraits', () => {
+        const d = withPhotos(3);
+        delete d.persons['a3' as PersonId].photo;
+        const m = buildFanModel(d, 'a1' as PersonId, { generations: 3, shape: 'half' })!;
+        const o = { ...svgOpts, uid: 'pp', measure: estimate, ppu: 2, protect: (p: Person) => p.id === 'a2' || p.id === 'a1' };
+        const asked: string[] = [];
+        const svg = buildFanSvg(m, { ...o, portrait: p => { asked.push(p.id); return photoOf(p); } });
+        const plain = buildFanSvg(m, o);
+        expect(asked).not.toContain('a2');
+        expect(asked).not.toContain('a1');
+        for (const key of ['f', 'a2', 'a3']) expect(sectorOf2(svg, key), key).toBe(sectorOf2(plain, key));
+        expect(sectorOf2(svg, 'a4')).toContain('<image ');
+        // Portraits on, nobody with a photo: the very drawing without them.
+        const none = buildFanSvg(m, { ...o, portrait: () => null });
+        expect(none).toBe(plain);
+    });
+
+    it('the text comes first: no portrait at a small scale', () => {
+        const m = buildFanModel(withPhotos(3), 'a1' as PersonId, { generations: 3, shape: 'half' })!;
+        const o = { ...svgOpts, uid: 'ps', measure: estimate, ppu: 0.4 };
+        expect(buildFanSvg(m, { ...o, portrait: photoOf })).toBe(buildFanSvg(m, o));
+    });
+
+    it('a portrait moves the text outward, past itself', () => {
+        const m = buildFanModel(withPhotos(3), 'a1' as PersonId, { generations: 3, shape: 'half' })!;
+        const svg = buildFanSvg(m, { ...svgOpts, uid: 'po', measure: estimate, ppu: 2, portrait: photoOf });
+        // The father's sector (90°–180°, along the arc at 135°): the photo's centre nearer the focus than the text's rail.
+        const g = sectorOf2(svg, 'a2');
+        const [cx, cy, r] = g.match(/<circle class="fan-photo-ring" cx="([-0-9.]+)" cy="([-0-9.]+)" r="([0-9.]+)"/)!.slice(1).map(Number);
+        const rPhoto = Math.hypot(cx, cy);
+        const [r1, r2] = ancestorRingRadii(1);
+        expect(rPhoto - r).toBeGreaterThanOrEqual(r1);
+        expect(rPhoto).toBeLessThan((r1 + r2) / 2);
+        // Every row of its text runs on a rail outside the photo.
+        const ids = [...g.matchAll(/<textPath href="#(por\d+)"/g)].map(x => x[1]);
+        expect(ids.length).toBeGreaterThan(0);
+        for (const id of ids) {
+            const rail = Number(svg.match(new RegExp(`<path id="${id}" d="M[-0-9.]+ [-0-9.]+A([0-9.]+)`))![1]);
+            expect(rail).toBeGreaterThan(rPhoto + r);
+            expect(rail).toBeLessThan(r2);
+        }
+    });
+
+    it('the antique style sepia, black and white grey, colour as it is', () => {
+        const m = buildFanModel(withPhotos(2), 'a1' as PersonId, { generations: 2, shape: 'half' })!;
+        const draw = (style: 'color' | 'pastel' | 'antique' | 'mono') => buildFanSvg(m, { ...svgOpts, uid: 'pf', measure: estimate, ppu: 2, portrait: photoOf, style });
+        expect(draw('antique')).toContain('<filter id="pfsepia"');
+        expect(draw('antique')).toContain('filter="url(#pfsepia)"');
+        expect(draw('mono')).toContain('<filter id="pfgrey"');
+        expect(draw('mono')).toContain('type="saturate" values="0"');
+        expect(draw('color')).not.toContain('<filter');
+        expect(draw('pastel')).not.toContain('<filter');
+    });
+
+    it('a photo on its way: initials on grey under the veil, an older photo under it', () => {
+        const m = buildFanModel(withPhotos(2), 'a1' as PersonId, { generations: 2, shape: 'half' })!;
+        const svg = buildFanSvg(m, {
+            ...svgOpts, uid: 'pl', measure: estimate, ppu: 2,
+            portrait: p => p.id === 'a2' ? { loading: true, initials: 'BL' } : p.id === 'a3' ? { loading: true, initials: 'AK', href: PHOTO } : null,
+        });
+        const a2 = sectorOf2(svg, 'a2');
+        expect(a2).toContain('data-img-state="loading"');
+        expect(a2).toContain('class="fan-photo-wait"');
+        expect(a2).toContain('>BL</text>');
+        expect(a2).toContain('class="fan-photo-veil"');
+        expect(a2).not.toContain('<image ');
+        const a3 = sectorOf2(svg, 'a3');
+        expect(a3).toContain('data-img-state="refresh"');
+        expect(a3).toContain('<image ');
+        expect(a3).toContain('class="fan-photo-veil"');
+    });
+
+    it('the poster takes the portraits (no veil: outputs wait for the photos)', () => {
+        const m = buildFanModel(withPhotos(3), 'a1' as PersonId, { generations: 3, shape: 'half' })!;
+        const poster = buildFanPosterSvg(m, { ...svgOpts, measure: estimate, portrait: photoOf, style: 'antique' }, {});
+        expect(images(poster)).toBe(7);
+        expect(poster).not.toContain('fan-photo-veil"');
+        expect(poster).toContain('filter="url(#fanpostersepia)"');
+        expect(buildFanPosterSvg(m, { ...svgOpts, measure: estimate }, {})).not.toContain('<image ');
     });
 });

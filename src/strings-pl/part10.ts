@@ -1,11 +1,12 @@
 /**
- * Polish strings of the one "working" state (src/ui/busy.ts, waiting buttons §1, §10, §12).
+ * Polish strings of the one "working" state (src/ui/busy.ts, waiting buttons §1, §10, §12)
+ * and of the photos that come after the tree (spec 116).
  */
 
 import type { StringsType } from '../strings.js';
 import { plPl } from './helpers.js';
 
-export const plPart10: Pick<StringsType, 'busy'> = {
+export const plPart10: Pick<StringsType, 'busy' | 'photos'> = {
     busy: {
         generic: 'Wczytywanie…',
         saving: 'Zapisywanie…',
@@ -126,5 +127,36 @@ export const plPart10: Pick<StringsType, 'busy'> = {
         adoptWaitingSub: 'Zakładanie kończy się w terminalu.',
         stopWaiting: 'Przerwij oczekiwanie',
         adoptWaitEnd: 'Badanie przejmie drzewo, gdy zostanie założone w terminalu.',
+    },
+    /** Photos that come after the tree (spec 116, src/ui/image-slot.ts). */
+    photos: {
+        loading: 'Wczytywanie zdjęcia…',
+        loadingNew: 'Wczytywanie nowego zdjęcia…',
+        failed: 'Zdjęcie nie zostało wczytane.',
+        failedNew: 'Nowe zdjęcie nie zostało wczytane.',
+        ariaLoading: 'zdjęcie się wczytuje',
+        ariaFailed: 'zdjęcie nie wczytane',
+        tileFailed: 'Nie wczytano',
+        recropWait: 'Kadr można edytować po wczytaniu zdjęcia.',
+        chipLabel: 'Zdjęcia',
+        chipAria: (k: number, n: number) => `Wczytywanie zdjęć: ${k} z ${n}`,
+        chipFailed: (n: number) => `· nie wczytano: ${n}`,
+        detailLeft: (left: number, failed: number) => `Pozostało ${left} · nie wczytano: ${failed}`,
+        detailEditable: 'Drzewo można w tym czasie edytować.',
+        detailViewOnly: 'Drzewo można w tym czasie przeglądać.',
+        someFailed: (n: number) => `Niektóre zdjęcia nie zostały wczytane (${n}).`,
+        whyMissing: 'Badanie nie ma tych zdjęć.',
+        waiting: 'Oczekiwanie na zdjęcia',
+        continueWithout: (n: number) => `Kontynuuj bez ${n} ${plPl(n, 'zdjęcia', 'zdjęć', 'zdjęć')}`,
+        out: {
+            poster: 'Drukowanie plakatu',
+            png: 'Obraz PNG',
+            svg: 'Wektor SVG',
+            personPage: 'Strona osoby',
+            familyPages: 'Strony rodziny',
+            book: 'Księga rodu',
+            backup: 'Kopia danych',
+            gedcom: 'Eksport GEDCOM',
+        },
     },
 };

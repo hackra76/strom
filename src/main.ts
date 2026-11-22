@@ -22,12 +22,13 @@ import { initToolbarFit } from './ui/toolbar-fit.js';
 import { initDefaultFocusButtons } from './ui/default-focus.js';
 import { DebugOptions, DebugStep, DebugPhase } from './layout/pipeline/debug-types.js';
 import { CryptoSession } from './crypto.js';
-import { AppMode, APP_VERSION, TreeId } from './types.js';
+import { AppMode, TreeId } from './types.js';
+import { APP_VERSION } from './version.js';
 import { strings, getCurrentLanguage } from './strings.js';
 import { onTreeSavedElsewhere } from './tab-sync.js';
 import { StorageManager } from './storage.js';
 import { PERSISTENCE_EVENT } from './persistence.js';
-import { FILE_COPY_EVENT, RESEARCH_BASE_EVENT } from './tree-manager.js';
+import { FILE_COPY_EVENT, RESEARCH_BASE_EVENT, UPDATE_BACKUP_FAILED_EVENT } from './tree-manager.js';
 import { SNAPSHOTS_TRIMMED_EVENT, SNAPSHOT_CREATED_EVENT, SnapshotTrim } from './snapshots.js';
 import { collectPoolGarbage } from './media-pool.js';
 import { keepLifelineChipsFor } from './lifeline-view.js';
@@ -47,6 +48,8 @@ import { peekBecomeMainMark, retryBecomeMain, takeBecomeMainMark } from './windo
 import { formatLiveClock } from './live-time.js';
 import { startedAgainAsMain } from './resume-view.js';
 import { initWindowControls } from './windows/window-controls.js';
+import { initImageLoadChip } from './ui/image-load-chip.js';
+import { watchLandscapePanelFold } from './ui/landscape-panel-fold.js';
 import { windowTitle } from './windows/window-title.js';
 import { mountSatHeader, SAT_VIEWS } from './windows/sat-header.js';
 import { followSatelliteView, openAnotherWindow } from './windows/sat-views.js';
@@ -347,6 +350,8 @@ function wireAgentFollow(client: SatelliteClient, state: ReturnType<typeof start
         update();
         // The Table's agent row: tinted, scrolled to again once attached, its hidden note (§5).
         UI.tableAgentFollowChanged();
+        // "Focus on the centre of the selection" only while not following (spec 098 §13).
+        TreeRenderer.refreshSelectionCenter();
     });
 }
 
@@ -441,7 +446,8 @@ function startSatelliteWindow(params: SatelliteParams, debugOptions: DebugOption
     mirror.onChange((changed) => {
         UI.agentMirrorApplied(changed);
         // Whom the agent works on, the bridge lost or back: following here and the strip look again.
-        if (changed.includes('live')) {
+        // The run followed chosen in the main window (spec 126 U10 §7): the marks and the jump follow it.
+        if (changed.includes('live') || changed.includes('follow')) {
             UI.syncLiveFollow();
             states.update();
         }
@@ -465,6 +471,8 @@ function startSatelliteWindow(params: SatelliteParams, debugOptions: DebugOption
     UI.initKeyboard();
     UI.initSearch();
     UI.initHistoryManage();
+    // The window's own selection of people (spec 098 §7): highlighted, Hide others, the map's scope Selection.
+    UI.initRodView();
     if (debugOptions.enabled) TreeRenderer.setDebugOptions(debugOptions);
 
     // The view switched in this window (K2): its address, the main window's list, the header and the title follow.
@@ -733,6 +741,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.addEventListener('strom:storage-blocked', () => {
         UI.showStorageNotice('storage-blocked-notice', strings.storageSafety.storageBlocked);
     });
+    // A stored tree left as it was, as the backup before its data update
+    // failed (registered before init: the start reads the open tree).
+    window.addEventListener(UPDATE_BACKUP_FAILED_EVENT, (e) => {
+        const treeId = (e as CustomEvent<{ treeId?: TreeId }>).detail?.treeId;
+        const name = treeId ? TreeManager.getTreeMetadata(treeId)?.name ?? '' : '';
+        UI.showStorageNotice('update-backup-notice', strings.storageSafety.updateBackupFailed(name));
+    });
     window.addEventListener('strom:storage-closed', () => {
         UI.showStorageNotice('storage-closed-notice', strings.storageSafety.storageClosed, {
             label: strings.storageSafety.reload,
@@ -884,6 +899,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Strom Research in the app: welcome-screen offer + menu item gating.
     UI.initResearchPromo();
+
+    // The tree's photos on their way: "Photos k / n" and the notice of those that did not load (spec 116 §6, §7).
+    initImageLoadChip(() => DataManager.getCurrentTreeId(), () => DataManager.isReadOnly() || DataManager.isTreeLocked());
+    // A phone held sideways: the followed research's panel folds for that indicator and for messages (spec 116).
+    watchLandscapePanelFold(() => UI.livePanelOpen(), () => UI.foldLivePanelForOverlay());
 
     // History in the life timeline (on by default): bridge statuses, tree switches.
     UI.initHistoryLayer();

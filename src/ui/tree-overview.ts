@@ -32,7 +32,8 @@ import { DataManager } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { TreeRenderer } from '../renderer.js';
 import { strings, getCurrentLanguage } from '../strings.js';
-import { LAST_FOCUSED, Person, PersonId, StromData, TreeId } from '../types.js';
+import { Person, PersonId, StromData, TreeId } from '../types.js';
+import { LAST_FOCUSED } from '../model-values.js';
 import {
     validateTreeData, translateValidationType, groupValidationIssues, validationCounts, ValidationResult, ValidationIssue,
 } from '../validation.js';
@@ -45,7 +46,7 @@ import {
     DeathAgeSummary, PeriodMedian, GenerationChildren, Rememberer, rememberers, remembererGaps, remembererDeathGaps,
     researchCertainty, ResearchCertainty, CertaintyCounts, percentNumber,
 } from '../tree-overview.js';
-import { FACT_STATUSES } from '../types.js';
+import { FACT_STATUSES } from '../model-values.js';
 import { factStatusLabel } from './fact-status.js';
 import { computeFamilyStats, computeCompleteness, computeEvidenceGaps, EvidenceKind, FamilyStats, Completeness } from '../stats.js';
 import { isLivingPerson, inferBirthUpperBounds } from '../privacy.js';
@@ -53,6 +54,7 @@ import { findComponents, componentName } from '../components.js';
 import { orphanedPlaceKeys } from '../places.js';
 import { totalPhotoBytes } from '../photo.js';
 import { totalAttachmentBytes, ATTACHMENT_WARN_BYTES } from '../attachments.js';
+import { imageLoads } from '../image-loads.js';
 import { upcomingAnniversaries, Anniversary } from '../anniversaries.js';
 import { SettingsManager } from '../settings.js';
 import { shownName } from '../person-name.js';
@@ -1890,7 +1892,8 @@ export const treeOverviewMethods = uiModule({
     treeOverviewQualityData(): QualityData {
         return cached('quality', false, () => {
             const st = state!;
-            const data = st.data;
+            // The images still on their way are the tree's: counted as photos, files and sizes (spec 116 §5).
+            const data = imageLoads.view(st.data);
             const persons = Object.values(data.persons).filter(p => !p.isPlaceholder);
             const year = new Date().getFullYear();
             const bounds = inferBirthUpperBounds(data);

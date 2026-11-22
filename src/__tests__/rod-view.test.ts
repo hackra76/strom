@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { buildLineages, rodOf, RodId, LineageIndex, rodLabels, rods } from '../lineage.js';
-import { rodFocusTarget } from '../rod-focus.js';
+import { rodFocusTarget, selectionFocusTarget } from '../rod-focus.js';
 import { rodPickerHtml, rodPickerItems, rodPickerSmallItems } from '../rod-picker.js';
 import { sortRods } from '../rods-overview.js';
 import { StromData, PersonId, Person, Partnership, PartnershipId } from '../types.js';
@@ -14,9 +14,10 @@ import { DataManager } from '../data.js';
 import { SettingsManager } from '../settings.js';
 import { TreeRenderer } from '../renderer.js';
 import { evidenceUiMethods } from '../ui/evidence-ui.js';
+import { clearRodSelection, getSelectedRod, onRodSelectionChange, rodBack, setRodSelection } from '../ui/rod-view.js';
 import {
-    clearRodSelection, getSelectedRod, onRodSelectionChange, resetRodView, rodBack, rodViewDataChanged, setRodSelection, setRodViewHost,
-} from '../ui/rod-view.js';
+    resetViewSelection as resetRodView, selectionDataChanged as rodViewDataChanged, setSelectionHost,
+} from '../ui/view-selection-ui.js';
 
 type Sex = 'male' | 'female';
 interface Spec { first: string; last: string; sex: Sex; born?: string; parents?: string[] }
@@ -84,6 +85,31 @@ describe('the focus move of a chosen line (§4.4)', () => {
     });
 });
 
+describe('the focus move of any selection (spec 098 §9)', () => {
+    const data = brumlak();
+
+    it('a list: stays while one of it is drawn; else its nearest person, a tie to the one born first', () => {
+        const list = [P('bozetech'), P('bolemir')];
+        expect(selectionFocusTarget(data, list, null, P('borivoj'), new Set([P('borivoj'), P('bozetech')]), 'family')).toBeNull();
+        expect(selectionFocusTarget(data, list, null, P('borivoj'), new Set([P('borivoj')]), 'family')).toBe(P('bozetech'));
+        expect(selectionFocusTarget(data, list, null, P('hostivit'), new Set([P('hostivit')]), 'fan')).toBe(P('bolemir'));
+    });
+
+    it('nobody connected to the focus, or Descendants: the root, else the one born first', () => {
+        const list = [P('bozetech'), P('bolemir')];
+        expect(selectionFocusTarget(data, list, null, P('vratislav'), new Set([P('vratislav')]), 'family')).toBe(P('bolemir'));
+        expect(selectionFocusTarget(data, list, P('borivoj'), P('vratislav'), new Set([P('vratislav')]), 'descendants')).toBe(P('borivoj'));
+        // Ancestors of Bolemír chosen in Descendants: to Bolemír himself
+        expect(selectionFocusTarget(data, [P('spytihnev'), P('radoslava')], P('bolemir'), P('vratislav'), new Set([P('vratislav')]), 'descendants'))
+            .toBe(P('bolemir'));
+    });
+
+    it('an empty selection or the focus itself the target: no move', () => {
+        expect(selectionFocusTarget(data, [], null, P('borivoj'), new Set(), 'family')).toBeNull();
+        expect(selectionFocusTarget(data, [P('borivoj')], null, P('borivoj'), new Set(), 'family')).toBeNull();
+    });
+});
+
 /** SettingsManager over a stubbed storage. */
 function stubSettings(): void {
     const store = new Map<string, string>();
@@ -103,6 +129,7 @@ describe('the chosen line: one state, per tree, covered and back (§0, §3)', ()
     const trees: Record<string, StromData> = {};
     let ui: typeof evidenceUiMethods & Record<string, unknown>;
     const moves: RodId[] = [];
+    const toasts: string[] = [];
     let rod: RodId;
 
     beforeEach(() => {
@@ -120,14 +147,17 @@ describe('the chosen line: one state, per tree, covered and back (§0, §3)', ()
         vi.spyOn(TreeRenderer, 'setEvidenceLevels').mockImplementation(() => {});
         resetRodView();
         moves.length = 0;
-        ui = { ...evidenceUiMethods, renderEvidencePill() {}, showToast() {}, openRodPicker() {} } as never;
-        setRodViewHost({
+        ui = { ...evidenceUiMethods, renderEvidencePill() {}, showToast() {}, openSelectionPicker() {} } as never;
+        toasts.length = 0;
+        setSelectionHost({
             highlightGroup: (g) => ui.highlightGroup.call(ui as never, g),
             evidenceHighlightKind: () => ui.evidenceHighlightKind.call(ui as never),
             isEvidenceHighlightOn: () => ui.isEvidenceHighlightOn.call(ui as never),
             endEvidenceHighlight: () => ui.endEvidenceHighlight.call(ui as never),
-            moveFocusToRod: (id) => { moves.push(id); },
-            rodViewChanged: () => {},
+            moveFocusToSelection: (ref) => { if (ref.kind === 'rod') moves.push(ref.rodId); },
+            selectionChanged: () => {},
+            selectionShown: () => ui.evidenceHighlightKind.call(ui as never) === 'selection',
+            showToast: (text) => { toasts.push(text); },
         });
         rod = rodIdOf(buildLineages(data), 'hostivit');
     });
@@ -147,13 +177,13 @@ describe('the chosen line: one state, per tree, covered and back (§0, §3)', ()
         onRodSelectionChange(id => seen.push(id));
         setRodSelection(rod, 'picker');
         expect(getSelectedRod()).toBe(rod);
-        expect(kind()).toBe('rod');
-        expect(SettingsManager.getRodForTree('lhota')).toBe(rod);
+        expect(kind()).toBe('selection');
+        expect(SettingsManager.getSelectionForTree('lhota')?.ref).toEqual({ kind: 'rod', rodId: rod });
         expect(moves).toEqual([rod]);
         clearRodSelection();
         expect(getSelectedRod()).toBeNull();
         expect(kind()).toBeNull();
-        expect(SettingsManager.getRodForTree('lhota')).toBeNull();
+        expect(SettingsManager.getSelectionForTree('lhota')).toBeNull();
         expect(seen).toEqual([rod, null]);
     });
 
@@ -175,25 +205,25 @@ describe('the chosen line: one state, per tree, covered and back (§0, §3)', ()
         data = trees.lhota;
         rodViewDataChanged();
         expect(getSelectedRod()).toBe(rod);
-        expect(kind()).toBe('rod');
+        expect(kind()).toBe('selection');
         expect(moves).toEqual([]);
     });
 
     it('from memory at the start, also when the tree\'s data comes after its id (locked, then read)', () => {
-        SettingsManager.setRodForTree('lhota', rod);
+        SettingsManager.setSelectionForTree('lhota', { ref: { kind: 'rod', rodId: rod }, hideOthers: false });
         data = tree({}, []);
         vi.spyOn(DataManager, 'isLocked').mockImplementation(() => true);
         expect(getSelectedRod()).toBeNull();
-        expect(SettingsManager.getRodForTree('lhota')).toBe(rod);
+        expect(SettingsManager.getSelectionForTree('lhota')?.ref).toEqual({ kind: 'rod', rodId: rod });
         vi.spyOn(DataManager, 'isLocked').mockImplementation(() => false);
         data = trees.lhota;
         rodViewDataChanged();
         expect(getSelectedRod()).toBe(rod);
-        expect(kind()).toBe('rod');
+        expect(kind()).toBe('selection');
         expect(moves).toEqual([]);
     });
 
-    it('a line gone after a change: let go without a word, forgotten', () => {
+    it('a line gone after a change: cleared and forgotten, the toast names it (spec 098 §7)', () => {
         setRodSelection(rod, 'picker');
         const toast = vi.fn();
         ui.showToast = toast;
@@ -202,8 +232,22 @@ describe('the chosen line: one state, per tree, covered and back (§0, §3)', ()
         ui.refreshEvidenceHighlight.call(ui as never);
         expect(getSelectedRod()).toBeNull();
         expect(kind()).toBeNull();
-        expect(SettingsManager.getRodForTree('lhota')).toBeNull();
+        expect(SettingsManager.getSelectionForTree('lhota')).toBeNull();
+        // The selection's own toast, not the group's "nobody left".
         expect(toast).not.toHaveBeenCalled();
+        expect(toasts).toEqual(['Selection cleared: the Brumlák line is gone.']);
+    });
+
+    it('a line gone while another group covers it: cleared without a word', () => {
+        setRodSelection(rod, 'picker');
+        ui.highlightGroup.call(ui as never, {
+            kind: 'lineEnds', title: (n: number) => `${n}`, personIds: [P('bolemir')], recount: () => [P('bolemir')], cite: false,
+        });
+        data = tree({ bolemir: { first: 'Bolemír', last: 'Trnkavec', sex: 'male', born: '1858' } }, []);
+        ui.refreshEvidenceHighlight.call(ui as never);
+        expect(getSelectedRod()).toBeNull();
+        expect(kind()).toBe('lineEnds');
+        expect(toasts).toEqual([]);
     });
 
     it('another group covers the line; its × brings the line back; × on the line forgets it', () => {
@@ -214,12 +258,12 @@ describe('the chosen line: one state, per tree, covered and back (§0, §3)', ()
         expect(kind()).toBe('lineEnds');
         expect(getSelectedRod()).toBe(rod);
         dismiss();
-        expect(kind()).toBe('rod');
+        expect(kind()).toBe('selection');
         expect(getSelectedRod()).toBe(rod);
         dismiss();
         expect(kind()).toBeNull();
         expect(getSelectedRod()).toBeNull();
-        expect(SettingsManager.getRodForTree('lhota')).toBeNull();
+        expect(SettingsManager.getSelectionForTree('lhota')).toBeNull();
     });
 
     it('a line chosen while another group is shown ends that group; a restore under it waits', () => {
@@ -227,21 +271,21 @@ describe('the chosen line: one state, per tree, covered and back (§0, §3)', ()
             kind: 'lineEnds', title: (n: number) => `${n}`, personIds: [P('bozetech')], recount: null, cite: false,
         });
         setRodSelection(rod, 'picker');
-        expect(kind()).toBe('rod');
+        expect(kind()).toBe('selection');
         ui.highlightGroup.call(ui as never, {
             kind: 'lineEnds', title: (n: number) => `${n}`, personIds: [P('bozetech')], recount: null, cite: false,
         });
         setRodSelection(rod, 'restore');
         expect(kind()).toBe('lineEnds');
         ui.endEvidenceHighlight.call(ui as never);
-        expect(kind()).toBe('rod');
+        expect(kind()).toBe('selection');
     });
 
     it('"Back to overview" only from the overview, in memory only', () => {
         const back = vi.fn();
         setRodSelection(rod, 'overview', { back });
         expect(rodBack()).toBe(back);
-        expect(SettingsManager.getRodForTree('lhota')).toBe(rod);
+        expect(SettingsManager.getSelectionForTree('lhota')?.ref).toEqual({ kind: 'rod', rodId: rod });
         setRodSelection(rod, 'picker');
         expect(rodBack()).toBeNull();
         setRodSelection(rod, 'overview', { back });

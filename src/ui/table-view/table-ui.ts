@@ -20,12 +20,13 @@
  * error" there marks it as Data quality does, with the same toast and Undo.
  */
 
+import { imageLoads } from '../../image-loads.js';
 import { auditPersonName, DataManager } from '../../data.js';
 import { TreeManager } from '../../tree-manager.js';
 import { TreeRenderer } from '../../renderer.js';
 import { runBusy, nextPaint, busyButtonHtml } from '../busy.js';
 import { isPhoneBar, isTabletOrMobile } from '../../breakpoints.js';
-import { strings, getCurrentLanguage, type Language } from '../../strings.js';
+import { strings, countText, getCurrentLanguage, type Language } from '../../strings.js';
 import { uiModule } from '../module.js';
 import { cellOf, columnById, columnLabel, columnNote, dateCell, eventPersons, eventTypeLabel, setResearchOffer, sharedAgeRows, type SortSpec } from './table-columns.js';
 import {
@@ -60,7 +61,9 @@ import { createBar, createStatus, createWindowButton, fitBarRow, updateAgentNote
 import { JumpHistory, jumpTargetCell, type JumpStep } from './table-jump.js';
 import { PIN_MAX, TablePins, pinRanks, pinSvg } from './table-pins.js';
 import { createNotice, showNotice } from './table-notice.js';
-import { applyScopeCells, outsideScope, scopeCounts, scopeRows, tableScopeOf, type TableScope } from './table-scope.js';
+import {
+    applyScopeCells, legacyScopeSelection, outsideScope, scopeCounts, scopeRows, selectionScopeKey, tableScopeNow, tableScopeOf, type TableScope,
+} from './table-scope.js';
 import { LEAD_COLUMNS } from './table-columns.js';
 import { listDisplayName, listKind } from '../../person-lists.js';
 import { listKindIcon } from '../list-kind-icon.js';
@@ -86,8 +89,8 @@ import { dismissalFor, dismissalKey } from '../../quality-dismiss.js';
 import { QUALITY_CHANGED_EVENT } from '../quality-ui.js';
 import type { Partnership, PartnershipId, Person, PersonId, PersonList, StromData, TableGroupKey, TableView, TreeId } from '../../types.js';
 import {
-    discardViewChanges, dropMissingViews, isBuiltinId, isResearchViewId, newViewId, openViewOf, readTableWork, restoreTableState, setResearchViews, switchView,
-    tableWorkOf, takenViewNames, uniqueViewName, viewChanged, viewFromState, viewList, writeTableWork,
+    discardViewChanges, dropMissingViews, findView, isBuiltinId, isResearchViewId, newViewId, openViewOf, readTableWork, restoreTableState, setResearchViews, switchView,
+    sortForView, stateForView, tableWorkOf, takenViewNames, uniqueViewName, viewChanged, viewFromState, viewList, viewSortOf, writeTableWork,
 } from './table-views.js';
 import { exportDownloadLabel, exportForm, ViewBar, viewNameForm, type ExportFormat, type ExportSummary } from './table-viewbar.js';
 import { buildTableCsv, exportColumnCount, exportsNotLive, tableCsvFileName, type TableCsvInput } from './table-export.js';
@@ -113,6 +116,11 @@ import { sourcePlaceLine } from '../../source-location.js';
 import { shareDivergence } from '../../shared-events.js';
 import { divergenceSentence, divergentPersons } from '../../shared-divergence.js';
 import { TreeEditLock } from '../tree-edit-lock.js';
+import { getSelection, selectionText, setSelection } from '../view-selection-ui.js';
+import { decodeSelectionRef, type SelectionRef } from '../../view-selection-ref.js';
+import type { ViewScope } from '../../view-scope.js';
+import { realSelectionIds, registerScopeHost, type ScopeSegHost } from '../scope-seg-ui.js';
+import { selectionQuickRows } from '../selection-picker-ui.js';
 
 interface Mounted {
     container: HTMLElement;
@@ -171,7 +179,7 @@ let researchCounts: { env: ResearchTableEnv; window: ResearchNewWindow; counts: 
 function researchBarState(
     env: ResearchTableEnv, m: TableModel, filter: TableFilter, columns: readonly ColumnDef[], researchView: boolean,
 ): ResearchBarState | undefined {
-    const offer = researchChipOffer(env);
+    const offer = researchChipOffer(env, id => !!chipItem(filter, id));
     if (!offer.length) return undefined;
     const chipOn = filter.items.some(i => isChipItem(i) && isResearchChipId(i.chip));
     const window = newWindowOf(chipItem(filter, 'xNew'));
@@ -270,67 +278,54 @@ let jumpsTree: string | null = null;
 let tempShown: { tree: string; person: PersonId; ctx: string } | null = null;
 /** The jump the strip waits on (spec 103 2a); gone with a change of the row type or the People table's filter. */
 let hiddenJump: { tree: string; step: JumpStep; ctx: string; outsideList?: boolean } | null = null;
-/** A view opened with a list that is gone (spec 084 §9): said under the bar until closed or the scope changes (the tree's key). */
-let scopeGone: string | null = null;
+/** The stored state's old list being taken over as the window's selection (spec 098 §11c): no redraw meanwhile. */
+let takingLegacyScope = false;
+/** The People table's scope key last drawn, per tree (spec 098 §11c): a list taken or left changes its sort. */
+const scopeSeen = new Map<string, string | null>();
 /** A row a jump goes to (spec 084 §10): its group is opened when it is closed. */
 let openGroupFor: string | null = null;
 /** A Table filter rule being edited in the Table (spec 084 §7, §9): ⋯ offers Save to the list. */
 let ruleEdit: { tree: string; listId: string } | null = null;
 
-/** A menu row of Scope (spec 084 §9): the whole tree, a list, Manage lists…; null between the parts. */
-interface ScopeRow { id: string; label: string; iconHtml?: string; count?: number; current?: boolean; run: () => void }
-
-/** What a row shown for now depends on: the People table's filter, search, sort and open view. */
-function peopleCtx(state: TableState): string {
+/** What a row shown for now depends on: the People table's filter, search, sort and open view, the scope. */
+function peopleCtx(state: TableState, scope: TableScope | null): string {
     const st = state.types.persons;
-    return JSON.stringify([st.filter, searchQuery(st.search), st.sort, state.open.persons, st.scope]);
+    return JSON.stringify([st.filter, searchQuery(st.search), st.sort, state.open.persons, scope?.key ?? null]);
 }
 
-/** A row type's scope (spec 084 §9): its list, none for Sources or a list that is gone. */
-function scopeOfType(state: TableState, type: RowType): TableScope | null {
-    return type === 'sources' ? null : tableScopeOf(state.types[type].scope);
-}
-
-/** The sort a scope starts with (spec 084 §9): People in the list's order (# ↑). */
+/** The sort a list's scope starts with (spec 084 §9): People in the list's order (# ↑). */
 const LIST_SORT: readonly SortSpec[] = [{ col: 'num', dir: 'asc' }];
 
 /**
- * Set the Table's scope (spec 084 §9): the list, or the whole tree (null),
- * for People, Unions and Events at once (Sources have none). The People
- * table takes the list's order; back on the whole tree, the list's order
- * gives way to the default view's sort. Returns whether anything changed.
+ * The scope drawn now against the one before (spec 098 §11c): a list taken
+ * gives People its order (# ↑), a list left takes # out of the sort; another
+ * scope starts the rows at the top. The first draw of a tree only takes out
+ * a # the scope has not.
  */
-function setTableScope(state: TableState, listId: string | null): boolean {
-    let changed = false;
-    for (const type of ['persons', 'unions', 'events'] as const) {
-        const st = state.types[type];
-        if (st.scope === listId) continue;
-        st.scope = listId;
-        st.top = 0;
-        changed = true;
-        if (type !== 'persons') continue;
-        if (listId) st.sort = LIST_SORT.map(x => ({ ...x }));
-        else if (st.sort.some(x => x.col === 'num')) st.sort = st.sort.filter(x => x.col !== 'num');
+function followScope(tree: string, state: TableState, scope: TableScope | null, viewSort: readonly SortSpec[]): void {
+    const key = scope?.key ?? null;
+    const list = scope?.kind === 'list';
+    const pst = state.types.persons;
+    // A list's order left: the open view's own sort again (sortForView).
+    const dropNum = (): void => { if (pst.sort.some(x => x.col === 'num')) pst.sort = sortForView(pst.sort, viewSort); };
+    if (!scopeSeen.has(tree)) {
+        scopeSeen.set(tree, key);
+        if (!list) dropNum();
+        // A list's order is not kept with a view (it is the scope's): a list's scope opens in it while the view's sort stands.
+        else if (JSON.stringify(pst.sort) === JSON.stringify(viewSort)) pst.sort = LIST_SORT.map(x => ({ ...x }));
+        return;
     }
-    if (changed) scopeGone = null;
-    return changed;
-}
-
-/** A list of a row type's scope that is gone (deleted, an undo): back to the whole tree. True when one was. */
-function dropGoneScopes(state: TableState): boolean {
-    let gone = false;
-    for (const type of ['persons', 'unions', 'events'] as const) {
-        const st = state.types[type];
-        if (!st.scope || DataManager.getPersonList(st.scope)) continue;
-        st.scope = null;
-        if (type === 'persons') st.sort = st.sort.filter(x => x.col !== 'num');
-        gone = true;
-    }
-    return gone;
+    if (scopeSeen.get(tree) === key) return;
+    scopeSeen.set(tree, key);
+    for (const type of ['persons', 'unions', 'events'] as const) state.types[type].top = 0;
+    if (list) pst.sort = LIST_SORT.map(x => ({ ...x }));
+    else dropNum();
 }
 
 /** The scope's lead columns (spec 084 §9, §13d): # and, for a work list, Done. */
 function leadColumnsOf(scope: TableScope): ColumnDef[] {
+    // The window's selection has no order of its own (spec 098 §5): no # column.
+    if (scope.kind !== 'list') return [];
     return LEAD_COLUMNS.filter(c => c.id === 'num' || !!scope.cells.done);
 }
 
@@ -379,6 +374,9 @@ const BRIDGE_TOAST_MS = 8000;
 let mounted: Mounted | null = null;
 
 /** From this many cells the export says its state at once (building it takes longer than 120 ms). */
+/** The load of the tree's images the couples' photo cells were drawn with (seq, phase, failed). */
+let tableImagesKey = '';
+
 export const TABLE_EXPORT_SHOWN_AT_ONCE = 30_000;
 /** The coverage row's cells (§6.1) for the rows last drawn; computed when a column is first drawn. */
 let coverage: { rows: readonly TableRow[]; cells: Map<string, CoverageCell> } | null = null;
@@ -612,7 +610,7 @@ function viewRows(
     const q = searchQuery(search);
     const byChecks = sort.some(s => CHECK_COLUMNS.includes(s.col))
         || filter.items.some(i => isChipItem(i) && CHECK_CHIPS.includes(i.chip));
-    const key = JSON.stringify([filter, q, q ? columns.map(c => c.id) : 0, sort, scope?.listId ?? null]);
+    const key = JSON.stringify([filter, q, q ? columns.map(c => c.id) : 0, sort, scope?.key ?? null]);
     const checksVersion = byChecks ? m.ctx.checks?.version ?? 0 : 0;
     // A research chip or a research column's sort reads the research: a new environment filters and sorts again.
     const byResearch = filter.items.some(i => isChipItem(i) && isResearchChipId(i.chip))
@@ -808,7 +806,7 @@ export const tableMethods = uiModule({
         const tree = treeKey();
         const state = stateOf(tree);
         if (state.rowType !== 'persons') return;
-        tempShown = { tree, person, ctx: peopleCtx(state) };
+        tempShown = { tree, person, ctx: peopleCtx(state, this.tableWindowScope()) };
         const el = document.getElementById('table-container');
         if (!el || TreeRenderer.getViewMode() !== 'table') return;
         // The note's button goes: the focus stays in the table, not on the page.
@@ -888,6 +886,13 @@ export const tableMethods = uiModule({
             model = buildTableModel(data, { rev, homeId, lang, reliability: this.reliabilityOptionsNow() });
         }
         const m = model;
+        // The couples' photos on their way or not come (spec 116 §5): a change of the load draws their cells anew.
+        const images = imageLoads.snapshot();
+        const imagesKey = `${images.seq}:${images.phase}:${images.failed}`;
+        if (imagesKey !== tableImagesKey) {
+            tableImagesKey = imagesKey;
+            for (const row of m.unions) row.cache.delete('uPhoto');
+        }
         const tree = treeKey();
         const index = this.tableChecksFor(tree, data, rev);
         applyChecks(m, index);
@@ -898,19 +903,22 @@ export const tableMethods = uiModule({
         // §16.5: the research's views the tree offers, before its state is read (a view no longer offered falls back).
         setResearchViews(research && research.input.kind !== 'none' ? {
             overview: true,
-            lines: research.lines.lines.map(l => ({ id: l.id, name: l.name })),
+            lines: research.lines.lines.map(l => ({ id: l.id, name: l.name, state: l.state })),
             exchange: research.input.kind === 'research' && !research.input.readOnly,
         } : null);
         const state = stateOf(tree);
         // An undo or a delete took the open view away: back to the default one (§9.3).
         dropMissingViews(state, data.tableViews);
-        // A view's list that is gone (spec 084 §9): the whole tree, said under the bar.
-        if (dropGoneScopes(state)) scopeGone = tree;
+        // The list the stored state was narrowed to before the shared switch (spec 098 §11c): the window's selection, once.
+        this.tableLegacyScope(state);
         const type = state.rowType;
         const st = state.types[type];
-        const scope = scopeOfType(state, type);
+        // The window's scope (spec 098 §11c): the same for People, Unions and Events; Sources have none.
+        const windowScope = this.tableWindowScope();
+        const scope = type === 'sources' ? null : windowScope;
+        followScope(tree, state, windowScope, viewSortOf(openViewOf(state, 'persons', data.tableViews)));
         // # and Done read the People table's scope; the work list's chips too.
-        applyScopeCells(m, scopeOfType(state, 'persons'));
+        applyScopeCells(m, windowScope);
         // Jumps by a name (spec 103 U3): another tree drops the history, the row shown for now and the strip.
         if (jumpsTree !== tree) {
             jumps.clear();
@@ -920,7 +928,7 @@ export const tableMethods = uiModule({
         }
         // Pinned rows (spec 103 §3): another tree or row type drops them.
         pins.use(tree, type);
-        const pctx = peopleCtx(state);
+        const pctx = peopleCtx(state, windowScope);
         if (tempShown && (tempShown.tree !== tree || type !== 'persons' || tempShown.ctx !== pctx)) tempShown = null;
         if (hiddenJump && (hiddenJump.tree !== tree || hiddenJump.ctx !== `${type}|${pctx}`)) hiddenJump = null;
 
@@ -938,7 +946,9 @@ export const tableMethods = uiModule({
                 onMoreMenu: () => this.showTableMoreMenu(),
                 onHistory: (d) => { this.tableHistory(d, false); },
                 onScopeMenu: (anchor) => this.showTableScopeMenu(anchor),
-            });
+            }, this.scopeSegHtml('table'));
+            registerScopeHost('table', this.tableScopeHost());
+            this.bindScopeSeg('table', bar);
             const notice = createNotice({
                 onShow: () => { if (hiddenJump) this.tableRunJump(hiddenJump.step, true, true); },
                 onClear: () => {
@@ -954,12 +964,12 @@ export const tableMethods = uiModule({
                 onWhole: () => {
                     const h = hiddenJump;
                     if (!h) return;
-                    setTableScope(stateOf(treeKey()), null);
+                    this.rememberViewScope('table', 'tree');
+                    this.renderScopeSeg('table');
                     this.tableRunJump(h.step, false, true);
                 },
                 onClose: () => {
                     hiddenJump = null;
-                    scopeGone = null;
                     showNotice(notice, null);
                     mounted?.grid.el.focus({ preventScroll: true });
                 },
@@ -1147,7 +1157,7 @@ export const tableMethods = uiModule({
         }
 
         // The row types count what the scope has (spec 084 §9); Sources count the whole tree's.
-        const countScope = scope ?? (type === 'sources' ? scopeOfType(state, 'persons') : null);
+        const countScope = windowScope;
         const counts = countScope ? scopeCounts(m, countScope) : rowCounts(m);
         const phone = isPhoneBar();
         mounted.windowBtn.hidden = !canOpenWindows();
@@ -1227,9 +1237,14 @@ export const tableMethods = uiModule({
         mounted.colsBtn.setAttribute('aria-label', `${strings.table.columns}, ${strings.table.columnsCount(st.columns.length, total)}`);
         container.dataset.rowtype = type;
         updateBar(mounted.bar, type, counts);
-        const scopeList = scopeOfType(state, type === 'sources' ? 'persons' : type)?.list ?? null;
+        this.renderScopeSeg('table');
+        const ref = getSelection().ref;
+        const viewScope = this.viewScope('table');
         updateScope(mounted.bar, {
-            list: type !== 'sources' && scopeList ? { name: listDisplayName(scopeList), kind: listKind(scopeList) } : null,
+            scope: viewScope,
+            name: viewScope === 'sel' && ref ? selectionText(ref) : undefined,
+            list: viewScope === 'sel' && windowScope?.kind === 'list' ? listKind(windowScope.list) : undefined,
+            sel: viewScope === 'sel' && ref && ref.kind !== 'list' ? ref.kind : undefined,
             disabled: type === 'sources',
         });
         this.renderTableSplitBar(mounted.bulk, type);
@@ -1299,9 +1314,8 @@ export const tableMethods = uiModule({
         }, restore);
         if (revealFocus) mounted.grid.revealKey(revealFocus);
         this.tableAgentRow(follow, agentKey, shownRows.some(r => rowKey(r) === agentKey), !!pinned?.keys.has(agentKey ?? ''));
-        if (scopeGone && scopeGone !== tree) scopeGone = null;
-        showNotice(mounted.notice, hiddenJump ? hiddenJump.step.to.label : scopeGone ? '' : null,
-            hiddenJump?.outsideList ? 'list' : !hiddenJump && scopeGone ? 'gone' : 'filter');
+        showNotice(mounted.notice, hiddenJump ? hiddenJump.step.to.label : null,
+            hiddenJump?.outsideList ? 'list' : 'filter', windowScope?.kind ?? 'list');
         updateNav(mounted.bar, jumps.any(), jumps.canBack() ? jumps.backLabel() : null, jumps.canForward() ? jumps.forwardLabel() : null);
         if (flashNext) {
             const lit = flashNext.tree === tree ? rowKeysFor(data, type, flashNext.keys, type === 'events' ? m.events : undefined) : null;
@@ -2198,7 +2212,7 @@ export const tableMethods = uiModule({
         const tree = treeKey();
         const pst = stateOf(tree).types.persons;
         const state = stateOf(tree);
-        const scope = scopeOfType(state, 'persons');
+        const scope = this.tableWindowScope();
         const columns = withLeadColumns(displayColumns('persons', pst, isPhoneBar()), scope).columns;
         return viewRows(tree, m, 'persons', pst.filter, pst.search, pst.sort, columns, scope).rows.some(r => r.kind === 'person' && r.id === personId);
     },
@@ -2225,9 +2239,9 @@ export const tableMethods = uiModule({
         const tree = treeKey();
         const state = stateOf(tree);
         // Outside the People table's list (spec 084 §9): "Not in the list", with Whole tree.
-        const scope = scopeOfType(state, 'persons');
+        const scope = this.tableWindowScope();
         const row = model?.personRows.get(personId);
-        hiddenJump = { tree, step, ctx: `${state.rowType}|${peopleCtx(state)}`, outsideList: !!scope && !!row && outsideScope(row, scope) };
+        hiddenJump = { tree, step, ctx: `${state.rowType}|${peopleCtx(state, scope)}`, outsideList: !!scope && !!row && outsideScope(row, scope) };
         const el = document.getElementById('table-container');
         if (el && TreeRenderer.getViewMode() === 'table') this.renderTableView(el);
     },
@@ -2251,7 +2265,7 @@ export const tableMethods = uiModule({
         state.rowType = 'persons';
         pst.selected = `p:${step.to.personId}`;
         openGroupFor = pst.selected;
-        if (temp) tempShown = { tree, person: step.to.personId as PersonId, ctx: peopleCtx(state) };
+        if (temp) tempShown = { tree, person: step.to.personId as PersonId, ctx: peopleCtx(state, this.tableWindowScope()) };
         const el = document.getElementById('table-container');
         if (!el || TreeRenderer.getViewMode() !== 'table') return;
         this.renderTableView(el);
@@ -2509,56 +2523,124 @@ export const tableMethods = uiModule({
         });
     },
 
-    /** The rows of Scope ▾ and the phone's Scope › (spec 084 §9): Whole tree, the lists, Manage lists…. */
-    tableScopeRows(): ScopeRow[] {
-        const state = stateOf(treeKey());
-        const current = scopeOfType(state, state.rowType)?.listId ?? null;
-        const t = strings.table;
-        const rows: ScopeRow[] = [{ id: 'scope-whole', label: t.scopeWhole, current: !current, run: () => this.setTableScopeTo(null) }];
-        for (const l of DataManager.getPersonLists()) {
-            rows.push({
-                id: `scope-${l.id}`, label: listDisplayName(l), iconHtml: listKindIcon(listKind(l), 16), count: DataManager.getPersonListIds(l.id).length,
-                current: l.id === current, run: () => this.setTableScopeTo(l.id),
-            });
+    /**
+     * The Table's scope now (spec 098 §11c) from the window's switch: the
+     * window's selection (a list with its order, # and Done), This view (the
+     * people the Family view lays out) or the whole tree (null).
+     */
+    tableWindowScope(): TableScope | null {
+        this.syncViewScopeTree('table');
+        return tableScopeNow(this.tableScope, getSelection().ref, () => TreeRenderer.familyViewPersonIds());
+    },
+
+    /** The Table's part of the scope's switch (src/ui/scope-seg-ui.ts). */
+    tableScopeHost(): ScopeSegHost {
+        return {
+            root: () => mounted?.bar ?? null,
+            popoverParent: () => mounted?.container ?? null,
+            // Folded where the bar is tight (11c·2): the choice opens under the folded button.
+            pickerAnchor: () => mounted?.bar.querySelector<HTMLElement>('.tv-scope-btn') ?? null,
+            apply: (scope) => this.applyTableScope(scope),
+            viewCount: () => tableScopeNow('view', null, () => TreeRenderer.familyViewPersonIds())?.ids.length ?? 0,
+            // Sources are never narrowed: the switch says so (§11c).
+            disabled: () => (stateOf(treeKey()).rowType === 'sources' ? strings.table.scopeSources : null),
+            beforePicker: () => closeHeadMenu(),
+            selectionChanged: () => this.tableScopeChanged(),
+        };
+    },
+
+    /** A scope chosen for the Table (setViewScope): remembered, the rows drawn anew (the pinned rows stay). */
+    applyTableScope(scope: ViewScope): void {
+        this.rememberViewScope('table', scope);
+        this.closeScopePicker(false);
+        this.tableScopeChanged();
+    },
+
+    /**
+     * The list (or selection) a stored state was narrowed to before the
+     * shared switch (spec 098 §11c), read once: with no selection in the
+     * window and the list still there, it becomes the window's selection with
+     * the scope Selection; else it is dropped.
+     */
+    tableLegacyScope(state: TableState): void {
+        if (state.legacyScope === undefined) return;
+        const stored = state.legacyScope;
+        delete state.legacyScope;
+        const ref = legacyScopeSelection(stored, !!getSelection().ref, r => !!tableScopeOf(selectionScopeKey(r)));
+        if (!ref) return;
+        takingLegacyScope = true;
+        try {
+            setSelection(ref, 'restore');
+        } finally {
+            takingLegacyScope = false;
         }
-        // A read-only export shows the scope without Manage lists… (spec 084 §9).
-        if (!DataManager.isReadOnly()) rows.push({ id: 'scope-manage', label: t.scopeManage, run: () => this.showPersonLists(current ? { listId: current } : {}) });
-        return rows;
+        if (getSelection().ref) this.rememberViewScope('table', 'sel');
     },
 
-    /** Scope ▾ (spec 084 §9): Whole tree ✓, the lists with their kind and count (✓ on the chosen one), Manage lists…. */
-    showTableScopeMenu(anchor: HTMLElement): void {
-        const rows = this.tableScopeRows();
-        const item = (r: ScopeRow): MenuEntry => ({
-            id: r.id, label: r.label, icon: '', ...(r.iconHtml ? { iconHtml: r.iconHtml } : {}), checked: !!r.current,
-            ...(r.count !== undefined && !r.current ? { hint: String(r.count) } : {}), run: r.run,
-        });
-        const manage = rows.find(r => r.id === 'scope-manage');
-        const lists = rows.filter(r => r.id !== 'scope-whole' && r !== manage);
-        const entries: MenuEntry[] = [item(rows[0])];
-        if (lists.length) entries.push(SEP, { heading: strings.lists.title }, ...lists.map(item));
-        if (manage) entries.push(SEP, item(manage));
-        const menu = openHeadMenu(anchor, strings.table.scope, '', entries);
-        menu.classList.add('tv-scope-menu');
-    },
-
-    /** The phone's Scope › page rows (spec 084 §9). */
-    tableScopeSheetRows(): { id: string; label: string; icon: string; iconHtml?: string; value?: string; ariaLabel?: string; run: () => void }[] {
-        return this.tableScopeRows().map(r => ({
-            id: r.id, label: r.label, icon: '', ...(r.iconHtml ? { iconHtml: r.iconHtml } : {}),
-            value: r.current ? '✓' : r.count !== undefined ? String(r.count) : '',
-            ...(r.current ? { ariaLabel: `${r.label} ✓` } : {}), run: r.run,
-        }));
-    },
-
-    /** Choose the Table's scope (spec 084 §9): a list, or the whole tree (null); the pinned rows stay. */
-    setTableScopeTo(listId: string | null): void {
-        const state = stateOf(treeKey());
-        if (state.rowType === 'sources') return;
-        if (!setTableScope(state, listId)) return;
+    /** The Table's scope or the window's selection changed: the switch and the open Table drawn anew. */
+    tableScopeChanged(): void {
+        if (takingLegacyScope) return;
+        this.renderScopeSeg('table');
         tempShown = null;
         hiddenJump = null;
-        if (mounted) this.renderTableView(mounted.container);
+        if (!mounted || !mounted.container.isConnected || TreeRenderer.getViewMode() !== 'table') return;
+        this.renderTableView(mounted.container);
+    },
+
+    /**
+     * The scope folded into one button (spec 098 §11c, 11c·2): "Table scope"
+     * with This view, Selection and Whole tree (✓ on the one now, their
+     * people), then Change the selection (a few) and All selections….
+     */
+    showTableScopeMenu(anchor: HTMLElement): void {
+        if (anchor.getAttribute('aria-disabled') === 'true') return;
+        const s = strings.scope;
+        const now = this.viewScope('table');
+        const ref = getSelection().ref;
+        const all = Object.values(DataManager.getData().persons).filter(p => p && !p.isPlaceholder).length;
+        const viewN = tableScopeNow('view', null, () => TreeRenderer.familyViewPersonIds())?.ids.length ?? 0;
+        const option = (scope: ViewScope, label: string, n: number | null): MenuEntry => ({
+            id: `scope-${scope}`, label, icon: '', checked: now === scope, ...(n === null ? {} : { hint: countText(n) }),
+            run: () => { void this.setViewScope('table', scope); },
+        });
+        const entries: MenuEntry[] = [
+            { heading: s.sheetSec.table },
+            option('view', s.view, viewN),
+            option('sel', ref ? `${s.sel}: ${selectionText(ref)}` : `${s.sel}…`, ref ? realSelectionIds().length : null),
+            option('tree', s.tree, all),
+            SEP,
+            { heading: s.change },
+        ];
+        for (const r of selectionQuickRows(5)) {
+            entries.push({
+                id: `scope-pick-${r.sel}`, label: r.label, icon: '', iconHtml: `<span class="tv-scope-selic" aria-hidden="true">${r.icon}</span>`,
+                hint: countText(r.count),
+                run: () => {
+                    const pick = decodeSelectionRef(r.sel);
+                    if (!pick) return;
+                    setSelection(pick, 'picker');
+                    void this.setViewScope('table', 'sel');
+                },
+            });
+        }
+        entries.push({ id: 'scope-all', label: s.all, icon: '', run: () => { setTimeout(() => this.openScopePicker('table'), 0); } });
+        const menu = openHeadMenu(anchor, '', '', entries);
+        menu.classList.add('tv-scope-menu');
+        menu.setAttribute('aria-label', s.sheetSec.table);
+    },
+
+    /**
+     * The Table in a list's scope (spec 084 §9, spec 098 §11c): the list as
+     * the window's selection, the scope Selection; null: the whole tree. The
+     * pinned rows stay.
+     */
+    setTableScopeTo(listId: string | null): void {
+        if (stateOf(treeKey()).rowType === 'sources') return;
+        if (listId === null) { void this.setViewScope('table', 'tree'); return; }
+        if (!DataManager.getPersonList(listId)) return;
+        const ref = getSelection().ref;
+        if (ref?.kind !== 'list' || ref.listId !== listId) setSelection({ kind: 'list', listId }, 'list');
+        if (this.viewScope('table') !== 'sel') this.applyTableScope('sel');
     },
 
     /**
@@ -2569,12 +2651,34 @@ export const tableMethods = uiModule({
     openTableInScope(listId: string, opts: { noSource?: boolean } = {}): void {
         if (!DataManager.getPersonList(listId)) return;
         const state = stateOf(treeKey());
-        setTableScope(state, listId);
+        this.rememberViewScope('table', 'sel');
         state.rowType = 'persons';
         tempShown = null;
         hiddenJump = null;
         const st = state.types.persons;
         if (opts.noSource && setChip(st.filter, 'noSource', true)) filterChanged(st);
+        this.showTableNow();
+        // The list becomes the window's selection once the Table is on (the Family view keeps its focus).
+        const ref = getSelection().ref;
+        if (ref?.kind !== 'list' || ref.listId !== listId) setSelection({ kind: 'list', listId }, 'list');
+    },
+
+    /**
+     * The Table with the window's selection (spec 098 §5): a list's scope, or
+     * the scope of a selection that is not a list; `filter: 'noPlace'` with
+     * the chip of people without any place (the map's "N people … no place").
+     */
+    openTableForSelection(opts: { filter?: 'noPlace' } = {}): void {
+        const ref = getSelection().ref;
+        if (!ref) return;
+        if (!tableScopeOf(selectionScopeKey(ref))) return;
+        const state = stateOf(treeKey());
+        this.rememberViewScope('table', 'sel');
+        state.rowType = 'persons';
+        tempShown = null;
+        hiddenJump = null;
+        const st = state.types.persons;
+        if (opts.filter === 'noPlace' && setChip(st.filter, 'noPlace', true)) filterChanged(st);
         this.showTableNow();
     },
 
@@ -2589,7 +2693,7 @@ export const tableMethods = uiModule({
         if (!rule || rule.kind !== 'tableFilter') return;
         const tree = treeKey();
         const state = stateOf(tree);
-        setTableScope(state, null);
+        this.rememberViewScope('table', 'tree');
         const st = state.types[rule.rowType];
         st.filter = { op: 'and', items: structuredClone(rule.filter.items) as unknown as TableFilter['items'] };
         st.sort = rule.sort.map(x => ({ col: x.col, dir: x.dir === -1 ? 'desc' : 'asc' }));
@@ -2634,8 +2738,8 @@ export const tableMethods = uiModule({
     /** A work list's Done box (spec 084 §13d): the person ticked off or back, one undo step. */
     toggleTableDone(line: GridLine): void {
         if (line.kind !== 'row' || line.row.kind !== 'person' || DataManager.listsReadOnly()) return;
-        const scope = scopeOfType(stateOf(treeKey()), 'persons');
-        if (!scope?.cells.done || !scope.cells.pos.has(line.row.id)) return;
+        const scope = this.tableWindowScope();
+        if (scope?.kind !== 'list' || !scope.cells.done || !scope.cells.pos.has(line.row.id)) return;
         DataManager.togglePersonListDone(scope.listId, line.row.id);
     },
 
@@ -2647,15 +2751,15 @@ export const tableMethods = uiModule({
         if (line.kind === 'more' || DataManager.listsReadOnly() || !model) return [];
         const state = stateOf(treeKey());
         if (state.rowType !== 'persons') return [];
-        const scope = scopeOfType(state, 'persons');
+        const scope = this.tableWindowScope();
         if (!scope?.fixed) return [];
         const keys = area.length && area.includes(rowKey(line.row)) ? area : [rowKey(line.row)];
         return keys.filter(k => k.startsWith('p:')).map(k => k.slice(2) as PersonId).filter(id => scope.cells.pos.has(id));
     },
 
     removeTableRowsFromList(ids: PersonId[]): void {
-        const scope = scopeOfType(stateOf(treeKey()), 'persons');
-        if (scope?.fixed && ids.length) DataManager.removePersonsFromList(scope.listId, ids);
+        const scope = this.tableWindowScope();
+        if (scope?.kind === 'list' && scope.fixed && ids.length) DataManager.removePersonsFromList(scope.listId, ids);
     },
 
     showTableRowMenu(line: GridLine, anchor: HTMLElement, cell: GridCellRef | null = null): void {
@@ -3031,6 +3135,13 @@ export const tableMethods = uiModule({
         const state = stateOf(treeKey());
         if (!switchView(state, id, storedViews())) return;
         view = null;
+        // A view saved with a list (before the shared switch, spec 098 §11c): the list becomes the window's selection.
+        const listId = state.rowType !== 'sources' ? findView(id, storedViews())?.scope?.listId : undefined;
+        if (listId && DataManager.getPersonList(listId)) {
+            this.rememberViewScope('table', 'sel');
+            const ref = getSelection().ref;
+            if (ref?.kind !== 'list' || ref.listId !== listId) { setSelection({ kind: 'list', listId }, 'list'); return; }
+        }
         this.redrawTableNow();
     },
 
@@ -3042,7 +3153,7 @@ export const tableMethods = uiModule({
         const st = state.types[type];
         const open = openViewOf(state, type, storedViews());
         if (isBuiltinId(open.id)) return;
-        if (!DataManager.saveTableView(viewFromState(type, st, open.id, open.name, new Date().toISOString()))) return;
+        if (!DataManager.saveTableView(viewFromState(type, stateForView(st, open), open.id, open.name, new Date().toISOString()))) return;
         st.base = columnSetupOf(st);
         this.redrawTableNow();
     },
@@ -3061,7 +3172,7 @@ export const tableMethods = uiModule({
             const st = state.types[type];
             const name = uniqueViewName(form.read(), takenViewNames(storedViews()));
             const id = newViewId();
-            if (!DataManager.saveTableView(viewFromState(type, st, id, name, new Date().toISOString()))) return;
+            if (!DataManager.saveTableView(viewFromState(type, stateForView(st, open), id, name, new Date().toISOString()))) return;
             // The changes went into the new view: the view left has none.
             delete state.drafts[open.id];
             state.open[type] = id;
@@ -3150,7 +3261,7 @@ export const tableMethods = uiModule({
         const st = state.types[type];
         const display = displayColumns(type, st, isPhoneBar());
         // The scope's rows only (spec 084 §9), People with the scope's # and Done first as drawn (§12).
-        const scope = scopeOfType(state, type);
+        const scope = type === 'sources' ? null : this.tableWindowScope();
         const shown = viewRows(tree, model, type, st.filter, st.search, st.sort, display.columns, scope);
         const filter = filterSummary(model, type, st.filter, st.search);
         const every = scopeRows(model, type, scope);
@@ -3388,7 +3499,7 @@ export const tableMethods = uiModule({
         const state = stateOf(treeKey());
         const type = state.rowType;
         const st = state.types[type];
-        const scope = scopeOfType(state, type);
+        const scope = type === 'sources' ? null : this.tableWindowScope();
         const offer = model ? this.tableGroupOffer(model, scope) : { lines: false, work: false };
         const by = groupingFits(type, st.group, offer) ? st.group.by : null;
         const t = strings.table;
@@ -3408,11 +3519,13 @@ export const tableMethods = uiModule({
         // Editing a Table filter rule (spec 084 §7, §9): its list takes the filter as it is now.
         const ruleList = this.tableRuleList();
         const saveRule = ruleList ? { label: strings.lists.saveRule(listDisplayName(ruleList)), run: () => this.saveTableRule() } : null;
+        // On the map (spec 098 §6): only in a list's or the window selection's scope, the last row.
+        const onMap = this.tableOnMap();
         if (!isPhoneBar()) {
             const anchor = mounted?.bar.querySelector<HTMLElement>('.tv-more-menu-btn');
             const hasRows = !!rowCounts(model)[state.rowType];
             const canGroup = hasRows && groupChoices.length > 1;
-            if (!anchor || (!saveRule && (!hasRows || (!saveList && !canGroup)))) return;
+            if (!anchor || (!saveRule && !onMap && (!hasRows || (!saveList && !canGroup)))) return;
             const entries: MenuEntry[] = [];
             // Group by › and Collapse / Expand all groups (spec 084 §10), then the saves.
             if (canGroup) {
@@ -3430,6 +3543,10 @@ export const tableMethods = uiModule({
             if ((saveRule || (saveList && hasRows)) && entries.length) entries.push(SEP);
             if (saveRule) entries.push({ id: 'saveRule', label: saveRule.label, icon: '', run: saveRule.run });
             if (saveList && hasRows) entries.push({ id: 'saveList', label: strings.lists.saveAs, icon: '', run: () => this.saveTableAsList() });
+            if (onMap) {
+                if (entries.length) entries.push(SEP);
+                entries.push({ id: 'onMap', label: t.onMap, icon: '', disabled: onMap.disabled, title: onMap.why, run: onMap.run });
+            }
             openHeadMenu(anchor, '', '', entries);
             return;
         }
@@ -3451,15 +3568,8 @@ export const tableMethods = uiModule({
         }
         this.noteBottomSheetTrigger();
         this.hideBottomSheet();
-        // The phone's ⋯ starts with Scope › (spec 084 §9; not for Sources) and the saves.
+        // The phone's ⋯ starts with Group by › and the saves (the scope has its own button, spec 098 §11c).
         const first: { label: string; run: () => void; value?: string; id?: string; page?: { title: string; rows: { label: string; run: () => void; value?: string; iconHtml?: string; icon?: string; id?: string; ariaLabel?: string }[] } }[] = [];
-        if (state.rowType !== 'sources') {
-            const scope = scopeOfType(state, state.rowType);
-            first.push({
-                id: 'tv-scope-row', label: t.scope, value: scope ? listDisplayName(scope.list) : t.scopeWhole,
-                run: () => {}, page: { title: t.scope, rows: this.tableScopeSheetRows() },
-            });
-        }
         // Group by › (spec 084 §10): its page lists the choices, the chosen one ticked.
         if (groupChoices.length > 1 && rowCounts(model)[state.rowType]) {
             first.push({
@@ -3474,7 +3584,21 @@ export const tableMethods = uiModule({
         }
         if (saveRule) first.push({ label: saveRule.label, run: saveRule.run });
         if (saveList) first.push({ label: strings.lists.saveAs, run: () => this.saveTableAsList() });
-        this.presentMenuSheet(t.moreActions, first.length ? [{ rows: first }, { rows, divider: true }] : [{ rows }]);
+        const blocks: { rows: { label: string; run: () => void; disabled?: boolean; why?: string; id?: string }[]; divider?: boolean }[] = first.length ? [{ rows: first }, { rows, divider: true }] : [{ rows }];
+        if (onMap) blocks.push({ rows: [{ id: 'tv-onmap-row', label: t.onMap, run: onMap.run, ...(onMap.disabled ? { disabled: true, why: onMap.why } : {}) }], divider: true });
+        this.presentMenuSheet(t.moreActions, blocks);
+    },
+
+    /** ⋯'s On the map (spec 098 §6): the Table's list or window selection as the selection on the Map; null in another scope. */
+    tableOnMap(): { disabled: boolean; why?: string; run: () => void } | null {
+        const state = stateOf(treeKey());
+        if (state.rowType === 'sources') return null;
+        // The Table in the scope Selection (spec 098 §11c): the window's selection; This view and the whole tree have none.
+        const scope = this.tableWindowScope();
+        if (!scope || scope.kind === 'view') return null;
+        const ref: SelectionRef = scope.kind === 'list' ? { kind: 'list', listId: scope.listId } : scope.ref;
+        const avail = this.showOnMapState();
+        return { ...avail, run: () => { if (!this.showOnMapState().disabled) this.showSelectionOnMap(ref); } };
     },
 
     /** A completeness cell's bubble by touch (§6.2): the share, what is missing, what it counts. */

@@ -17,8 +17,7 @@ import {
 import { overviewWindowScreen } from '../ui/overview-window-states.js';
 import { waitingAuditShown } from '../ui/waiting-task-ui.js';
 import {
-    OVERVIEW_STATE_VERSION, emptyOverviewExtras, type OverviewActionId, type OverviewResearchState, type OverviewSessionData,
-} from '../windows/overview-window.js';
+    OVERVIEW_STATE_VERSION, emptyOverviewExtras, type OverviewActionId, type OverviewResearchState, type OverviewSessionData, readOverviewAction } from '../windows/overview-window.js';
 import { strings } from '../strings.js';
 import { SECTION_PREFS_EVENT, SECTION_PREFS_KEY } from '../ui/live-section-prefs.js';
 
@@ -262,6 +261,24 @@ describe('the overview\'s controls ask the main window', () => {
         expect(port.focusMain).not.toHaveBeenCalled();
     });
 
+    it('a file of a book\'s inbox set aside: answered by the main window; done or gone, the item goes here at once; no answer, why', async () => {
+        const { o, port } = overrides();
+        const a = { file: '3.jpg.other-than-M0042', recordset: 'B0001', image: 3, kind: 'other', media: 'M0042', at: '' };
+        const w = { id: 'aside:B0001/3.jpg.other-than-M0042', what: a.file, on: '', at: '', kind: 'aside', section: 'decide', book: 'B0001', aside: a } as LiveWaiting;
+        const other = { id: 'T0001', what: 'x', on: 'user', at: '' } as LiveWaiting;
+        const s = { ended: false, lostSince: null, waiting: [w, other] } as unknown as LiveSession;
+        port.ask.mockResolvedValueOnce({ ok: false, text: 'Number 7 already has another scan.', retry: false, tone: 'danger' });
+        expect(await o.writeAsideAnswer(s, w, 'image', 7)).toEqual({ ok: false, text: 'Number 7 already has another scan.', retry: false, tone: 'danger' });
+        expect(port.ask).toHaveBeenLastCalledWith('waiting-aside', { itemId: w.id, do: 'image', image: 7 }, 30_000);
+        expect(s.waiting).toHaveLength(2);
+        port.ask.mockResolvedValueOnce(null);
+        expect(await o.writeAsideAnswer(s, w, 'take')).toMatchObject({ ok: false, retry: true });
+        expect(port.ask).toHaveBeenLastCalledWith('waiting-aside', { itemId: w.id, do: 'take' }, 30_000);
+        port.ask.mockResolvedValueOnce({ ok: false, gone: true });
+        expect(await o.writeAsideAnswer(s, w, 'discard')).toEqual({ ok: false, gone: true });
+        expect(s.waiting).toEqual([other]);
+    });
+
     it('an answer waits for the main window\'s outcome (no answer: failed)', async () => {
         const { o, port } = overrides();
         await expect(o.sendWaitingAnswer(null, W1, 'Kutná Hora')).resolves.toBe('saved');
@@ -298,6 +315,20 @@ describe('the overview\'s controls ask the main window', () => {
         o.showVerifyBulkDialog();
         expect(sent[0]).toEqual({ action: 'verify-bulk', args: undefined });
         expect(port.focusMain).toHaveBeenCalledTimes(1);
+    });
+
+    it('Stop of a run (spec 126 U10 §4) asks the main window and says its answer; no answer is the main window\'s silence', async () => {
+        const { o, sent, port } = overrides();
+        port.ask.mockResolvedValueOnce({ ok: true });
+        await expect(o.writeRunStop('run-1a07')).resolves.toEqual({ ok: true });
+        expect(port.ask).toHaveBeenCalledWith('run-stop', { run: 'run-1a07' }, expect.any(Number));
+        port.ask.mockResolvedValueOnce({ ok: false, text: 'Not saved, the research is busy.' });
+        await expect(o.writeRunStop('run-1a07')).resolves.toEqual({ ok: false, text: 'Not saved, the research is busy.' });
+        port.ask.mockResolvedValueOnce(null);
+        await expect(o.writeRunStop('run-1a07')).resolves.toEqual({ ok: false, text: strings.busy.mainWindowSilent });
+        expect(sent).toEqual([]);
+        expect(readOverviewAction('run-stop', { run: 'run-1a07' })).toEqual({ action: 'run-stop', args: { run: 'run-1a07' } });
+        expect(readOverviewAction('run-stop', {})).toBeNull();
     });
 
     it('Stop and "All questions": the main window silent for 10 s is said here; a snapshot of the work keeps it waiting', async () => {

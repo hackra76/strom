@@ -984,6 +984,11 @@ const WORD_MAP: Record<string, string> = {
     'překlad': 'preklad',
     'udělal': 'urobil',
     'příčina': 'príčina',
+    'sčítání': 'sčítanie',
+    'odvolat': 'odvolať',
+    'odvolá': 'odvolá',
+    'odvolán': 'odvolaný',
+    'místní': 'miestne',
 };
 
 const WORD_REGEX = new RegExp(
@@ -1033,6 +1038,18 @@ const CHAPTER_TITLES: Record<string, { title: string; desc?: string }> = {
     A9: {
         title: 'Ovládanie aplikácie',
         desc: 'kde čo je, čitateľné názvy prvkov, úpravy pri sledovaní výskumu, agent v aplikácii',
+    },
+    A10: {
+        title: 'Jedna udalosť pri viacerých osobách',
+        desc: 'spoločná udalosť domácnosti, krstní rodičia a svedkovia v živote osoby',
+    },
+    A11: {
+        title: 'Zoznamy osôb',
+        desc: 'pevný, automatický a pracovný zoznam, pravidlá, odškrtávanie hotových, export',
+    },
+    A12: {
+        title: 'Portrét a fotka zväzku',
+        desc: 'editor výrezu portrétu, originál, fotka zväzku a portréty z nej',
     },
     R1: {
         title: 'Výskum v skratke',
@@ -1117,6 +1134,10 @@ const CHAPTER_TITLES: Record<string, { title: string; desc?: string }> = {
     S7: {
         title: 'Spoľahlivosť údajov a overenie podľa originálov',
         desc: 'značky pri údajoch a na kartičke, Overiť pri údaji, osobe a v strome',
+    },
+    S8: {
+        title: 'Kde sú dáta',
+        desc: 'čo je len v prehliadači, vo výskume a v Archíve Stromu, fotky a prílohy',
     },
 };
 

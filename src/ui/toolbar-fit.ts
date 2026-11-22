@@ -24,7 +24,8 @@
  *   5. `.toolbar-squeeze-3`: the search field → the magnifier, the field
  *      opens over the toolbar.
  *
- * The view tabs never fold. A renamed tree is measured again (the name's text
+ * Step 4 is left again once step 5 is taken when the name then fits whole
+ * (the magnifier frees more room than the cap took). The view tabs never fold. A renamed tree is measured again (the name's text
  * is watched: a name squeezed before and after need not change any size).
  *
  * Each step is measured with the steps before it taken and itself not, so the
@@ -61,6 +62,7 @@
  */
 
 import { isDesktop, isPhoneBar, isTablet } from '../breakpoints.js';
+import { strings } from '../strings.js';
 
 /** The steps in their order (see above). */
 export const TOOLBAR_FIT_STEPS = ['toolbar-add-compact', 'toolbar-squeeze', 'toolbar-squeeze-2', 'toolbar-squeeze-name', 'toolbar-squeeze-3'] as const;
@@ -82,13 +84,15 @@ const placeholderWidths = new Map<string, number>();
 /** The width the search input's placeholder needs, in its own font. */
 function placeholderWidth(input: HTMLInputElement, cs: CSSStyleDeclaration): number {
     const font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
-    const key = `${font}|${input.placeholder}`;
+    // Measured in full even while the field shows the short form (fitSearchPlaceholder).
+    const text = input.placeholder === strings.search.placeholderShort ? strings.search.placeholder : input.placeholder;
+    const key = `${font}|${text}`;
     const known = placeholderWidths.get(key);
     if (known !== undefined) return known;
     if (measureCtx === undefined) measureCtx = document.createElement('canvas').getContext('2d');
     if (!measureCtx) return 0;
     measureCtx.font = font;
-    const width = measureCtx.measureText(input.placeholder).width;
+    const width = measureCtx.measureText(text).width;
     placeholderWidths.set(key, width);
     return width;
 }
@@ -96,13 +100,14 @@ function placeholderWidth(input: HTMLInputElement, cs: CSSStyleDeclaration): num
 /**
  * The room the search input lacks (0 when it has enough), with `reserve` px
  * held back: every tree's input asks for SEARCH_MIN_PX, a research tree's
- * also for its placeholder (up to SEARCH_ROOM_CAP_PX).
+ * also for its placeholder (up to SEARCH_ROOM_CAP_PX). With `placeholder`
+ * any tree's input asks for its placeholder too (the first step, below).
  */
-export function searchShortfall(toolbar: HTMLElement, reserve = 0): number {
+export function searchShortfall(toolbar: HTMLElement, reserve = 0, placeholder = false): number {
     const input = toolbar.querySelector<HTMLInputElement>('#toolbar-search-picker .person-picker-input');
     if (!input || input.getClientRects().length === 0) return 0;
     const belowMin = Math.max(0, Math.ceil(SEARCH_MIN_PX - (input.getBoundingClientRect().width - reserve)));
-    if (!document.body.classList.contains('research-actions') || !input.placeholder) return belowMin;
+    if ((!placeholder && !document.body.classList.contains('research-actions')) || !input.placeholder) return belowMin;
     const cs = getComputedStyle(input);
     const room = input.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0) - reserve;
     const need = Math.min(placeholderWidth(input, cs), SEARCH_ROOM_CAP_PX);
@@ -127,8 +132,15 @@ function switcherSqueezed(toolbar: HTMLElement, nameCap: boolean): boolean {
     return name.getBoundingClientRect().width + 1 < wanted;
 }
 
-/** True when the toolbar, as laid out now, does not hold its content. */
-function tooTight(toolbar: HTMLElement, reserve: number): boolean {
+/**
+ * True when the toolbar, as laid out now, does not hold its content. The
+ * first step ("＋ Add person" → ＋) is taken also when the search field of a
+ * tree without a research cannot hold its full placeholder: a computer's
+ * width then keeps "Person suchen…" whole, whatever the line picker's label
+ * ("Wybór ▾" is wider than "Rody ▾" was, spec 098 §1.1). The later steps
+ * still ask such a field for SEARCH_MIN_PX alone (it has its short form).
+ */
+function tooTight(toolbar: HTMLElement, reserve: number, step: string): boolean {
     const previous = toolbar.style.paddingRight;
     if (reserve > 0) {
         const pad = parseFloat(getComputedStyle(toolbar).paddingRight) || 0;
@@ -136,7 +148,7 @@ function tooTight(toolbar: HTMLElement, reserve: number): boolean {
     }
     const tight = toolbar.scrollWidth > toolbar.clientWidth + 0.5 || switcherSqueezed(toolbar, true);
     toolbar.style.paddingRight = previous;
-    return tight || searchShortfall(toolbar, reserve) > 0;
+    return tight || searchShortfall(toolbar, reserve, step === TOOLBAR_FIT_STEPS[0]) > 0;
 }
 
 /**
@@ -181,13 +193,25 @@ function tabletSearchTooNarrow(toolbar: HTMLElement, reserve: number): boolean {
     return input.getBoundingClientRect().width - reserve < TABLET_SEARCH_MIN_PX;
 }
 
-/** Take the steps of `steps` the toolbar needs, measured one by one. */
-function fitSteps(toolbar: HTMLElement, steps: readonly string[], tight: (reserve: number, step: string) => boolean): void {
+/**
+ * Take the steps of `steps` the toolbar needs, measured one by one. With
+ * `giveBack` [earlier, later]: when the later step is taken, the earlier one
+ * is left again if the toolbar holds its content without it (the search field
+ * folded into the magnifier frees more than the capped tree name took: the
+ * window's selection beside the tabs, spec 098 §2, left de at 1440 px with a
+ * research the name "Familie …" and 185 px unused).
+ */
+function fitSteps(toolbar: HTMLElement, steps: readonly string[], tight: (reserve: number, step: string) => boolean, giveBack?: readonly [string, string]): void {
     const had = steps.map(step => toolbar.classList.contains(step));
     toolbar.classList.remove(...steps);
     for (let i = 0; i < steps.length; i++) {
         if (!tight(had[i] ? HYSTERESIS_PX : 0, steps[i])) break;
         toolbar.classList.add(steps[i]);
+    }
+    if (giveBack && toolbar.classList.contains(giveBack[0]) && toolbar.classList.contains(giveBack[1])) {
+        const i = steps.indexOf(giveBack[0]);
+        toolbar.classList.remove(giveBack[0]);
+        if (tight(had[i] ? HYSTERESIS_PX : 0, giveBack[0])) toolbar.classList.add(giveBack[0]);
     }
 }
 
@@ -199,7 +223,7 @@ export function updateToolbarFit(): void {
     const tabletOnly = TOOLBAR_TABLET_FIT_STEPS.filter(step => !(TOOLBAR_FIT_STEPS as readonly string[]).includes(step));
     if (isDesktop()) {
         toolbar.classList.remove(...tabletOnly);
-        fitSteps(toolbar, TOOLBAR_FIT_STEPS, reserve => tooTight(toolbar, reserve));
+        fitSteps(toolbar, TOOLBAR_FIT_STEPS, (reserve, step) => tooTight(toolbar, reserve, step), ['toolbar-squeeze-name', 'toolbar-squeeze-3']);
     } else if (isTablet() && !isPhoneBar()) {
         toolbar.classList.remove(...desktopOnly);
         fitSteps(toolbar, TOOLBAR_TABLET_FIT_STEPS, reserve => tabletTooTight(toolbar, reserve)
@@ -207,7 +231,26 @@ export function updateToolbarFit(): void {
     } else {
         toolbar.classList.remove(...TOOLBAR_FIT_STEPS, ...TOOLBAR_TABLET_FIT_STEPS);
     }
+    fitSearchPlaceholder(toolbar);
     nameTooltip(toolbar);
+}
+
+/**
+ * The search field's placeholder in full where it fits, else its short form
+ * ("Person suchen…" → "Suchen…"): over a tree without a research the field
+ * keeps only SEARCH_MIN_PX before the steps fold the bar, and de showed
+ * "Person suche" (verification of 3.30.0). Only the placeholder changes, the
+ * layout does not.
+ */
+function fitSearchPlaceholder(toolbar: HTMLElement): void {
+    const input = toolbar.querySelector<HTMLInputElement>('#toolbar-search-picker .person-picker-input');
+    const { placeholder: full, placeholderShort: short } = strings.search;
+    if (!input || (input.placeholder !== full && input.placeholder !== short)) return;
+    if (input.getClientRects().length === 0) return;
+    const cs = getComputedStyle(input);
+    const room = input.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+    const next = placeholderWidth(input, cs) <= room ? full : short;
+    if (input.placeholder !== next) input.placeholder = next;
 }
 
 /** A tree name cut short carries the whole name in its tooltip. */

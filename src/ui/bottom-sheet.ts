@@ -21,7 +21,8 @@ import { menuItemBody, menuItemAria, PersonMenuAction } from './context-menu.js'
 import { shownName, shownNameFull, nameHtml } from '../person-name.js';
 import type { ResearchSheetGroup } from './research-actions-ui.js';
 import { researchTrialTagHtml } from './research-tree-settings-ui.js';
-import { getSelectedRod, rodLabel, rodPickerOffered } from './rod-view.js';
+import { getSelection, selectionText } from './view-selection-ui.js';
+import { selectionOffered } from './selection-picker-ui.js';
 import { satelliteResearchMenu } from '../windows/window-research-menu.js';
 
 /** A row / section in a menu-style bottom sheet (the "More" and "Tree" sheets). */
@@ -59,6 +60,10 @@ interface MenuRow {
     iconHtml?: string;
     /** A second line of the row's own (the tree's research marks). */
     extra?: HTMLElement;
+    /** Offered but not working now (`aria-disabled`, never `disabled`: it can be focused and read); a click does nothing. */
+    disabled?: boolean;
+    /** Why it does not work now: a quiet line under the label. */
+    why?: string;
 }
 /** The prominent "Strom: {name}" row that opens the second-level tree sheet
  *  (serif name + chevron + tinted background — mirrors the desktop submenu row). */
@@ -73,6 +78,8 @@ interface MenuBlock {
     pairLabel?: string;
     /** A framed row across the sheet under the pair ("Family line · Whole tree ›"). */
     valueRow?: ValueRow;
+    /** The value row at the end of the pair's line instead of under it (a phone held sideways has no height for a row more). */
+    valueInPair?: boolean;
     /** The research group (a narrow window with a mouse): title, state, frequent actions, "All research actions ›". */
     research?: ResearchSheetGroup;
     /** A quiet line with its link before the block (the research programs out of the browser's reach); hidden until it applies. */
@@ -387,7 +394,7 @@ export const bottomSheetMethods = uiModule({
         if (!isView && this.isUnsavedInBrowser()) {
             // (A storage row comes before its block's divider: the next block separates it.)
             blocks.push({ rows: [], storageRow: {
-                title: s.fileCopy.menuUnsaved,
+                title: this.isUnsavedPhotosOnly() ? s.fileCopy.photosShort : s.fileCopy.menuUnsaved,
                 run: () => { void this.showStorageStatusDialog(); },
             } });
         }
@@ -421,7 +428,13 @@ export const bottomSheetMethods = uiModule({
         // Lists of people (spec 084 §2, 15a): after Sources, an exported page reads them too.
         const listsRow: MenuRow = { label: s.lists.title, id: 'sheet-lists', run: () => this.showPersonLists() };
         // "For the family ›": the book and the family pages (an exported page has them too), the poster, the fly-through.
+        // Materials on a phone: the desktop has them in the same block beside "For the family ›";
+        // the phone's first level stays without scrolling, so they head this page instead.
+        const materialsRow: MenuRow | null = active && !viewMode && this.isMaterialsMenuOffered()
+            ? { label: s.materials.menu, id: 'sheet-materials', value: this.materialsAppCount().toLocaleString(getCurrentLanguage()), run: () => this.openMaterials() }
+            : null;
         const familyRow: MenuRow = { label: s.menu.forFamily, id: 'sheet-family', run: () => {}, page: { title: s.menu.forFamily, rows: [
+            ...(materialsRow && isPhoneBar() ? [materialsRow] : []),
             ...(active || viewMode ? [bookRow, pagesRow, treePagesRow] : []),
             { label: s.menu.poster, id: 'sheet-poster', run: () => this.showPosterDialog() },
             slideshowRow,
@@ -437,8 +450,7 @@ export const bottomSheetMethods = uiModule({
                 ...(active ? [annRow] : []),
                 ...(active && this.isSourcesMenuOffered() ? [{ label: s.sources.menu, run: () => this.showSourcesDialog() }] : []),
                 // Materials N (spec 102 §1) on a tablet; a phone's sheet keeps its first level without scrolling.
-                ...(active && this.isMaterialsMenuOffered() && !isPhoneBar()
-                    ? [{ label: s.materials.menu, id: 'sheet-materials', value: this.materialsAppCount().toLocaleString(getCurrentLanguage()), run: () => this.openMaterials() }] : []),
+                ...(materialsRow && !isPhoneBar() ? [materialsRow] : []),
                 ...(active ? [listsRow] : []),
                 // One Export…: the whole tree or the current view, chosen in its dialog
                 // (locked data exports what it shows).
@@ -450,14 +462,15 @@ export const bottomSheetMethods = uiModule({
         }
 
         // 5) View: Fan | Map | Timeline tiles (no bottom-bar tab of their own); on a phone under them the
-        //    family line's choice (spec 039 §5.1: not on the timeline and the map, nor in a tree
-        //    without a line; a tablet has it in its top bar).
-        const rod = getSelectedRod();
-        const rodRow: ValueRow | undefined = isPhoneBar() && mode !== 'timeline' && mode !== 'map' && mode !== 'table' && rodPickerOffered()
-            ? { label: s.rodView.row, value: rod ? rodLabel(rod) : s.familyPages.wholeTree, id: 'sheet-rod', run: () => this.showRodPickerSheet() }
+        //    window's selection (spec 098 §10: in every tree with people in Family, Descendants and the fan, not
+        //    on the timeline, the map, the table; a tablet has it in its top bar).
+        const sel = getSelection().ref;
+        const selectionRow: ValueRow | undefined = isPhoneBar() && mode !== 'timeline' && mode !== 'map' && mode !== 'table' && selectionOffered()
+            ? { label: s.selection.row, value: sel ? selectionText(sel) : s.selection.none, id: 'sheet-rod', run: () => this.showSelectionSheet() }
             : undefined;
         // Full screen (spec 082 K1.3): only in the bottom-bar regime; on an iPhone the way to the Home Screen.
-        // Held sideways the sheet has no height to spare: there it joins the View line as a fourth tile.
+        // Held sideways the sheet has no height to spare: there it joins the View line as a fourth tile,
+        // and the selection closes that line (a row of its own would make the first level scroll).
         const fullscreen = isTabletOrMobile() ? currentFullscreenOffer() : null;
         const fullscreenRow: MenuRow | null = fullscreen ? {
             id: 'sheet-fullscreen',
@@ -473,7 +486,7 @@ export const bottomSheetMethods = uiModule({
             { label: s.viewModeSwitch.map, run: () => this.setDisplayViewMode('map'), active: mode === 'map' },
             { label: s.viewModeSwitch.timeline, run: () => this.setDisplayViewMode('timeline'), active: mode === 'timeline' },
             ...(fullscreenRow && sideways ? [fullscreenRow] : []),
-        ], valueRow: rodRow });
+        ], valueRow: selectionRow, valueInPair: sideways });
         if (fullscreenRow && !sideways) blocks.push({ rows: [fullscreenRow] });
 
         // 6) [Ancestor research · New] · "Tree: {name} ›" (every whole-tree action) · Add family.
@@ -584,6 +597,12 @@ export const bottomSheetMethods = uiModule({
                 label.appendChild(sub);
             }
             if (row.extra) label.appendChild(row.extra);
+            if (row.why) {
+                const why = document.createElement('span');
+                why.className = 'bottom-sheet-why';
+                why.textContent = row.why;
+                label.appendChild(why);
+            }
             btn.appendChild(label);
             if (row.treeId) btn.dataset.treeId = row.treeId;
             if (row.value) {
@@ -634,6 +653,10 @@ export const bottomSheetMethods = uiModule({
                 chevron.textContent = '›';
                 btn.appendChild(chevron);
                 btn.addEventListener('click', () => showSubPage(btn, page));
+                return btn;
+            }
+            if (row.disabled) {
+                btn.setAttribute('aria-disabled', 'true');
                 return btn;
             }
             btn.addEventListener('click', () => {
@@ -947,9 +970,10 @@ export const bottomSheetMethods = uiModule({
                     const btn = pairRow.appendChild(makeButton(row));
                     if (btn.classList.contains('sel-opt')) btn.dataset.selForm = 'tile';
                 }
+                if (block.valueRow && block.valueInPair) pairRow.appendChild(makeValueButton(block.valueRow));
                 list.appendChild(pairRow);
             }
-            if (block.valueRow) list.appendChild(makeValueButton(block.valueRow));
+            if (block.valueRow && !(block.valueInPair && block.pair)) list.appendChild(makeValueButton(block.valueRow));
         }
 
         overlay.appendChild(sheet);
@@ -1000,6 +1024,67 @@ export const bottomSheetMethods = uiModule({
         // Opened for the research (its state in the toolbar, a narrow window): straight on its page.
         if (opts.research) showResearchPage();
         requestAnimationFrame(() => overlay.classList.add('active'));
+    },
+
+    /**
+     * The sheet of the portrait picker (touch, a window up to 1024 px; spec
+     * 107): the same overlay, handle and swipe-down as the menu sheets, the
+     * person's name as its title (`titleHtml`: trusted markup), and an empty
+     * body the picker draws itself (returned). A phone held sideways shows it
+     * as a panel at the right.
+     */
+    presentPortraitSheet(titleHtml: string, opts: { label?: string; onClose?: () => void } = {}): HTMLElement {
+        const overlay = document.createElement('div');
+        overlay.className = 'bottom-sheet-overlay';
+        const sheet = document.createElement('div');
+        sheet.className = 'bottom-sheet bottom-sheet-menu portrait-pick-sheet';
+        sheet.setAttribute('role', 'dialog');
+        if (opts.label) sheet.setAttribute('aria-label', opts.label);
+        const handle = document.createElement('div');
+        handle.className = 'bottom-sheet-handle';
+        const title = document.createElement('div');
+        title.className = 'bottom-sheet-menu-title';
+        title.innerHTML = titleHtml;
+        const body = document.createElement('div');
+        body.className = 'portrait-pick-body';
+        sheet.append(handle, title, body);
+        overlay.appendChild(sheet);
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) this.hideBottomSheet();
+        });
+        // Swipe-down to dismiss (a swipe right on a phone held sideways), as the person sheet.
+        let startX = 0;
+        let startY = 0;
+        let dragging = false;
+        const side = (): boolean => typeof window.matchMedia === 'function' && window.matchMedia(MQ_PHONE_LANDSCAPE).matches;
+        sheet.addEventListener('touchstart', (e) => {
+            // The grid scrolls: a drag inside it moves it, not the sheet.
+            if ((e.target as Element | null)?.closest?.('.portrait-pick-grid') && sheet.scrollTop > 0) return;
+            startX = e.touches[0].clientX;
+            startY = e.touches[0].clientY;
+            dragging = true;
+            sheet.style.transition = 'none';
+        }, { passive: true });
+        sheet.addEventListener('touchmove', (e) => {
+            if (!dragging) return;
+            const d = side() ? e.touches[0].clientX - startX : e.touches[0].clientY - startY;
+            if (d > 0) sheet.style.transform = side() ? `translateX(${d}px)` : `translateY(${d}px)`;
+        }, { passive: true });
+        sheet.addEventListener('touchend', (e) => {
+            if (!dragging) return;
+            dragging = false;
+            sheet.style.transition = '';
+            const d = side() ? e.changedTouches[0].clientX - startX : e.changedTouches[0].clientY - startY;
+            if (d > SWIPE_CLOSE_PX) this.hideBottomSheet();
+            else sheet.style.transform = '';
+        });
+        this.noteBottomSheetTrigger();
+        this.hideBottomSheet();
+        document.body.appendChild(overlay);
+        this.bottomSheet = overlay;
+        this.bottomSheetOnClose = opts.onClose ?? null;
+        requestAnimationFrame(() => overlay.classList.add('active'));
+        return body;
     },
 
     /**

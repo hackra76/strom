@@ -7,7 +7,8 @@ import { migrateData } from '../data.js';
 import { exportToGedcom } from '../ged-exporter.js';
 import { parseGedcom, convertToStrom } from '../ged-parser.js';
 import { personMedia, mediaSourceId, allMedia } from '../media.js';
-import { STROM_DATA_VERSION, type PersonId, type StromData } from '../types.js';
+import { type PersonId, type StromData } from '../types.js';
+import { STROM_DATA_VERSION } from '../version.js';
 import { ORIGINAL_ONLY_DATA_URL } from '../validation.js';
 
 const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -42,8 +43,8 @@ function v23Tree(): Record<string, unknown> {
 }
 
 describe('data v24: StromData.media', () => {
-    it('is the current data version', () => {
-        expect(STROM_DATA_VERSION).toBe(24);
+    it('is in the current data version', () => {
+        expect(STROM_DATA_VERSION).toBeGreaterThanOrEqual(24);
     });
 
     it('moves the attachments into records with their places, the source as a place', () => {

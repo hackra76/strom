@@ -3,6 +3,17 @@
  * Branded types for type-safe IDs and comprehensive interfaces
  */
 
+// Only types live here: a change to this file needs the typecheck, not the
+// tests that run the code. Runtime values and helpers of the model are in
+// src/ids.ts, src/model-values.ts, src/layout-config.ts and src/version.ts
+// (STROM_DATA_VERSION with its history, APP_VERSION).
+import type { LAST_FOCUSED, PARTNERSHIP_CITATION_FIELDS, PERSON_CITATION_FIELDS } from './model-values.js';
+
+// Kept for readers outside the app that take the data version of a checkout
+// from this file (the research's tests of the app's GEDCOM path). App code
+// imports it from src/version.ts, so no module of the app loads this file.
+export { STROM_DATA_VERSION } from './version.js';
+
 // ==================== BRANDED TYPES ====================
 
 /** Branded type for Person IDs - prevents mixing with other string IDs */
@@ -10,64 +21,6 @@ export type PersonId = string & { readonly __brand: 'PersonId' };
 
 /** Branded type for Partnership IDs */
 export type PartnershipId = string & { readonly __brand: 'PartnershipId' };
-
-/** Helper to create a PersonId from string */
-export function toPersonId(id: string): PersonId {
-    return id as PersonId;
-}
-
-/** Helper to create a PartnershipId from string */
-export function toPartnershipId(id: string): PartnershipId {
-    return id as PartnershipId;
-}
-
-let idSeq = 0;
-
-/**
- * The end of a generated id: a counter of this page, then randomness. The
- * counter makes ids made within one millisecond unique (a GEDCOM import makes
- * thousands at once, and 5 random characters alone collided: a person lost);
- * the randomness keeps two windows apart.
- */
-export function uniqueIdSuffix(): string {
-    idSeq = (idSeq + 1) % 1679616;
-    return `${idSeq.toString(36).padStart(4, '0')}${Math.random().toString(36).slice(2, 7)}`;
-}
-
-/** Generate unique PersonId */
-export function generatePersonId(): PersonId {
-    return `p_${Date.now()}_${uniqueIdSuffix()}` as PersonId;
-}
-
-/** Generate unique PartnershipId */
-export function generatePartnershipId(): PartnershipId {
-    return `u_${Date.now()}_${uniqueIdSuffix()}` as PartnershipId;
-}
-
-/** Generate unique LifeEvent id */
-export function generateLifeEventId(): string {
-    return `ev_${Date.now()}_${uniqueIdSuffix()}`;
-}
-
-/** Generate unique EventParticipant id */
-export function generateParticipantId(): string {
-    return `pt_${Date.now()}_${uniqueIdSuffix()}`;
-}
-
-/** Generate unique Source id */
-export function generateSourceId(): string {
-    return `src_${Date.now()}_${uniqueIdSuffix()}`;
-}
-
-/** Generate unique SourceExcerpt id */
-export function generateExcerptId(): string {
-    return `exc_${Date.now()}_${uniqueIdSuffix()}`;
-}
-
-/** Generate unique Attachment id */
-export function generateAttachmentId(): string {
-    return `att_${Date.now()}_${uniqueIdSuffix()}`;
-}
 
 // ==================== CORE ENTITIES ====================
 
@@ -79,53 +32,6 @@ export type Gender = 'male' | 'female' | 'unknown';
 
 /** Shape of the lineage marker on cards (spec 112, R1); 'none' draws none. */
 export type BranchMarker = 'arc' | 'tag' | 'stripe' | 'corner' | 'none';
-export const BRANCH_MARKERS: readonly BranchMarker[] = ['arc', 'tag', 'stripe', 'corner', 'none'];
-
-/** Every value of Gender, in the order the person dialog offers them. */
-export const GENDERS: readonly Gender[] = ['male', 'female', 'unknown'];
-
-/** True for a value of Gender (data from a file, a form, an older app). */
-export function isGender(value: unknown): value is Gender {
-    return value === 'male' || value === 'female' || value === 'unknown';
-}
-
-/** The other sex of a couple: male ↔ female; unknown stays unknown. */
-export function oppositeGender(gender: Gender | undefined): Gender {
-    return gender === 'male' ? 'female' : gender === 'female' ? 'male' : 'unknown';
-}
-
-/**
- * Two persons who may be the same one as far as their sex goes: the same
- * sex, or either of them unknown (merge, duplicate matching).
- */
-export function gendersCompatible(a: Gender | undefined, b: Gender | undefined): boolean {
-    return a === b || a === 'unknown' || b === 'unknown' || a === undefined || b === undefined;
-}
-
-/**
- * The two sides of a couple, left (the father's / husband's side) and right:
- * a man on the left, a woman on the right, a person of unknown sex on the
- * side the other one leaves free; two of one sex, or two unknown, keep the
- * order they are given in.
- */
-export function coupleSides<T extends { gender?: Gender }>(a: T, b: T): [T, T] {
-    if (a.gender === 'male' && b.gender !== 'male') return [a, b];
-    if (b.gender === 'male' && a.gender !== 'male') return [b, a];
-    if (b.gender === 'female' && a.gender !== 'female') return [a, b];
-    if (a.gender === 'female' && b.gender !== 'female') return [b, a];
-    return [a, b];
-}
-
-/**
- * A person's (first two) parents in the father's and the mother's slot, by
- * the rule of coupleSides; one parent alone stands in the father's slot
- * unless she is a woman.
- */
-export function parentSlots<T extends { gender?: Gender }>(parents: readonly T[]): [T | null, T | null] {
-    if (parents.length === 0) return [null, null];
-    if (parents.length === 1) return parents[0].gender === 'female' ? [null, parents[0]] : [parents[0], null];
-    return coupleSides(parents[0], parents[1]);
-}
 
 export type PartnershipStatus = 'married' | 'partners' | 'divorced' | 'separated';
 
@@ -166,9 +72,6 @@ export type LifeEventType =
  */
 export type ParticipantRole = 'godparent' | 'witness' | 'officiant' | 'other';
 
-/** Every participant role, in the order the editor offers them. */
-export const PARTICIPANT_ROLES: readonly ParticipantRole[] = ['godparent', 'witness', 'officiant', 'other'];
-
 /**
  * Someone present at an event besides its subject.
  *
@@ -201,14 +104,6 @@ export interface EventParticipant {
  * and a new version of the research replaces it.
  */
 export type FactStatus = 'lead' | 'possible' | 'probable' | 'proven';
-
-export const FACT_STATUSES: readonly FactStatus[] = ['lead', 'possible', 'probable', 'proven'];
-
-/** The status a `_STROM_STATUS` value names, or undefined for one the app does not know. */
-export function parseFactStatus(value: string | undefined): FactStatus | undefined {
-    const v = value?.trim().toLowerCase();
-    return (FACT_STATUSES as readonly string[]).includes(v ?? '') ? v as FactStatus : undefined;
-}
 
 /** One more family a GEDCOM file recorded a person in as a child (Person.alsoChildOf). */
 export interface AlsoChildOf {
@@ -382,9 +277,6 @@ export interface SourceExcerpt {
     orient?: number;
 }
 
-/** The UI offers at most this many excerpts per source (an entry across a page break). */
-export const MAX_EXCERPTS_UI = 2;
-
 /**
  * A source/citation entry. Sources are a per-tree catalog (StromData.sources);
  * persons, events and partnerships reference them by id via sourceIds, so one
@@ -414,6 +306,15 @@ export interface Source {
      * "34a"; text, spec 075, data v18). GEDCOM `1 _STROM_IMAGE`.
      */
     image?: string;
+    /**
+     * The image number is the research's, found from the scans it keeps of the
+     * entry, not written by anyone (GEDCOM `2 _STROM_DERIVED Y` under
+     * `_STROM_IMAGE`). The location may then name another image (an index's
+     * page) on purpose: composing the PAGE cuts nothing of it, it only adds
+     * the image when the location does not say it (src/source-location.ts).
+     * Dropped when the image is changed by hand.
+     */
+    imageDerived?: boolean;
     /**
      * "Further location" — the rest of where the entry stands (its number, a
      * column) when the source has any of callNumber / folio / image; without
@@ -712,6 +613,14 @@ export interface Person {
     /** The research's status of the birth and of the death fields (see FactStatus). */
     birthStatus?: FactStatus;
     deathStatus?: FactStatus;
+    /**
+     * The research's status of the name (fact `name`, `_STROM_STATUS` under the
+     * primary NAME of the research's or the app's own file); read, shown and
+     * sent back as it came, never worked out here.
+     */
+    nameStatus?: FactStatus;
+    /** …and of the name after marriage (the NAME with TYPE married that gave marriedSurname): shown quietly, no mark of the card. */
+    marriedNameStatus?: FactStatus;
     /**
      * Dates as the GEDCOM file wrote them, by their flex value, where the
      * app's own form would write them differently ('CAL 1885' is '~1885',
@@ -1253,6 +1162,12 @@ export interface ResearchConflictValue {
     side?: 'user' | 'research';
     /** The sex as a machine value (GEDCOM 3 _STROM_RAW), SEX conflicts only: the value itself is in the research's words. */
     raw?: 'M' | 'F' | 'U';
+    /**
+     * Sources it stood on that the person deleted in the research (GEDCOM
+     * 3 _STROM_RETRACTED S0042, in place of its 3 SOUR; spec 117 §8): the
+     * value stays shown, its source as retracted.
+     */
+    retracted?: string[];
 }
 
 /** Sources that disagree about one fact. */
@@ -1276,6 +1191,13 @@ export interface ResearchConflict {
     take?: true;
     /** Whose value the research proposes to change (GEDCOM 2 _STROM_KIND): from the family tree, or entered by a person. */
     kind?: 'import' | 'user';
+    /**
+     * To be looked at again, as the research wrote it (GEDCOM 2 _STROM_REVIEW):
+     * `source.retracted` (CONFLICT_REVIEW_SOURCE_RETRACTED) when a source it
+     * stood on was deleted; a word the app does not know reads as a plain
+     * "to review". Open or decided alike; its state stays (spec 117 §8).
+     */
+    review?: string;
 }
 
 /** A question the research works with ("Father: Václav, or Jan?"). */
@@ -1659,8 +1581,6 @@ export type PartnershipUpdates = Partial<Pick<Partnership,
 
 // ==================== LAST FOCUSED MARKER ====================
 
-/** Special marker value for "last focused" default setting */
-export const LAST_FOCUSED = "__last_focused__" as const;
 export type LastFocusedMarker = typeof LAST_FOCUSED;
 
 /**
@@ -1685,185 +1605,9 @@ export type CitationQuay<F extends string = string> = Partial<Record<F, Record<s
  */
 export type CitationMain<F extends string = string> = Partial<Record<F, string>>;
 
-/** A person's citation lists: the person as a whole, the birth, the death. */
-export const PERSON_CITATION_FIELDS = ['sourceIds', 'birthSourceIds', 'deathSourceIds'] as const;
 export type PersonCitationField = typeof PERSON_CITATION_FIELDS[number];
 
-/** Every source a person's own citations name (the person, the birth, the death), once each. */
-export function personSourceIds(p: Pick<Person, PersonCitationField>): string[] {
-    return [...new Set(PERSON_CITATION_FIELDS.flatMap(f => p[f] ?? []))];
-}
-
-/** A couple's citation lists: the union itself (the wedding), the divorce. */
-export const PARTNERSHIP_CITATION_FIELDS = ['sourceIds', 'divorceSourceIds'] as const;
 export type PartnershipCitationField = typeof PARTNERSHIP_CITATION_FIELDS[number];
-
-/** Every source a couple's citations name (the union itself, the divorce and each of its events), once each. */
-export function partnershipSourceIds(u: Partial<Pick<Partnership, PartnershipCitationField | 'events'>>): string[] {
-    return [...new Set([...PARTNERSHIP_CITATION_FIELDS.flatMap(f => u[f] ?? []), ...(u.events ?? []).flatMap(e => e.sourceIds ?? [])])];
-}
-
-/** Everyone a couple's records name: the wedding witnesses and the people at each of its events. */
-export function partnershipParticipants(u: Pick<Partnership, 'participants' | 'events'>): EventParticipant[] {
-    return [...(u.participants ?? []), ...(u.events ?? []).flatMap(e => e.participants ?? [])];
-}
-
-/**
- * Current StromData format version.
- * v2 (2026-07): added optional Person.events (life events).
- * v3 (2026-07): added the per-tree source catalog (StromData.sources) and
- * citation ids (Person.sourceIds, LifeEvent.sourceIds).
- * v4 (2026-07): added Person.attachments (inline documents).
- * v5 (2026-07): added Person.parentRelTypes (adoptive/step/foster links).
- * v6 (2026-08): added Partnership.participants (wedding witnesses) and
- *   Person.story / Partnership.story (narratives, GEDCOM _STORY).
- * v7 (2026-09): register entries on sources — Source.transcript / recordDate /
- *   excerpts / refn; Attachment.note / sourceId. An older app keeps them when
- *   it only reads, but its source editor would rebuild a source without them.
- * v8 (2026-09): Person.birthSourceIds / deathSourceIds — the birth and death
- *   fields cited on their own (GEDCOM BIRT.SOUR / DEAT.SOUR used to land in
- *   Person.sourceIds, so a name citation looked like a documented birth).
- * v9 (2026-10): register details — Person.birthAddress / deathCause /
- *   deathAge / deathAddress; LifeEvent.cause / age / address;
- *   Partnership.address / ages / endPlace (the divorce place); the waiting
- *   new version of an approved story (Story.draft).
- * v10 (2026-10): the couple's own events — Partnership.events (banns, a
- *   marriage contract, a census of the household…), which used to be folded
- *   into the couple's note as text lines.
- * v11 (2026-10): Source.transcriptVerified (the user read the transcript
- *   from the record — the research's first reading) and Source.readBy (who
- *   read the entry, from the research); the research's certainty of a fact
- *   (FactStatus: Person.birthStatus / deathStatus, LifeEvent.status); the
- *   original behind an image (Attachment.original, Attachment.originalOnly —
- *   kept as an original only, no picture in the tree — SourceExcerpt.originalSha
- *   and .orient).
- * All additive/backward-compatible for reading; the bump makes an older app
- * warn ("newer version") before it silently drops the new fields on re-save.
- * 3.8.x (v10) keeps the v11 fields on a round trip: an attachment kept as an
- * original only carries a page icon as its data (ORIGINAL_ONLY_DATA_URL), which
- * 3.8.x keeps (it drops an attachment without image or PDF data);
- * transcriptVerified stays on a transcript edited in 3.8.x.
- * Person.titleBefore / titleAfter (3.10) came without a bump: an older app
- * carries persons whole (migrateData) and edits them in place (updatePerson),
- * so it keeps the titles on a re-save; it only shows the name without them.
- * Person.marriedSurname (3.13) likewise came without a bump: an older app keeps
- * it on a re-save and reads the married name as another spelling meanwhile.
- * Person.primaryName (3.18) came without a bump too: an older app keeps it on a
- * re-save (persons carried whole) and shows the married surname meanwhile; its
- * GEDCOM import skips `_STROM_PRIMARY` under a NAME silently and its export
- * does not write it (the research takes the missing mark as no change).
- * Person.dismissedMarriedSuggestion (3.13, app-local) the same way.
- * Person.marriedFirstName (3.26) came without a bump too: an older app keeps
- * it on a re-save and shows the married name with the person's own given
- * name meanwhile; its GEDCOM export writes that name so.
- * Source.reading / readingEntry / readingSha (3.14) came without a bump too: an
- * older app loads sources whole (migrateData) and edits them in place
- * (updateSource), so it keeps the reading's marks on a re-save. Its merge keeps
- * them on a source it adds but not when it folds a duplicate into the tree's
- * own entry, and its GEDCOM export does not write them: the research then takes
- * that entry as a source of the app's, not as the reading's entry (harmless).
- * v12 (2026-10): Gender 'unknown' (GEDCOM SEX U, or no SEX): a sex the records
- *   do not give, no longer guessed from the family role (or female). Older
- *   data keeps its male/female; a missing or invalid gender reads as unknown
- *   (migrateData). An older app (v11) warns before it shows 'unknown' as male.
- * v13 (2026-10, spec 021): StromData.qualityDismissed (findings of the tree
- *   check marked "not an error" / "two different people") and
- *   StromData.surnameRejections (spelling groups the research suggested and
- *   the user rejected). Both tree-level lists, additive; an older app (v12)
- *   would drop them on a re-save (migrateData builds field by field), so the
- *   bump makes it warn first.
- *   Also v13 (before it reached production): a period date ('1871/1882',
- *   '1871/', '/1882' — GEDCOM FROM/TO, before read as the range '..' or as
- *   '>'/'<') and Person/Partnership.gedcomDates (the file's own form of a
- *   date, see there). A v12 app reads neither: it shows the period as
- *   written and drops it from its GEDCOM export — hence under the same warning.
- * v14 (2026-10, package 1031): StromData.lineageOverrides (a lineage's
- *   founder moved down, a line split off by hand). A tree-level field; an
- *   older app (v13) would drop it on a re-save (migrateData builds field by
- *   field), so the bump makes it warn first.
- * v15 (2026-11, spec 066): StromData.imports (the GEDCOM files loaded into
- *   the tree) and the origin of facts and links from them
- *   (Person/Partnership.importedValues, importId, Person.importedParents,
- *   Source.importId), plus the research's origin of facts (researchOrigins,
- *   ResearchConflict.kind), and the records' ids in the loaded files
- *   (Person/Partnership.originalIds: xref, _UID, RIN, EXID…) and another
- *   program's own level-1 tags kept for "Back to {prog}"
- *   (Person/Partnership/Source.gedcomExtra; the source's came after
- *   3.26.0-beta.2 without a bump: a v15 app keeps sources whole) and a
- *   picture's date (Attachment.date, Person.photoDate, kept whole the same
- *   way). Additive;
- *   existing trees get no origin and no ids (nothing is guessed). An older
- *   app (v14) would drop imports on a re-save.
- * v16 (2026-11, spec 065): Person/Partnership.confirmed (facts confirmed by
- *   hand from a scan, each with its day and the value it was confirmed with)
- *   and Person/Partnership.researchVerify (the research's re-verification of
- *   facts: confirmed, waiting, last checked). Additive; existing trees get
- *   neither. An older app (v15) keeps persons whole but would show a
- *   confirmed fact as unconfirmed and drop the mark from its GEDCOM export,
- *   so the bump makes it warn first. The value the research's confirmation
- *   holds for (ResearchFactVerify.value) came within v16 without a bump: an
- *   entry without it is filled when the tree is read, from the research's
- *   kept copy of the tree, else from the current value.
- * v17 (2026-11, spec 073): StromData.tableViews (saved views of the Table
- *   view). Additive; existing trees get none. An older app (v16) ignores the
- *   field and would drop it on a re-save, so the bump makes it warn first.
- * v18 (2026-11, spec 075): Source.callNumber, Source.folio, Source.image
- *   (where the entry stands, field by field); Source.reference is then the
- *   rest of the location. Additive: an existing source keeps its whole
- *   location in reference, nothing is split by itself. An older app (v17)
- *   keeps sources whole but would write neither the folio nor the image to
- *   its GEDCOM export (only the reference), so the bump makes it warn first.
- * v19 (2026-11, spec 077): the reliability of a single citation
- *   (Person/Partnership/LifeEvent/CoupleEvent.citationQuay) where it differs
- *   from its source's; Source.quality is the source's default. A page cited
- *   with another QUAY is no longer a source of its own: the sources an import
- *   of 3.26 made only for that are joined back into their entry when the
- *   tree is read (src/citation-quality.ts, a backup first). An older app
- *   (v18) would show and export the source's QUAY at every citation, so the
- *   bump makes it warn first.
- * v20 (2026-11, spec 085): one event of several persons (a census household,
- *   a residence, a move): a copy at each person with a common
- *   LifeEvent.shareId (+ the copy's own shareRole), written to every copy at
- *   once (src/shared-events.ts); a person's own record of a part at
- *   another's event (LifeEvent.roleAt, types 'godparent' / 'weddingWitness');
- *   EventParticipant.linkRejected. Nothing is joined by itself: copies that
- *   are the same stay separate events; invalid shares and roles are cleaned
- *   when the tree is read, a backup is taken first. An older app (v19) would
- *   edit one copy alone and the copies would go apart, so the bump makes it
- *   open the tree read-only.
- * v22 (2026-11, spec 084): StromData.personLists (named lists of people,
- *   fixed or automatic by a rule) and StromData.personListsDropped (the
- *   ready-made "Added in the last 30 days" deleted), Person.addedAt (when a
- *   person came into the tree), TableView.scope and TableView.group.
- *   Additive: nothing is computed for older trees (people without addedAt
- *   are "earlier"; the ready-made list exists without being stored, see
- *   src/person-lists.ts). An older app (v21) would drop the lists on a
- *   re-save, so the bump makes it warn first.
- * v21 (2026-11, spec 095): the main citation of a fact
- *   (Person/Partnership/LifeEvent/CoupleEvent.citationMain), chosen by hand,
- *   and the events a source records (Source.events, GEDCOM EVENTS_RECORDED
- *   `1 DATA / 2 EVEN`), by which the citations of a fact are ordered when
- *   shown and exported (src/citation-order.ts; the stored lists are never
- *   reordered). Additive: nothing is changed when a tree is read. An older
- *   app (v20) would show the automatic first citation and drop the choice on
- *   a re-save, so the bump makes it warn first.
- * v23 (2026-11, spec 107): Person.photoSource (the original a portrait was
- *   cut from — an image attachment of the person or a union's photo — with the
- *   crop, JSON only) and Partnership.photo / photoOriginalName / photoDate
- *   (the couple's photo, GEDCOM `FAM > OBJE`). Additive: a tree of v22 reads
- *   unchanged, nothing is made. An older app (v22) would drop the couple's
- *   photo and the portraits' originals on a re-save, so the bump makes it
- *   warn first.
- * v24 (2026-11, spec 102): the tree's files are records of their own
- *   (StromData.media, one record per file) with the places where each is in
- *   the tree (a person, a fact or event, a couple, a source), a title, a
- *   kind and who gave them; Person.attachments and Attachment.sourceId go:
- *   a tree of v23 is moved over when read (each attachment a record at its
- *   person and its source; the same file at several people one record).
- *   An older app (v23) would find no attachments and drop them on a
- *   re-save, so the bump makes it warn first.
- */
-export const STROM_DATA_VERSION = 24;
 
 /** The rows of a saved Table view (spec 073 §2; events and sources come later). */
 export type TableViewRowType = 'persons' | 'unions' | 'events' | 'sources';
@@ -2214,9 +1958,6 @@ export interface StromData {
  */
 export type ViewMode = 'family' | 'descendants' | 'timeline' | 'fan' | 'map' | 'table';
 
-/** Views drawn by something other than the layout pipeline (own containers). */
-export const STANDALONE_VIEWS: readonly ViewMode[] = ['timeline', 'fan', 'map', 'table'];
-
 // ==================== UI TYPES ====================
 
 export type RelationType = 'parent' | 'child' | 'partner' | 'sibling';
@@ -2273,12 +2014,6 @@ export type LayoutUnit = FamilyUnit | SingleUnit;
 /** Application mode - PWA on stromapp.info, embedded HTML file, or dev server */
 export type AppMode = 'pwa' | 'embedded' | 'dev';
 
-/** PWA hostname for mode detection */
-export const PWA_HOSTNAME = 'stromapp.info';
-
-/** Pre-release test site: the beta PWA on its own origin (own storage) */
-export const BETA_HOSTNAME = 'beta.stromapp.info';
-
 // ==================== CONFIGURATION ====================
 
 export interface LayoutConfig {
@@ -2319,16 +2054,6 @@ export interface LayoutConfig {
     roomBelow?: ReadonlyArray<{ personIds: ReadonlySet<PersonId>; px: number }>;
 }
 
-/** The partner line's distance from the card's top: the set offset, else the card's middle. */
-export function spouseLineOffset(config: Pick<LayoutConfig, 'cardHeight' | 'spouseLineY'>): number {
-    return config.spouseLineY ?? config.cardHeight / 2;
-}
-
-/** The height of one person's card: its own (personHeights), else cardHeight. */
-export function personCardHeight(config: Pick<LayoutConfig, 'cardHeight' | 'personHeights'>, personId: PersonId): number {
-    return config.personHeights?.get(personId) ?? config.cardHeight;
-}
-
 /**
  * How much a person card shows (src/card-fields.ts CARD_DENSITIES). Compact
  * and Normal are cards of a fixed size (CARD_SIZE: the layout engine must be
@@ -2338,56 +2063,10 @@ export function personCardHeight(config: Pick<LayoutConfig, 'cardHeight' | 'pers
  */
 export type CardDensity = 'compact' | 'normal' | 'detailed' | 'register' | 'custom';
 
-/**
- * Card box per fixed density. Keys match LayoutConfig on purpose so the values can be
- * spread straight into it — with `width`/`height` names the spread silently did
- * nothing and the engine kept spacing for the default card.
- * MUST match the CSS for .person-card at each density.
- */
-export const CARD_SIZE: Record<'compact' | 'normal', Pick<LayoutConfig, 'cardWidth' | 'cardHeight'>> = {
-    // "Letopis" card: a 34px avatar + a two-row text column (name + meta).
-    // compact drops the avatar and meta (names only), so it is shorter and
-    // narrower. MUST match the CSS for .person-card at each density.
-    compact: { cardWidth: 150, cardHeight: 44 },
-    normal: { cardWidth: 188, cardHeight: 64 },
-};
-
 /** Settings → Person card → Photo on the card (spec 096): its size; small = the card as it always was. */
 export type CardPhotoSize = 'small' | 'medium' | 'large';
 /** The photo's (and the initials') shape on the card. */
 export type CardPhotoShape = 'circle' | 'rounded';
-
-/**
- * The Normal card's box per photo size of the view (spec 096 §2): the card's
- * width and base height, the avatar's size and the card's side padding on a
- * card with an avatar, a photo or the initials alike (spec 103 K2.1). A view
- * takes the medium or large box only when someone drawn in it has an avatar
- * (renderer.ts viewHasAvatar), else the small one, which is CARD_SIZE.normal.
- * The text column beside the avatar is 126px in every size (src/card-width.ts
- * normalCardTextWidth). A large card with an avatar is 96px tall through
- * LayoutConfig.personHeights (the view's cardHeight stays 64; a placeholder
- * 64). MUST match index.html body[data-card-photo].
- */
-export const NORMAL_PHOTO_BOX: Record<CardPhotoSize, { cardWidth: number; cardHeight: number; avatar: number; padX: number }> = {
-    small: { cardWidth: 188, cardHeight: 64, avatar: 34, padX: 9 },
-    medium: { cardWidth: 200, cardHeight: 64, avatar: 48, padX: 8 },
-    large: { cardWidth: 236, cardHeight: 96, avatar: 80, padX: 10 },
-};
-
-export const DEFAULT_LAYOUT_CONFIG: LayoutConfig = {
-    cardWidth: 188,
-    cardHeight: 64,
-    horizontalGap: 31,
-    verticalGap: 80,
-    // Kept comfortably above horizontalGap/2 (the overlap-check minGap): the
-    // +16 horizontalGap bump for the 188px card pushed minGap to 15.5. Couples
-    // sit partnerGap apart and V-fan ancestor trees lean to ~partnerGap-1.5 at
-    // their inner leaves, so 18 keeps every partner/inner-leaf pair a real,
-    // valid distance apart.
-    partnerGap: 18,
-    padding: 50,
-    minEdgeClearance: 14
-};
 
 /**
  * Spacing of the tree view (Settings → Person card → Spacing): the normal
@@ -2395,24 +2074,6 @@ export const DEFAULT_LAYOUT_CONFIG: LayoutConfig = {
  * into the view. A setting of this device, never stored with the tree data.
  */
 export type TreeSpacing = 'normal' | 'dense';
-
-/**
- * The dense spacing: the same cards, smaller gaps. Everything derived from
- * the gaps (couple and chain widths, generation bands, the bus in the middle
- * of a gap) follows by itself; `dense` caps the bus lanes (step 7).
- */
-export const DENSE_LAYOUT_CONFIG: LayoutConfig = {
-    ...DEFAULT_LAYOUT_CONFIG,
-    horizontalGap: 20,
-    verticalGap: 48,
-    partnerGap: 14,
-    dense: true,
-};
-
-/** The layout configuration of a spacing (card size still to be spread over it). */
-export function layoutConfigFor(spacing: TreeSpacing): LayoutConfig {
-    return spacing === 'dense' ? DENSE_LAYOUT_CONFIG : DEFAULT_LAYOUT_CONFIG;
-}
 
 // ==================== AUDIT LOG ====================
 
@@ -2484,15 +2145,6 @@ export interface AuditLog {
 
 // ==================== EMBEDDED DATA ENVELOPE ====================
 
-/**
- * Current app version, shown in the About dialog and stamped into exports.
- * Injected from package.json at build time (see scripts/bundle.js); the literal
- * fallback is used only for dev builds and tests where no define is set and
- * should be kept in sync with package.json.
- */
-declare const __APP_VERSION__: string | undefined;
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '3.30.0';
-
 /** Envelope wrapping embedded data in exported HTML files */
 export interface EmbeddedDataEnvelope {
     /** Unique export ID for deduplication */
@@ -2524,23 +2176,7 @@ export interface EncryptedDataRef {
     data: string;
 }
 
-/** Generate unique export ID */
-export function generateExportId(): string {
-    return `exp_${Date.now()}_${uniqueIdSuffix()}`;
-}
-
-/** Check if object is an embedded data envelope */
-export function isEmbeddedEnvelope(obj: unknown): obj is EmbeddedDataEnvelope {
-    return obj !== null &&
-        typeof obj === 'object' &&
-        'exportId' in obj &&
-        'data' in obj &&
-        'appVersion' in obj;
-}
-
 // ==================== SETTINGS ====================
-
-export const SETTINGS_KEY = 'strom-settings';
 
 export type ThemeMode = 'light' | 'dark' | 'system';
 
@@ -2553,34 +2189,7 @@ export type ThemeMode = 'light' | 'dark' | 'system';
 export type SurnameDisplay = 'birth' | 'both' | 'married';
 /** Which surname a person goes by (Person.primaryName): the birth one or the married one. */
 export type PrimaryName = 'birth' | 'married';
-/** Whether a value is a valid Person.primaryName. */
-export function isPrimaryName(v: unknown): v is PrimaryName {
-    return v === 'birth' || v === 'married';
-}
 
-/**
- * Which surname a person kept by a merge goes by (Person.primaryName): the
- * choice travels with the married surname the kept person ends up with.
- * `keptMarriedBefore` is the kept person's married surname before the merge.
- * When it stayed, her own choice stays, and without one the other person's
- * comes along if its married surname is the same; when the other person's
- * married surname replaced it (filled a gap or won a conflict), the other's
- * choice comes along, her own one stays without it. Never one without a
- * married surname.
- */
-export function mergedPrimaryName(
-    kept: Pick<Person, 'marriedSurname' | 'primaryName'>,
-    other: Pick<Person, 'marriedSurname' | 'primaryName'>,
-    keptMarriedBefore: string | undefined,
-): PrimaryName | undefined {
-    const married = kept.marriedSurname?.trim();
-    if (!married) return undefined;
-    const own = isPrimaryName(kept.primaryName) ? kept.primaryName : undefined;
-    const theirs = isPrimaryName(other.primaryName) && other.marriedSurname?.trim() === married ? other.primaryName : undefined;
-    if (keptMarriedBefore?.trim() === married) return own ?? theirs;
-    return theirs ?? own;
-}
-export const SURNAME_DISPLAYS: readonly SurnameDisplay[] = ['birth', 'both', 'married'];
 export type LanguageSetting = 'sk' | 'en' | 'cs' | 'de' | 'pl' | 'system';
 
 export interface AppSettings {
@@ -2611,9 +2220,25 @@ export interface AppSettings {
      * Per tree (spec 020 K4.5): the card timeline's default set in the tree's settings; absent = the two values above.
      * `kinds` (K8.6): only the kinds of history this tree shows otherwise than the three values below.
      */
-    lifelineByTree?: Record<string, { childEvents?: boolean; history?: boolean; kinds?: { region?: boolean; place?: boolean; local?: boolean } }>;
-    /** Per tree (spec 039): the family line chosen in the tree view (its id), kept until ended by ×. A view setting of this device, not tree data. */
+    lifelineByTree?: Record<string, {
+        childEvents?: boolean; history?: boolean; kinds?: { region?: boolean; place?: boolean; local?: boolean };
+        /** The Timeline's history options (spec 121 §0): the kinds and the region shown, local history on the life lines. */
+        timeline?: { kinds?: string[]; region?: string; local?: boolean };
+    }>;
+    /** Before spec 098 (read once, moved to selectionByTree): the family line chosen in the tree view, per tree. */
     rodByTree?: Record<string, string>;
+    /**
+     * Per tree (spec 098 §7): the main window's selection of people and its "Hide others", kept until cleared.
+     * A view setting of this device, never tree data. The ref is checked when read (src/view-selection.ts).
+     */
+    selectionByTree?: Record<string, { ref: unknown; hideOthers?: boolean }>;
+    /** Before spec 098 §11 (read once, moved to scopeByTree[tree].map): the map's scope per tree. */
+    mapScopeByTree?: Record<string, string>;
+    /**
+     * Per tree and view (spec 098 §7, §11): the scope of the Map, the Timeline and the Table,
+     * 'view' | 'sel' | 'tree'; a view's default (Map, Timeline 'view', Table 'tree') is not stored.
+     */
+    scopeByTree?: Record<string, { map?: string; timeline?: string; table?: string }>;
     historyKindRegion?: boolean;  // default: true - the card's timeline shows regional history (spec 1028 §6)
     historyKindPlace?: boolean;   // default: true - the card's timeline shows the history of a place (with history.place)
     historyKindLocal?: boolean;   // default: true - the card's timeline shows findings from the research's sources
@@ -2654,16 +2279,6 @@ export interface AppSettings {
 
 /** Branded type for Tree IDs */
 export type TreeId = string & { readonly __brand: 'TreeId' };
-
-/** Helper to create a TreeId from string */
-export function toTreeId(id: string): TreeId {
-    return id as TreeId;
-}
-
-/** Generate unique TreeId */
-export function generateTreeId(): TreeId {
-    return `tree_${Date.now()}_${uniqueIdSuffix()}` as TreeId;
-}
 
 /** Metadata for a tree (lightweight, always in memory) */
 export interface TreeMetadata {
@@ -2717,6 +2332,12 @@ export interface TreeMetadata {
      * them Unknown the same way when it is restored (N31).
      */
     legacySexU?: { map: Record<string, string>; at: number };
+    /**
+     * Images of the research's version that had not come when the tree was
+     * stored (spec 116, I1): by their place in the tree, what the next
+     * connect to the research asks for. Gone once they came.
+     */
+    pendingImages?: import('./image-loads.js').PendingImageNotes;
     /**
      * The tree was downloaded to move to another browser for the research
      * (research-transfer.ts), or from a phone to a computer (`mobile`). The
@@ -2780,6 +2401,13 @@ export interface ResearchLink {
     copy?: boolean;
     /** The last send straight to the bridge and what became of it (a research that announces `accepts`). */
     sent?: ResearchSend;
+    /**
+     * Sources the person deleted in edit mode, by their research id (S0042;
+     * spec 117 §4): told to a research that retracts sources
+     * (`_STROM_SOURCE_DELETED`) until it says it did (`retracted` of `/sync`
+     * or `/status.sends`). Survives updates from the research.
+     */
+    deletedSources?: string[];
     /**
      * The bridge refused the last send at once, with its reason (cleared by the next good send or an update).
      * `held`: refused for what the research itself has to settle first (sealed elsewhere, files not downloaded,

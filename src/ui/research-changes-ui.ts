@@ -15,13 +15,15 @@ import { strings, getCurrentLanguage } from '../strings.js';
 import { Person, PersonId, StromData, TreeId } from '../types.js';
 import { formatLiveClock } from '../live-time.js';
 import {
-    ChangeKind, PersonChange, diffByPerson, baseCopy, diffOther, otherRowCount, previewInexact, OtherChanges, SourceChange, CoupleChange,
-    SourceChangeKind, CoupleChangeKind, PlaceChange, VariantChange, SentOtherRow, sentOtherRows, sanitizeSentOtherRow,
+    ChangeKind, PersonChange, diffByPerson, baseCopy, diffOther, otherRowCount, previewInexact, previewNothing, OtherChanges, SourceChange, CoupleChange,
+    SourceChangeKind, CoupleChangeKind, PlaceChange, VariantChange, SentOtherRow, sentOtherRows, sanitizeSentOtherRow, withRetractedRows,
     sourceAppOnly, coupleAppOnly, placesAppOnly, variantsAppOnly, lineageAppOnly, pairNotWritten, RESEARCH_UNREAD_KINDS,
     NotWrittenItem, PairedNotWritten, withWrittenMedia, MEDIA_APP_READ_KINDS, gateMediaChanges, docSentRows, type MediaWrites,
+    splitPersonAppOnly, personAppOnly,
 } from '../research-changes.js';
 import { lifeEventLabel } from '../person-sources.js';
 import { researchKeepsAppMedia, MATERIAL_LINKS_FEATURE, type SyncMediaWritten } from '../research-link.js';
+import { deletedSourcesToSend, sourceRestoreOffered } from '../source-retract.js';
 import { gedcomTagEventType } from '../ged-parser.js';
 import { foreignSendCheck, researchRefsOf } from '../research-foreign-send.js';
 import { yearOf } from '../dates.js';
@@ -34,6 +36,10 @@ import { uiModule } from './module.js';
 import { surnamesReadByResearch, lineageReadByResearch } from './surname-suggest-ui.js';
 import { returnFocusAfterViewer } from './sources.js';
 import { shownNameOrEmpty } from '../person-name.js';
+import { imgStateOf, smallPortraitHtml, type ImgState } from './image-slot.js';
+import { personPhotoKey } from './person-photo-model.js';
+import { personInitials } from '../initials.js';
+import { IMAGES_ARRIVED_EVENT, IMAGES_STATE_EVENT } from '../image-loads.js';
 
 const PANEL_ID = 'research-changes-panel';
 /** The fingerprint the kept copy stands for (the tie's base, or the written send's). */
@@ -278,7 +284,9 @@ export function nwReason(item: NotWrittenItem, removedHere = false): string {
     if (why === 'removed') return s.notWrittenRemoved;
     if (!code) return strings.changes.noReason;
     // A file that could not be read (spec 108): its name or note (written as it came), or its data (not written).
-    const key = code === 'media.unreadable' ? `${code}.${item.params?.part === 'text' ? 'text' : 'data'}` : code;
+    // A source deleted here and not retracted (spec 117 §4): by the research's `why`.
+    const key = code === 'media.unreadable' ? `${code}.${item.params?.part === 'text' ? 'text' : 'data'}`
+        : code === 'source.retract-skipped' ? `${code}:${item.params?.why ?? item.params?.retractWhy ?? ''}` : code;
     const own = Object.prototype.hasOwnProperty.call(s.nw, key) ? s.nw[key] : '';
     if (own) return own;
     // What the research wanted to write and could not (`record.none` …): its write failed.
@@ -347,8 +355,53 @@ export function nwRowParts(row: Extract<PairedNotWritten, { type: 'coded' }>, da
     return { who, fact, source, ...(row.alsoCited?.length ? { more: row.alsoCited.map(c => ({ ...c })) } : {}) };
 }
 
-/** A not-written row with a code: "person · fact · source" and its reason below. */
-function nwCodedRow(row: Extract<PairedNotWritten, { type: 'coded' }>, data: StromData): string {
+/** The research's words about a source deleted here or retracted there (spec 117 §4). */
+const SOURCE_NW_CODES: ReadonlySet<string> = new Set(['source.retract-skipped', 'source.retracted']);
+/** A research source id by its number (S42 = S0042); '' when it is none. */
+const refNum = (id: string | undefined): string => (id && /^S\d{1,9}$/.test(id) ? String(Number(id.slice(1))) : '');
+/** The research's source a not-written item is about (its `source`, else `params.source`), '' when none. */
+function nwSourceRef(n: NotWrittenItem): string {
+    const id = refNum(n.source) ? n.source! : n.params?.source ?? '';
+    return refNum(id) ? id : '';
+}
+
+/**
+ * Restoring a retracted source after its row (spec 117 §4): `now` — the
+ * action, through the bridge (no mark); `later` — said after the reason
+ * (the bridge not running, or a research without the gate).
+ */
+type RestoreOffer = 'now' | 'later' | '';
+
+function restoreTail(ref: string, title: string, restore: RestoreOffer): string {
+    return restore === 'now' && ref
+        ? `<button type="button" class="link-button research-changes-restore" data-restore-source="${esc(ref)}" data-title="${esc(title)}">${esc(strings.changes.restoreSource)}</button>`
+        : '';
+}
+
+/**
+ * A not-written row about a source alone (spec 117 §4: a source deleted here
+ * not retracted, or one retracted there): "Source · title" and the reason.
+ * The title from the tree, else as the send carried it, else its id.
+ */
+function nwSourceRow(row: Extract<PairedNotWritten, { type: 'coded' }>, data: StromData, sentOther: readonly SentOtherRow[], restore: RestoreOffer): string {
+    const c = strings.changes;
+    const n = row.item;
+    const ref = nwSourceRef(n);
+    const inTree = ref ? Object.entries(data.sources ?? {}).find(([, src]) => refNum(src.refn?.trim()) === refNum(ref)) : undefined;
+    const sent = ref ? sentOther.find(r => r.type === 'source' && refNum(r.refn) === refNum(ref)) : undefined;
+    const title = inTree?.[1].title?.trim() || sent?.title || row.title || ref || c.unnamedOne;
+    const name = inTree
+        ? `<button type="button" class="research-changes-name" data-source="${esc(inTree[0])}">${esc(title)}</button>`
+        : `<span class="research-changes-name${sent?.deleted ? ' is-deleted' : ''}">${esc(title)}</span>`;
+    const why = nwReason(n) + (restore === 'later' ? ` · ${c.restoreLater}` : '');
+    return `<li class="research-changes-row is-not-written" data-kind="source" data-code="${esc(n.code ?? '')}"${ref ? ` data-ref="${esc(ref)}"` : ''}>`
+        + `<span class="research-changes-icon is-warn" aria-hidden="true">!</span>`
+        + `<span class="research-changes-text">${rowLine(name, c.typeSource, false)}`
+        + `<span class="research-changes-why">${esc(why)}</span>${restoreTail(ref, title, restore)}</span></li>`;
+}
+
+/** A not-written row with a code: "person · fact · source" and its reason below (`restore`: a retracted source's, §4). */
+function nwCodedRow(row: Extract<PairedNotWritten, { type: 'coded' }>, data: StromData, restore: RestoreOffer = ''): string {
     const { who, fact, source, more } = nwRowParts(row, data);
     const parts: string[] = [];
     if (who) {
@@ -368,7 +421,8 @@ function nwCodedRow(row: Extract<PairedNotWritten, { type: 'coded' }>, data: Str
     return `<li class="research-changes-row is-not-written" data-kind="coded" data-code="${esc(row.item.code ?? '')}">`
         + `<span class="research-changes-icon is-warn" aria-hidden="true">!</span>`
         + `<span class="research-changes-text"><span class="research-changes-line is-parts">${parts.join('<span class="research-changes-sep">·</span>')}</span>`
-        + `<span class="research-changes-why">${esc(nwReason(row.item, !!row.deleted))}</span></span></li>`;
+        + `<span class="research-changes-why">${esc(nwReason(row.item, !!row.deleted) + (restore === 'later' ? ` · ${strings.changes.restoreLater}` : ''))}</span>`
+        + `${restoreTail(nwSourceRef(row.item), source?.title ?? '', restore)}</span></li>`;
 }
 
 /** A row's name line: a grey type before it (rows of mixed kinds), the "app only" tag after it. */
@@ -379,22 +433,46 @@ function rowLine(nameHtml: string, type: string, appOnly: boolean): string {
         + (appOnly ? `<span class="research-changes-tag" title="${esc(c.appOnlyTitle)}">${esc(c.appOnly)}</span>` : '') + '</span>';
 }
 
-/** A person's row: a ring before a send, a tick once written. */
-function personRowOf(ch: PersonChange, mode: 'send' | 'written'): string {
+/** A person's row: a ring before a send, a tick once written. `appOnly`: the research does not write any of it (its tag). */
+function personRowOf(ch: PersonChange, mode: 'send' | 'written', appOnly = false): string {
     const name = ch.deleted || !DataManager.getPerson(ch.personId)
         ? `<span class="research-changes-name is-deleted">${esc(ch.name)}</span>`
         : `<button type="button" class="research-changes-name" data-person="${esc(ch.personId)}">${esc(ch.name)}</button>`;
     return `<li class="research-changes-row" data-kind="person">`
         + `<span class="research-changes-icon ${mode === 'written' ? 'is-check' : 'is-ring'}" aria-hidden="true">${mode === 'written' ? '✓' : ''}</span>`
-        + `<span class="research-changes-text">${name}<span class="research-changes-kinds">${esc(changeKindsText(ch.kinds, ch))}</span></span>`
+        + `<span class="research-changes-text">${rowLine(name, '', appOnly)}<span class="research-changes-kinds">${esc(changeKindsText(ch.kinds, ch))}</span></span>`
         + photoPic(ch) + '</li>';
 }
 
-/** A changed portrait's 30 px preview at the row's end (spec 102 §10; a removed one has none). */
+/**
+ * A changed portrait's 30 px preview at the row's end (spec 102 §10; a
+ * removed one has none). One still on its way: the initials under the veil;
+ * one that did not come: the initials (spec 116 §5).
+ */
 function photoPic(ch: PersonChange): string {
     if (!ch.kinds.includes('photo') || ch.deleted) return '';
-    const photo = DataManager.getPerson(ch.personId)?.photo;
-    return photo && /^data:image\//.test(photo) ? `<img class="research-changes-pic" src="${esc(photo)}" alt="" aria-hidden="true">` : '';
+    const person = DataManager.getPerson(ch.personId);
+    return changePicHtml(person, person ? imgStateOf(personPhotoKey(person.id), !!person.photo) : 'none');
+}
+
+/** photoPic's preview of `person` with its portrait's state (none: the photo, or nothing). */
+export function changePicHtml(person: Pick<Person, 'firstName' | 'lastName' | 'photo'> & { id?: string } | null | undefined, state: ImgState): string {
+    if (!person) return '';
+    return smallPortraitHtml('research-changes-pic', person.photo, personInitials(person.firstName, person.lastName), state, undefined,
+        person.id ? ` data-pic-person="${esc(person.id)}"` : '');
+}
+
+/** The previews of the open list again as their portraits now are (an image came, or did not). */
+function refreshChangePics(): void {
+    document.querySelectorAll<HTMLElement>('.research-changes-pic[data-pic-person]').forEach(el => {
+        const person = DataManager.getPerson(el.dataset.picPerson as PersonId);
+        const html = person ? changePicHtml(person, imgStateOf(personPhotoKey(person.id), !!person.photo)) : '';
+        if (el.outerHTML !== html) el.outerHTML = html;
+    });
+}
+if (typeof window !== 'undefined') {
+    window.addEventListener(IMAGES_ARRIVED_EVENT, refreshChangePics);
+    window.addEventListener(IMAGES_STATE_EVENT, refreshChangePics);
 }
 
 /**
@@ -406,7 +484,19 @@ function otherRowOf(r: SentOtherRow, as: 'written' | 'appOnly', data: StromData)
     let name: string;
     let type: string;
     let kinds = '';
-    if (r.type === 'source') {
+    if (r.type === 'person') {
+        // A person's files a research without `media.app` does not write: the person (a link while in the tree), the files' kinds.
+        type = '';
+        kinds = changeKindsText(r.kinds as ChangeKind[]);
+        name = data.persons[r.id as PersonId]
+            ? `<button type="button" class="research-changes-name" data-person="${esc(r.id)}">${esc(rowPersonName(r.id as PersonId, data))}</button>`
+            : `<span class="research-changes-name is-deleted">${esc(r.title)}</span>`;
+    } else if (r.type === 'source' && r.deleted && r.retracted) {
+        // Deleted here in edit mode and retracted by the write (spec 117 §4).
+        type = c.sourceDeleted;
+        kinds = c.retracted;
+        name = `<span class="research-changes-name is-deleted">${esc(r.title)}</span>`;
+    } else if (r.type === 'source') {
         type = c.typeSource;
         kinds = sourceKindsText(r.kinds as SourceChangeKind[]);
         name = !r.deleted && data.sources?.[r.id]
@@ -600,8 +690,11 @@ export const researchChangesMethods = uiModule({
         // What the research does not write of the tree's files is not promised as written (spec 102 §10, R10 b).
         const w = this.researchMediaWritesOf(treeId);
         const gated = now && w ? gateMediaChanges(now, this.researchOtherNow(), w) : null;
-        const list = gated ? gated.list : now;
-        const other = list ? sentOtherRows(gated ? gated.other : this.researchOtherNow(), researchUnread(surnamesReadByResearch(treeId), lineageReadByResearch(treeId), keepsMedia)) : [];
+        // The files at a person a research without `media.app` does not write: "app only", never "written".
+        const split = gated ? splitPersonAppOnly(gated.list, w) : null;
+        const list = split ? split.list : now;
+        const other = list ? [...(split?.appOnly ?? []),
+            ...sentOtherRows(gated ? gated.other : this.researchOtherNow(), researchUnread(surnamesReadByResearch(treeId), lineageReadByResearch(treeId), keepsMedia))] : [];
         const link = TreeManager.getTreeMetadata(treeId)?.research;
         const stands = [link?.fingerprint ?? '', link?.sent?.state === 'written' ? link.sent.fingerprint : ''].filter(Boolean);
         pendingSent.set(treeId, { fingerprint, data: baseCopy(data), list, other, stands, ...(keepsMedia ? { keepsMedia: true as const } : {}),
@@ -651,10 +744,12 @@ export const researchChangesMethods = uiModule({
      * those rows are told by it alone (withWrittenMedia).
      */
     researchNoteWritten(treeId: TreeId, fingerprint: string, at: string, retagged?: { fingerprint: string; data: StromData },
-        media?: { items: readonly SyncMediaWritten[]; count: number }): void {
-        const p = pendingSent.get(treeId);
-        if (!p || p.fingerprint !== fingerprint) return;
+        media?: { items: readonly SyncMediaWritten[]; count: number }, retracted: readonly string[] = []): void {
+        const sent = pendingSent.get(treeId);
+        if (!sent || sent.fingerprint !== fingerprint) return;
         pendingSent.delete(treeId);
+        // The deleted sources the write retracted in the research (spec 117 §4): their rows say so.
+        const p = retracted.length ? { ...sent, other: withRetractedRows(sent.other, retracted) } : sent;
         // The copy it replaces: the research's version again if this send is taken back.
         if (copy?.treeId === treeId && copy.base && copy.fp) {
             prevCopy = { treeId, base: copy.base, fp: copy.fp };
@@ -795,6 +890,15 @@ export const researchChangesMethods = uiModule({
                 // A person this send removed here is paired by its number there: the window had it.
                 const paired = pairNotWritten(nw.items, data, list);
                 const named = new Set<string>();
+                // A retracted source can be restored there (§4): the action once per source, while the bridge runs.
+                const restoreNow = sourceRestoreOffered();
+                const restoreSaid = new Set<string>();
+                const restoreOf = (n: NotWrittenItem): RestoreOffer => {
+                    const ref = nwSourceRef(n);
+                    if (n.code !== 'source.retracted' || !ref || restoreSaid.has(refNum(ref))) return '';
+                    restoreSaid.add(refNum(ref));
+                    return restoreNow ? 'now' : 'later';
+                };
                 const items = paired.rows.map(row => {
                     const n = row.item;
                     // Kept there, or removed there by another window: the research's version (without them) at once.
@@ -805,7 +909,9 @@ export const researchChangesMethods = uiModule({
                         const ofFile = (n.code ?? '').startsWith('media.');
                         if (row.personId && !ofFile) named.add(row.personId);
                         if (row.sourceId && !ofFile) named.add(`source:${row.sourceId}`);
-                        return nwCodedRow(row, data);
+                        if (SOURCE_NW_CODES.has(n.code ?? '') && nwSourceRef(n)) named.add(`ref:${refNum(nwSourceRef(n))}`);
+                        if (SOURCE_NW_CODES.has(n.code ?? '') && !n.person && !n.fact && !n.family) return nwSourceRow(row, data, sentOther, restoreOf(n));
+                        return nwCodedRow(row, data, restoreOf(n));
                     }
                     const why = nwReason(n, row.type === 'person' && !!row.deleted);
                     let name: string;
@@ -843,7 +949,7 @@ export const researchChangesMethods = uiModule({
                 const m = nw.items.length + nw.unexplained;
                 notWrittenHtml = `<div class="research-changes-section is-warn">${esc(c.notWrittenSection(m))}</div><ul class="research-changes-list">${items.join('')}</ul>`;
                 list = list.filter(ch => !named.has(ch.personId));
-                written = written.filter(r => !(r.type === 'source' && named.has(`source:${r.id}`)));
+                written = written.filter(r => !(r.type === 'source' && (named.has(`source:${r.id}`) || (r.deleted && named.has(`ref:${refNum(r.refn)}`)))));
                 // Places named as not written leave the written summary (its count less those).
                 const placesNot = paired.rows.filter(row => row.type === 'places').length;
                 if (placesNot) {
@@ -892,20 +998,31 @@ export const researchChangesMethods = uiModule({
             const since = [lastSent, researchAutoState(ctx.treeId).lastWritten?.at ?? '', ctx.link.syncedAt]
                 .filter(t => Number.isFinite(Date.parse(t))).sort((a, b) => Date.parse(b) - Date.parse(a))[0];
             const o = otherRowCount(other);
+            // In step with the research: its version just loaded, or the last send written (or waiting in its
+            // inbox) and nothing edited since.
+            const sent = ctx.link.sent;
+            const fps = this.researchSyncFingerprints(ctx.treeId, ctx.link);
+            const inStep = fps.matchesBase || (!!sent && (sent.state === 'written' || sent.state === 'pending') && fps.current === sent.fingerprint);
             // No count when the exact list cannot be told: no base to compare with (a restore before loading, a send
-            // taken back with no copy before it, the copy not read yet) — or, about to send, nothing it could
-            // name although the tree is not where the research's version is ("0 people" would say nothing changed).
-            inexact = previewInexact(now, other, opts);
-            sub = inexact ? c.changedSince(clock(since)) : auto ? c.willSendAutoSub(list.length, o) : c.willSendSub(list.length, o, clock(since));
-            footPair = !(auto && !opts.confirm);
-            foot = auto && !opts.confirm
+            // taken back with no copy before it, the copy not read yet) — or nothing it could name although the
+            // tree is not where the research's version is ("0 people" with Send would say nothing changed).
+            inexact = previewInexact(now, other, { inexact: opts.inexact, inStep });
+            // Nothing to send (a tree just taken from the research, unchanged): said so, and no Send.
+            const nothing = previewNothing(now, other, inStep, opts);
+            sub = nothing ? c.nothingToSend : inexact ? c.changedSince(clock(since)) : auto ? c.willSendAutoSub(list.length, o) : c.willSendSub(list.length, o, clock(since));
+            footPair = !nothing && !(auto && !opts.confirm);
+            foot = nothing
+                ? `<button type="button" class="secondary btn-sm" data-act="close">${esc(strings.buttons.close)}</button>`
+                : auto && !opts.confirm
                 ? `<button type="button" class="research-sync-link" data-act="send">${esc(s.sendNow)}</button>`
                 : (opts.confirm && !ctx.link.previewDue
                     ? `<label class="research-changes-skip"><input type="checkbox" id="research-changes-skip"> ${esc(c.skipPreview)}</label>` : '')
                     + `<button type="button" class="secondary btn-sm" data-act="close">${esc(strings.buttons.close)}</button>`
                     + `<button type="button" class="primary btn-sm" data-act="send">${esc(s.barSend)}</button>`;
         }
-        const personRow = (ch: PersonChange): string => personRowOf(ch, mode);
+        // About to send to a research without `media.app`: a person with only files is tagged "app only" (as a source is).
+        const writes = mode === 'send' ? this.researchMediaWritesOf(ctx.treeId) : null;
+        const personRow = (ch: PersonChange): string => personRowOf(ch, mode, personAppOnly(ch.kinds, writes));
         // The sections of "What will be sent": the rows of each kind, a long one grouped ("+ N more" adds GROUP_STEP).
         const groups = new Map<string, { rows: (() => string)[]; shown: number }>();
         const section = (key: string, head: string, rows: (() => string)[]): string => {
@@ -923,7 +1040,15 @@ export const researchChangesMethods = uiModule({
             const baseData = base && base !== 'same' ? base.base : null;
             // What the research reads: a source's attachments and a couple's photo too, once it keeps the tree's own files.
             const unreadNow = researchUnread(surnamesReadByResearch(), lineageReadByResearch(), this.researchKeepsMediaOf(ctx.treeId));
+            // Sources deleted here that the research retracts with this write (spec 117 §4); under review: waiting there.
+            const retracting = new Set(deletedSourcesToSend(ctx.link).map(refNum));
+            const reviewing = ctx.link.sent?.state === 'pending';
             const sourceRows = (other?.sources ?? []).map(ch => (): string => {
+                if (ch.deleted && ch.refn && retracting.has(refNum(ch.refn))) {
+                    return `<li class="research-changes-row" data-kind="source" data-retract="${esc(ch.refn)}"><span class="research-changes-icon is-ring" aria-hidden="true"></span>`
+                        + `<span class="research-changes-text">${rowLine(`<span class="research-changes-name is-deleted">${esc(ch.title)}</span>`, c.sourceDeleted, false)}`
+                        + (reviewing ? `<span class="research-changes-kinds">${esc(c.reviewWait)}</span>` : '') + '</span></li>';
+                }
                 const linked = !ch.deleted && !ch.attachmentOnly && !!data.sources?.[ch.sourceId];
                 const name = linked
                     ? `<button type="button" class="research-changes-name" data-source="${esc(ch.sourceId)}">${esc(ch.title)}</button>`
@@ -1057,6 +1182,9 @@ export const researchChangesMethods = uiModule({
                 (ul.children[before]?.querySelector<HTMLElement>('button') ?? ul.querySelector<HTMLElement>('[data-detail-more]'))?.focus?.();
             }
         });
+        panel.querySelectorAll<HTMLButtonElement>('[data-restore-source]').forEach(btn => btn.addEventListener('click', () => {
+            void this.sourceRestoreFromChanges(btn);
+        }));
         panel.querySelector('[data-act="close"]')?.addEventListener('click', () => this.closeResearchChanges());
         panel.querySelector<HTMLButtonElement>('[data-act="send"]')?.addEventListener('click', (e) => {
             const btn = e.currentTarget as HTMLButtonElement;

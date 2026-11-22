@@ -6,10 +6,11 @@
 import { DataManager } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { TreeRenderer } from '../renderer.js';
-import { UI } from '../ui.js';
+import { getUI } from '../ui-ref.js';
 import { ZoomPan } from '../zoom.js';
 import { TreePreview, TreeCompare } from '../tree-preview.js';
-import { PersonId, PartnershipId, Person, StromData, TreeId, PartnershipStatus, isGender } from '../types.js';
+import { PersonId, PartnershipId, Person, StromData, TreeId, PartnershipStatus } from '../types.js';
+import { isGender } from '../model-values.js';
 import { strings } from '../strings.js';
 import { runHeavy, activatedElement } from '../ui/busy.js';
 import {
@@ -50,6 +51,11 @@ import {
 } from './persistence.js';
 import { shownNameOrEmpty, fitNameHtml } from '../person-name.js';
 import { iconSvg } from '../icons.js';
+import { imageLoads } from '../image-loads.js';
+import { pendingImageOf } from '../research-image-refs.js';
+import { imgStateOf, smallPortraitHtml, type ImgState } from '../ui/image-slot.js';
+import { personPhotoKey } from '../ui/person-photo-model.js';
+import { personInitials } from '../initials.js';
 
 // Auto-save debounce delay (ms)
 const AUTO_SAVE_DELAY = 2000;
@@ -328,7 +334,7 @@ class MergerUIClass {
                 ? `${this.targetTreeName} + ${this.sourceTreeName}`
                 : this.incomingFileName || 'Merge';
             void saveMergeSession(this.mergeState, displayName, this.targetTreeName, this.sourceTreeName);
-            UI.showToast(strings.merge.closeSave);
+            getUI().showToast(strings.merge.closeSave);
         }
         this.closeMergeModalInternal();
 
@@ -484,7 +490,7 @@ class MergerUIClass {
 
         // Return to tree manager if it was opened from there
         if (shouldReturnToTreeManager) {
-            UI.showTreeManagerDialog();
+            getUI().showTreeManagerDialog();
         }
     }
 
@@ -1108,7 +1114,7 @@ class MergerUIClass {
         const targetId = this.manualMatchPicker?.getValue();
 
         if (!targetId) {
-            UI.showAlert(strings.merge.selectExistingError, 'warning');
+            getUI().showAlert(strings.merge.selectExistingError, 'warning');
             return;
         }
 
@@ -1232,7 +1238,7 @@ class MergerUIClass {
                     <label class="conflict-option sel-opt" data-sel-form="tile">
                         <input type="radio" name="conflict-${conflict.field}" value="keep_existing"
                             ${conflict.resolution === 'keep_existing' ? 'checked' : ''}>
-                        <span class="conflict-value existing">${this.conflictValueHtml(conflict.field, conflict.existingValue)}</span>
+                        <span class="conflict-value existing">${this.conflictValueHtml(conflict.field, conflict.existingValue, match.existingId)}</span>
                         <span class="conflict-badge existing">${strings.merge.keepExisting}</span>
                         ${conflict.resolution === 'keep_existing' ? suggestedLabel(conflict) : ''}
                     </label>
@@ -1437,7 +1443,7 @@ class MergerUIClass {
         const pending = this.mergeState.matches.filter(m =>
             !this.mergeState!.decisions.has(m.incomingId) && m.score < AUTO_CONFIRM_SCORE);
         if (pending.length > 0) {
-            const proceed = await UI.showConfirm(strings.merge.pendingGate(pending.length));
+            const proceed = await getUI().showConfirm(strings.merge.pendingGate(pending.length));
             if (!proceed) return;
         }
 
@@ -1449,7 +1455,7 @@ class MergerUIClass {
                 : strings.treeManager.newTree;
 
         // Prompt for new tree name
-        const newTreeName = await UI.showPrompt(
+        const newTreeName = await getUI().showPrompt(
             strings.merge.newTreeNamePrompt,
             defaultName
         );
@@ -1507,7 +1513,7 @@ class MergerUIClass {
             this.gedcomImport = undefined;
             if (gedcomImport) {
                 const importId = gedcomImport.importId ? result.importMap?.get(gedcomImport.importId) : undefined;
-                void UI.afterImport(newTreeId, {
+                void getUI().afterImport(newTreeId, {
                     gedcom: true, path: 'merge', ...(importId ? { importId } : {}),
                     added: result.stats.added, updated: result.stats.merged,
                 });
@@ -1530,13 +1536,13 @@ class MergerUIClass {
             window.dispatchEvent(new CustomEvent('strom:merge-session-changed'));
 
             // Show tree manager with new tree visible
-            UI.showTreeManagerDialog();
+            getUI().showTreeManagerDialog();
 
             // Push tree manager to dialog stack so ESC returns to it
-            UI.pushDialog('tree-manager-modal');
+            getUI().pushDialog('tree-manager-modal');
 
             // Show confirmation dialog to switch to new tree
-            const shouldSwitch = await UI.showConfirm(
+            const shouldSwitch = await getUI().showConfirm(
                 `${strings.merge.complete}\n${stats}\n\n${strings.merge.switchToNewTree}`,
                 strings.merge.complete
             );
@@ -1544,33 +1550,33 @@ class MergerUIClass {
             if (shouldSwitch) {
                 // Switch to new tree and close tree manager
                 await DataManager.switchTree(newTreeId);
-                UI.updateTreeSwitcher();
+                getUI().updateTreeSwitcher();
                 TreeRenderer.restoreFromSession();
                 await TreeRenderer.renderAsync();
-                UI.refreshSearch();
+                getUI().refreshSearch();
                 // Center view on focused person
                 ZoomPan.centerOnFocusWithContext();
                 window.dispatchEvent(new CustomEvent('strom:tree-switched'));
-                UI.closeTreeManagerDialog();
+                getUI().closeTreeManagerDialog();
             }
             // If user cancels (ESC), stay in tree manager
 
             // If the merge introduced new issues, offer to open validation on
             // the merged tree so the user can review (and fix) them right away.
             // A file from another program: its "What next" card carries the data check.
-            if (newIssueCount > 0 && !UI.importNextPendingFor(newTreeId)) {
-                const openValidation = await UI.showConfirm(
+            if (newIssueCount > 0 && !getUI().importNextPendingFor(newTreeId)) {
+                const openValidation = await getUI().showConfirm(
                     strings.merge.newIssues(newIssueCount),
                     strings.merge.newIssuesTitle
                 );
                 if (openValidation) {
-                    await UI.showTreeValidationDialog(newTreeId);
+                    await getUI().showTreeValidationDialog(newTreeId);
                 }
             }
         } else {
             // The technical detail is in the console (executeMerge logs it); the
             // user gets the translated message, not a raw exception text.
-            UI.showAlert(strings.merge.failed, 'error');
+            getUI().showAlert(strings.merge.failed, 'error');
         }
     }
 
@@ -1608,12 +1614,12 @@ class MergerUIClass {
      * data: URL is inert as an <img src>) so the dialog never dumps a data URL
      * as text; gender is localized; everything else is escaped plain text.
      */
-    private conflictValueHtml(field: string, v?: string): string {
+    private conflictValueHtml(field: string, v?: string, existingId?: PersonId): string {
         if (field === 'photo') {
-            if (v && v.startsWith('data:')) {
-                return `<img class="conflict-photo" src="${this.escapeHtml(v)}" alt="${this.escapeHtml(strings.labels.photo)}">`;
-            }
-            return '—';
+            // The open tree's portrait may still be on its way (spec 116 §5): its state from the evidence.
+            const person = existingId ? this.mergeState?.existingData.persons[existingId] : undefined;
+            const state = existingId ? imgStateOf(personPhotoKey(existingId), !!v) : 'none';
+            return conflictPhotoHtml(v, person ? personInitials(person.firstName, person.lastName) : '', state);
         }
         if (field === 'gender' && isGender(v)) return this.escapeHtml(strings.gender[v]);
         return this.escapeHtml(v || '—');
@@ -1625,6 +1631,28 @@ class MergerUIClass {
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
+}
+
+/**
+ * A photo of a merge conflict (a thumbnail; never a data URL as text): one
+ * of the open tree still on its way shows the initials under the veil, one
+ * that did not come the initials with a title saying so (spec 116 §5).
+ */
+export function conflictPhotoHtml(v: string | undefined, initials: string, state: ImgState): string {
+    const pending = state === 'loading' || state === 'refresh' || state === 'failed';
+    const standIn = v ? pendingImageOf(v) : null;
+    if (pending || standIn) {
+        const shown = pending ? state : imageLoads.stateOfSha(standIn!.sha)?.state === 'pending' ? 'loading' : 'failed';
+        return smallPortraitHtml('conflict-photo', v, initials, shown, strings.photos.failed) || '—';
+    }
+    if (v && v.startsWith('data:')) {
+        return `<img class="conflict-photo" src="${escapeAttr(v)}" alt="${escapeAttr(strings.labels.photo)}">`;
+    }
+    return '—';
+}
+
+function escapeAttr(text: string): string {
+    return (text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 export const MergerUI = new MergerUIClass();

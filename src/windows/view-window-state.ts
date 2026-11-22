@@ -8,11 +8,15 @@
  * - Family and Descendants: the zoom and the point in the middle of the view
  *   (the satellite's view is smaller: the same point stands in its middle);
  *   Descendants also "whole families";
- * - Fan: its rings, the descendants' rings of the two-way shape, the shape
- *   and the colours;
+ * - Fan: its rings, the descendants' rings of the two-way shape, the shape,
+ *   the colours and the current look (spec 118 §10: style, family lines,
+ *   the sectors' text, portraits);
  * - Timeline: no range of its own (the years follow the persons shown);
  * - Map: what it shows (this view / the whole tree), its centre and zoom, the
  *   kinds of places on and the time layer (on, its year).
+ *
+ * Every view, the Table too, also carries the window's selection of people
+ * with "Hide others" and the map's scope (spec 098 §7, `CarriedSelection`).
  *
  * Sent as `init` after the satellite's hello, never in the address. Applied
  * once, at the first tree of the window; after that the window has its own
@@ -20,6 +24,8 @@
  */
 
 import type { PersonId } from '../types.js';
+import { isViewScope, scopeDefault, type ScopedView, type ViewScope, type ViewScope as MapScope } from '../view-scope.js';
+import { sanitizeSelectionRef, type WindowSelection } from '../view-selection-ref.js';
 import type { SatelliteKind } from './window-role.js';
 
 /** The views whose state is carried here (the Table's is table-ui's). */
@@ -56,6 +62,23 @@ export interface FanWindowState extends ViewStateBase {
     descGenerations: number;
     shape: string;
     colorMode: string;
+    /** The current look (spec 118 §10), checked where it is applied. */
+    style?: string;
+    rodScope?: string;
+    content?: string;
+    portraits?: boolean;
+}
+
+/** The fan's settings a window carries over. */
+export interface FanWindowSettings {
+    generations: number;
+    descGenerations: number;
+    shape: string;
+    colorMode: string;
+    style?: string;
+    rodScope?: string;
+    content?: string;
+    portraits?: boolean;
 }
 
 export interface TimelineWindowState extends ViewStateBase {
@@ -64,7 +87,7 @@ export interface TimelineWindowState extends ViewStateBase {
 
 export interface MapWindowState extends ViewStateBase {
     view: 'map';
-    scope: 'view' | 'tree';
+    scope: MapScope;
     /** null: not framed yet (the window frames the places itself). */
     center: { lat: number; lon: number } | null;
     zoom: number;
@@ -91,8 +114,8 @@ export interface ViewStateSource {
     /** The chart's zoom, only while Family or Descendants is shown (another view's frame is not theirs). */
     chartZoom(): ChartZoom | null;
     fullFamilies(): boolean;
-    fan(): { generations: number; descGenerations: number; shape: string; colorMode: string };
-    map(): { scope: 'view' | 'tree'; center: { lat: number; lon: number } | null; zoom: number; kinds: string[]; time: MapTimeState };
+    fan(): FanWindowSettings;
+    map(): { scope: MapScope; center: { lat: number; lon: number } | null; zoom: number; kinds: string[]; time: MapTimeState };
 }
 
 /** What a satellite applies the state to. */
@@ -102,7 +125,7 @@ export interface ViewStateTarget {
     setFocus(id: PersonId, depthUp: number, depthDown: number): void;
     setWindowSelected(id: PersonId): void;
     setFullFamilies(on: boolean): void;
-    setFan(fan: { generations: number; descGenerations: number; shape: string; colorMode: string }): void;
+    setFan(fan: FanWindowSettings): void;
     setMap(map: Omit<MapWindowState, keyof ViewStateBase | 'view'>): void;
     /** After the first drawing: the chart's zoom and middle. */
     restoreZoom(zoom: ChartZoom): void;
@@ -170,7 +193,13 @@ export function parseViewState(kind: SatelliteKind, raw: unknown): ViewWindowSta
         }
         case 'fan':
             if (!num(raw.generations) || !num(raw.descGenerations) || typeof raw.shape !== 'string' || typeof raw.colorMode !== 'string') return null;
-            return { ...base, view: 'fan', generations: raw.generations, descGenerations: raw.descGenerations, shape: raw.shape, colorMode: raw.colorMode };
+            return {
+                ...base, view: 'fan', generations: raw.generations, descGenerations: raw.descGenerations, shape: raw.shape, colorMode: raw.colorMode,
+                ...(typeof raw.style === 'string' ? { style: raw.style } : {}),
+                ...(typeof raw.rodScope === 'string' ? { rodScope: raw.rodScope } : {}),
+                ...(typeof raw.content === 'string' ? { content: raw.content } : {}),
+                ...(typeof raw.portraits === 'boolean' ? { portraits: raw.portraits } : {}),
+            };
         case 'timeline':
             return { ...base, view: 'timeline' };
         case 'map': {
@@ -186,7 +215,7 @@ export function parseViewState(kind: SatelliteKind, raw: unknown): ViewWindowSta
             }
             const kinds = Array.isArray(raw.kinds) ? raw.kinds.filter((k): k is string => typeof k === 'string') : [];
             if (!num(raw.zoom)) return null;
-            return { ...base, view: 'map', scope: raw.scope === 'tree' ? 'tree' : 'view', center, zoom: raw.zoom, kinds, time };
+            return { ...base, view: 'map', scope: raw.scope === 'tree' || raw.scope === 'sel' ? raw.scope : 'view', center, zoom: raw.zoom, kinds, time };
         }
     }
 }
@@ -206,7 +235,13 @@ export function applyViewStateBeforeDraw(state: ViewWindowState, target: ViewSta
             target.setFullFamilies(state.fullFamilies);
             break;
         case 'fan':
-            target.setFan({ generations: state.generations, descGenerations: state.descGenerations, shape: state.shape, colorMode: state.colorMode });
+            target.setFan({
+                generations: state.generations, descGenerations: state.descGenerations, shape: state.shape, colorMode: state.colorMode,
+                ...(state.style !== undefined ? { style: state.style } : {}),
+                ...(state.rodScope !== undefined ? { rodScope: state.rodScope } : {}),
+                ...(state.content !== undefined ? { content: state.content } : {}),
+                ...(state.portraits !== undefined ? { portraits: state.portraits } : {}),
+            });
             break;
         case 'timeline':
             break;
@@ -225,6 +260,57 @@ export function applyViewStateAfterDraw(state: ViewWindowState | null, view: str
     if (view !== 'family' && view !== 'descendants') return;
     if (state && (state.view === 'family' || state.view === 'descendants') && state.zoom) target.restoreZoom(state.zoom);
     else target.centerView();
+}
+
+// ---- the window's selection and the views' scopes (spec 098 §7, §11.0) ----
+
+/**
+ * The window's selection with "Hide others" and the scopes of the Map, the
+ * Timeline and the Table, as a new window takes them over (any view, the
+ * Table too) and a satellite keeps them over its reload. The window then has
+ * its own: a change in one window changes no other, and only the main window
+ * remembers them for the tree.
+ */
+export interface CarriedSelection {
+    selection: WindowSelection;
+    mapScope: MapScope;
+    /** Older windows' states carry no Timeline or Table scope: read as the views' defaults. */
+    timelineScope?: ViewScope;
+    tableScope?: ViewScope;
+}
+
+/** The field of a window's starting state that carries them. */
+const CARRIED_KEY = 'windowSelection';
+
+/** The starting state with the selection and the scopes beside the view's own fields (an object state only). */
+export function withCarriedSelection(state: unknown, carried: CarriedSelection): unknown {
+    if (!isObj(state)) return state;
+    const selection: WindowSelection = carried.selection.ref
+        ? { ref: { ...carried.selection.ref }, hideOthers: carried.selection.hideOthers }
+        : { ref: null, hideOthers: false };
+    return {
+        ...state,
+        [CARRIED_KEY]: {
+            selection, mapScope: carried.mapScope,
+            ...(carried.timelineScope ? { timelineScope: carried.timelineScope } : {}),
+            ...(carried.tableScope ? { tableScope: carried.tableScope } : {}),
+        },
+    };
+}
+
+/** The selection and the scopes a state carries, checked (null: none, an older window's state; an unknown scope: the view's default). */
+export function carriedSelectionOf(raw: unknown): CarriedSelection | null {
+    if (!isObj(raw)) return null;
+    const c = raw[CARRIED_KEY];
+    if (!isObj(c) || !isObj(c.selection)) return null;
+    const ref = sanitizeSelectionRef(c.selection.ref);
+    const scope = (v: unknown, view: ScopedView): ViewScope => isViewScope(v) ? v : scopeDefault(view);
+    return {
+        selection: { ref, hideOthers: !!ref && c.selection.hideOthers === true },
+        mapScope: scope(c.mapScope, 'map'),
+        timelineScope: scope(c.timelineScope, 'timeline'),
+        tableScope: scope(c.tableScope, 'table'),
+    };
 }
 
 // ---- a satellite's own state over its reload, and its start without one ----

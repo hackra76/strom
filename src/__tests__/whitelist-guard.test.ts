@@ -36,8 +36,10 @@ import { extractSubtree } from '../subtree.js';
 import { decomposeIntoFamilies, seedIdsFor } from '../split-families.js';
 import {
     StromData, Person, Partnership, PersonId, PartnershipId, TreeId,
-    toPersonId, toPartnershipId, LAST_FOCUSED, STROM_DATA_VERSION,
 } from '../types.js';
+import { toPersonId, toPartnershipId } from '../ids.js';
+import { LAST_FOCUSED } from '../model-values.js';
+import { STROM_DATA_VERSION } from '../version.js';
 
 const ALICE = toPersonId('p_alice');
 const BOB = toPersonId('p_bob');
@@ -372,6 +374,8 @@ type OwnedElsewhere =
     | 'birthStatus'         // the research's status of the birth (GEDCOM import), never edited
     | 'birthAge'            // a Strom file's BIRT > AGE (GEDCOM import), kept for the way back, never edited
     | 'deathStatus'         // …and of the death
+    | 'nameStatus'          // …and of the name (GEDCOM import, 066 K6.3), never edited
+    | 'marriedNameStatus'   // …and of the name after marriage
     | 'gedcomDates'         // GEDCOM import only; a changed date simply has no entry
     | 'importId'            // GEDCOM import only (spec 066): the import the person came from
     | 'importedValues'      // GEDCOM import only: an edit ends the mark by changing the value

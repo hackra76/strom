@@ -2,8 +2,8 @@
  * The family line chosen in the tree view (spec 039): the toolbar's choice
  * (desktop before the view tabs, tablet at the bar's right end), its search
  * with Enter on the first result and the small lines unfolding under Other
- * families; the person menu's "Only the X line" (birth line first, the chosen
- * one offering the whole tree); on a phone More → Family line → the list as a
+ * families; the person menu's "Select ›" (the lines, birth line first; a
+ * person in the selection offered to clear it); on a phone More → Selection → the list as a
  * sheet, the pill's label opening it again; sideways beside the side bar;
  * German and the dark theme without overflow; a reload keeps the line.
  * Invented names only (e2e/rods-fixture.ts).
@@ -60,7 +60,7 @@ test.describe('the toolbar\'s choice on a computer', () => {
         await setup(page);
         await expect(host(page)).toBeVisible();
         const btn = host(page).locator('.sp-rodpick-btn');
-        await expect(btn).toHaveText(/^Lines/);
+        await expect(btn).toHaveText(/^Selection/);
         // Before the view tabs, 6px or so between them.
         const gap = await page.evaluate(() => {
             const a = document.querySelector('#view-rod-picker .sp-rodpick-btn')!.getBoundingClientRect();
@@ -79,7 +79,7 @@ test.describe('the toolbar\'s choice on a computer', () => {
         await expect(pill(page)).toBeVisible();
         await expect(pill(page).locator('.evidence-pill-label--pick')).toContainText('Hollberg');
         await expect(host(page).locator('.sp-rodpick-btn')).toContainText('Hollberg');
-        await expect(pill(page).locator('.evidence-pill-close')).toHaveAttribute('aria-label', 'Show the whole tree');
+        await expect(pill(page).locator('.evidence-pill-close')).toHaveAttribute('aria-label', 'Clear the selection');
 
         await page.reload();
         await expect(page.locator('html')).not.toHaveClass(/app-loading/);
@@ -90,7 +90,7 @@ test.describe('the toolbar\'s choice on a computer', () => {
         await host(page).locator('.sp-rodpick-btn').click();
         await host(page).locator('.sp-rodpick-tree button').click();
         await expect(pill(page)).toBeHidden();
-        await expect(host(page).locator('.sp-rodpick-btn')).toHaveText(/^Lines/);
+        await expect(host(page).locator('.sp-rodpick-btn')).toHaveText(/^Selection/);
     });
 
     test('Descendants: another line already chosen, a line with nobody drawn moves the focus; ↩ Back brings it back', async ({ page }) => {
@@ -127,6 +127,19 @@ test.describe('the toolbar\'s choice on a computer', () => {
         await expect.poll(focus).toBe('h1');
         await page.locator('.focus-toast-box .focus-toast-back').click();
         await expect.poll(focus).toBe('b16');
+
+        // The list, built while the focus was elsewhere, is built again as it opens; a query
+        // typed before that (the open's toggle comes as a task of its own) stays, Enter picks.
+        await page.evaluate(() => {
+            document.querySelector<HTMLElement>('#view-rod-picker summary')!.click();
+            const q = document.querySelector<HTMLInputElement>('#view-rod-picker .sp-rodpick-q')!;
+            q.value = 'bran';
+            q.dispatchEvent(new Event('input'));
+        });
+        await expect(host(page).locator('.sp-rodpick-q')).toHaveValue('bran');
+        await expect(host(page).locator('button.sp-rodpick-first')).toContainText('Brandvold');
+        await host(page).locator('.sp-rodpick-q').press('Enter');
+        await expect(pill(page).locator('.evidence-pill-label--pick')).toContainText('Brandvold');
     });
 
     test('Other families unfold the small lines alphabetically; one of them is chosen and marked', async ({ page }) => {
@@ -148,29 +161,30 @@ test.describe('the toolbar\'s choice on a computer', () => {
         await expect(host(page).locator('li.sp-rodpick-small[aria-current]')).toBeVisible();
     });
 
-    test('the person menu: one line, two lines (birth first), the chosen one offers the whole tree', async ({ page }) => {
+    test('the person menu: Select › with two lines (birth first); a person in the selection offered to clear it', async ({ page }) => {
         await setup(page, 'b4');
         // Karin Brandvold married into the Tallqvist line.
         await card(page, 'Karin').click();
         const menu = page.locator('.context-menu.person-menu');
         await expect(menu).toBeVisible();
-        const rows = menu.locator('[data-action^="rod-only:"]');
+        // Right after Show descendants, without a research mark.
+        const order = await menu.locator('[data-action], [data-menu]').evaluateAll(els => els.map(e => (e as HTMLElement).dataset.action ?? (e as HTMLElement).dataset.menu));
+        expect(order[order.indexOf('descendants') + 1]).toBe('select');
+        const select = menu.locator('[data-menu="select"]');
+        await expect(select.locator('.research-open-mark, .research-ai-badge')).toHaveCount(0);
+        await select.click();
+        const rows = page.locator('.context-submenu [data-action^="select:rod:"]');
         await expect(rows).toHaveCount(2);
-        await expect(rows.first()).toContainText('Only the Brandvold line');
+        await expect(rows.first()).toContainText('Brandvold line');
         await expect(rows.first().locator('.menu-item-meta')).toHaveText('birth');
         await expect(rows.nth(1)).toContainText('Tallqvist');
         await expect(rows.nth(1).locator('.menu-item-meta')).toHaveText('wife');
-        // Right after Show descendants, without a research mark.
-        const order = await menu.locator('[data-action]').evaluateAll(els => els.map(e => (e as HTMLElement).dataset.action));
-        expect(order[order.indexOf('descendants') + 1]).toMatch(/^rod-only:/);
-        await expect(rows.first().locator('.research-open-mark, .research-ai-badge')).toHaveCount(0);
         await rows.first().click();
         await expect(pill(page).locator('.evidence-pill-label--pick')).toContainText('Brandvold');
 
         await card(page, 'Karin').click();
-        await expect(menu.locator('[data-action="rod-clear"]')).toHaveText(/Show the whole tree/);
-        await expect(menu.locator('[data-action^="rod-only:"]')).toHaveCount(1);
-        await menu.locator('[data-action="rod-clear"]').click();
+        await expect(menu.locator('[data-action="select-clear"]')).toHaveText(/Clear the selection/);
+        await menu.locator('[data-action="select-clear"]').click();
         await expect(pill(page)).toBeHidden();
     });
 
@@ -178,7 +192,8 @@ test.describe('the toolbar\'s choice on a computer', () => {
         await setup(page, 'b14');
         await page.evaluate(() => { (window.Strom.DataManager as unknown as { isReadOnly: () => boolean }).isReadOnly = () => true; });
         await card(page, 'Karl').click();
-        const row = page.locator('.context-menu.person-menu [data-action^="rod-only:"]');
+        await page.locator('.context-menu.person-menu [data-menu="select"]').click();
+        const row = page.locator('.context-submenu [data-action^="select:rod:"]');
         await expect(row).toHaveCount(1);
         await expect(row).toContainText('Brandvold');
     });
@@ -253,7 +268,8 @@ test.describe('the pill covers no card on a phone', () => {
         await setup(page);
         await founderDescendants(page);
         await page.evaluate(() => window.Strom.UI.showPersonBottomSheet('b1' as never));
-        await page.locator('.bottom-sheet-person [data-action^="rod-only:"]').first().click();
+        await page.locator('.bottom-sheet-person [data-menu="select"]').click();
+        await page.locator('.bottom-sheet-person [data-action^="select:rod:"]').first().click();
         await expect(pill(page).locator('.evidence-pill-label--pick')).toContainText('Brandvold');
         expect(await cardsUnderPill(page)).toEqual([]);
         for (let i = 0; i < 4; i++) {
@@ -287,14 +303,14 @@ test.describe('the toolbar\'s choice on a tablet', () => {
 test.describe('the phone', () => {
     test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
 
-    test('More → Family line → the list → a pick → the pill → its label → another line', async ({ page }) => {
+    test('More → Selection → the list → a pick → the pill → its label → another line', async ({ page }) => {
         await setup(page);
         await expect(host(page)).toBeHidden();
         await page.locator('#bb-view-more').click();
         const row = page.locator('#sheet-rod');
         await expect(row).toBeVisible();
-        await expect(row.locator('.more-rod-row-label')).toHaveText('Family line');
-        await expect(row.locator('.more-rod-row-value')).toHaveText('Whole tree');
+        await expect(row.locator('.more-rod-row-label')).toHaveText('Selection');
+        await expect(row.locator('.more-rod-row-value')).toHaveText('No selection');
         expect((await row.boundingBox())!.height).toBeGreaterThanOrEqual(51.5);
         await row.click();
         const sheet = pickSheet(page);
@@ -330,17 +346,18 @@ test.describe('the phone', () => {
         await expect(label).toContainText('Tallqvist');
     });
 
-    test('the person\'s sheet offers the line; More has no Family line row on the timeline', async ({ page }) => {
+    test('the person\'s sheet offers the line; More has no Selection row on the timeline', async ({ page }) => {
         await setup(page);
         await page.evaluate(() => window.Strom.UI.showPersonBottomSheet('b16' as never));
         const sheet = page.locator('.bottom-sheet-person');
-        const row = sheet.locator('[data-action^="rod-only:"]');
+        await sheet.locator('[data-menu="select"]').click();
+        const row = sheet.locator('[data-action^="select:rod:"]');
         await expect(row).toHaveCount(1);
-        await expect(row).toContainText('Only the Brandvold line');
+        await expect(row).toContainText('Brandvold line');
         await row.click();
         await expect(pill(page).locator('.evidence-pill-label--pick')).toContainText('Brandvold');
         await page.evaluate(() => window.Strom.UI.showPersonBottomSheet('b16' as never));
-        await expect(page.locator('.bottom-sheet-person [data-action="rod-clear"]')).toBeVisible();
+        await expect(page.locator('.bottom-sheet-person [data-action="select-clear"]')).toBeVisible();
         await page.keyboard.press('Escape');
 
         await page.evaluate(() => window.Strom.UI.setDisplayViewMode('timeline'));
@@ -357,11 +374,11 @@ test.describe('the phone', () => {
         });
         await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
         await page.locator('#bb-view-more').click();
-        await expect(page.locator('#sheet-rod .more-rod-row-label')).toHaveText('Stammlinie');
-        await expect(page.locator('#sheet-rod .more-rod-row-value')).toHaveText('Ganzer Stammbaum');
+        await expect(page.locator('#sheet-rod .more-rod-row-label')).toHaveText('Auswahl');
+        await expect(page.locator('#sheet-rod .more-rod-row-value')).toHaveText('Keine Auswahl');
         await page.locator('#sheet-rod').click();
         const sheet = pickSheet(page);
-        await expect(sheet.locator('.rod-pick-sheet-title')).toHaveText('Stammlinie wählen');
+        await expect(sheet.locator('.rod-pick-sheet-title')).toHaveText('Auswahl');
         expect(await overflowing(page, '.rod-pick-sheet')).toEqual([]);
         await sheet.locator('.sp-rodpick-rod', { hasText: 'Brandvold' }).locator('button').click();
         await expect(pill(page).locator('.evidence-pill-label--pick')).toContainText('Brandvold');

@@ -193,7 +193,8 @@ test.describe('view mode: Actions and More carry what an exported page can do', 
         await expect(page.locator('#sheet-undo')).toHaveCount(0);
         const rows = (await sheet.locator('.bottom-sheet-items > .bottom-sheet-item').allInnerTexts()).map(t => t.replace(/\s+/g, ' ').trim());
         // "For the family ›" as in editing (menu 1020 D18); Full screen where the browser offers it (spec 082 K1.3).
-        expect(rows.map(r => r.replace(/\s*\d+$/, ''))).toEqual(['Anniversaries', 'Lists of people', 'For the family ›', 'Tree overview', 'Full screen']);
+        // The window's selection (spec 098 §10, §12: it works in an exported page too).
+        expect(rows.map(r => r.replace(/\s*\d+$/, ''))).toEqual(['Anniversaries', 'Lists of people', 'For the family ›', 'Tree overview', 'Selection No selection ›', 'Full screen']);
         await expect(sheet.locator('.bottom-sheet-pair').last().locator('.bottom-sheet-item')).toHaveText(['Settings', 'How Strom works', 'About Strom']);
         await page.locator('#sheet-family').click();
         await page.locator('#sheet-book').click();
@@ -241,6 +242,7 @@ test('lists of people in the exported HTML: shown, opened in the Table and as it
     await expect(d.locator('.pl-new, .pl-dots, .pl-more, .pl-pencil, .pl-x, .pl-check, .pl-handle, [data-act="add-person"]')).toHaveCount(0);
     await d.locator('[data-act="open-table"]').first().click();
     await expect(d).toHaveCount(0);
-    await expect(page.locator('#table-container .tv-scope-btn')).toHaveAttribute('aria-label', 'Scope: Letters to write');
+    // The list as the window's selection with the scope Selection (spec 098 §11c).
+    await expect(page.locator('#table-container .tv-scope-btn')).toHaveAttribute('aria-label', 'Scope: List: Letters to write');
     await expect(page.locator('#table-container .tv-status-count')).toHaveText('2 of 2 people');
 });

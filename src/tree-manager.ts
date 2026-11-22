@@ -15,19 +15,19 @@ import {
     PartnershipId,
     Person,
     Partnership,
-    generateTreeId,
-    uniqueIdSuffix,
-    LAST_FOCUSED,
+    
     LastFocusedMarker,
-    STROM_DATA_VERSION
 } from './types.js';
+import { generateTreeId, uniqueIdSuffix } from './ids.js';
+import { LAST_FOCUSED } from './model-values.js';
+import { STROM_DATA_VERSION } from './version.js';
 import { strings } from './strings.js';
 import { isEncrypted, EncryptedData, CryptoSession, decrypt, classifyCryptoError, CryptoFailure } from './crypto.js';
 import { SettingsManager } from './settings.js';
 import { peekReloadPoint, forgetLastView } from './resume-view.js';
 import { AuditLogManager } from './audit-log.js';
 import { StorageManager } from './storage.js';
-import { createSnapshot, SnapshotResearchBase } from './snapshots.js';
+import { createSnapshot, listSnapshots, SnapshotResearchBase } from './snapshots.js';
 import { researchAutoState, patchResearchAutoState, type ResearchAutoState } from './research-device.js';
 import { researchBaseKey, isHistoryKey } from './storage-keys.js';
 import { deleteHistoryStore } from './history-store.js';
@@ -47,6 +47,7 @@ import { browserMediaFingerprint } from './browser-media.js';
 import { looksLikeSampleTree } from './demo-sample.js';
 import { announceTreeSaved, clearTreeStale, isTreeStale } from './tab-sync.js';
 import { cloneTreeDataAsJson, estimateJsonBytes } from './clone.js';
+import { imageLoads, type PendingImageNotes } from './image-loads.js';
 import {
     withPoolLock, collectPoolable, storeImages, stringifyPooled, replacePooled,
     unpoolJson, unpoolObject, registerPoolReferences, forgetPoolScope, seedPoolScope, notePoolSizes,
@@ -148,6 +149,12 @@ function forgetResearchKeysOfGoneTrees(ids: ReadonlySet<string>): void {
 /** A tree's data were stored with another research base than this window's link (see ResearchBase). */
 export const RESEARCH_BASE_EVENT = 'strom:research-base-changed';
 
+/**
+ * Window event: the backup before a stored tree's data update could not be
+ * written, so the tree was left as stored (updateStoredData); detail: { treeId }.
+ */
+export const UPDATE_BACKUP_FAILED_EVENT = 'strom:update-backup-failed';
+
 /** The research base stored with a tree's data (store `researchBases`, key = tree id). */
 interface StoredResearchBase extends ResearchBase {
     researchId: string;
@@ -197,7 +204,9 @@ function slugify(text: string): string {
  * tree of 3.26 with sources made only for another QUAY (v19), and from v20
  * on every tree with persons (shared events, spec 085: the backup is taken
  * even though nothing is joined, as the data version changes). An empty tree
- * needs nothing.
+ * needs nothing. Such a tree is never stored updated without that backup:
+ * when it cannot be written, the read leaves the tree as stored, and so does
+ * its first write here (takePreMigrationBackup).
  */
 function needsDataUpdate(data: StromData, version: number): boolean {
     if (version < 19 && qualityOnlySources(data.sources).size > 0) return true;
@@ -293,6 +302,21 @@ class TreeManagerClass {
             console.error('Saving the tree index failed', err);
             dispatchSaveFailed(null, err);
         });
+    }
+
+    /**
+     * Note the images of the research's version the stored tree still lacks
+     * (spec 116, I1); none or empty: the note goes. The index is stored only
+     * when the note changed.
+     */
+    setPendingImages(id: TreeId, notes: PendingImageNotes | null): void {
+        const tree = this.index.trees.find(t => t.id === id);
+        if (!tree) return;
+        const next = notes && Object.keys(notes).length ? notes : undefined;
+        if (JSON.stringify(tree.pendingImages ?? null) === JSON.stringify(next ?? null)) return;
+        if (next) tree.pendingImages = next;
+        else delete tree.pendingImages;
+        this.saveIndex();
     }
 
     /**
@@ -726,7 +750,8 @@ class TreeManagerClass {
 
     /**
      * A tree an older app stored that is read here as it was (no update on
-     * reading, see needsDataUpdate) still changes when this window first
+     * reading, see needsDataUpdate, or one left for want of its backup, see
+     * updateStoredData) still changes when this window first
      * writes it: the data are moved over in memory (data v24: attachments
      * become records of the tree's files) and the first save stamps this
      * version. The state as stored is kept until then, and that first write
@@ -748,7 +773,14 @@ class TreeManagerClass {
         });
     }
 
-    /** The first write of a newer data version over a tree kept by notePreMigrationState: its backup first. */
+    /**
+     * The first write of a newer data version over a tree kept by
+     * notePreMigrationState: its backup first. A tree its read would have
+     * updated (needsDataUpdate: kept so because that backup failed then) is
+     * not written without the backup either: the write fails (the "saving
+     * failed" notice), the state stays kept and the next write tries the
+     * backup again. Any other tree is written as before, its backup best-effort.
+     */
     private async takePreMigrationBackup(id: TreeId, writing: StromData): Promise<void> {
         const kept = this.preMigrationStates.get(id);
         if (!kept || (writing.version ?? 1) <= kept.version) return;
@@ -757,6 +789,9 @@ class TreeManagerClass {
             await createSnapshot(id, kept.data, 'pre-migration', Date.now(), kept.base);
         } catch (err) {
             console.warn('The backup before the data update could not be written', err);
+            if (!needsDataUpdate(kept.data, kept.version)) return;
+            if (!this.preMigrationStates.has(id)) this.preMigrationStates.set(id, kept);
+            throw err;
         }
     }
 
@@ -777,13 +812,26 @@ class TreeManagerClass {
      * A tree in step with the research before stays in step (its fingerprint
      * follows), and the kept copies of the research's version change the
      * same way.
+     * Without the backup nothing is updated (Milan, 19 Nov 2026): when it
+     * cannot be written (storage full, encryption on but locked) the data are
+     * returned as read, nothing is saved (neither the tree nor the research's
+     * fingerprints and copies), a notice says so (UPDATE_BACKUP_FAILED_EVENT)
+     * and the next read tries again, backup first. Until then the tree is kept
+     * as stored (notePreMigrationState), so its first write here takes that
+     * backup too or is not written (takePreMigrationBackup). Automatic backups
+     * turned off do not matter: this backup is taken all the same.
      */
     private async updateStoredData(id: TreeId, tree: TreeMetadata | undefined, data: StromData, version: number): Promise<StromData> {
         try {
             await createSnapshot(id, data, 'pre-migration', Date.now(), this.backupResearchBase(id, this.researchBaseOf(id)));
         } catch (err) {
-            console.warn('The backup before the data update could not be written', err);
+            console.warn('The backup before the data update could not be written: the tree stays as stored', err);
+            this.notePreMigrationState(id, data, version);
+            dispatchUpdateBackupFailed(id);
+            return data;
         }
+        // Backed up: the save below is not backed up a second time.
+        this.preMigrationStates.delete(id);
         const next = structuredClone(data);
         const joined = version < 19 ? joinQualityOnlySources(next) : 0;
         const censuses = version < 20 ? convertLegacyCensusEvents(next) : 0;
@@ -856,6 +904,11 @@ class TreeManagerClass {
         // Ensure this tree's queued saves (and any other pending writes) have
         // landed before reading (review S20).
         await this.flush(id);
+        return this.readStoredRecord(id);
+    }
+
+    /** readTreeRecord without waiting for the tree's queue (a step on that queue reads with it). */
+    private async readStoredRecord(id: TreeId): Promise<TreeReadResult> {
         const raw = await StorageManager.get<StromData | EncryptedData | PooledTreeRecord>('trees', id);
         if (!raw) {
             this.unreadableTrees.delete(id);
@@ -1117,10 +1170,37 @@ class TreeManagerClass {
             for (const item of list) if (item !== store) void this.backUpRescue(id, item.key, item.rescued);
             if (!store) continue;
             store.rescued.data.version = STROM_DATA_VERSION;
+            // Its first write here may be the one that moves an older app's tree to this version (N1-b).
+            this.noteStoredPreMigrationState(id);
             this.queueWrite(id, { data: store.rescued.data, base: store.rescued.base ?? null });
             // Its key goes once the write lands (settle).
             this.restoredRescues.set(id, store.key);
         }
+    }
+
+    /**
+     * A rescued state goes over the tree as stored, which may still be an
+     * older app's (the page was left while the first write here waited for
+     * the backup before the data update): that stored state is kept as
+     * notePreMigrationState keeps it, so the rescued write takes the backup
+     * first (takePreMigrationBackup). Read on the tree's queue, ahead of the
+     * rescued write. Not when a backup of it was taken already (the page
+     * went away after the backup, before the write landed): never a second.
+     */
+    private noteStoredPreMigrationState(id: TreeId): void {
+        const storedAt = Date.parse(this.index.trees.find(t => t.id === id)?.lastModifiedAt ?? '');
+        const prev = this.saveQueues.get(id) ?? Promise.resolve();
+        const step = prev.then(async () => {
+            if (this.preMigrationStates.has(id)) return;
+            const stored = await this.readStoredRecord(id);
+            if (stored.status !== 'ok' || (stored.data.version ?? 1) >= STROM_DATA_VERSION) return;
+            const backups = await listSnapshots(id);
+            if (Number.isFinite(storedAt) && backups.some(m => m.reason === 'pre-migration' && m.createdAt >= storedAt)) return;
+            this.notePreMigrationState(id, stored.data, stored.data.version ?? 1);
+        }).catch((err) => {
+            console.warn('The tree as stored could not be read for the backup before the data update', err);
+        });
+        this.saveQueues.set(id, step);
     }
 
     /**
@@ -1190,6 +1270,11 @@ class TreeManagerClass {
         // shares strings (photos, scans) with the live data, so it is cheap
         // even for a tree carrying tens of MB of images.
         const snapshot = cloneTreeDataAsJson(data);
+        // Images of a load still to come are not in the data stored (a field
+        // keeps its older image, or has none): noted with the tree, the next
+        // connect to the research asks for them (spec 116, I1).
+        const load = imageLoads.current();
+        if (load && load.treeId === id && !load.isAborted()) this.setPendingImages(id, load.notes(!SettingsManager.isEncryptionEnabled()));
         // The counts follow the data at once: the write lands later, and a
         // dialog opened meanwhile (deleting the tree) said "0 people".
         // Stored with the index when the write lands (updateMetadata).
@@ -1823,6 +1908,7 @@ class TreeManagerClass {
             if (prev?.sendMedia === false && link.sendMedia === undefined) kept.sendMedia = false;
             if (prev?.autoLoadImages === false && link.autoLoadImages === undefined) kept.autoLoadImages = false;
             if (prev?.titlesIn && link.titlesIn === undefined) kept.titlesIn = prev.titlesIn;
+            if (prev?.deletedSources?.length && link.deletedSources === undefined) kept.deletedSources = prev.deletedSources;
             tree.research = { ...kept, ...link, id };
         } else delete tree.research;
         this.saveIndex();
@@ -1907,6 +1993,12 @@ function dispatchSaveFailed(treeId: TreeId | null, err: unknown): void {
     }));
 }
 
+/** Raise UPDATE_BACKUP_FAILED_EVENT (its notice in main.ts). */
+function dispatchUpdateBackupFailed(treeId: TreeId): void {
+    if (typeof window === 'undefined' || typeof CustomEvent === 'undefined') return;
+    window.dispatchEvent(new CustomEvent(UPDATE_BACKUP_FAILED_EVENT, { detail: { treeId } }));
+}
+
 /** Window event: a tree's file-copy state changed; detail: { treeId }. */
 export const FILE_COPY_EVENT = 'strom:file-copy';
 
@@ -1930,8 +2022,8 @@ registerPoolReferences('trees', async () => {
     return ids;
 });
 
-/** A research link without the state of a send (a duplicate starts with none). */
+/** A research link without the state of a send (a duplicate starts with none, nor with sources waiting to be retracted). */
 function withoutSendState(link: ResearchLink): ResearchLink {
-    const { sent: _sent, refused: _refused, ...rest } = link;
+    const { sent: _sent, refused: _refused, deletedSources: _deleted, ...rest } = link;
     return rest;
 }

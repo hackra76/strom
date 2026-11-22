@@ -559,10 +559,13 @@ test.describe('the search field beside the view tabs (de-DE, no research)', () =
  * tabs, ⋯, a shorter tree name; on a tablet the steppers' words, the count,
  * the switch) and a field that still cannot have it becomes the magnifier,
  * which opens the field over the bar. Before, only a research tree was
- * measured: without one, de and pl at 1300 px kept a stub of 8-36 px. On a
+ * measured: without one, de and pl at 1300 px kept a stub of 8-36 px. The
+ * placeholder shows whole: in full where it fits, else its short form ("Suchen…";
+ * before, de showed "Person suche" over the sample tree). On a
  * phone the magnifier opens the field over the bar as well. Nothing runs
  * over the bar and its controls do not overlap.
  */
+const FULL_PLACEHOLDER: Record<string, string> = { 'de-DE': 'Person suchen…', 'pl-PL': 'Szukaj osoby…' };
 for (const locale of ['de-DE', 'pl-PL']) {
     test.describe(`the search field keeps its minimum (${locale})`, () => {
         test.use({ locale });
@@ -592,8 +595,20 @@ for (const locale of ['de-DE', 'pl-PL']) {
                         overlaps.push(`${parts[i][0]} × ${parts[j][0]}`);
                     }
                 }
+                // The placeholder ("Person suchen…") against the field's room for text.
+                let phShort = 0;
+                const ph = (input as HTMLInputElement | null)?.placeholder ?? '';
+                if (shown(input)) {
+                    const el = input as HTMLInputElement, cs = getComputedStyle(el);
+                    const ctx = document.createElement('canvas').getContext('2d')!;
+                    ctx.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+                    const room = el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+                    phShort = Math.ceil(ctx.measureText(el.placeholder).width - room);
+                }
                 return {
                     field: shown(input) ? Math.round(input.getBoundingClientRect().width) : 0,
+                    phShort,
+                    ph,
                     magnifier: shown(magnifier),
                     overflow: tb.scrollWidth - tb.clientWidth,
                     page: document.documentElement.scrollWidth - window.innerWidth,
@@ -603,7 +618,7 @@ for (const locale of ['de-DE', 'pl-PL']) {
         }
 
         async function checkWidths(page: Page, what: string) {
-            for (const width of [1440, 1300, 1024, 768, 390]) {
+            for (const width of [1440, 1300, 1200, 1100, 1024, 768, 390]) {
                 await page.setViewportSize({ width, height: width > 500 ? 900 : 844 });
                 const s = await searchFit(page);
                 const at = `${what} @${width}px`;
@@ -621,6 +636,10 @@ for (const locale of ['de-DE', 'pl-PL']) {
                     await expect(page.locator('body')).not.toHaveClass(/search-open/);
                 } else {
                     expect(s.field, `${at}: the search field (${s.field}px) keeps 80 px`).toBeGreaterThanOrEqual(80);
+                    // Its placeholder shows whole, in full or its short form ("Suchen…"): de cut "Person
+                    // suchen…" to "Person suche" (verification of 3.30.0). A computer's width has the full one.
+                    expect(s.phShort, `${at}: the placeholder (${s.ph}) fits the field`).toBeLessThanOrEqual(0);
+                    if (width === 1440) expect(s.ph, `${at}: the full placeholder`).toBe(FULL_PLACEHOLDER[locale]);
                 }
             }
         }
@@ -681,8 +700,8 @@ test.describe('the 1280 fold boundary', () => {
 test.describe('the sample tree\'s toolbar with the line picker and ⧉', () => {
     const WIDE_FONT = '* { font-family: Verdana, "DejaVu Sans", sans-serif !important; }';
     const FIT_WIDTHS = [1440, 1100, 1024, 960, 900, 800, 700, 641];
-    /** The line picker's "all lines" label: the language is the one asked for. */
-    const ALL_LINES: Record<string, string> = { 'de-DE': 'Stammlinien', 'cs-CZ': 'Rody', 'en-US': 'Lines', 'pl-PL': 'Rody' };
+    /** The line picker's label with nothing chosen (spec 098 §1.1): the language is the one asked for. */
+    const ALL_LINES: Record<string, string> = { 'de-DE': 'Auswahl', 'cs-CZ': 'Výběr', 'en-US': 'Selection', 'pl-PL': 'Wybór' };
 
     async function toolbarAudit(page: Page) {
         return page.evaluate(() => {
@@ -801,8 +820,9 @@ test.describe('the tree switcher and the search field are equally high (T54 H4)'
 test.describe('Esc folds the search opened from the magnifier back to it', () => {
     test.use({ locale: 'de-DE' });
 
-    // Widths where the de bar folds the search on its own: a computer at 1100, a tablet at 700.
-    for (const [width, height, touch] of [[1100, 800, false], [700, 1000, true]] as const) {
+    // Widths where the de bar folds the search on its own: the narrowest computer bar (1025), a tablet at 700
+    // (from 1030 px the capped tree name, step 4, leaves the field its 80 px).
+    for (const [width, height, touch] of [[1025, 800, false], [700, 1000, true]] as const) {
         test.describe(`${width} px${touch ? ', touch' : ''}`, () => {
             test.use({ viewport: { width, height }, hasTouch: touch });
 

@@ -28,9 +28,9 @@ import {
     RelationContext,
     StromData,
     TreeId,
-    LAST_FOCUSED,
     LastFocusedMarker
 } from '../types.js';
+import { LAST_FOCUSED } from '../model-values.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { CARD_STATUS_CLASSES } from '../reliability.js';
 import { cardStatusLegendLabel, statusMarkHtml } from './fact-status.js';
@@ -49,7 +49,9 @@ import {
 import { PersonPicker } from '../person-picker.js';
 import { AppExporter } from '../export.js';
 import { SettingsManager } from '../settings.js';
-import { ThemeMode, LanguageSetting, AppMode, AuditLog, APP_VERSION, ViewMode, STANDALONE_VIEWS, SurnameDisplay } from '../types.js';
+import { ThemeMode, LanguageSetting, AppMode, AuditLog, ViewMode, SurnameDisplay } from '../types.js';
+import { STANDALONE_VIEWS } from '../model-values.js';
+import { APP_VERSION } from '../version.js';
 import { CryptoSession, isEncrypted, encrypt, decrypt, EncryptedData } from '../crypto.js';
 import { validateTreeData, ValidationResult as TreeValidationResult, ValidationIssue } from '../validation.js';
 import * as CrossTree from '../cross-tree.js';
@@ -63,11 +65,16 @@ import { showToast as showToastNow, putToast as putToastNow, showProgressToast a
 import { helpMark, setHelpMarkTopic } from './help-mark.js';
 import { HELP_TOPICS, type HelpTopic } from '../help/topics.js';
 import { openHelp } from './help-ui.js';
+import { fanStylePreviewSvg } from '../fan-look.js';
+import { FAN_STYLES } from '../fan-colors.js';
 import { syncControlBlock } from './minimap.js';
 import { addLender, cancelWaiting, removeLender, watchToasts, whenFree } from '../toast-slot.js';
 import { defaultFocusKey, focusDefaultPerson, isDefaultFocusContext, updateDefaultFocusButtons } from './default-focus.js';
 
 
+
+/** Dialog backdrops: a click on one closes its dialog (their own handlers, the info dialogs' below). */
+const BACKDROP = '.modal-overlay, .bottom-sheet-overlay';
 
 /** The sample name under Settings > Surname display (no titles shown). */
 const SURNAME_SAMPLE = { firstName: 'Marie', lastName: 'Dvořáková', marriedSurname: 'Nováková' };
@@ -302,7 +309,8 @@ export const miscMethods = uiModule({
     },
 
     // ---- SETTINGS DIALOG ----
-    showSettingsDialog(): void {
+    /** Settings; `section` 'fan': scrolled to the fan's group (the Appearance panel's link, spec 118 §10). */
+    showSettingsDialog(section?: 'fan'): void {
         const modal = document.getElementById('settings-modal');
         if (!modal) return;
         // A fresh opening (not a redraw while open, as on a language change): no
@@ -382,6 +390,7 @@ export const miscMethods = uiModule({
         this.renderResearchEdgeSettings();
         const kekuleToggle = document.getElementById('fan-kekule-toggle') as HTMLInputElement | null;
         if (kekuleToggle) kekuleToggle.checked = SettingsManager.isFanKekuleEnabled();
+        this.syncFanDefaultSetting();
         const titlesToggle = document.getElementById('show-titles-toggle') as HTMLInputElement | null;
         if (titlesToggle) titlesToggle.checked = SettingsManager.isShowTitles();
         const relCardToggle = document.getElementById('reliability-card-toggle') as HTMLInputElement | null;
@@ -415,6 +424,26 @@ export const miscMethods = uiModule({
         this.renderResearchLiveSettings();
         modal.classList.add('active');
         this.fitSurnameDisplaySetting();
+        if (section === 'fan') document.getElementById('settings-group-fan')?.scrollIntoView({ block: 'start' });
+    },
+
+    /**
+     * Settings › Fan (spec 118 §10): the default look's choices as the device
+     * keeps them, each style's row with its small fan (drawn once).
+     */
+    syncFanDefaultSetting(): void {
+        const look = TreeRenderer.getFanLookDefault();
+        document.querySelectorAll<HTMLElement>('#settings-modal [data-fan-style-prev]').forEach(el => {
+            const style = FAN_STYLES.find(s => s === el.dataset.fanStylePrev);
+            if (style && !el.firstElementChild) el.innerHTML = fanStylePreviewSvg(style);
+        });
+        const check = (name: string, value: string) => document.querySelectorAll<HTMLInputElement>(`#settings-modal input[name="${name}"]`)
+            .forEach(radio => { radio.checked = radio.value === value; });
+        check('fan-default-style', look.style);
+        check('fan-default-scope', look.rodScope);
+        check('fan-default-content', look.content);
+        const portraits = document.getElementById('fan-default-portraits') as HTMLInputElement | null;
+        if (portraits) portraits.checked = look.portraits;
     },
 
     /** Experimental features: the group shows only while it has a row (none at the moment). */
@@ -534,8 +563,10 @@ export const miscMethods = uiModule({
         const mode = TreeRenderer.getViewMode();
         // Away from the Table view its rows kept in place after an edit are sorted again next time (§10.3).
         if (mode !== 'table') this.forgetTableOrder();
-        // The family line's choice (spec 039 §1.5): hidden on the timeline and the map.
-        this.syncRodPickerHost();
+        // The window's selection choice (spec 098 §2): hidden on the timeline, the map and the table.
+        this.syncSelectionPickerHost();
+        // The pill's "Hide others" in the Fan only for a selection of ancestors (§11b).
+        this.syncEvidencePillHide();
         // Mobile CSS hides the focus bar under the descendants badge.
         document.body.classList.toggle('descendants-view', mode === 'descendants');
         // Standalone views (map/timeline/fan) have their own top-left controls;
@@ -812,7 +843,21 @@ export const miscMethods = uiModule({
         // dialog (a text selection dragged out) is not a backdrop click, and
         // overlays wiring their own backdrop handler keep it.
         let pressTarget: EventTarget | null = null;
-        document.addEventListener('pointerdown', (e) => { pressTarget = e.target; }, true);
+        let pressBackdrop: Element | null = null;
+        window.addEventListener('pointerdown', (e) => {
+            pressTarget = e.target;
+            pressBackdrop = e.target instanceof Element ? e.target.closest(BACKDROP) : null;
+        }, true);
+        // A backdrop's click counts only when the press started on the backdrop itself. A press inside the
+        // dialog released on the backdrop (a word in a field selected by dragging past the dialog's edge),
+        // or one whose element was drawn anew before the release, makes the browser fire the click on the
+        // nearest common ancestor: the backdrop. Stopped here, before every overlay's own close handler.
+        window.addEventListener('click', (e) => {
+            const t = e.target;
+            if (!e.isTrusted || !(t instanceof Element) || !t.matches(BACKDROP)) return;
+            if (pressBackdrop !== t || pressTarget === t) return;
+            e.stopImmediatePropagation();
+        }, true);
         document.addEventListener('click', (e) => {
             const overlay = e.target;
             if (!(overlay instanceof HTMLElement) || pressTarget !== overlay) return;
@@ -1978,8 +2023,9 @@ export const miscMethods = uiModule({
      */
     performUndo(): void {
         this.dismissUndoToast();
-        // A locked tree is read-only: say why nothing happens (review S21).
-        if (DataManager.isTreeLocked() && !DataManager.isViewMode() && DataManager.canUndo()) {
+        // A locked tree is read-only: say why nothing happens (review S21); a list's step
+        // while following a research goes (N2).
+        if (DataManager.undoLocked('undo') && !DataManager.isViewMode() && DataManager.canUndo()) {
             this.showToast(strings.storageSafety.treeLocked);
             return;
         }
@@ -1999,7 +2045,7 @@ export const miscMethods = uiModule({
     /** Replay the last undone mutation. Symmetric to performUndo(). */
     performRedo(): void {
         this.dismissUndoToast();
-        if (DataManager.isTreeLocked() && !DataManager.isViewMode() && DataManager.canRedo()) {
+        if (DataManager.undoLocked('redo') && !DataManager.isViewMode() && DataManager.canRedo()) {
             this.showToast(strings.storageSafety.treeLocked);
             return;
         }

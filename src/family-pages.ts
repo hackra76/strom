@@ -12,7 +12,8 @@
  */
 
 import { personMedia, personMediaCount } from './media.js';
-import { Partnership, PartnershipId, Person, PersonId, StromData, personSourceIds } from './types.js';
+import { Partnership, PartnershipId, Person, PersonId, StromData } from './types.js';
+import { personSourceIds } from './model-values.js';
 import { PrivacyMode } from './privacy.js';
 import { getStringsForLang, Language } from './strings.js';
 import { yearOf } from './dates.js';
@@ -25,11 +26,11 @@ export { isGapOnlyName };
 import { asciiSlug } from './filenames.js';
 import { normalizeSearchText, searchableSurnames, alternateNames } from './name-search.js';
 import {
-    LineageIndex, Rod, RodId, Selection, otherFamilyRods, rodGenerations, rodNameForms, rodOfPersonForCrumbs, rods as allRods, selection,
+    LineageIndex, Rod, RodId, Selection, otherFamilyRods, rodGenerations, rodNameForms, rodOfPersonForCrumbs, rods as allRods, selection, spouseRodOf,
 } from './lineage.js';
 import { BookSelectionSpec, lineageSpec } from './book-model.js';
 import { sortRods } from './rods-overview.js';
-import { PERSON_PAGE_DEFAULT_PRIVACY, ProtectedPersonPageTree, dataUrlImageSize, personPageFileName, protectPersonPageTree } from './person-page.js';
+import { PERSON_PAGE_DEFAULT_PRIVACY, ProtectedPersonPageTree, dataUrlImageSize, personPageFileName, protectPersonPageTree, type PersonPageOptions } from './person-page.js';
 import { ImageChoice, ImageRegistry, RegistryImageKind, SHRINK_CLIP_PX, SHRINK_PHOTO_PX } from './image-registry.js';
 import type { HistoryPayload, PersonHistoryEnv } from './history.js';
 
@@ -115,6 +116,8 @@ export interface PageSetOptions {
     /** The research's history (the timelines' history layer); none: no layer. */
     history?: { payload: HistoryPayload; env?: PersonHistoryEnv } | null;
     now?: Date;
+    /** The app's window while the tree's images come (spec 116 §5, PersonPageOptions.imageWait); never a file. */
+    imageWait?: PersonPageOptions['imageWait'];
 }
 
 /** The groups of the person pages a set carries (1102 §4.4); stories and sources also on the family pages. */
@@ -140,7 +143,8 @@ export interface PageSetContext {
 
 export interface PageSet {
     spec: BookSelectionSpec;
-    options: Required<Pick<PageSetOptions, 'lang' | 'privacy' | 'families' | 'clips' | 'photos' | 'map' | 'sources' | 'stories' | 'timelines' | 'minimal'>> & { now: Date; groups: PageSetGroups };
+    options: Required<Pick<PageSetOptions, 'lang' | 'privacy' | 'families' | 'clips' | 'photos' | 'map' | 'sources' | 'stories' | 'timelines' | 'minimal'>> & { now: Date; groups: PageSetGroups }
+        & Pick<PageSetOptions, 'imageWait'>;
     /** The research's history for the timelines (null: none). */
     history: { payload: HistoryPayload; env?: PersonHistoryEnv } | null;
     selection: Selection;
@@ -474,6 +478,7 @@ export function buildPageSet(data: StromData, spec: BookSelectionSpec, opts: Pag
         lang, privacy: opts.privacy ?? PERSON_PAGE_DEFAULT_PRIVACY, families: opts.families ?? 'pages',
         clips: opts.clips ?? 'full', photos: opts.photos ?? 'full', map: opts.map ?? true,
         sources, stories, groups, timelines: opts.timelines ?? false, minimal: opts.minimal ?? false, now: opts.now ?? new Date(),
+        ...(opts.imageWait ? { imageWait: opts.imageWait } : {}),
     };
     // Ancestors without a depth: the dialog's default (§4.1).
     if (spec.kind === 'ancestors' && spec.generations == null) spec = { ...spec, generations: PAGE_SET_ANCESTOR_GENERATIONS };
@@ -760,9 +765,9 @@ function buildSearchIndex(set: PageSet, rods: readonly Rod[]): SearchEntry[] {
         if (!f) { const nf = rodNameForms(rod, tree); f = [...nf.forms, ...nf.feminine]; forms.set(rod.id, f); }
         return f;
     };
-    // A married-in spouse's lineage: the member's they married.
-    const spouseRod = new Map<PersonId, RodId>();
-    for (const rod of rods) for (const s of rod.spouses) if (!spouseRod.has(s.personId)) spouseRod.set(s.personId, rod.id);
+    // A married-in spouse's lineage: of the set's lineages they married into, the one the
+    // person's row names (spouseRodOf: a big one first, the last marriage).
+    const spouseRod = (id: PersonId): RodId | null => spouseRodOf(prot.lineages, id, r => rodById.has(r));
     const memberSet = new Set(set.selection.memberIds);
 
     const out: SearchEntry[] = [];
@@ -791,7 +796,7 @@ function buildSearchIndex(set: PageSet, rods: readonly Rod[]): SearchEntry[] {
             const canon = [rod.surname, feminineForm(rod.surname) ?? ''].filter(Boolean).map(normalizeSearchText);
             if (last && !canon.includes(normalizeSearchText(last))) t += ` · ${F.recordedAs[genderKey(p)](last)}`;
         } else {
-            const sr = spouseRod.get(id);
+            const sr = spouseRod(id);
             if (sr) t = F.spouseIn[genderKey(p)](set.rodLabels.get(sr) || F.rodGeneric);
         }
         out.push({ s: set.personSlug.get(id) ?? '', n, y: yearsOf(p), t, k: keys.join(' '), o: surnameFirst(p) });

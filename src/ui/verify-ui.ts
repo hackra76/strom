@@ -16,17 +16,19 @@
  */
 
 import { DataManager } from '../data.js';
+import { TreeRenderer } from '../renderer.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { formatFlexDate } from '../dates.js';
+import { shownName } from '../person-name.js';
 import type { LifeEvent, PartnershipId, PersonId } from '../types.js';
 import { FactHolder, factCitations, isPartnership, localIsoDay } from '../import-origin.js';
 import { factConfirmation, factConfirmMark, factPendingPosition, factSourceIds, factValueSignature, factVerifyInfo, factVerifyReaders, type FactVerifyInfo } from '../verify.js';
 import { confirmRefusalText, verifyRefusalText } from '../verify-refusal.js';
 import { postFactConfirm, postVerify, type FactConfirmResult, type VerifyFact, type VerifyResult } from '../research-verify.js';
 import type { VerifyResearch } from '../verify-offer.js';
-import type { ReliabilityInput, ReliabilityStepName } from '../reliability.js';
-import { type FactOffer, factOffer, verifyFactKind, verifyRecordText } from '../verify-ui-model.js';
-import { type FactPillTarget, reliabilityLabel, setFactPendingResolver } from './fact-status.js';
+import type { FactReliability, ReliabilityInput, ReliabilityStepName } from '../reliability.js';
+import { type FactOffer, factOffer, verifyFactKind, verifyRecordText, verifyTogetherKind } from '../verify-ui-model.js';
+import { type FactPillTarget, importOriginParts, reliabilityLabel, setFactPendingResolver } from './fact-status.js';
 import {
     type StatusTipContext, type StatusTipSlots, closeStatusTip, openStatusTip, refreshStatusTip, registerStatusTipExtension,
 } from './status-tip.js';
@@ -246,11 +248,12 @@ function factNameText(holder: FactHolder, fact: string): string {
     return fact;
 }
 
-/** The fact's value as the preview's "What" says it: its date and place. */
+/** The fact's value as the preview's "What" says it: its date and place, a name as shown. */
 function factValueText(holder: FactHolder, fact: string): string {
     const lang = uiLang();
     const join = (date?: string, place?: string): string => [date ? formatFlexDate(date, lang) : '', place ?? ''].filter(Boolean).join(', ');
     if (isPartnership(holder)) return fact === 'marriage' ? join(holder.startDate, holder.startPlace) : '';
+    if (fact === 'name') return shownName(holder);
     if (fact === 'birth') return join(holder.birthDate, holder.birthPlace);
     if (fact === 'death') return join(holder.deathDate, holder.deathPlace);
     if (fact.startsWith('event:')) {
@@ -301,6 +304,8 @@ interface FactView {
     offer: FactOffer;
     info: FactVerifyInfo;
     step: ReliabilityStepName | null;
+    /** The fact's reliability as the tip read it (its import record while the value is the file's). */
+    reliability: FactReliability | null;
     key: string;
 }
 
@@ -355,7 +360,7 @@ export const verifyUiMethods = uiModule({
             localPending: !!localOf(holder, fact)?.pending,
             editable: !DataManager.isReadOnly(),
         });
-        return { holder, fact, target, offer, info, step, key: stateKey(holder, fact) };
+        return { holder, fact, target, offer, info, step, reliability: ctx.reliability ?? null, key: stateKey(holder, fact) };
     },
 
     /** The status tip's extension: the reason, the actions, the preview of one fact. */
@@ -389,6 +394,12 @@ export const verifyUiMethods = uiModule({
             }
             // The state the action led to: ✓ belongs to it, never to the action.
             sentence.innerHTML = `<span class="st-v-check" aria-hidden="true">✓</span> ${esc(text)}`;
+            // The family tree it came from stays as history under the confirmation (any fact, 066 K6.3 §4.1).
+            const rec = v.reliability?.fromImport ? v.reliability.importRecord : undefined;
+            if (rec) {
+                const o = importOriginParts(rec);
+                slots.reason.insertAdjacentHTML('afterbegin', `<div class="st-v-line st-v-taken">${esc(strings.verify.takenFrom(o.prog, o.date))}</div>`);
+            }
         }
         const checked = info.checked;
         if (offer.row === 'reason' && checked?.why && v.step) {
@@ -465,6 +476,7 @@ export const verifyUiMethods = uiModule({
             <span class="st-preview-label">${esc(label)}</span>
             <span class="st-preview-value">${esc(value)}${sub ? `<span class="st-preview-sub">${esc(sub)}</span>` : ''}</span></div>`;
         let note = '';
+        let together = '';
         let canStart = false;
         let failed = p.failed ?? '';
         if (p.loading) {
@@ -484,6 +496,9 @@ export const verifyUiMethods = uiModule({
                 rows.push(row(s.estimate1, f.how === 'read' ? s.costLow : s.costHigh,
                     est.sessions > 0 ? s.sessions(est.sessions, usdText(est.usd)) : ''));
                 note = f.how === 'search' ? s.previewNoteSearch : s.previewNote;
+                // A name read from the record of the birth or the baptism goes with it (066 K6.3).
+                const withKind = verifyTogetherKind(p.result.facts, f.fact);
+                together = withKind ? s.together[withKind] ?? '' : '';
                 canStart = true;
             }
         } else if (p.result && !p.result.ok) {
@@ -491,7 +506,8 @@ export const verifyUiMethods = uiModule({
             else failed = verifyRefusalText(p.result.code);
         }
         slots.actions.appendChild(block('st-preview', `<div class="st-preview-head">${esc(s.previewHead(factNameText(v.holder, v.fact)))}</div>`
-            + rows.join('') + (note ? `<div class="st-preview-note">${esc(note)}</div>` : '')));
+            + rows.join('') + (together ? `<div class="st-preview-note st-preview-together">${esc(together)}</div>` : '')
+            + (note ? `<div class="st-preview-note">${esc(note)}</div>` : '')));
         const back = button('back', esc(s.back));
         back.addEventListener('click', () => this.verifyClosePreview(v));
         const start = button('start', researchBridgeActionLabel(s.start, 'verify'), { primary: true, disabled: !canStart || !!p.starting });
@@ -622,6 +638,8 @@ export const verifyUiMethods = uiModule({
             });
         }
         this.verifyRedraw(confirm ? 'undo' : 'scan');
+        // The tree's card says it at once too: the tree holds none of it until the research's next version.
+        if (v.target.personId) TreeRenderer.refreshCardStatus(v.target.personId as PersonId);
         if (opts.inToast) return { ok: true, text: strings.verify.confirmedAt(dayText(result.confirmed ?? localIsoDay())) };
         done();
         return undefined;

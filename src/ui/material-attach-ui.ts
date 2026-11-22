@@ -12,11 +12,12 @@
  * See src/ui/module.ts for the composition pattern.
  */
 
-import { DataManager } from '../data.js';
+import { isPendingImageUrl } from '../research-image-refs.js';
+import { DataManager, LIVE_FOLLOW_EVENT } from '../data.js';
 import { Attachment, MediaPlace, PartnershipId, Person, PersonId, Source } from '../types.js';
 import { strings } from '../strings.js';
-import { MaterialItem, directPersons, fileUrl } from '../materials.js';
-import { mediaPersonIds, placePersonId } from '../media.js';
+import { MATERIAL_TIMEOUT_MS, MaterialError, MaterialItem, directPersons, fileUrl, materialErrorOf, materialRecordNote } from '../materials.js';
+import { mediaAt, mediaPersonIds, placePersonId } from '../media.js';
 import { mediaPlaceLabel, mediaUseLabel, mediaUses } from '../media-uses.js';
 import { MultiPersonPicker, PersonPicker } from '../person-picker.js';
 import { researchPersonRef } from '../research-link.js';
@@ -67,6 +68,40 @@ function allHave(records: Attachment[], place: MediaPlace, key: (p: MediaPlace) 
     if (!records.length) return false;
     const k = key(place);
     return records.every(r => r.places.some(p => key(p) === k));
+}
+
+/**
+ * The people every one of the files is already theirs: a place of theirs in
+ * the tree (not taken out), or the research's assignment (REFN). Shown in
+ * "Link to…" as linked already (ticked, not changeable), never "Nobody yet".
+ */
+export function attachFixedPeople(files: MaterialItem[], persons: Person[], recordOf: (item: MaterialItem) => Attachment | undefined = treeRecord): PersonId[] {
+    if (!files.length) return [];
+    const byRefn = new Map<string, Person>();
+    for (const p of persons) {
+        const refn = researchPersonRef(p.refn);
+        if (refn && !byRefn.has(refn)) byRefn.set(refn, p);
+    }
+    const has = (item: MaterialItem, p: Person): boolean => {
+        const rec = recordOf(item);
+        if (rec && !rec.removed && mediaAt(rec, { personId: p.id })) return true;
+        const refn = researchPersonRef(p.refn);
+        return !!refn && item.persons.includes(refn);
+    };
+    // The first file's people, in its order; then those every other file has too.
+    const first = files[0];
+    const rec = recordOf(first);
+    const ids: PersonId[] = [];
+    for (const pl of rec && !rec.removed ? rec.places : []) if ('personId' in pl && !pl.fact && !pl.eventId && !ids.includes(pl.personId)) ids.push(pl.personId);
+    for (const refn of first.persons) {
+        const p = byRefn.get(refn);
+        if (p && !ids.includes(p.id)) ids.push(p.id);
+    }
+    const known = new Map(persons.map(p => [p.id, p]));
+    return ids.filter(id => {
+        const p = known.get(id);
+        return !!p && !p.isPlaceholder && files.every(i => has(i, p));
+    });
 }
 
 function placeKeyOf(p: MediaPlace): string {
@@ -124,7 +159,8 @@ export const materialAttachMethods = uiModule({
         if (one) {
             dialog.box.querySelector('.mdlg-title')!.textContent = one.title;
             const att = treeRecord(one);
-            if (att?.dataUrl && att.mimeType.startsWith('image/') && !att.originalOnly) {
+            // A stand-in of a file on its way is never drawn as an image (spec 116 §5): the head without one.
+            if (att?.dataUrl && att.mimeType.startsWith('image/') && !att.originalOnly && !isPendingImageUrl(att.dataUrl)) {
                 const img = h('img', 'mdlg-attach-thumb');
                 img.alt = '';
                 img.src = att.dataUrl;
@@ -137,6 +173,21 @@ export const materialAttachMethods = uiModule({
         // Context: the person it came from, else the file's only person.
         const own = records.length === 1 && files.length === 1 ? mediaPersonIds(records[0]) : [];
         let anchorPerson: PersonId | null = ctx.personId && DataManager.getPerson(ctx.personId) ? ctx.personId : own.length === 1 ? own[0] : null;
+        // The person it was opened from is chosen at the start (1121), unless every file is theirs already
+        // (a place in the tree or the research's assignment): then nothing is chosen and one sentence says so.
+        const fromPerson = ctx.personId ? DataManager.getPerson(ctx.personId) : undefined;
+        const fromRefn = researchPersonRef(fromPerson?.refn);
+        const hasFromPerson = (i: MaterialItem): boolean => {
+            const rec = treeRecord(i);
+            return (!!rec && !rec.removed && !!fromPerson && mediaAt(rec, { personId: fromPerson.id })) || (!!fromRefn && i.persons.includes(fromRefn));
+        };
+        const fromAlready = !!fromPerson && files.every(hasFromPerson);
+        const preselect: PersonId[] = fromPerson && !fromPerson.isPlaceholder && !fromAlready ? [fromPerson.id] : [];
+        // Whose all the files are already (a place in the tree or the research's assignment): ticked and not
+        // changeable in the list, and named above it — the same people the sentence "already linked" speaks of.
+        const pickable = DataManager.getAllPersons().filter(p => !p.isPlaceholder);
+        const fixedPeople = attachFixedPeople(files, pickable);
+        const fixedSet = new Set(fixedPeople);
 
         const seg = h('div', 'mdlg-seg sel-seg');
         seg.setAttribute('role', 'radiogroup');
@@ -150,6 +201,19 @@ export const materialAttachMethods = uiModule({
         }
         const off = outside.length > 0 && !bridgeUp;
         if (off) dialog.body.appendChild(h('p', 'mdlg-text mdlg-attach-off', m.actionsWhenRunning));
+        // A tree followed live is read-only (1122 F): said at once with the way out, the choice kept meanwhile.
+        const followedNote = h('p', 'mdlg-text mdlg-attach-followed');
+        followedNote.setAttribute('role', 'status');
+        const endFollow = h('button', 'link-button mdlg-attach-endfollow', strings.research.stop);
+        endFollow.type = 'button';
+        endFollow.addEventListener('click', () => {
+            this.stopLiveFollow();
+            refresh();
+            if (!confirm.disabled) confirm.focus();
+        });
+        followedNote.append(h('span', '', m.attachFollowed), ' ', endFollow);
+        followedNote.hidden = true;
+        dialog.body.appendChild(followedNote);
 
         const confirm = button(m.attachBtn, 'is-primary', () => void run());
         confirm.disabled = true;
@@ -162,12 +226,17 @@ export const materialAttachMethods = uiModule({
         let single: PersonPicker | null = null;
         const cleanup = () => { multi?.destroy(); multi = null; single?.destroy(); single = null; };
         const close = dialog.close;
-        dialog.close = () => { cleanup(); close(); };
+        // Following that starts or ends while the dialog is open is said at once.
+        const onFollow = () => refresh();
+        window.addEventListener(LIVE_FOLLOW_EVENT, onFollow);
+        dialog.close = () => { window.removeEventListener(LIVE_FOLLOW_EVENT, onFollow); cleanup(); close(); };
 
         const refresh = () => {
             const n = target === 'person' ? chosenPeople.length : chosenPlace ? 1 : 0;
+            const followed = DataManager.isLiveFollowing();
+            followedNote.hidden = !followed;
             confirm.textContent = target === 'person' && n ? m.attachN(n) : m.attachBtn;
-            confirm.disabled = off || n === 0;
+            confirm.disabled = off || followed || n === 0;
             let text = '';
             if (target === 'person' && mc?.caps.list && chosenPeople.some(id => !researchPersonRef(DataManager.getPerson(id)?.refn))) {
                 text = mc.agent ? m.noRefnTreeResearch : m.noRefnTree;
@@ -242,23 +311,26 @@ export const materialAttachMethods = uiModule({
                 b.tabIndex = on ? 0 : -1;
             });
             if (next === 'person') {
+                if (fromAlready && fromPerson) pane.appendChild(h('p', 'mdlg-text mdlg-attach-has', m.attachPersonAlready(fullName(fromPerson), files.length)));
                 const host = h('div');
                 host.id = PICKER_ID;
                 pane.appendChild(host);
-                const fixed = (p: Person) => allHave(records, { personId: p.id }, placeKeyOf) && !outside.length;
                 multi = new MultiPersonPicker({
                     containerId: PICKER_ID,
                     multi: true,
-                    persons: DataManager.getAllPersons().filter(p => !p.isPlaceholder),
+                    persons: pickable,
                     placeholder: m.attachPersonPh,
                     max: MAX_PEOPLE,
-                    fixed,
+                    fixed: p => fixedSet.has(p.id),
+                    fixedChips: fixedPeople,
                     onChange: ids => { chosenPeople = ids; refresh(); },
                     noneLabel: m.noneChosen,
                     removeLabel: m.removePerson,
                     maxLabel: m.assignMax,
                     fixedLabel: m.attachAlready,
+                    initial: preselect,
                 });
+                chosenPeople = [...preselect];
                 multi.focusInput();
             } else if (next === 'event') {
                 withPerson(person => {
@@ -341,32 +413,55 @@ export const materialAttachMethods = uiModule({
         });
         show('person');
 
+        /** A click that wrote nothing says why in the dialog, with Try again where another try may go (1122 F). */
+        const refused = (text: string, retry: boolean) => {
+            dialog.busy(false);
+            dialog.error(text, retry ? { label: m.retry, run: () => void run() } : undefined);
+        };
         const run = async () => {
             if (confirm.disabled || isBusy(confirm)) return;
             const places: MediaPlace[] = target === 'person' ? chosenPeople.map(id => ({ personId: id })) : chosenPlace ? [chosenPlace] : [];
             if (!places.length) return;
             dialog.busy(true);
             dialog.error(null);
-            const targets: Array<{ id: string } | { record: Omit<Attachment, 'id' | 'places'> }> = files.filter(i => treeRecord(i)).map(i => ({ id: treeRecord(i)!.id }));
-            for (const item of outside) {
-                const record = await this.materialWorkingCopy(item, mc);
-                if (!record) {
-                    dialog.busy(false);
-                    dialog.error(m.attachFailed);
+            try {
+                const targets: Array<{ id: string } | { record: Omit<Attachment, 'id' | 'places'> }> = files.filter(i => treeRecord(i)).map(i => ({ id: treeRecord(i)!.id }));
+                for (const item of outside) {
+                    const why: { error?: MaterialError } = {};
+                    const record = await this.materialWorkingCopy(item, mc, why);
+                    if (!record) {
+                        console.warn('Link to…: the working copy was not read', item.file?.id, why.error ?? 'no file or bridge');
+                        const busy = why.error?.kind === 'busy';
+                        refused(busy ? (mc?.agent ? m.errBusyResearch : m.errBusy) : m.attachFailed, true);
+                        return;
+                    }
+                    targets.push({ record });
+                }
+                // Read-only meanwhile (following began, the tree or a person locked): nothing is written, said so.
+                if (DataManager.isLiveFollowing()) {
+                    console.warn('Link to…: the tree is followed live (read-only)');
+                    refresh();
+                    refused(m.attachFollowed, false);
                     return;
                 }
-                targets.push({ record });
+                const data = DataManager.getData();
+                const toast = target === 'person'
+                    ? m.attachedToast.persons(chosenPeople.map(id => { const p = DataManager.getPerson(id); return p ? fullName(p) : id; }))
+                    : m.attachedToast[target](mediaPlaceLabel(data, places[0]));
+                const changed = DataManager.linkMedia(targets, places, { toast });
+                if (!changed.length) {
+                    console.warn('Link to…: nothing was written', { readOnly: DataManager.isReadOnly(), treeLocked: DataManager.isTreeLocked() });
+                    refused(m.attachNothing, false);
+                    return;
+                }
+                dialog.busy(false);
+                dialog.close();
+                this.afterMediaChange();
+                ctx.done?.();
+            } catch (err) {
+                console.warn('Link to… failed', err);
+                refused(m.errGeneric, true);
             }
-            const data = DataManager.getData();
-            const toast = target === 'person'
-                ? m.attachedToast.persons(chosenPeople.map(id => { const p = DataManager.getPerson(id); return p ? fullName(p) : id; }))
-                : m.attachedToast[target](mediaPlaceLabel(data, places[0]));
-            const changed = DataManager.linkMedia(targets, places, { toast });
-            dialog.busy(false);
-            if (!changed.length) return;
-            dialog.close();
-            this.afterMediaChange();
-            ctx.done?.();
         };
     },
 
@@ -375,22 +470,34 @@ export const materialAttachMethods = uiModule({
      * the bridge (an image reduced as an attachment, a PDF up to 2 MB; any
      * other kind only its original) and what the research knows of it.
      */
-    async materialWorkingCopy(item: MaterialItem, mc: MaterialsContext | null): Promise<Omit<Attachment, 'id' | 'places'> | null> {
+    async materialWorkingCopy(item: MaterialItem, mc: MaterialsContext | null, why?: { error?: MaterialError }): Promise<Omit<Attachment, 'id' | 'places'> | null> {
         const sha = materialItemSha(item);
         const file = item.file;
         if (!sha || !file || !mc?.base) return null;
         const mime = file.mime || item.mime || 'application/octet-stream';
         const original = { sha256: sha, name: file.name, mimeType: mime, bytes: file.bytes ?? 0 };
+        // The sender's note goes with it: a send of the tree without it would take it off in the research.
+        const note = materialRecordNote(item);
         const details = {
             ...(item.titled ? { title: item.title } : {}),
             ...(item.kind ? { kind: item.kind } : {}),
             ...(item.date ? { date: item.date } : {}),
+            ...(note ? { note } : {}),
         };
         const shown = ATTACHMENT_IMAGE_TYPES.includes(mime) || (mime === 'application/pdf' && (file.bytes ?? 0) <= MAX_PDF_BYTES);
         if (!shown) return { name: file.name, mimeType: mime, dataUrl: ORIGINAL_ONLY_DATA_URL, sizeBytes: 0, original, originalOnly: true, ...details };
+        // A bridge that does not answer ends the wait too: never a click that waits for good (1122 F).
+        const timeout = new AbortController();
+        const timer = setTimeout(() => timeout.abort(), MATERIAL_TIMEOUT_MS);
         try {
-            const res = await fetch(fileUrl(mc.base, sha), { method: 'GET', mode: 'cors', credentials: 'omit' });
-            if (!res.ok) return null;
+            const res = await fetch(fileUrl(mc.base, sha), { method: 'GET', mode: 'cors', credentials: 'omit', signal: timeout.signal });
+            if (!res.ok) {
+                // Its answer (503 busy with retry, 500 material.failed, 410 gone) for the caller's sentence.
+                let body: unknown = null;
+                try { body = await res.json(); } catch { body = null; }
+                if (why) why.error = materialErrorOf(res.status, body, res.headers?.get?.('Retry-After') ?? null);
+                return null;
+            }
             const blob = await res.blob();
             const type = blob.type || mime;
             const picked = new File([blob], file.name, { type });
@@ -407,7 +514,10 @@ export const materialAttachMethods = uiModule({
             }
             return { name: file.name, mimeType, dataUrl, sizeBytes: dataUrlByteSize(dataUrl), original: { ...original, bytes: original.bytes || blob.size }, ...details };
         } catch {
+            if (why) why.error = { kind: timeout.signal.aborted ? 'aborted' : 'down', status: 0 };
             return null;
+        } finally {
+            clearTimeout(timer);
         }
     },
 

@@ -4,10 +4,15 @@
  */
 
 import { personMediaCount } from './media.js';
-import { AppSettings, BranchMarker, BRANCH_MARKERS, ThemeMode, SurnameDisplay, SURNAME_DISPLAYS, LanguageSetting, CardDensity, TreeSpacing, SETTINGS_KEY, StromData, personSourceIds, CARD_SIZE, CardPhotoSize, CardPhotoShape, NORMAL_PHOTO_BOX } from './types.js';
+import { AppSettings, BranchMarker, ThemeMode, SurnameDisplay, LanguageSetting, CardDensity, TreeSpacing, StromData, CardPhotoSize, CardPhotoShape } from './types.js';
+import { CARD_SIZE, NORMAL_PHOTO_BOX } from './layout-config.js';
+import { BRANCH_MARKERS, SURNAME_DISPLAYS, SETTINGS_KEY, personSourceIds } from './model-values.js';
 import { CardFieldSettings, normalizeCardFields, customCardSize, normalizeCardDensity, effectiveCardFields, normalizeCardPhoto } from './card-fields.js';
 import { initLanguage, Language } from './strings.js';
 import { MapKind, MAP_KINDS, isMapKind, readPlacesSort, type PlacesSort } from './places.js';
+import { HISTORY_KINDS, isHistoryKind, type HistoryKind } from './history.js';
+import { sameSelectionRef, sanitizeSelectionRef, type SelectionRef } from './view-selection-ref.js';
+import { isViewScope, scopeDefault, type ScopedView, type ViewScope } from './view-scope.js';
 
 /** How many recently cited sources the picker remembers per tree. */
 export const RECENT_SOURCES_MAX = 5;
@@ -62,6 +67,64 @@ export function migrateCardSignals(stored: Record<string, unknown>,
 export interface LifelineDefaults {
     childEvents: boolean;
     history: boolean;
+}
+
+/**
+ * The Timeline's history options in a tree (spec 121 §0): the kinds shown
+ * (absent: all), the region (absent: all) and local history on the life lines
+ * (default off). This device only: never in the tree, an export, GEDCOM or a backup.
+ */
+export interface TimelineHistoryOptions {
+    kinds?: HistoryKind[];
+    region?: string;
+    local: boolean;
+}
+
+/** A tree's remembered selection of people (spec 098 §7): the main window's, with its "Hide others". */
+export interface StoredSelection {
+    ref: SelectionRef;
+    hideOthers: boolean;
+}
+
+/** The map's scope remembered per tree (spec 098 §3, §7). */
+export type StoredMapScope = ViewScope;
+
+/**
+ * The map's scope remembered per tree before spec 098 §11 (`mapScopeByTree`)
+ * becomes the map's part of the scopes per tree and view (`scopeByTree`),
+ * pure: a scope already stored there wins; `mapScopeByTree` goes. Returns
+ * whether anything changed (the caller stores it).
+ */
+export function migrateMapScopeByTree(settings: AppSettings): boolean {
+    const old = settings.mapScopeByTree;
+    if (!old) return false;
+    const all: NonNullable<AppSettings['scopeByTree']> = { ...(settings.scopeByTree ?? {}) };
+    for (const [treeId, scope] of Object.entries(old)) {
+        if (!isViewScope(scope) || all[treeId]?.map) continue;
+        all[treeId] = { ...(all[treeId] ?? {}), map: scope };
+    }
+    delete settings.mapScopeByTree;
+    if (Object.keys(all).length) settings.scopeByTree = all;
+    return true;
+}
+
+/**
+ * The family line remembered per tree before spec 098 (`rodByTree`) becomes
+ * the tree's selection (`selectionByTree`, a line, Hide others off), pure:
+ * a selection already stored for the tree wins; `rodByTree` goes. Returns
+ * whether anything changed (the caller stores it).
+ */
+export function migrateRodByTree(settings: AppSettings): boolean {
+    const old = settings.rodByTree;
+    if (!old) return false;
+    const all = { ...(settings.selectionByTree ?? {}) };
+    for (const [treeId, rodId] of Object.entries(old)) {
+        if (typeof rodId !== 'string' || !rodId || all[treeId]) continue;
+        all[treeId] = { ref: { kind: 'rod', rodId }, hideOthers: false };
+    }
+    delete settings.rodByTree;
+    if (Object.keys(all).length) settings.selectionByTree = all;
+    return true;
 }
 
 /** Per device, apart from the other settings. */
@@ -143,6 +206,10 @@ class SettingsManagerClass {
                 const parsed = JSON.parse(stored);
                 // Merge with defaults (for forward compatibility)
                 this.settings = { ...this.settings, ...parsed };
+                // Spec 098 §7: the family line remembered per tree becomes the tree's selection.
+                // Spec 098 §11: the map's scope per tree becomes the map's part of the scopes per tree and view.
+                const scopes = migrateMapScopeByTree(this.settings);
+                if (migrateRodByTree(this.settings) || scopes) this.saveQuietly();
             }
         } catch {
             // Use defaults on error
@@ -279,34 +346,107 @@ class SettingsManagerClass {
     setLifelineDefaults(treeId: string, defaults: LifelineDefaults): void {
         const all = (this.settings.lifelineByTree ??= {});
         const kinds = all[treeId]?.kinds;
-        all[treeId] = { childEvents: defaults.childEvents, history: defaults.history, ...(kinds ? { kinds } : {}) };
+        const timeline = all[treeId]?.timeline;
+        all[treeId] = { childEvents: defaults.childEvents, history: defaults.history, ...(kinds ? { kinds } : {}), ...(timeline ? { timeline } : {}) };
+        this.save();
+    }
+
+    /**
+     * The Timeline's history options of a tree (spec 121 §0), read
+     * defensively: unknown kinds dropped, all nine (or none valid) = no
+     * filter. A region the research no longer has is the caller's to drop.
+     */
+    getTimelineHistory(treeId: string | null): TimelineHistoryOptions {
+        const own = treeId ? this.settings.lifelineByTree?.[treeId]?.timeline : undefined;
+        const kinds = Array.isArray(own?.kinds) ? HISTORY_KINDS.filter(k => own!.kinds!.some(v => isHistoryKind(v) && v === k)) : null;
+        const region = typeof own?.region === 'string' && own.region ? own.region : undefined;
+        return {
+            ...(kinds && kinds.length < HISTORY_KINDS.length && (kinds.length || own!.kinds!.length === 0) ? { kinds } : {}),
+            ...(region ? { region } : {}),
+            local: own?.local === true,
+        };
+    }
+
+    setTimelineHistory(treeId: string, o: TimelineHistoryOptions): void {
+        const all = (this.settings.lifelineByTree ??= {});
+        const entry = (all[treeId] ??= {});
+        const kinds = o.kinds ? HISTORY_KINDS.filter(k => o.kinds!.includes(k)) : null;
+        const timeline = {
+            ...(kinds && kinds.length < HISTORY_KINDS.length ? { kinds } : {}),
+            ...(o.region ? { region: o.region } : {}),
+            ...(o.local ? { local: true } : {}),
+        };
+        if (Object.keys(timeline).length) entry.timeline = timeline;
+        else delete entry.timeline;
         this.save();
     }
 
     /** Forget a tree's timeline defaults (the tree was deleted). */
     forgetLifelineDefaults(treeId: string): void {
-        // The tree's chosen family line goes with it (spec 039 §3.5).
-        if (this.settings.rodByTree?.[treeId]) {
-            delete this.settings.rodByTree[treeId];
-            if (!this.settings.lifelineByTree?.[treeId]) { this.save(); return; }
+        // The tree's selection and map scope go with it (spec 039 §3.5, 098 §7).
+        let changed = false;
+        for (const all of [this.settings.selectionByTree, this.settings.scopeByTree]) {
+            if (all?.[treeId]) { delete all[treeId]; changed = true; }
         }
-        if (!this.settings.lifelineByTree?.[treeId]) return;
+        if (!this.settings.lifelineByTree?.[treeId]) { if (changed) this.save(); return; }
         delete this.settings.lifelineByTree[treeId];
         this.save();
     }
 
-    /** The family line chosen in a tree's view (spec 039 §3.5), or null. */
-    getRodForTree(treeId: string | null): string | null {
-        return (treeId && this.settings.rodByTree?.[treeId]) || null;
+    /** The selection of people remembered for a tree (spec 098 §7), checked; null: none. */
+    getSelectionForTree(treeId: string | null): StoredSelection | null {
+        const own = treeId ? this.settings.selectionByTree?.[treeId] : undefined;
+        const ref = sanitizeSelectionRef(own?.ref);
+        return ref ? { ref, hideOthers: own?.hideOthers === true } : null;
     }
 
-    /** Remember (or, with null, forget) the family line chosen in a tree's view. */
-    setRodForTree(treeId: string, rodId: string | null): void {
-        const now = this.settings.rodByTree?.[treeId] ?? null;
-        if (now === rodId) return;
-        if (rodId) (this.settings.rodByTree ??= {})[treeId] = rodId;
-        else delete this.settings.rodByTree![treeId];
+    /**
+     * Remember (or, with null, forget) a tree's selection. Only the main
+     * window remembers (§7): another window keeps its selection in its own
+     * state and changes nothing here. Stored only when it changed.
+     */
+    setSelectionForTree(treeId: string, sel: StoredSelection | null): void {
+        if (this.readOnly) return;
+        const now = this.getSelectionForTree(treeId);
+        if (!now && !sel) return;
+        if (now && sel && sameSelectionRef(now.ref, sel.ref) && now.hideOthers === sel.hideOthers) return;
+        if (sel) (this.settings.selectionByTree ??= {})[treeId] = { ref: { ...sel.ref }, hideOthers: sel.hideOthers };
+        else delete this.settings.selectionByTree![treeId];
         this.save();
+    }
+
+    /** A view's scope remembered for a tree (spec 098 §7, §11); null: never chosen. */
+    getScopeForTree(treeId: string | null, view: ScopedView): ViewScope | null {
+        const v = treeId ? this.settings.scopeByTree?.[treeId]?.[view] : undefined;
+        return isViewScope(v) ? v : null;
+    }
+
+    /**
+     * Remember a view's scope for a tree (null or the view's default:
+     * forgotten). The main window only (a read-only window writes nothing),
+     * stored only when it changed.
+     */
+    setScopeForTree(treeId: string, view: ScopedView, scope: ViewScope | null): void {
+        if (this.readOnly) return;
+        const next = scope === scopeDefault(view) ? null : scope;
+        if (this.getScopeForTree(treeId, view) === next) return;
+        const all = (this.settings.scopeByTree ??= {});
+        const entry = { ...(all[treeId] ?? {}) };
+        if (next) entry[view] = next;
+        else delete entry[view];
+        if (Object.keys(entry).length) all[treeId] = entry;
+        else delete all[treeId];
+        this.save();
+    }
+
+    /** The map's scope remembered for a tree (spec 098 §7); null: never chosen. */
+    getMapScopeForTree(treeId: string | null): StoredMapScope | null {
+        return this.getScopeForTree(treeId, 'map');
+    }
+
+    /** Remember (or, with null, forget) a tree's map scope; the main window only, stored only when it changed. */
+    setMapScopeForTree(treeId: string, scope: StoredMapScope | null): void {
+        this.setScopeForTree(treeId, 'map', scope);
     }
 
     /**

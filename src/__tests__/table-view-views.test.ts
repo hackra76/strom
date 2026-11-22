@@ -14,10 +14,11 @@ import { UndoManager } from '../undo.js';
 import { extractSubtree } from '../subtree.js';
 import { setLanguage } from '../strings.js';
 import { keepTableViews, sanitizeTableView, sanitizeTableViews } from '../table-views-data.js';
-import { STROM_DATA_VERSION, type PersonId, type StromData, type TableView, type TreeId } from '../types.js';
+import { type PersonId, type StromData, type TableView, type TreeId } from '../types.js';
+import { STROM_DATA_VERSION } from '../version.js';
 import {
     applyView, builtinView, builtinViews, customViews, defaultViewId, findView, isBuiltinId, readTableWork, takenViewNames, uniqueViewName,
-    viewChanged, viewFromState, workStorageKey, writeTableWork, BUILTIN_VIEWS,
+    viewChanged, viewFromState, workStorageKey, writeTableWork, BUILTIN_VIEWS, sortForView, stateForView,
     discardViewChanges, dropMissingViews, openViewOf, restoreTableState, switchView, tableWorkOf, viewList,
 } from '../ui/table-view/table-views.js';
 import { defaultTableState, defaultTypeState, hideColumn, resetColumns, setColumnWidth, sortClick } from '../ui/table-view/table-state.js';
@@ -223,6 +224,25 @@ describe('views and a row type\'s state (§9.2–§9.4)', () => {
         expect(again.filter).toEqual(st.filter);
     });
 
+    it('a list\'s order (# first, the scope\'s, spec 098 §11c) does not make "changed" and is not kept with the view', () => {
+        const v = saved();
+        const st = defaultTypeState('persons');
+        applyView(v, st);
+        st.sort = [{ col: 'num', dir: 'asc' }];
+        expect(viewChanged(v, st)).toBe(false);
+        expect(stateForView(st, v).sort).toEqual([{ col: 'bapDate', dir: 'desc' }]);
+        // Another change still counts; its draft keeps the view's own sort.
+        hideColumn('persons', st, 'bapPlace');
+        expect(viewChanged(v, st)).toBe(true);
+        expect(viewFromState('persons', stateForView(st, v), v.id, v.name, '').sort).toEqual([{ col: 'bapDate', dir: -1 }]);
+        // A sort of its own: changed; a # further down is dropped.
+        expect(sortForView([{ col: 'name', dir: 'asc' }, { col: 'num', dir: 'asc' }], [])).toEqual([{ col: 'name', dir: 'asc' }]);
+        const own = defaultTypeState('persons');
+        applyView(v, own);
+        own.sort = [{ col: 'name', dir: 'asc' }, { col: 'num', dir: 'asc' }];
+        expect(viewChanged(v, own)).toBe(true);
+    });
+
     it('a view with an unknown column is not "changed" once opened', () => {
         const v = saved('tv-c', 'C', { columns: [{ id: 'name' }, { id: 'noSuchColumn' }, { id: 'bDate' }] });
         const st = defaultTypeState('persons');
@@ -315,7 +335,7 @@ describe('the working state in localStorage (§9.1)', () => {
         switchView(b, 'tv-a', stored);
         const savedNow = viewFromState('persons', b.types.persons, 'tv-a', stored[0].name, '2026-11-11T10:00:00Z');
         writeTableWork('t1', tableWorkOf(b, [savedNow]));
-        expect(readTableWork('t1')).toEqual({ rowType: 'persons', open: { persons: 'tv-a', unions: 'b:marriages', events: 'b:events', sources: 'b:allSources' }, work: {} });
+        expect(readTableWork('t1')).toEqual({ rowType: 'persons', open: { persons: 'tv-a', unions: 'b:marriages', events: 'b:events', sources: 'b:allSources' }, work: {}, sharedScope: true });
     });
 
     it('a stored unsaved state is read as a stored view is: malformed parts left out, unknown ones dropped', () => {
@@ -358,7 +378,7 @@ describe('opening, switching and keeping views in the table state (§9.2, §9.3)
         expect(state.restored).toBe(true);
         expect(state.open).toEqual({ persons: 'b:overview', unions: 'b:marriages', events: 'b:events', sources: 'b:allSources' });
         expect(viewChanged(openViewOf(state, 'persons', undefined), state.types.persons)).toBe(false);
-        expect(tableWorkOf(state, undefined)).toEqual({ rowType: 'persons', open: { persons: 'b:overview', unions: 'b:marriages', events: 'b:events', sources: 'b:allSources' }, work: {} });
+        expect(tableWorkOf(state, undefined)).toEqual({ rowType: 'persons', open: { persons: 'b:overview', unions: 'b:marriages', events: 'b:events', sources: 'b:allSources' }, work: {}, sharedScope: true });
     });
 
     it('switching keeps the changes of the view left until it is chosen again, and switches the row type', () => {

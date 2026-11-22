@@ -3,8 +3,15 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { computeTimelineModel, yearToFraction, axisTicks, axisLabelStep, clusterTimelineHistory, timelineHistoryYears, TimelineHistoryItem } from '../timeline.js';
-import { buildTimelineSvg, buildTimelinePosterSvg, historyRowHeight, historyClusterGap, placeSharedLabels } from '../timeline-chart.js';
+import {
+    computeTimelineModel, yearToFraction, axisTicks, axisLabelStep, clusterTimelineHistory, timelineHistoryYears, TimelineHistoryItem,
+    filterTimelineHistory, timelineClusterKind, timelineClusterKinds, timelinePeriodTracks,
+    timelineConcernPersons, timelineClusterPersons, placeTimelinePop,
+} from '../timeline.js';
+import { setLanguage, strings } from '../strings.js';
+import { HISTORY_KINDS } from '../history.js';
+import { historyKindSvg } from '../history-symbols.js';
+import { buildTimelineSvg, buildTimelinePosterSvg, historyRowHeight, historyClusterGap, historyClusterClearance, placeSharedLabels } from '../timeline-chart.js';
 import { StromData, PersonId, PartnershipId, Person, Partnership, Gender, LifeEvent } from '../types.js';
 
 interface POpts {
@@ -382,11 +389,11 @@ describe('axis labels fit the width', () => {
     });
 });
 
-// ==================== HISTORY ROW (DEV symboly-dejin §9) ====================
+// ==================== HISTORY ROW (spec 121, after DEV symboly-dejin §9) ====================
 
 describe('timeline history row', () => {
     const ev = (id: string, year: number, o: Partial<TimelineHistoryItem> = {}): TimelineHistoryItem =>
-        ({ id, year, kind: 'war', scope: 'region', text: `Event ${id}.`, ...o });
+        ({ id, year, kind: 'war', scope: 'region', text: `Event ${id}.`, persons: ['jan'], ...o });
     const fam = () => data([
         person('jan', 'Jan', 'male', { birthDate: '1860', deathDate: '1910' }),
         person('anna', 'Anna', 'female', { birthDate: '1862', deathDate: '1930' }),
@@ -396,24 +403,138 @@ describe('timeline history row', () => {
     const svgOf = (model: ReturnType<typeof computeTimelineModel>, narrow = false) =>
         buildTimelineSvg(model, { esc, width: 1440, rowH: 30, labelW: 160, mode: 'screen', narrow });
 
-    it("carries only the focused person's events, sorted by year, with that person's life span", () => {
+    it('carries the events of the whole timeline sorted by year, the persons in the rows\' order, the focus only as its life', () => {
         const d = fam();
         const m = computeTimelineModel(d, ids(d), TODAY_YEAR, {
-            history: { personId: 'jan', events: [ev('b', 1880), ev('a', 1866), ev('c', 1866, { kind: 'epidemic' })] },
+            history: { events: [ev('b', 1880, { persons: ['anna', 'jan'] }), ev('a', 1866), ev('c', 1866, { kind: 'epidemic', persons: ['anna'] })], focusId: 'anna' },
         });
-        expect(m.history?.personId).toBe('jan');
-        expect(m.history?.name).toBe('Jan X');
-        expect([m.history?.startYear, m.history?.endYear]).toEqual([1860, 1910]);
-        // By year; the same year keeps the given order (the card's: region before local).
+        // By year; the same year keeps the given order.
         expect(m.history?.events.map(e => e.id)).toEqual(['a', 'c', 'b']);
+        // Jan (1860) has the first row, Anna the second.
+        expect(m.history?.events[2].persons).toEqual(['jan', 'anna']);
+        expect(m.history?.focus).toEqual({ personId: 'anna', startYear: 1862, endYear: 1930 });
+        expect(m.history?.total).toBe(3);
+        expect(m.history?.filtered).toEqual({});
+        // Another focus: the same events, only the line moves.
+        const m2 = computeTimelineModel(d, ids(d), TODAY_YEAR, {
+            history: { events: [ev('b', 1880, { persons: ['anna', 'jan'] }), ev('a', 1866), ev('c', 1866, { kind: 'epidemic', persons: ['anna'] })], focusId: 'jan' },
+        });
+        expect(m2.history?.events).toEqual(m.history?.events);
+        expect(m2.history?.focus?.personId).toBe('jan');
     });
 
-    it('is absent without events, without the option, or for a person with no row', () => {
+    it('is absent without events or when no person of the events has a row (privacy: no row, nothing)', () => {
         const d = fam();
         expect(computeTimelineModel(d, ids(d), TODAY_YEAR).history).toBeUndefined();
-        expect(computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { personId: 'jan', events: [] } }).history).toBeUndefined();
-        expect(computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { personId: 'nob', events: [ev('a', 1866)] } }).history).toBeUndefined();
-        expect(computeTimelineModel(d, ['anna'], TODAY_YEAR, { history: { personId: 'jan', events: [ev('a', 1866)] } }).history).toBeUndefined();
+        expect(computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [] } }).history).toBeUndefined();
+        expect(computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [ev('a', 1866, { persons: ['nob'] })] } }).history).toBeUndefined();
+        const onlyAnna = computeTimelineModel(d, ['anna'], TODAY_YEAR, { history: { events: [ev('a', 1866), ev('b', 1870, { persons: ['jan', 'anna'] })] } });
+        expect(onlyAnna.history?.events.map(e => [e.id, e.persons])).toEqual([['b', ['anna']]]);
+        // A focus without a row: no line.
+        expect(computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [ev('a', 1866)], focusId: 'nob' } }).history?.focus).toBeUndefined();
+    });
+
+    it('names the region only while the row has two regions or more', () => {
+        const d = fam();
+        const one = computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [
+            ev('a', 1866, { regionId: 'r1', region: 'Valdorie' }), ev('b', 1870, { regionId: 'r1', region: 'Valdorie' }),
+        ] } });
+        expect(one.history?.regions).toBe(1);
+        expect(one.history?.events.every(e => e.region === undefined)).toBe(true);
+        const two = computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [
+            ev('a', 1866, { regionId: 'r1', region: 'Valdorie' }), ev('b', 1870, { regionId: 'r2', region: 'Quellnitz' }),
+        ] } });
+        expect(two.history?.regions).toBe(2);
+        expect(two.history?.events.map(e => e.region)).toEqual(['Valdorie', 'Quellnitz']);
+        expect(svgOf(two)).toContain('<title>1866 · war · Valdorie – Event a.</title>');
+        expect(svgOf(one)).toContain('<title>1866 · war – Event a.</title>');
+        // Trimmed to one region by the rows: no name.
+        const trimmed = computeTimelineModel(d, ['anna'], TODAY_YEAR, { history: { events: [
+            ev('a', 1866, { regionId: 'r1', region: 'Valdorie', persons: ['anna'] }), ev('b', 1870, { regionId: 'r2', region: 'Quellnitz' }),
+        ] } });
+        expect(trimmed.history?.events.map(e => e.region)).toEqual([undefined]);
+    });
+
+    it('filters by kinds and region on the finished list; a filter of nothing keeps the row', () => {
+        const d = fam();
+        const events = [
+            ev('a', 1866, { regionId: 'r1' }), ev('b', 1870, { kind: 'census', regionId: 'r2' }), ev('c', 1880, { kind: 'epidemic', regionId: 'r1' }),
+        ];
+        expect(filterTimelineHistory(events, { kinds: ['war', 'epidemic'] }).map(e => e.id)).toEqual(['a', 'c']);
+        expect(filterTimelineHistory(events, { region: 'r2' }).map(e => e.id)).toEqual(['b']);
+        expect(filterTimelineHistory(events, { kinds: ['war'], region: 'r1' }).map(e => e.id)).toEqual(['a']);
+        expect(filterTimelineHistory(events).map(e => e.id)).toEqual(['a', 'b', 'c']);
+        const m = computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events, filter: { kinds: ['census', 'war', 'law'] } } });
+        expect(m.history?.events.map(e => e.id)).toEqual(['a', 'b']);
+        expect(m.history?.filtered).toEqual({ kinds: ['war', 'census', 'law'] });
+        expect(svgOf(m)).toContain('class="tl-hist-btn is-filtered"');
+        // The label counts the kinds chosen the timeline has (law has no event here: §10's "0 kinds" when none).
+        expect(svgOf(m)).toContain('<span class="tl-hist-meta">· 2 kinds</span>');
+        // All nine kinds: no filter.
+        const all = computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events, filter: { kinds: [...HISTORY_KINDS] } } });
+        expect(all.history?.filtered).toEqual({});
+        expect(svgOf(all)).not.toContain('is-filtered');
+        // A region: its name in the label; both: "2 filters".
+        const reg = computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events, filter: { region: 'r2', regionName: 'Valdorie' } } });
+        expect(svgOf(reg)).toContain('<span class="tl-hist-meta">· Valdorie</span>');
+        const both = computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events, filter: { region: 'r2', regionName: 'Valdorie', kinds: ['law'] } } });
+        expect(both.history?.events).toEqual([]);
+        expect(both.history?.total).toBe(3);
+        expect(svgOf(both)).toContain('<span class="tl-hist-meta">· 2 filters</span>');
+        expect(svgOf(both)).toContain('class="tl-hist-row"');
+    });
+
+    it('puts the local events on their rows only with the option, filtered by kind too', () => {
+        const d = fam();
+        const local = new Map([['anna', [
+            { id: 'L2', year: 1891, kind: 'disaster' as const, scope: 'local' as const, place: 'Quellnitz', text: 'Fire.' },
+            { id: 'L1', year: 1880, kind: 'epidemic' as const, scope: 'place' as const, place: 'Quellnitz', text: 'Cholera.' },
+        ]], ['nob', [{ id: 'L3', year: 1880, kind: 'war' as const, scope: 'place' as const, place: 'X', text: 'War.' }]]]);
+        const m = computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [], local } });
+        // Only local: the row stays (its label), the line has them by year.
+        expect(m.history?.events).toEqual([]);
+        expect(m.rows.find(r => r.personId === 'anna')?.local?.map(e => e.id)).toEqual(['L1', 'L2']);
+        expect(m.rows.find(r => r.personId === 'jan')?.local).toBeUndefined();
+        const f = computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [], local, filter: { kinds: ['disaster'] } } });
+        expect(f.rows.find(r => r.personId === 'anna')?.local?.map(e => e.id)).toEqual(['L2']);
+        // A kind no line has: the row stays (§10, its filter can be cleared there), no line keeps one.
+        const none = computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [], local, filter: { kinds: ['law'] } } });
+        expect(none.history?.events).toEqual([]);
+        expect(none.rows.every(r => !r.local)).toBe(true);
+        expect(svgOf(none)).toContain('class="link-button tl-hist-clear"');
+    });
+
+    it('a cluster stands for the kind most of its events have (a tie: the earlier); its name has up to three kinds and +n', () => {
+        expect(timelineClusterKind([ev('a', 1880, { kind: 'census' }), ev('b', 1881, { kind: 'emigration', scope: 'place' }), ev('c', 1882, { kind: 'emigration' })]))
+            .toEqual({ kind: 'emigration', scope: 'place' });
+        expect(timelineClusterKind([ev('a', 1880, { kind: 'census' }), ev('b', 1881, { kind: 'emigration' })])).toEqual({ kind: 'census', scope: 'region' });
+        expect(timelineClusterKinds([ev('a', 1, { kind: 'census' }), ev('b', 1, { kind: 'war' }), ev('c', 1, { kind: 'law' }), ev('d', 1, { kind: 'state' }), ev('e', 1, { kind: 'war' })]))
+            .toEqual({ kinds: ['census', 'war', 'law'], more: 1 });
+        const d = fam();
+        const svg = svgOf(computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [
+            ev('a', 1880, { kind: 'census', persons: ['jan'] }), ev('b', 1880, { kind: 'emigration', persons: ['anna'] }),
+            ev('c', 1880, { kind: 'emigration', persons: ['jan', 'anna'] }),
+        ] } }));
+        expect(svg).toContain('aria-label="1880: census, emigration; concerns 2 people"');
+        // The symbol is emigration's (the majority), one symbol per cluster.
+        expect((svg.match(/class="hist-kind-svg"/g) ?? []).length).toBe(1);
+        const pathOf = (k: 'emigration' | 'census') => /<path d="([^"]+)"/.exec(historyKindSvg(k, 12))![1];
+        expect(svg).toContain(pathOf('emigration'));
+        expect(svg).not.toContain(pathOf('census'));
+    });
+
+    it('periods in two tracks: the second when the first one has not ended 1 px before it starts', () => {
+        expect(timelinePeriodTracks([{ x1: 0, x2: 50 }, { x1: 40, x2: 60 }, { x1: 55, x2: 70 }, { x1: 80, x2: 90 }])).toEqual([0, 1, 0, 0]);
+        expect(timelinePeriodTracks([{ x1: 0, x2: 50 }, { x1: 40, x2: 60 }, { x1: 45, x2: 70 }])).toEqual([0, 1, 1]);
+        expect(timelinePeriodTracks([{ x1: 0, x2: 50 }, { x1: 51.5, x2: 60 }])).toEqual([0, 0]);
+        expect(timelinePeriodTracks([{ x1: 0, x2: 50 }, { x1: 50.5, x2: 60 }])).toEqual([0, 1]);
+        const d = fam();
+        const svg = svgOf(computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [
+            ev('a', 1866, { year2: 1880 }), ev('b', 1870, { year2: 1875, scope: 'place' }), ev('c', 1890, { year2: 1895 }),
+        ] } }));
+        const ys = [...svg.matchAll(/class="tl-hist-period[^"]*" x="[\d.]+" y="([\d.]+)"[^>]*height="2.5" rx="1.25"/g)].map(m => Number(m[1]));
+        // cy = 40 + 28 / 2 = 54: track 0 at 61, track 1 at 64.5.
+        expect(ys).toEqual([61, 64.5, 61]);
     });
 
     it("clusters by pixels: closer than the gap to the cluster's FIRST event (16 px; a phone 22 px)", () => {
@@ -434,6 +555,28 @@ describe('timeline history row', () => {
         expect(clusterTimelineHistory([ev('a', 1866), ev('b', 1873), ev('c', 1876)], phone, 16).length).toBe(2);
     });
 
+    it('a dense row (the whole timeline): a cluster pulled towards its neighbour merges with it, no badge over the next symbol', () => {
+        // An event a year at 6 px a year (1440 px, ~210 years): with the gap alone the means come 12–18 px apart
+        // and a badge (3 px right of the centre, 13 px wide) covers the next 12 px symbol.
+        const xOf = (y: number) => (y - 1830) * 6;
+        const evs = Array.from({ length: 80 }, (_, i) => ev(`e${i}`, 1832 + i));
+        const plain = clusterTimelineHistory(evs, xOf, 16);
+        const tight = (cs: { x: number; items: unknown[] }[]) => cs.slice(1).some((c, i) => c.x - cs[i].x < historyClusterClearance(cs[i].items.length));
+        expect(tight(plain)).toBe(true);
+        for (const gap of [16, 22]) {
+            const cs = clusterTimelineHistory(evs, xOf, gap, historyClusterClearance);
+            expect(tight(cs)).toBe(false);
+            // Every event stays, in order; the drawn boxes (symbol x ± 6, badge x + 3 … x + 3 + width) do not touch.
+            expect(cs.flatMap(c => c.items.map(e => e.id))).toEqual(evs.map(e => e.id));
+            for (let i = 1; i < cs.length; i++) {
+                const badgeRight = cs[i - 1].items.length > 1 ? cs[i - 1].x + historyClusterClearance(cs[i - 1].items.length) - 7 : cs[i - 1].x + 6;
+                expect(badgeRight).toBeLessThan(cs[i].x - 6);
+            }
+        }
+        // 1 digit: 13 px badge → 23 px; 2 digits: 17 px → 27 px; a single symbol 13 px.
+        expect([historyClusterClearance(1), historyClusterClearance(9), historyClusterClearance(10)]).toEqual([13, 23, 27]);
+    });
+
     it("says a cluster's years, a period's end included", () => {
         expect(timelineHistoryYears([ev('a', 1866), ev('b', 1866)])).toBe('1866');
         expect(timelineHistoryYears([ev('a', 1886), ev('b', 1892)])).toBe('1886–1892');
@@ -445,48 +588,56 @@ describe('timeline history row', () => {
         const plain = svgOf(computeTimelineModel(d, ids(d), TODAY_YEAR));
         expect(plain).not.toContain('tl-hist');
         expect(plain).not.toContain('tl-rows');
-        const withEmpty = svgOf(computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { personId: 'jan', events: [] } }));
+        const withEmpty = svgOf(computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [] } }));
         expect(withEmpty).toBe(plain);
     });
 
-    it('draws the row under the axis band: label, life tint, a symbol per cluster with its count, aria and tooltip', () => {
+    it('draws the row under the axis band: the options button, a tint over the whole axis, the focused life, clusters', () => {
         const d = fam();
         const model = computeTimelineModel(d, ids(d), TODAY_YEAR, {
-            history: { personId: 'jan', events: [
-                ev('E1', 1866), ev('E6', 1866, { kind: 'epidemic', text: 'Cholera.' }),
+            history: { events: [
+                ev('E1', 1866), ev('E6', 1866, { kind: 'epidemic', text: 'Cholera.', persons: ['jan', 'anna'] }),
                 ev('E9', 1897, { kind: 'economy', scope: 'place', year2: 1901 }),
-            ] },
+            ], focusId: 'anna' },
         });
         const plain = svgOf(computeTimelineModel(d, ids(d), TODAY_YEAR));
         const svg = svgOf(model);
         const h = (s: string) => Number(/height="(\d+)"/.exec(s)![1]);
         expect(h(svg) - h(plain)).toBe(historyRowHeight(false));
-        expect(svg).toContain('class="tl-hist-row" data-hist-person="jan"');
-        expect(svg).toContain('<b>History</b> · Jan X');
-        expect(svg).toContain('class="tl-hist-band"');
+        expect(svg).toContain('<g class="tl-hist-row">');
+        expect(svg).not.toContain('data-hist-person');
+        // The label: a button "History ▾", its options a dialog (§5), no name.
+        expect(svg).toContain('<button type="button" class="tl-hist-btn" aria-haspopup="dialog" aria-expanded="false" title="History options on the timeline">'
+            + '<b>History</b><span class="tl-hist-caret" aria-hidden="true">▾</span></button>');
+        // The tint over the whole axis: from the plot's start − 4 to the width − 2.
+        expect(svg).toContain('<rect class="tl-hist-band" x="156.0" y="43" width="1282.0" height="22" rx="6"/>');
+        // Anna's life (1862–1930) as the 2 px line at the bottom of the tint.
+        const xOf = (y: number) => 160 + (y - model.axis.minYear) / (model.axis.maxYear - model.axis.minYear) * (1440 - 160 - 16);
+        expect(svg).toContain(`<rect class="tl-hist-life" x="${xOf(1862).toFixed(1)}" y="63" width="${(xOf(1930) - xOf(1862)).toFixed(1)}" height="2" rx="1"/>`);
         expect(svg).toContain('<g class="tl-rows" transform="translate(0 28)">');
-        // 1866: war + epidemic in one cluster, the first event's symbol, a badge "2".
-        expect(svg).toContain('aria-label="1866: war, epidemic"');
+        // 1866: war + epidemic in one cluster (a tie: the first), a badge "2", two persons.
+        expect(svg).toContain('aria-label="1866: war, epidemic; concerns 2 people"');
         expect(svg).toContain('data-hist-ids="E1 E6"');
         expect(svg).toMatch(/class="tl-hist-n-txt"[^>]*>2<\/text>/);
-        expect(svg).toContain('<title>1866 war – Event E1.\n1866 epidemic – Cholera.</title>');
+        expect(svg).toContain('<title>1866 · war – Event E1.\n1866 · epidemic – Cholera.</title>');
         // A period: its years in the name, a stripe in its origin's colour.
-        expect(svg).toContain('aria-label="1897–1901: economy"');
+        expect(svg).toContain('aria-label="1897–1901: economy; concerns 1 person"');
         expect(svg).toContain('class="tl-hist is-place"');
         expect(svg).toContain('class="tl-hist-period is-place"');
         expect((svg.match(/class="hist-kind-svg"/g) ?? []).length).toBe(2);
         expect((svg.match(/role="button" tabindex="0"/g) ?? []).length).toBe(2);
         // 44 × 44 touch target.
         expect(svg).toContain('width="44" height="44"');
+        // No focused person: no line.
+        expect(svgOf(computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [ev('E1', 1866)] } }))).not.toContain('tl-hist-life');
     });
 
-    it('a phone: 26 px, the label without the name; the poster never has the row', () => {
+    it('a phone: 26 px, the same label; the poster never has the row', () => {
         const d = fam();
-        const model = computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { personId: 'jan', events: [ev('E1', 1866)] } });
+        const model = computeTimelineModel(d, ids(d), TODAY_YEAR, { history: { events: [ev('E1', 1866)], focusId: 'jan' } });
         const phone = buildTimelineSvg(model, { esc, width: 390, rowH: 28, labelW: 96, mode: 'screen', narrow: true });
         expect(phone).toContain('translate(0 26)');
-        expect(phone).toContain('<b>History</b></span>');
-        expect(phone).not.toContain(' · Jan X</span>');
+        expect(phone).toContain('<b>History</b><span class="tl-hist-caret"');
         const poster = buildTimelineSvg(model, { esc, width: 1440, rowH: 30, labelW: 190, mode: 'poster' });
         expect(poster).not.toContain('tl-hist');
         // Kolo 4 point 2: the row's label is a <foreignObject> on screen only; the export builder never inserts one.
@@ -534,6 +685,26 @@ describe('a shared event on the family timeline (spec 085 §2e)', () => {
         expect(svg).toContain('<title>Census (1921)</title>');
     });
 
+    it('with the history row (spec 121): a mark from the first row keeps its label below that row, never in the history row', () => {
+        const hist: TimelineHistoryItem = { id: 'E1', year: 1890, kind: 'war', scope: 'region', text: 'War.', persons: ['sudivoj'] };
+        const model = computeTimelineModel(household(), ['sudivoj', 'radegunda', 'bohuchval'], TODAY_YEAR, { history: { events: [hist] } });
+        expect(model.shared[0].rows).toEqual([0, 1, 2]);
+        expect(model.history).toBeDefined();
+        const baselines = (svg: string) => [...svg.matchAll(/class="tl-shared-label" x="[\d.]+" y="([\d.]+)"/g)].map(m => Number(m[1]));
+        // Without the history row: centred above the first row, in the free gap under the axis.
+        const plain = buildTimelineSvg(computeTimelineModel(household(), ['sudivoj', 'radegunda', 'bohuchval'], TODAY_YEAR),
+            { esc, width: 1440, rowH: 30, labelW: 160, mode: 'screen' });
+        expect(baselines(plain)).toHaveLength(1);
+        expect(baselines(plain)[0]).toBeLessThan(40 + (30 - 14) / 2);
+        // With it: the rows move down under the row and the label's top stays below the first row's top (rows' own coordinates).
+        for (const narrow of [false, true]) {
+            const svg = buildTimelineSvg(model, { esc, width: 1440, rowH: 30, labelW: 160, mode: 'screen', narrow });
+            expect(svg).toContain('class="tl-hist-row"');
+            const [baseline] = baselines(svg);
+            expect(baseline).toBeGreaterThanOrEqual(40 + 30 + (30 - 14) / 2 - 6.5 - 0.01);
+        }
+    });
+
     it('labels of marks close together: none over a mark or another label, beside its own mark; "…" only without room (A-N3)', () => {
         // Census 1921 over rows 1–4 and 6–7, residence 1930 over rows 4, 5 and 8, emigration 1925 over rows 6–7 (the reported family).
         const rowH = 28, TOP = 40;
@@ -579,5 +750,75 @@ describe('a shared event on the family timeline (spec 085 §2e)', () => {
         const poster = buildTimelinePosterSvg(model, { esc }, { treeName: 'T' });
         expect(poster).toContain('.tl-shared-mark{fill:#3f6b4f');
         expect(poster.match(/class="tl-shared-mark"/g)).toHaveLength(2);
+    });
+});
+
+// ==================== A CLUSTER'S POPOVER AND SHEET (spec 121 §2) ====================
+
+describe('timeline history: whom a cluster concerns', () => {
+    const ev = (id: string, persons: string[]): TimelineHistoryItem =>
+        ({ id, year: 1880, kind: 'census', scope: 'region', text: id, persons });
+
+    it("an event names at most two persons in the rows' order, the focused person first, and how many more", () => {
+        expect(timelineConcernPersons(['a', 'b', 'c', 'd'])).toEqual({ shown: ['a', 'b'], more: 2 });
+        expect(timelineConcernPersons(['a', 'b', 'c', 'd'], 'c')).toEqual({ shown: ['c', 'a'], more: 2 });
+        expect(timelineConcernPersons(['a', 'b'], 'z')).toEqual({ shown: ['a', 'b'], more: 0 });
+        expect(timelineConcernPersons(['a'], 'a')).toEqual({ shown: ['a'], more: 0 });
+        expect(timelineConcernPersons([], 'a')).toEqual({ shown: [], more: 0 });
+    });
+
+    it("the sheet's persons: everyone of the cluster in the rows' order, the focused first, each with the first event that concerns them", () => {
+        const items = [ev('E1', ['c', 'a']), ev('E2', ['b', 'c']), ev('E3', ['x'])];
+        const order = ['a', 'b', 'c'];
+        expect(timelineClusterPersons(items, order)).toEqual([
+            { personId: 'a', eventId: 'E1' }, { personId: 'b', eventId: 'E2' }, { personId: 'c', eventId: 'E1' },
+            { personId: 'x', eventId: 'E3' },
+        ]);
+        expect(timelineClusterPersons(items, order, 'b').map(p => p.personId)).toEqual(['b', 'a', 'c', 'x']);
+        expect(timelineClusterPersons([ev('E1', ['a'])], order, 'c')).toEqual([{ personId: 'a', eventId: 'E1' }]);
+    });
+
+    it('"Concerns: …" and "and N more" in all four languages', async () => {
+        const said = (lang: 'en' | 'cs' | 'de' | 'pl', n: number) => { setLanguage(lang); return strings.history.timelineConcerns('A, B', n); };
+        try {
+            expect(said('en', 2)).toBe('Concerns: A, B and 2 more');
+            expect(said('en', 0)).toBe('Concerns: A, B');
+            expect(said('cs', 2)).toBe('Týká se: A, B a 2 další');
+            expect(said('cs', 5)).toBe('Týká se: A, B a 5 dalších');
+            expect(said('de', 1)).toBe('Betrifft: A, B und 1 weitere');
+            expect(said('pl', 2)).toBe('Dotyczy: A, B i 2 innych');
+            setLanguage('cs');
+            expect(strings.history.timelineYearsTitle('1880–1891')).toBe('Dějiny 1880–1891');
+            expect(strings.history.timelinePeopleMore(2)).toBe('a 2 další');
+            setLanguage('de');
+            expect(strings.history.timelinePeopleMore(1)).toBe('und 1 weitere');
+        } finally {
+            setLanguage('en');
+        }
+    });
+});
+
+describe('timeline history: where the popover goes', () => {
+    const view = { width: 1440, height: 900 };
+    const size = { width: 380, height: 300 };
+
+    it('under the row, 6 px below it, at the cluster x − 40', () => {
+        expect(placeTimelinePop({ x: 600, top: 100, bottom: 128 }, size, view)).toEqual({ left: 560, top: 134, above: false, maxHeight: null });
+    });
+
+    it('clipped into the window, 8 px from its edges', () => {
+        expect(placeTimelinePop({ x: 20, top: 100, bottom: 128 }, size, view).left).toBe(8);
+        expect(placeTimelinePop({ x: 1430, top: 100, bottom: 128 }, size, view).left).toBe(1440 - 380 - 8);
+    });
+
+    it('above the row where there is no room below (the bottom bar counts)', () => {
+        expect(placeTimelinePop({ x: 600, top: 700, bottom: 728 }, size, view)).toEqual({ left: 560, top: 394, above: true, maxHeight: null });
+        expect(placeTimelinePop({ x: 600, top: 500, bottom: 528 }, size, { ...view, bottomInset: 120 }).above).toBe(true);
+    });
+
+    it('no room on either side: the side with more, its height limited', () => {
+        const tall = { width: 380, height: 800 };
+        expect(placeTimelinePop({ x: 600, top: 300, bottom: 328 }, tall, view)).toEqual({ left: 560, top: 334, above: false, maxHeight: 900 - 8 - 334 });
+        expect(placeTimelinePop({ x: 600, top: 600, bottom: 628 }, tall, view)).toEqual({ left: 560, top: 8, above: true, maxHeight: 600 - 6 - 8 });
     });
 });

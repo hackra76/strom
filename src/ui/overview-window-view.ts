@@ -35,6 +35,7 @@ import { activatedElement } from './busy.js';
 import type { ResearchLinkKind } from './research-ui.js';
 import { auditRefusalOf, auditResearchUnavailable, setWaitingAuditState } from './waiting-task-ui.js';
 import { asAuditPreview } from '../research-audit.js';
+import { readAsideOutcome, type AsideDo, type AsideOutcome } from '../research-aside.js';
 import type { WaitingAuditPreviewResult, WaitingAuditResult, WaitingFileResult } from '../research-waiting-write.js';
 import { itemKey } from './waiting-images-ui.js';
 import { SECTION_PREFS_EVENT, sectionPrefs, watchSectionPrefsStorage } from './live-section-prefs.js';
@@ -180,6 +181,7 @@ export function overviewWindowOverrides(port: OverviewWindowPort, read: () => Ov
         isFollowingActiveResearch(): boolean { return read()?.source === 'live'; },
         isLiveFollowOn(): boolean { return extras().follow.on; },
         liveFollowView(): FollowView | null { return extras().follow.view; },
+        followedRun(): string | null { return extras().follow.run ?? null; },
         researchLiveState(this: UIClass, _treeId: string) {
             return extras().liveSwitch as ReturnType<UIClass['researchLiveState']>;
         },
@@ -218,10 +220,17 @@ export function overviewWindowOverrides(port: OverviewWindowPort, read: () => Ov
             return { ok: false, text: strings.verify.failed };
         },
         showVerifyBulkDialog(): void { run('verify-bulk'); },
+        // Stop of one run (spec 126 U10 §4): written by the main window (its bridge), its outcome said here.
+        async writeRunStop(runId: string): Promise<{ ok: true } | { ok: false; text: string }> {
+            const a = await port.ask('run-stop', { run: runId }, OVERVIEW_ANSWER_WAIT_MS);
+            if (a && typeof a === 'object' && 'ok' in a) return a as { ok: true } | { ok: false; text: string };
+            return { ok: false, text: a === null ? strings.busy.mainWindowSilent : strings.live.runStopFailed };
+        },
         // Research for this tree at the work outside the directions: a dialog of the main window.
         openOffLineSettings(): void { run('offline-settings'); },
         // Research for this tree at Books (Faster by downloading › Settings…): a dialog of the main window.
         openBooksSettings(): void { run('books-settings'); },
+        openRunsSettings(): void { run('runs-settings'); },
         offLineSettingsOffered(): boolean { return extras().offLineSettings === true; },
         // Its own overview (no small panel here); none opened or closed here.
         renderLivePanel(this: UIClass): void { this.renderResearchOverview(); },
@@ -257,6 +266,7 @@ export function overviewWindowOverrides(port: OverviewWindowPort, read: () => Ov
         },
         setLiveFollow(on: boolean): void { run('follow-tree', { on }); },
         setLiveFollowView(view: FollowView): void { run('follow-view', { view }); },
+        setFollowedRun(id: string | null): void { if (id) run('follow-run', { run: id }); },
         async toggleResearchLive(): Promise<void> { run('turn-on'); },
         overviewShowPerson(id: PersonId): void { run('show-person', { personId: id }); },
         startPersonHighlight(_kind: string, label: string, ids: PersonId[], _recount?: unknown, opts?: { quiet?: boolean }): void {
@@ -345,6 +355,13 @@ export function overviewWindowOverrides(port: OverviewWindowPort, read: () => Ov
         async sendWaitingAnswer(_s: LiveSession, w: LiveWaiting, text: string): Promise<WaitingAnswerOutcome> {
             const r = await port.ask('waiting-answer', { itemId: w.id, text }, OVERVIEW_ANSWER_WAIT_MS);
             return (typeof r === 'string' ? r : 'fail') as WaitingAnswerOutcome;
+        },
+        // A file of a book's inbox set aside: written by the main window (its toast); answered or gone, the item goes here at once.
+        async writeAsideAnswer(this: UIClass, s: LiveSession, w: LiveWaiting, what: AsideDo, image?: number): Promise<AsideOutcome> {
+            const r = await port.ask('waiting-aside', { itemId: w.id, do: what, ...(what === 'image' && image !== undefined ? { image } : {}) }, OVERVIEW_ANSWER_WAIT_MS);
+            const out = readAsideOutcome(r) ?? { ok: false, text: strings.busy.mainWindowSilent, retry: true, tone: 'danger' };
+            if (out.ok || out.gone) s.waiting = s.waiting.filter(x => x.id !== w.id);
+            return out;
         },
         async markWaitingSent(_s: LiveSession, w: LiveWaiting): Promise<void> { run('waiting-sent', { itemId: w.id }); },
         async markWaitingUnsent(_s: LiveSession, id: string): Promise<undefined> { run('waiting-unsent', { itemId: id }); return undefined; },
@@ -442,18 +459,23 @@ export function overviewWindowOverrides(port: OverviewWindowPort, read: () => Ov
             // "Work on the queue…" starts the agent there: the main window says so as for its own link.
             port.send('research-link', { link: l.link, params: l.params, ...(l.link === 'work' ? { kind: 'agent' } : {}) });
         },
-        /** "Work on the queue…" started from here: the main window hands it over and keeps its state (3a). */
-        beginQueueWork(this: UIClass, url: string): void {
-            lastWorkUrl = url;
+        /** "Work on the queue…" or a direction's own run started from here: the main window hands it over and keeps its state (3a). */
+        beginRunWork(this: UIClass, url: string, scope?: string): void {
+            lastWorkUrls.set(scope ?? 'queue', url);
             this.handOverResearchLink(url);
         },
         /** The start of the queue's work as the main window has it. */
         queueStartNow(): { phase: 'starting' | 'silent'; startedAt: number } | null {
             return extras().queueStart ?? null;
         },
+        /** Every start of the research's work as the main window has it. */
+        runStartsNow(): Array<{ scope: string; view: { phase: 'starting' | 'silent'; startedAt: number } }> {
+            return extras().runStarts ?? [];
+        },
         /** Try again: the same link once more through the main window. */
-        retryQueueWork(this: UIClass): void {
-            if (lastWorkUrl) this.handOverResearchLink(lastWorkUrl);
+        retryQueueWork(this: UIClass, scope?: string): void {
+            const url = lastWorkUrls.get(scope ?? 'queue');
+            if (url) this.handOverResearchLink(url);
         },
         /** A link from here: the element's state a moment; the main window hands it over and waits for its proof. */
         launchResearchLink(this: UIClass, url: string, kind: ResearchLinkKind = 'terminal', el?: HTMLElement | null): Promise<OpenBusyResult> {
@@ -468,8 +490,8 @@ export function overviewWindowOverrides(port: OverviewWindowPort, read: () => Ov
     };
 }
 
-/** The last "Work on the queue…" link started from this window (its Try again). */
-let lastWorkUrl: string | null = null;
+/** The last "Work on the queue…" link and each direction's run link started from this window, by scope (their Try again). */
+const lastWorkUrls = new Map<string, string>();
 /** A refused row's sentence drawn here already (its text): `role=alert` only on its first drawing. */
 const refusalsSaid = new Map<string, string>();
 

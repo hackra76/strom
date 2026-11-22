@@ -20,8 +20,15 @@ export type OverviewGroupMode = 'batch' | 'date' | 'added' | 'person';
 export type ArchiveGroupMode = 'batch' | 'date';
 export type AppGroupMode = 'added' | 'person';
 export type OverviewView = 'grid' | 'list';
-export type KindFilter = MaterialKind | 'none';
+/** `tree`: the family tree files (spec 117 §5), a row of its own only when there is one. */
+export type KindFilter = MaterialKind | 'none' | 'tree';
 export const KIND_FILTERS: KindFilter[] = ['photo', 'document', 'record', 'other', 'none'];
+const KNOWN_KINDS: readonly KindFilter[] = [...KIND_FILTERS, 'tree'];
+
+/** The item's row in the Kind filter. */
+export function itemKindFilter(item: Pick<MaterialItem, 'kind' | 'tree'>): KindFilter {
+    return item.tree ? 'tree' : item.kind ?? 'none';
+}
 
 /** Days after which received files are shown together as "Earlier" (by date). */
 export const EARLIER_DAYS = 60;
@@ -63,7 +70,7 @@ export function parseFilters(raw: unknown): Partial<OverviewFilters> {
     const out: Partial<OverviewFilters> = {};
     if (!raw || typeof raw !== 'object') return out;
     const r = raw as Record<string, unknown>;
-    if (Array.isArray(r.kinds)) out.kinds = r.kinds.filter((k): k is KindFilter => (KIND_FILTERS as readonly unknown[]).includes(k));
+    if (Array.isArray(r.kinds)) out.kinds = r.kinds.filter((k): k is KindFilter => (KNOWN_KINDS as readonly unknown[]).includes(k));
     for (const k of ['noPerson', 'noTitle', 'noSource', 'showHidden'] as const) if (r[k] === true) out[k] = true;
     if (r.where === 'tree' || r.where === 'archive') out.where = r.where;
     return out;
@@ -108,6 +115,8 @@ function withSourceOf(item: MaterialItem, rec: TreeRecord | undefined): void {
     if (!of?.length) return;
     item.sourceOf = of;
     if (!item.source) item.source = of[0].title ?? of[0].source;
+    // A family tree file is never a place in the tree (spec 117 §5: "Used: nowhere"), its source notwithstanding.
+    if (item.tree) return;
     const more = of.filter(s => s.inTree && !rec?.sourceRefs?.includes(s.source)).length;
     if (more) item.uses = (item.uses ?? 0) + more;
 }
@@ -191,16 +200,18 @@ export function queryWords(query: string): string[] {
  * union; a person the research does not know yet still counts as one).
  */
 export function itemWithoutPerson(item: MaterialItem): boolean {
-    // The file of a source is assigned (spec 102 §7): "Without a person" does not show it.
-    if (item.persons.length > 0 || item.sourceOf?.length) return false;
+    // The file of a source is assigned (spec 102 §7): "Without a person" does not show it; nor a family tree file (spec 117 §5).
+    if (item.persons.length > 0 || item.sourceOf?.length || item.tree) return false;
     return item.origin !== 'tree' || !item.attachment?.places?.some(p => 'personId' in p);
 }
 
 /**
  * The file is in the tree (the tree keeps it or uses it, or a source it is the file of comes to the tree,
- * spec 102 §7); beside an archive the rest is only in the archive.
+ * spec 102 §7); beside an archive the rest is only in the archive. A family tree file never is: the source
+ * made of it is, the file itself has no place in the tree (spec 117 §5, design 5a).
  */
 export function itemInTree(item: MaterialItem): boolean {
+    if (item.tree) return false;
     return !!item.attachment || (item.uses ?? 0) > 0 || !!item.sourceOf?.some(s => s.inTree);
 }
 
@@ -222,11 +233,12 @@ export function sourceOfPersons(item: Pick<MaterialItem, 'persons' | 'sourceOf'>
 export function passesFilters(item: MaterialItem, f: OverviewFilters, words: string[] = queryWords(f.query)): boolean {
     if (item.hidden && !f.showHidden) return false;
     if (f.person && !item.persons.includes(f.person)) return false;
-    if (f.kinds.length && !f.kinds.includes(item.kind ?? 'none')) return false;
+    if (f.kinds.length && !f.kinds.includes(itemKindFilter(item))) return false;
     if (f.batch && item.batch?.id !== f.batch) return false;
     if (f.noPerson && !itemWithoutPerson(item)) return false;
-    if (f.noTitle && item.titled) return false;
-    if (f.noSource && item.source) return false;
+    // A family tree file has no title nor source to give (spec 117 §5): the review filters leave it out.
+    if (f.noTitle && (item.titled || item.tree)) return false;
+    if (f.noSource && (item.source || item.tree)) return false;
     if (f.where && (f.where === 'tree') !== itemInTree(item)) return false;
     if (f.left && !item.agentLeft) return false;
     if (words.length) {
@@ -239,7 +251,7 @@ export function passesFilters(item: MaterialItem, f: OverviewFilters, words: str
 // ==================== SUMMARY ====================
 
 export interface OverviewSummary {
-    /** Files of the research, without hidden ones. */
+    /** Files shown (the research's and the tree's own, one per file), without hidden ones. */
     files: number;
     batches: number;
     /** Files without a person (without hidden ones). */
@@ -255,22 +267,22 @@ export interface OverviewSummary {
 }
 
 /**
- * The window's header counts. While only some files are known (the whole
- * list not loaded yet), the batches' own counts stand in for theirs.
+ * The window's header counts: every file it shows, the tree's own beside an
+ * archive too (a file an older research does not keep, e.g. a portrait without
+ * an original: its tile is there, so is its count). While only some files are
+ * known (the whole list not loaded yet), the batches' own counts stand in for theirs.
  */
-export function overviewSummary(items: readonly MaterialItem[], list: MaterialList | null, full: boolean, withTree = false): OverviewSummary {
+export function overviewSummary(items: readonly MaterialItem[], list: MaterialList | null, full: boolean): OverviewSummary {
     let files = 0, noPerson = 0, hidden = 0, noTitle = 0, noSource = 0, inTree = 0, onlyArchive = 0, left = 0;
     const loadedPerBatch = new Map<string, number>();
     for (const item of items) {
-        // The tree's own files count only where they are the whole list (a tree without an archive).
-        // The review counts are over every file shown (the tree's own too: the filters reach them).
+        // Every count is over the files shown (the tree's own too: they are tiles, the filters reach them).
         if (!item.hidden) {
-            if (!item.titled) noTitle++;
-            if (!item.source) noSource++;
+            if (!item.titled && !item.tree) noTitle++;
+            if (!item.source && !item.tree) noSource++;
             if (itemInTree(item)) inTree++; else onlyArchive++;
             if (item.agentLeft) left++;
         }
-        if (item.origin === 'tree' && !withTree) continue;
         if (item.hidden) { hidden++; continue; }
         files++;
         if (itemWithoutPerson(item)) noPerson++;
@@ -634,6 +646,8 @@ export interface RowMetrics {
     tileRow: number;
     /** Extra height of a grid row with a hidden tile ("Restore" under it). */
     restoreExtra: number;
+    /** Extra height of a grid row with a family tree file (its tag, kind and size on up to three lines). */
+    treeExtra?: number;
     listRow: number;
     group: number;
     folder: number;
@@ -679,7 +693,7 @@ export function overviewRows(groups: readonly OverviewGroup[], isOpen: (key: str
         const cols = Math.max(1, m.cols);
         for (let i = 0; i < items.length; i += cols) {
             const chunk = items.slice(i, i + cols);
-            const height = m.tileRow + (chunk.some(x => x.hidden) ? m.restoreExtra : 0);
+            const height = m.tileRow + (chunk.some(x => x.hidden) ? m.restoreExtra : 0) + (chunk.some(x => x.tree) ? m.treeExtra ?? 0 : 0);
             for (const item of chunk) rowOf.set(item.key, rows.length);
             push({ type: 'tiles', key: `t:${folder?.key ?? group.key}:${i}`, top, height, group, ...(folder ? { folder } : {}), items: chunk, first: order.length });
             order.push(...chunk);

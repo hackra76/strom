@@ -16,10 +16,10 @@ import { TreeManager } from '../tree-manager.js';
 import { strings } from '../strings.js';
 import { TreeId, ResearchTranscripts, ResearchSendMode, StromData } from '../types.js';
 import {
-    researchSchemeUrl, TERMINAL_CHOICE_FEATURE, STORIES_HISTORY_FEATURE, HYPOTHESES_DECIDE_FEATURE, researchLinkMark, researchUrlMark,
+    researchSchemeUrl, TERMINAL_CHOICE_FEATURE, STORIES_HISTORY_FEATURE, HYPOTHESES_DECIDE_FEATURE, CENSUS_FEATURE, INTAKE_AUTO_FEATURE, researchLinkMark, researchUrlMark,
     booksOn, BOOKS_MIN_TASKS_DEFAULT, BOOKS_SAME_BOOK_DEFAULT, type ResearchHypothesesDecide, type LiveBooksSettings,
 } from '../research-link.js';
-import { postBridgeStories, postBridgeHypotheses, postBridgeReadTask, postBridgeBooks, type BooksSettingBody } from '../history-bridge.js';
+import { postBridgeStories, postBridgeHypotheses, postBridgeReadTask, postBridgeBooks, postBridgeCensus, postBridgeIntake, type BooksSettingBody } from '../history-bridge.js';
 import { booksSettingHtml, booksMinTasksInput, type BooksSettingNote } from './books-setting-view.js';
 import { READ_SOURCE_TASK_FEATURE, type ReadTaskSetting } from '../research-read-task.js';
 import { readTaskSettingHtml, type ReadTaskSettingNote } from './read-task-setting-view.js';
@@ -28,11 +28,14 @@ import { researchAutoState, patchResearchAutoState, researchSendPreviewSkipped, 
 import { sourceReadingHash, unverifiedOlderSources, newTieSendMode } from '../research-sync.js';
 import { uiModule } from './module.js';
 import { normalizeModal } from './modal-skeleton.js';
-import { onComputer, readTree } from './research-ui.js';
+import { el, onComputer, readTree } from './research-ui.js';
 import { researchDisplayName, researchSendMode, onBridgeStatus, lastBridgeStatus } from './research-sync-ui.js';
 import { SettingsManager } from '../settings.js';
 import { formatBytesShort } from './originals-ui.js';
 import { isBetaBuildHere } from '../pwa.js';
+import { runLimit, runLimitCap, runLimitOn } from '../research-runs.js';
+import { postRunLimit, runLimitRaise, RUN_LIMIT_MIN } from '../research-runs-write.js';
+import { commandLine } from './research-live-ui.js';
 
 const SETTINGS_ID = 'research-tree-settings-modal';
 const ASK_ID = 'research-mode-ask-modal';
@@ -47,6 +50,20 @@ const askLater = new Set<TreeId>();
  */
 const stories: { rid: string; note?: { text: string; link?: ResearchNoteLink }; want?: boolean; busy?: boolean; sending?: boolean } = { rid: '' };
 let storiesListening = false;
+
+/**
+ * "Census records" (spec 106 §4.1): the same parts as `stories` — the sentence under the row (a refusal), the
+ * value asked until the research's status says it (`want`) with the tasks set aside its reply said (`wantHeld`),
+ * a write on its way (`busy`, `sending`), the row gone after the research said the tree is an archive (`gone`).
+ */
+const census: { rid: string; note?: string; want?: boolean; wantHeld?: number | null; busy?: boolean; sending?: boolean; gone?: boolean } = { rid: '' };
+
+/**
+ * "The agent goes through files sent to the research by itself" (spec 130 K2.1, K1.3: batches, single files, scans): the same parts as `census` — the
+ * sentence under the row (a refusal), the value asked until the research's status says it (`want`), a write on
+ * its way (`busy`, `sending`), the row gone after the research said the tree is an archive (`gone`).
+ */
+const intake: { rid: string; note?: string; want?: boolean; busy?: boolean; sending?: boolean; gone?: boolean } = { rid: '' };
 
 /**
  * "Who decides hypotheses" (spec 060): the same parts as `stories` — the
@@ -68,6 +85,16 @@ const readTask: { rid: string; note?: ReadTaskSettingNote; want?: ReadTaskSettin
 const HYPOS_PEND = 'tree:hypos';
 const READ_TASK_PEND = 'tree:readtask';
 const STORIES_PEND = 'tree:stories';
+const CENSUS_PEND = 'tree:census';
+const RUNS_PEND = 'tree:runs';
+
+/**
+ * "Agents at once, at most" (spec 126 U10 §5): the value asked until the research's status says it (`want`), the
+ * value on its way (`sending`), the sentence under it (a refusal; `command`: the terminal command that raises it),
+ * a research waiting for its agent (`away`: no row), a redraw held while the field is typed in (`stale`).
+ */
+const runsMax: { rid: string; want?: number; sending?: number; note?: { text: string; command?: string | null }; away?: boolean; stale?: boolean } = { rid: '' };
+const INTAKE_PEND = 'tree:intake';
 /** How long the group stays highlighted when a link opens the dialog at it. */
 const READ_TASK_FLASH_MS = 1500;
 
@@ -247,8 +274,9 @@ export const researchTreeSettingsMethods = uiModule({
     /**
      * The dialog for a tree tied to a research that knows how a transcript weighs.
      * `group: 'books'` opens it at "Books", open and highlighted for a moment (Faster by downloading › Settings…).
+     * `focus: 'runs-max'`: at "Most agents at once" (spec 126 U10), its field focused once the dialog has it.
      */
-    async showResearchTreeSettings(treeId: TreeId, opts: { group?: 'books' } = {}): Promise<void> {
+    async showResearchTreeSettings(treeId: TreeId, opts: { group?: 'books'; focus?: 'runs-max' } = {}): Promise<void> {
         const meta = TreeManager.getTreeMetadata(treeId);
         const link = meta?.research;
         if (!meta || !link) return;
@@ -347,8 +375,10 @@ export const researchTreeSettingsMethods = uiModule({
                 <button type="button" class="link-button research-older-sources" id="research-older-sources" hidden></button>`}
                 ${sendingHtml}
                 ${originalsHtml}
+                ${archive || agentAway ? '' : `<div class="research-intake-host" id="research-intake-host"></div>`}
                 <div class="research-images-host" id="research-images-host"></div>
                 <div class="research-stories-host" id="research-stories-host"></div>
+                ${archive || agentAway ? '' : `<div class="research-census-host" id="research-census-host"></div>`}
                 ${archive || agentAway ? '' : `<div class="research-hypos-host" id="research-hypos-host"></div>`}
                 ${archive || agentAway ? '' : `<div class="research-readtask-host" id="research-readtask-host"></div>`}
                 ${archive || agentAway ? '' : `<div class="research-books-host" id="research-books-host"></div>`}
@@ -370,6 +400,11 @@ export const researchTreeSettingsMethods = uiModule({
             this.renderBrowserRows(agentDl, { name: st?.agentName ?? '', away: agentAway }, st?.browser);
             this.watchBrowserRows();
         }
+        // The most agents at once (spec 126 U10 §5): the last row of the agent's box.
+        runsMax.rid = link.id;
+        runsMax.away = agentAway;
+        delete runsMax.want; delete runsMax.sending; delete runsMax.note; delete runsMax.stale;
+        this.renderResearchRunsRow();
         // Source images the research left out of its file (filled once the tree's stored images are read).
         const imagesHost = overlay.querySelector<HTMLElement>('#research-images-host');
         if (imagesHost) void this.renderResearchImagesSettings(treeId, imagesHost);
@@ -483,6 +518,12 @@ export const researchTreeSettingsMethods = uiModule({
         stories.rid = link.id;
         delete stories.note; delete stories.want; delete stories.busy;
         this.renderResearchStoriesRow();
+        census.rid = link.id;
+        delete census.note; delete census.want; delete census.wantHeld; delete census.busy; delete census.sending; delete census.gone;
+        this.renderResearchCensusRow();
+        intake.rid = link.id;
+        delete intake.note; delete intake.want; delete intake.busy; delete intake.sending; delete intake.gone;
+        this.renderResearchIntakeRow();
         hypos.rid = link.id;
         delete hypos.note; delete hypos.want; delete hypos.busy;
         this.renderResearchHypothesesRow();
@@ -500,9 +541,12 @@ export const researchTreeSettingsMethods = uiModule({
             onBridgeStatus((rid) => {
                 if (rid !== stories.rid) return;
                 this.renderResearchStoriesRow();
+                this.renderResearchCensusRow();
+                this.renderResearchIntakeRow();
                 this.renderResearchHypothesesRow();
                 this.renderResearchReadTaskRow();
                 this.renderResearchBooksRow();
+                this.renderResearchRunsRow();
                 this.renderOffLineSettings();
             });
         }
@@ -513,6 +557,130 @@ export const researchTreeSettingsMethods = uiModule({
         if (opts.group === 'books') {
             this.flashResearchSettingsGroup('research-books-group', '#research-books-min', () => { books.open = true; });
         }
+        if (opts.focus === 'runs-max') {
+            const field = overlay.querySelector<HTMLElement>('#research-runs-max, [data-focus="runs-max"]');
+            if (field) {
+                field.scrollIntoView?.({ block: 'nearest' });
+                field.focus();
+            }
+        }
+    },
+
+    /**
+     * Spec 126 U10 §5: "Agents at once, at most" — the last row of the agent's box, only with `run.limit` (not in
+     * an archive nor a research waiting for its agent). A stepper from 1 to the research's cap; lowering is written
+     * through the bridge at once (the runs at work go on), raising only in the research's terminal: its refusal puts
+     * the value back and gives the command to copy. Without the bridge inactive with its sentence. No mark: the
+     * write goes through the bridge.
+     */
+    renderResearchRunsRow(force = false): void {
+        const dl = document.querySelector<HTMLElement>(`#${SETTINGS_ID} dl.research-tree-agent`);
+        if (!dl) return;
+        const rid = runsMax.rid;
+        const ctx = this.historyManageContext();
+        const last = (ctx?.researchId === rid ? ctx.lastStatus : this.researchStatusOf(rid)) ?? lastBridgeStatus(rid);
+        const features = ctx?.researchId === rid ? ctx.features : last?.features ?? [];
+        let dt = dl.querySelector<HTMLElement>('dt[data-row="runs"]');
+        let dd = dl.querySelector<HTMLElement>('dd[data-row="runs"]');
+        if (runsMax.away || !runLimitOn(features) || (rid && this.researchAgentlessFor(rid))) {
+            dt?.remove();
+            dd?.remove();
+            return;
+        }
+        const active = document.activeElement as HTMLElement | null;
+        if (!force && dd && active?.id === 'research-runs-max' && dd.contains(active)) {
+            runsMax.stale = true;
+            return;
+        }
+        delete runsMax.stale;
+        const r = strings.research;
+        if (!dt || !dd) {
+            dt = el('dt', 'research-tree-runs-label');
+            dt.dataset.row = 'runs';
+            dt.innerHTML = `<label for="research-runs-max">${esc(r.runsMax)}</label>`;
+            dd = el('dd', 'research-tree-runs');
+            dd.dataset.row = 'runs';
+            dl.append(dt, dd);
+        }
+        const up = this.researchBridgeUp(rid);
+        const said = runLimit(last);
+        if (runsMax.want !== undefined && runsMax.want === said) delete runsMax.want;
+        const value = runsMax.sending ?? runsMax.want ?? said;
+        const cap = runLimitCap(last);
+        const pend = runsMax.sending !== undefined;
+        const note = !up ? { text: strings.history.storiesBridgeDown } : runsMax.note;
+        const focusId = active && dd.contains(active) ? active.id : '';
+        const off = !up ? ' disabled' : pend ? ' aria-disabled="true"' : '';
+        dd.innerHTML = `
+            <span class="research-tree-runs__stepper"${pend ? pendAttrs(RUNS_PEND).replace(' aria-disabled="true"', '') : ''}>
+                <button type="button" class="research-tree-runs__step" id="research-runs-less" aria-label="${esc(r.runsMaxLess)}"${value <= RUN_LIMIT_MIN ? ' disabled' : off}>−</button>
+                <input type="number" class="research-tree-runs__field" id="research-runs-max" inputmode="numeric" min="${RUN_LIMIT_MIN}" max="${cap}" step="1"
+                    value="${value}" aria-label="${esc(r.runsMaxAria)}"${off}>
+                <button type="button" class="research-tree-runs__step" id="research-runs-more" aria-label="${esc(r.runsMaxMore)}"${value >= cap ? ' disabled' : off}>+</button>
+            </span>${pend ? pendStatusHtml(RUNS_PEND) : ''}
+            <span class="research-tree-runs__hint">${esc(r.runsMaxHint)}</span>`;
+        if (note) {
+            const p = el('p', 'research-tree-runs__note');
+            p.id = 'research-runs-note';
+            p.appendChild(el('span', undefined, note.text));
+            if (note.command) p.append(' ', commandLine(note.command, c => this.copyResearchLiveCommand(c)));
+            dd.appendChild(p);
+        }
+        const field = dd.querySelector<HTMLInputElement>('#research-runs-max');
+        const take = (n: number): void => {
+            if (runsMax.sending !== undefined) { this.renderResearchRunsRow(true); return; }
+            if (!Number.isInteger(n) || n < RUN_LIMIT_MIN || n > cap || n === value) { this.renderResearchRunsRow(true); return; }
+            void this.setResearchRunsMax(n);
+        };
+        if (field) {
+            field.addEventListener('change', () => take(Number(field.value.trim())));
+            field.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); take(Number(field.value.trim())); } });
+            // A redraw held while typing comes when the field is left.
+            field.addEventListener('blur', () => {
+                window.setTimeout(() => { if (runsMax.stale && document.activeElement?.id !== 'research-runs-max') this.renderResearchRunsRow(); }, 0);
+            });
+        }
+        dd.querySelector<HTMLButtonElement>('#research-runs-less')?.addEventListener('click', () => take(value - 1));
+        dd.querySelector<HTMLButtonElement>('#research-runs-more')?.addEventListener('click', () => take(value + 1));
+        if (focusId) {
+            const again = dd.querySelector<HTMLElement>(`#${focusId}`);
+            // A stepper button at its end is disabled: the field keeps the focus.
+            (again && !(again as HTMLButtonElement).disabled ? again : field)?.focus({ preventScroll: true });
+        }
+    },
+
+    /**
+     * Spec 126 U10 §5: `POST /settings/runs {max}`. Lowering is the research's at once (its answer's `limits`);
+     * raising is refused (403 `runs.raise`): the value goes back and the sentence gives the terminal's command.
+     */
+    async setResearchRunsMax(n: number): Promise<void> {
+        const rid = runsMax.rid;
+        const ctx = this.historyManageContext();
+        const base = ctx?.researchId === rid ? ctx.base : null;
+        if (!base || runsMax.sending !== undefined) { this.renderResearchRunsRow(true); return; }
+        runsMax.sending = n;
+        delete runsMax.note;
+        startPend(RUNS_PEND, { redraw: () => this.renderResearchRunsRow(true) });
+        this.renderResearchRunsRow(true);
+        const r = await postRunLimit(base, n);
+        if (runsMax.rid !== rid) { dropPend(RUNS_PEND); return; }
+        await endPend(RUNS_PEND);
+        delete runsMax.sending;
+        const raise = runLimitRaise(r);
+        if (r.ok) {
+            runsMax.want = r.limits?.maxRuns ?? n;
+        } else if (raise) {
+            runsMax.note = { text: strings.research.runsMaxRaise, command: raise.command };
+        } else if (r.code === 'archive') {
+            runsMax.away = true;
+        } else if (r.code === 'busy') {
+            runsMax.note = { text: strings.history.errBusy };
+        } else if (r.code === 'network') {
+            runsMax.note = { text: strings.history.storiesBridgeDown };
+        } else {
+            runsMax.note = { text: r.reason || (r.held ? this.researchWriteHeldText(r.held, false).toast : strings.live.waitingWrite.writeFailed) };
+        }
+        this.renderResearchRunsRow(true);
     },
 
     /**
@@ -597,6 +765,174 @@ export const researchTreeSettingsMethods = uiModule({
             stories.note = { text: r.reason || (r.held ? this.researchWriteHeldText(r.held, false).toast : strings.live.waitingWrite.writeFailed) };
         }
         this.renderResearchStoriesRow();
+    },
+
+    /**
+     * Spec 106 §4.1: "Census records" under Sources — only with `census` (not in an archive nor a research waiting
+     * for its agent: no host there, and gone once the research says so); the switch follows `/status.census`, the
+     * tasks it set aside said under it while off; without the bridge inactive with its sentence. No mark: the
+     * write goes through the bridge, no terminal.
+     */
+    renderResearchCensusRow(): void {
+        const host = document.querySelector<HTMLElement>(`#${SETTINGS_ID} #research-census-host`);
+        if (!host) return;
+        const rid = census.rid;
+        const ctx = this.historyManageContext();
+        const last = (ctx?.researchId === rid ? ctx.lastStatus : this.researchStatusOf(rid)) ?? lastBridgeStatus(rid);
+        const features = ctx?.researchId === rid ? ctx.features : last?.features ?? [];
+        if (census.gone || !features.includes(CENSUS_FEATURE) || (rid && this.researchAgentlessFor(rid))) {
+            host.innerHTML = '';
+            return;
+        }
+        const h = strings.history;
+        const up = this.researchBridgeUp(rid);
+        // Null: the research has the feature but did not say a valid state (the row off, no sentence of tasks).
+        const said = last?.census ?? null;
+        if (census.want !== undefined && said?.on === census.want) { delete census.want; delete census.wantHeld; }
+        const on = census.sending ?? census.want ?? said?.on === true;
+        const held = census.want !== undefined ? census.wantHeld ?? null : said?.held ?? null;
+        const note = !up ? h.storiesBridgeDown
+            : census.note ?? (!on && census.sending === undefined && held !== null && held > 0 ? h.censusHeld(held) : '');
+        const focused = document.activeElement?.id === 'research-census-on';
+        // On its way (6.1): the new state at once, dashed and locked (keeping its focus), its words after 120 ms.
+        const pend = !!census.busy;
+        host.innerHTML = `
+            <fieldset class="research-transcripts research-census">
+                <legend>${esc(h.censusSection)}</legend>
+                <label class="settings-checkbox research-census-row"${pend ? pendAttrs(CENSUS_PEND).replace(' aria-disabled="true"', '') : ''}>
+                    <input type="checkbox" id="research-census-on"${on ? ' checked' : ''}${!up ? ' disabled' : pend ? ' aria-disabled="true"' : ''}>
+                    <span class="settings-text">
+                        <span class="settings-name">${esc(h.censusTitle)}</span>
+                        <span class="settings-desc">${esc(h.censusDesc)}</span>${pend ? pendStatusHtml(CENSUS_PEND) : ''}
+                    </span>
+                </label>
+                ${note ? `<p class="research-stories-note research-census-note" id="research-census-note"><span>${esc(note)}</span></p>` : ''}
+            </fieldset>`;
+        const input = host.querySelector<HTMLInputElement>('#research-census-on');
+        // Locked while on its way: a click changes nothing (the row drawn again as it stands).
+        input?.addEventListener('change', () => {
+            if (census.busy) { this.renderResearchCensusRow(); return; }
+            void this.setResearchCensus(input.checked);
+        });
+        if (focused) input?.focus({ preventScroll: true });
+    },
+
+    /**
+     * Spec 106 §4.1: `POST /census {on}` at once, both ways; a refusal says why under the row and the switch stays
+     * as the research says (an archive: the row goes).
+     */
+    async setResearchCensus(on: boolean): Promise<void> {
+        const rid = census.rid;
+        const ctx = this.historyManageContext();
+        const base = ctx?.researchId === rid ? ctx.base : null;
+        if (!base || census.busy) { this.renderResearchCensusRow(); return; }
+        census.busy = true;
+        census.sending = on;
+        delete census.note;
+        startPend(CENSUS_PEND, { redraw: () => this.renderResearchCensusRow() });
+        this.renderResearchCensusRow();
+        const r = await postBridgeCensus(base, on, ctx!.features);
+        if (census.rid !== rid) { dropPend(CENSUS_PEND); return; }
+        await endPend(CENSUS_PEND);
+        delete census.busy;
+        delete census.sending;
+        if (r.ok) {
+            census.want = r.census?.on ?? on;
+            census.wantHeld = r.census?.held ?? null;
+        } else {
+            const W = strings.live.waitingWrite;
+            switch (r.code) {
+                case 'archive': census.gone = true; break;
+                case 'busy': census.note = strings.history.errBusy; break;
+                case 'held': census.note = this.researchWriteHeldText(r.held!, false).toast; break;
+                case 'locked': census.note = W.locked; break;
+                case 'full': census.note = r.reason || W.fileFull; break;
+                default: census.note = r.reason || W.writeFailed;
+            }
+        }
+        this.renderResearchCensusRow();
+    },
+
+    /**
+     * Spec 130 K2.1: "The agent goes through files sent to the research by itself" — only with `intake.auto` and the
+     * research's `/status.intake` (neither in an archive nor a research waiting for its agent: no host there, and
+     * gone once the research says so); the switch follows `/status.intake.auto`; without the bridge inactive with
+     * its sentence. No mark: the write goes through the bridge, no terminal.
+     */
+    renderResearchIntakeRow(): void {
+        const host = document.querySelector<HTMLElement>(`#${SETTINGS_ID} #research-intake-host`);
+        if (!host) return;
+        const rid = intake.rid;
+        const ctx = this.historyManageContext();
+        const last = (ctx?.researchId === rid ? ctx.lastStatus : this.researchStatusOf(rid)) ?? lastBridgeStatus(rid);
+        const features = ctx?.researchId === rid ? ctx.features : last?.features ?? [];
+        const said = last?.intake;
+        if (intake.gone || !features.includes(INTAKE_AUTO_FEATURE) || (!said && intake.want === undefined) || (rid && this.researchAgentlessFor(rid))) {
+            host.innerHTML = '';
+            return;
+        }
+        const h = strings.history;
+        const up = this.researchBridgeUp(rid);
+        if (intake.want !== undefined && said?.auto === intake.want) delete intake.want;
+        const on = intake.sending ?? intake.want ?? said?.auto === true;
+        const note = !up ? h.storiesBridgeDown : intake.note ?? '';
+        const focused = document.activeElement?.id === 'research-intake-auto';
+        // On its way (6.1): the new state at once, dashed and locked (keeping its focus), its words after 120 ms.
+        const pend = !!intake.busy;
+        host.innerHTML = `
+            <fieldset class="research-transcripts research-intake">
+                <legend>${esc(h.intakeSection)}</legend>
+                <label class="settings-checkbox research-intake-row"${pend ? pendAttrs(INTAKE_PEND).replace(' aria-disabled="true"', '') : ''}>
+                    <input type="checkbox" id="research-intake-auto"${on ? ' checked' : ''}${!up ? ' disabled' : pend ? ' aria-disabled="true"' : ''}>
+                    <span class="settings-text">
+                        <span class="settings-name">${esc(h.intakeTitle)}</span>
+                        <span class="settings-desc">${esc(h.intakeDesc)}</span>${pend ? pendStatusHtml(INTAKE_PEND) : ''}
+                    </span>
+                </label>
+                ${note ? `<p class="research-stories-note research-intake-note" id="research-intake-note"><span>${esc(note)}</span></p>` : ''}
+            </fieldset>`;
+        const input = host.querySelector<HTMLInputElement>('#research-intake-auto');
+        // Locked while on its way: a click changes nothing (the row drawn again as it stands).
+        input?.addEventListener('change', () => {
+            if (intake.busy) { this.renderResearchIntakeRow(); return; }
+            void this.setResearchIntake(input.checked);
+        });
+        if (focused) input?.focus({ preventScroll: true });
+    },
+
+    /**
+     * Spec 130 K2.1: `POST /intake {"auto": bool}` at once, both ways; a refusal says why under the row and the
+     * switch stays as the research says (an archive: the row goes).
+     */
+    async setResearchIntake(auto: boolean): Promise<void> {
+        const rid = intake.rid;
+        const ctx = this.historyManageContext();
+        const base = ctx?.researchId === rid ? ctx.base : null;
+        if (!base || intake.busy) { this.renderResearchIntakeRow(); return; }
+        intake.busy = true;
+        intake.sending = auto;
+        delete intake.note;
+        startPend(INTAKE_PEND, { redraw: () => this.renderResearchIntakeRow() });
+        this.renderResearchIntakeRow();
+        const r = await postBridgeIntake(base, auto, ctx!.features);
+        if (intake.rid !== rid) { dropPend(INTAKE_PEND); return; }
+        await endPend(INTAKE_PEND);
+        delete intake.busy;
+        delete intake.sending;
+        if (r.ok) {
+            intake.want = r.intake?.auto ?? auto;
+        } else {
+            const W = strings.live.waitingWrite;
+            switch (r.code) {
+                case 'archive': intake.gone = true; break;
+                case 'busy': intake.note = strings.history.errBusy; break;
+                case 'held': intake.note = this.researchWriteHeldText(r.held!, false).toast; break;
+                case 'locked': intake.note = W.locked; break;
+                case 'full': intake.note = r.reason || W.fileFull; break;
+                default: intake.note = r.reason || W.writeFailed;
+            }
+        }
+        this.renderResearchIntakeRow();
     },
 
     /**

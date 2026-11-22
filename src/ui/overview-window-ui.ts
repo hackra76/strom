@@ -106,6 +106,7 @@ export const overviewWindowMethods = uiModule({
             extras.verify = this.treeVerifyNow();
             extras.offLineSettings = this.offLineSettingsOffered(treeId);
             extras.queueStart = this.queueStartNow();
+            extras.runStarts = this.runStartsNow();
             extras.followStart = followStartOf(researchId);
             if (filesSending.size) extras.fileSending = [...filesSending];
             if (notesReading.size) extras.noteReading = [...notesReading];
@@ -113,7 +114,9 @@ export const overviewWindowMethods = uiModule({
         }
         // What the evidence pill lights up in the tree here (the window's rows say it).
         extras.highlight = this.evidenceHighlightNow();
-        extras.follow = { on: this.isLiveFollowOn(), view: this.liveFollowView() };
+        // The run followed only with runs (spec 126 U10 §7): the state of before otherwise.
+        const followedRun = this.followedRun();
+        extras.follow = { on: this.isLiveFollowOn(), view: this.liveFollowView(), ...(followedRun ? { run: followedRun } : {}) };
         extras.lines = directionsWindowState(researchSession());
         extras.taskOrder = taskOrderWindowState();
         extras.waitingWrite = this.waitingRowsWindowState(w?.s ?? null);
@@ -212,6 +215,9 @@ export const overviewWindowMethods = uiModule({
             case 'offline-settings':
                 this.openOffLineSettings();
                 return true;
+            case 'runs-settings':
+                this.openRunsSettings();
+                return true;
             case 'books-settings':
                 this.openBooksSettings();
                 return true;
@@ -224,6 +230,9 @@ export const overviewWindowMethods = uiModule({
                     verifyStopping = false;
                     overviewChanged();
                 });
+            case 'run-stop':
+                // Written here (its bridge); the outcome goes back to the window's Stop.
+                return this.writeRunStop(a.args.run);
             case 'highlight-end':
                 // Only the highlight the window saw: another one begun here since stays.
                 if (this.evidenceHighlightKind() !== a.args.kind) return false;
@@ -241,6 +250,9 @@ export const overviewWindowMethods = uiModule({
                 return true;
             case 'follow-view':
                 this.setLiveFollowView(a.args.view);
+                return true;
+            case 'follow-run':
+                this.setFollowedRun(a.args.run);
                 return true;
             case 'turn-on': {
                 // "Turn on" only: the same switch would stop a research that runs.
@@ -319,6 +331,12 @@ export const overviewWindowMethods = uiModule({
                     overviewChanged();
                 });
             }
+            case 'waiting-aside': {
+                // Written through this window's bridge, the outcome to the window (it says a refusal at its item).
+                const w = item(a.args.itemId);
+                if (!s || !w?.aside) return { ok: false, gone: true };
+                return this.writeAsideAnswer(s, w, a.args.do, a.args.image);
+            }
             case 'hypothesis-ask': {
                 const h = researchHypotheses(DataManager.getData()).get(a.args.hypothesisId);
                 if (!h) return false;
@@ -338,8 +356,11 @@ export const overviewWindowMethods = uiModule({
                 // Built here for the open tree from the action and its parameters (never an address the window sends).
                 const url = this.activeResearchLink(a.args.link, (a.args.params ?? {}) as Omit<ResearchLinkParams, 'tree'>);
                 if (!url) return false;
-                // "Work on the queue…" starts here, its state in Now of both windows (3a).
-                if (a.args.link === 'work') this.beginQueueWork(url);
+                // "Work on the queue…" and a direction's own run start here, their state in Now of both windows (3a).
+                if (a.args.link === 'work') {
+                    const line = (a.args.params as { research?: unknown } | undefined)?.research;
+                    this.beginRunWork(url, typeof line === 'string' ? line : undefined);
+                }
                 else this.launchResearchLink(url, a.args.kind ?? 'terminal');
                 return true;
             }
@@ -354,7 +375,7 @@ export const overviewWindowMethods = uiModule({
             case 'queue-list': {
                 // A page of the queue or of its search, read from this window's bridge as the docked overview reads it.
                 if (!s || !queuePaged(s)) return Promise.resolve<QueuePageResult>({ ok: false, code: 'failed' });
-                return fetchQueuePage(s.bridge.base, a.args.filter, a.args.from, a.args.count);
+                return fetchQueuePage(s.bridge.base, a.args.filter, a.args.from, a.args.count, undefined, s.features);
             }
         }
     },

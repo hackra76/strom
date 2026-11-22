@@ -21,6 +21,17 @@ export interface UndoSnapshot {
     base?: ResearchBase | null;
     /** What kind of step this is, for a step a dialog offers to undo by name (the sources' split, spec 075 §5). */
     mark?: UndoMark;
+    /**
+     * The step changed only the tree's own lists of people (spec 084), which a
+     * research never has: undone and redone also while the tree follows a
+     * research (its other steps wait until following ends).
+     */
+    listsOnly?: true;
+    /**
+     * When the state was recorded (UndoManager sets it, rising): a load
+     * of images goes only into the states after its start (spec 116, I3).
+     */
+    seq?: number;
 }
 
 /** A step named beyond its description: its kind, when it was done, how many things it changed. */
@@ -38,6 +49,7 @@ class UndoManagerClass {
     private undoStack: UndoSnapshot[] = [];
     private redoStack: UndoSnapshot[] = [];
     private activeTreeId: TreeId | null = null;
+    private seq = 0;
 
     /**
      * Point the manager at a tree. When the tree changes, both stacks are
@@ -56,7 +68,7 @@ class UndoManagerClass {
      * stack (standard behavior).
      */
     push(snapshot: UndoSnapshot): void {
-        this.undoStack.push(snapshot);
+        this.undoStack.push({ ...snapshot, seq: ++this.seq });
         if (this.undoStack.length > MAX_UNDO_STEPS) {
             this.undoStack.shift();
         }
@@ -70,7 +82,7 @@ class UndoManagerClass {
     undo(currentData: StromData, currentBase?: ResearchBase | null): UndoSnapshot | null {
         const snapshot = this.undoStack.pop();
         if (!snapshot) return null;
-        this.redoStack.push({ data: currentData, description: snapshot.description, ...(currentBase !== undefined ? { base: currentBase } : {}), ...(snapshot.mark ? { mark: snapshot.mark } : {}) });
+        this.redoStack.push(stepLike(snapshot, currentData, currentBase));
         return snapshot;
     }
 
@@ -78,7 +90,7 @@ class UndoManagerClass {
     redo(currentData: StromData, currentBase?: ResearchBase | null): UndoSnapshot | null {
         const snapshot = this.redoStack.pop();
         if (!snapshot) return null;
-        this.undoStack.push({ data: currentData, description: snapshot.description, ...(currentBase !== undefined ? { base: currentBase } : {}), ...(snapshot.mark ? { mark: snapshot.mark } : {}) });
+        this.undoStack.push(stepLike(snapshot, currentData, currentBase));
         return snapshot;
     }
 
@@ -98,8 +110,30 @@ class UndoManagerClass {
         return this.undoStack[this.undoStack.length - 1]?.mark ?? null;
     }
 
+    /** The step a single undo (redo) would take back (replay) changed only lists of people. */
+    peekListsOnly(which: 'undo' | 'redo'): boolean {
+        const stack = which === 'undo' ? this.undoStack : this.redoStack;
+        return stack[stack.length - 1]?.listsOnly === true;
+    }
+
     canRedo(): boolean {
         return this.redoStack.length > 0;
+    }
+
+    /** The stamp of the history now: every state recorded later has a higher `seq`. */
+    historyStamp(): number {
+        return this.seq;
+    }
+
+    /**
+     * Change in place the data of every state on both stacks recorded after
+     * `since` (images that came in the background go into the states the
+     * user can go back or forth to, spec 116 I3).
+     */
+    patchHistory(since: number, fn: (data: StromData) => void): void {
+        for (const s of [...this.undoStack, ...this.redoStack]) {
+            if ((s.seq ?? 0) > since) fn(s.data);
+        }
     }
 
     /** Test/utility: drop all history for the current tree. */
@@ -107,6 +141,18 @@ class UndoManagerClass {
         this.undoStack = [];
         this.redoStack = [];
     }
+}
+
+/** The state `data` stashed on the other stack as the same step as `snapshot` (its description and kind). */
+function stepLike(snapshot: UndoSnapshot, data: StromData, base: ResearchBase | null | undefined): UndoSnapshot {
+    return {
+        data, description: snapshot.description,
+        ...(base !== undefined ? { base } : {}),
+        ...(snapshot.mark ? { mark: snapshot.mark } : {}),
+        ...(snapshot.listsOnly ? { listsOnly: true as const } : {}),
+        // The same step, seen from its other side: recorded when the step was.
+        ...(snapshot.seq !== undefined ? { seq: snapshot.seq } : {}),
+    };
 }
 
 export const UndoManager = new UndoManagerClass();

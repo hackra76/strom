@@ -19,23 +19,24 @@ import { strings, getCurrentLanguage } from '../strings.js';
 import { formatFlexDate } from '../dates.js';
 import { shownName } from '../person-name.js';
 import type { LifeEvent, Partnership, PartnershipId, PersonId } from '../types.js';
-import type { LiveStatus } from '../research-link.js';
+import { QUEUE_KIND_FEATURE, type LiveStatus } from '../research-link.js';
 import { FactHolder, factCitations, factsOf, isPartnership } from '../import-origin.js';
 import { factReliability, ReliabilityStepName } from '../reliability.js';
 import {
-    VERIFY_BULK_FEATURE, VERIFY_FEATURE, VERIFY_STOP_FEATURE, factResearchEid, factVerifyInfo, personResearchRef,
+    VERIFY_BULK_FEATURE, VERIFY_FEATURE, VERIFY_STOP_FEATURE, VERIFY_TRY_FIRST_FEATURE, factResearchEid, factVerifyInfo, personResearchRef,
 } from '../verify.js';
 import {
     VerifyBulkDone, VerifyBulkOrder, VerifyBulkResult, VerifyFact, VerifyTarget, postVerify, postVerifyBulk, postVerifyStop,
+    verifyBulkStartedKind,
 } from '../research-verify.js';
 import {
     BulkScopeOption, FactOffer, PERSON_VERIFY_KINDS, VERIFY_TRY_PEOPLE, bulkScopeOptions, factOffer, personVerifyAskCount, personVerifyCounts, queuedToastDue,
     verifyCostSplit, verifyFactKind, verifyRecordText,
 } from '../verify-ui-model.js';
 import { VerifyResearch, researchVerifies } from '../verify-offer.js';
-import { closeStatusTip, refreshStatusTip, registerStatusTipExtension } from './status-tip.js';
+import { closeStatusTip, openStatusTip, refreshStatusTip, registerStatusTipExtension } from './status-tip.js';
 import { reliabilityLabel } from './fact-status.js';
-import { researchBridgeActionLabel } from './research-open-mark.js';
+import { researchBridgeActionLabel, researchLinkFlags } from './research-open-mark.js';
 import { activeResearchId, bridgeBase } from './history-ui.js';
 import { onBridgeStatus } from './research-sync-ui.js';
 import { liveSession } from './research-ui.js';
@@ -51,6 +52,9 @@ export const VERIFY_TREE_DIALOG_ID = 'verify-tree-modal';
 
 /** How long the toast after a run of re-verification stands. */
 const QUEUED_TOAST_MS = 10_000;
+/** How long the toast after a try at the head of the queue stands (with "Process now": longer, closable). */
+const BULK_STARTED_MS = 5000;
+const BULK_PROCESS_MS = 15_000;
 const TOAST_KEY = (treeId: string): string => `strom-verify-toast:${treeId}`;
 
 const esc = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -97,10 +101,11 @@ export interface PersonVerifyState {
     pending: number;
 }
 
-/** The value of a fact as the preview names it ("3 Feb 1850, Horní Bříza"). */
+/** The value of a fact as the preview names it ("3 Feb 1850, Horní Bříza"; a name as shown). */
 function factValueText(holder: FactHolder, fact: string): string {
     const join = (date?: string, place?: string): string => [date ? formatFlexDate(date) : '', place ?? ''].filter(Boolean).join(', ');
     if (isPartnership(holder)) return fact === 'marriage' ? join(holder.startDate, holder.startPlace) : '';
+    if (fact === 'name') return shownName(holder);
     if (fact === 'birth') return join(holder.birthDate, holder.birthPlace);
     if (fact === 'death') return join(holder.deathDate, holder.deathPlace);
     if (fact.startsWith('event:')) {
@@ -239,7 +244,7 @@ export const verifyPersonMethods = uiModule({
         listening = true;
         registerStatusTipExtension((ctx, slots) => {
             if (ctx.kind !== 'card' || !ctx.personId) return;
-            this.verifyCardTipActions(ctx.personId as PersonId, slots.actions);
+            this.verifyCardTipActions(ctx.personId as PersonId, slots.actions, ctx.facts);
         });
         onBridgeStatus((rid, status) => this.noteVerifyStatus(rid, status));
     },
@@ -284,8 +289,54 @@ export const verifyPersonMethods = uiModule({
         return { research, facts, verify: researchVerifies(research) ? personVerifyAskCount(facts) : 0, pending: counts.pending };
     },
 
-    /** "Verify facts (N)" in a card mark's tip, else "N facts waiting to be verified". */
-    verifyCardTipActions(personId: PersonId, actions: HTMLElement): void {
+    /**
+     * "Verify facts (N)" in a card mark's tip, else "N facts waiting to be verified";
+     * and "The name in the person card ›" while the name holds the mark (`facts`) and
+     * its own pill offers more (066 K6.3 §5.2).
+     */
+    verifyCardTipActions(personId: PersonId, actions: HTMLElement, facts: readonly string[] = []): void {
+        this.verifyCardTipPersonActions(personId, actions);
+        if (facts.includes('name') && this.verifyNameMovable(personId, actions)) {
+            const link = document.createElement('button');
+            link.type = 'button';
+            link.className = 'st-link st-name-at-person';
+            link.textContent = strings.verify.nameAtPerson;
+            link.addEventListener('click', (e) => {
+                e.stopPropagation();
+                closeStatusTip();
+                this.verifyOpenNameAtPerson(personId);
+            });
+            actions.appendChild(link);
+        }
+    },
+
+    /**
+     * The name's own pill on the person card offers Verify or the scan: the
+     * same offer as its tip there (the name shown at its own pill, not only in
+     * the origin row's one for all facts).
+     */
+    verifyNameMovable(personId: PersonId, trigger: HTMLElement): boolean {
+        const person = DataManager.getData().persons[personId];
+        const view = person ? this.personReliabilityView(person) : null;
+        const r = view?.atFacts ? view.summary.facts.find(f => f.fact === 'name') : undefined;
+        if (!r) return false;
+        const v = this.verifyFactView({ kind: 'fact', personId, facts: ['name'], step: r.step, reliability: r, trigger });
+        return !!v && (v.offer.scan || v.offer.verify);
+    },
+
+    /** The person card open, the tip of the name's pill pinned beside it (at the surname, else at the given name). */
+    verifyOpenNameAtPerson(personId: PersonId): void {
+        this.clearDialogStack();
+        this.pushDialog('person-modal');
+        this.showEditPersonModal(personId);
+        const modal = document.getElementById('person-modal');
+        const pill = modal?.querySelector<HTMLElement>('#lastname-label button.fact-status[data-fact="name"]')
+            ?? modal?.querySelector<HTMLElement>('label[for="input-firstname"] button.fact-status[data-fact="name"]');
+        if (pill) openStatusTip(pill, { pinned: true });
+    },
+
+    /** The card tip's person-wide actions: Verify facts (N), or what waits. */
+    verifyCardTipPersonActions(personId: PersonId, actions: HTMLElement): void {
         const st = this.personVerifyState(personId);
         if (!st) return;
         if (st.verify > 0 && personResearchRef(DataManager.getData().persons[personId] ?? {})) {
@@ -571,8 +622,11 @@ export const verifyPersonMethods = uiModule({
 
     // ==================== The "Verifying" section ====================
 
-    /** The tree's verification now: waiting facts, Stop and the bulk dialog (null: the research does not verify). */
-    treeVerifyNow(): { waiting: number; stop: boolean; bulk: boolean } | null {
+    /**
+     * The tree's verification now: waiting facts, Stop, the bulk dialog and the way into the queue narrowed to
+     * Verification (`queue.kind`) (null: the research does not verify).
+     */
+    treeVerifyNow(): { waiting: number; stop: boolean; bulk: boolean; queue?: boolean } | null {
         const now = this.verifyBridgeNow();
         if (!now || !researchVerifies(now.research, VERIFY_FEATURE) || DataManager.isViewMode()) return null;
         const v = now.status.verify;
@@ -581,17 +635,23 @@ export const verifyPersonMethods = uiModule({
             waiting: v?.waiting ?? 0,
             stop: researchVerifies(now.research, VERIFY_STOP_FEATURE),
             bulk: researchVerifies(now.research, VERIFY_BULK_FEATURE),
+            // Said only when offered (a snapshot for the overview's own window carries it then).
+            ...(researchVerifies(now.research, QUEUE_KIND_FEATURE) ? { queue: true } : {}),
         };
     },
 
-    /** The rows of "Verifying" (HTML): waiting facts with Stop, the bulk verification. `pending`: the count said. */
-    verifyRowsHtml(pending: number, opts: { stop: boolean; bulk: boolean }): string {
+    /**
+     * The rows of "Verifying" (HTML): waiting facts with "Show in the queue" (stays in the app, no mark) and Stop,
+     * the bulk verification. `pending`: the count said.
+     */
+    verifyRowsHtml(pending: number, opts: { stop: boolean; bulk: boolean; queue?: boolean }): string {
         const v = strings.verify;
         const rows: string[] = [];
         if (pending > 0) {
             // Stop's `data-action` is its identity: its "Stopping…" follows it when the section is drawn anew.
             rows.push(`<div class="vfy-sec-row vfy-sec-pending"><span class="vfy-sec-main"><span class="vfy-sec-title">${esc(v.pendingRow(pending))}</span>`
                 + `<span class="vfy-sec-sub">${esc(v.pendingRowSub)}</span></span>`
+                + (opts.queue ? `<button type="button" class="link-button vfy-sec-queue" data-verify-act="queue">${esc(v.pendingQueue)}</button>` : '')
                 + (opts.stop ? `<button type="button" class="link-button vfy-sec-stop" data-verify-act="stop" data-action="verify-stop">${researchBridgeActionLabel(v.stop, 'verify-stop')}</button>` : '')
                 + '</div>');
         }
@@ -614,25 +674,31 @@ export const verifyPersonMethods = uiModule({
         return `<section class="person-research-section vfy-section" data-verify-section="person"><h3 class="menu-section-header">${esc(strings.verify.section)}</h3>${rows}</section>`;
     },
 
-    /** The tree's "Verifying" block (DOM), or null when there is nothing to say. */
-    treeVerifyBlock(onBulk?: () => void): HTMLElement | null {
+    /**
+     * The tree's "Verifying" block (DOM), or null when there is nothing to say. `onBulk`: before the bulk dialog
+     * opens; `onQueue`: before the overview's queue is shown.
+     */
+    treeVerifyBlock(onBulk?: () => void, onQueue?: () => void): HTMLElement | null {
         const tree = this.treeVerifyNow();
         if (!tree || (tree.waiting === 0 && !tree.bulk)) return null;
         const block = document.createElement('div');
         block.className = 'vfy-section vfy-section--tree';
         block.dataset.verifySection = 'tree';
         block.innerHTML = `<h4 class="vfy-section-head">${esc(strings.verify.section)}</h4>${this.verifyRowsHtml(tree.waiting, tree)}`;
-        this.bindVerifySection(block, onBulk);
+        this.bindVerifySection(block, onBulk, onQueue);
         return block;
     },
 
-    /** The section's Stop and its way into the bulk dialog. */
-    bindVerifySection(host: HTMLElement, onBulk?: () => void): void {
+    /** The section's Stop, its way into the bulk dialog and into the queue narrowed to Verification. */
+    bindVerifySection(host: HTMLElement, onBulk?: () => void, onQueue?: () => void): void {
         host.addEventListener('click', (e) => {
             const act = (e.target as HTMLElement).closest<HTMLElement>('[data-verify-act]');
             if (!act || !host.contains(act)) return;
             if (act.dataset.verifyAct === 'stop') void this.verifyStop(act as HTMLButtonElement);
-            else if (act.dataset.verifyAct === 'bulk') {
+            else if (act.dataset.verifyAct === 'queue') {
+                onQueue?.();
+                this.showOverviewQueueKind('verify');
+            } else if (act.dataset.verifyAct === 'bulk') {
                 onBulk?.();
                 this.showVerifyBulkDialog();
             }
@@ -751,7 +817,8 @@ export const verifyPersonMethods = uiModule({
             </div>
             <div class="vfy-body"></div>
             <div class="buttons vfy-foot"><button type="button" class="secondary" data-dismiss data-vfy="close">${esc(strings.buttons.close)}</button></div>`;
-        const block = this.treeVerifyBlock(() => removeDialog(VERIFY_TREE_DIALOG_ID, null, this));
+        const close = (): void => removeDialog(VERIFY_TREE_DIALOG_ID, null, this);
+        const block = this.treeVerifyBlock(close, close);
         const body = modal.querySelector<HTMLElement>('.vfy-body')!;
         if (block) body.appendChild(block);
         else body.innerHTML = `<p class="vfy-loading">${esc(strings.verify.nothing)}</p>`;
@@ -895,6 +962,8 @@ export const verifyPersonMethods = uiModule({
                 <input type="radio" name="vfy-order" value="${o}"${o === st.order ? ' checked' : ''}>
                 <span class="vfy-opt-main"><span class="vfy-opt-title">${esc(orderLabel(o))}</span></span>
             </label>`).join('');
+        // The try's tasks go to the head of the queue only where the research says so (spec 065 K7.3).
+        const tryHead = !!this.researchStatusOf(st.rid)?.features?.includes(VERIFY_TRY_FIRST_FEATURE);
         const restoreFocus = keepFocus(modal);
         modal.innerHTML = `
             <div class="modal-header vfy-header">
@@ -907,7 +976,7 @@ export const verifyPersonMethods = uiModule({
                 <label class="vfy-opt vfy-try">
                     <input type="checkbox" name="vfy-try"${st.tryFirst ? ' checked' : ''}>
                     <span class="vfy-opt-main"><span class="vfy-opt-title">${esc(v.tryFirst(VERIFY_TRY_PEOPLE))}</span>
-                    <span class="vfy-opt-sub">${esc(v.tryFirstSub(VERIFY_TRY_PEOPLE))}</span></span>
+                    <span class="vfy-opt-sub">${esc(tryHead ? v.tryFirstSubHead(VERIFY_TRY_PEOPLE) : v.tryFirstSub(VERIFY_TRY_PEOPLE))}</span></span>
                 </label>
                 <div class="vfy-est" aria-live="polite"></div>
             </div>
@@ -936,7 +1005,7 @@ export const verifyPersonMethods = uiModule({
                     .filter(Boolean).join(' · ');
                 est.innerHTML = `<p class="vfy-est-head">${esc(head)}</p>`
                     + (e.left > 0 ? `<p class="vfy-est-left">${esc(v.bulkLeft(e.left))}</p>` : '')
-                    + `<p class="vfy-est-note">${esc(v.bulkNote)}</p>`;
+                    + `<p class="vfy-est-note">${esc(v.bulkNote(`${strings.live.knowsTitle} › ${v.section}`))}</p>`;
             }
         }
         if (start) {
@@ -982,8 +1051,28 @@ export const verifyPersonMethods = uiModule({
             return;
         }
         this.closeVerifyBulkDialog();
-        this.showToast(strings.verify.bulkStarted(r.facts), 5000);
+        this.showVerifyBulkStarted(st.rid, r);
         this.afterVerifyStarted();
+    },
+
+    /**
+     * The toast after a start (spec 065 K7.2): a try at the head of the queue while the research is idle
+     * offers "Process now" (the `work` link on exactly its tasks, as "Work on the queue" opens it); while it
+     * works its tasks are next; without `verify.tryFirst` today's "N facts queued".
+     */
+    showVerifyBulkStarted(rid: string, r: VerifyBulkDone): void {
+        const v = strings.verify;
+        const kind = verifyBulkStartedKind(r, this.researchStatusOf(rid)?.features ?? null);
+        if (kind === 'plain') { this.showToast(v.bulkStarted(r.facts), BULK_STARTED_MS); return; }
+        if (kind === 'next') { this.showToast(v.bulkStartedNext(r.facts), BULK_STARTED_MS); return; }
+        const url = kind === 'process' && !this.activeResearchNoAgent() && activeResearchId() === rid.toLowerCase()
+            ? this.activeResearchLink('work', { workDo: 'tasks', workTasks: r.tasks }) : null;
+        if (!url) { this.showToast(v.bulkStartedHead(r.facts), BULK_STARTED_MS); return; }
+        // Its mark from the one map (RESEARCH_LINK_MARKS, `work`: the AI badge and the terminal mark).
+        this.showToast(v.bulkStartedIdle(r.facts), BULK_PROCESS_MS, {
+            closable: true, kind: 'verify-process',
+            action: { label: v.processNow, run: () => this.beginRunWork(url), ...researchLinkFlags(url) },
+        });
     },
 
     // ==================== The toast after a run (10m) ====================

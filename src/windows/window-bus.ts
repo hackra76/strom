@@ -23,6 +23,8 @@ export interface WindowStatus {
     locked: boolean;
     /** Nothing may be edited now (live, locked, a newer app's tree, the tree locked against edits). */
     readOnly: boolean;
+    /** The lists of people may be changed, also while `readOnly` because the tree follows a research (N2). */
+    listsOpen?: boolean;
     /** The research's state for the overview window (K3); null = no research. */
     researchState: unknown;
     /** The main window has a tree open that exists. */
@@ -34,6 +36,9 @@ export interface WindowStatus {
     revision: number;
     canUndo: boolean;
     canRedo: boolean;
+    /** The step to undo / redo goes also while `readOnly` (a list's step while following a research, N2). */
+    undoOpen?: boolean;
+    redoOpen?: boolean;
     /** The satellites the main window knows (one missing from it says hello again: a main window after its reload). */
     windows: string[];
     /**
@@ -84,7 +89,7 @@ export type WindowMessageBody =
     /** main → all: the tree after a save (any: own edit, a satellite's, undo, the research). */
     | { type: 'patch'; treeId: TreeId; revision: number; json: string }
     /** sat → main: an edit made on the copy of revision `baseRevision`; `json` = the whole data after it. */
-    | { type: 'edit'; windowId: string; editId: string; treeId: TreeId; baseRevision: number; json: string; label: string }
+    | { type: 'edit'; windowId: string; editId: string; treeId: TreeId; baseRevision: number; json: string; label: string; listsOnly?: true }
     /** main → sat: the edit's result; `ok: false` = not applied (a fresh `tree` follows to that window). */
     | { type: 'edit-result'; to: string; editId: string; ok: boolean; revision: number; reason?: EditRefusal }
     /**
@@ -153,6 +158,12 @@ export type WindowMessageBody =
     | { type: 'taking-over'; windowId: string }
     /** second tab / sat → main: an address or a launch to open there (?person= ?live= ?send= ?import-url=, files). */
     | { type: 'link'; search?: string; files?: unknown[] }
+    /**
+     * sat → main: "On the map" of a satellite's Table (spec 098 §6): the main
+     * window takes the selection (an encoded SelectionRef), shows the Map in
+     * the scope Selection and comes forward.
+     */
+    | { type: 'show-on-map'; ref: string; treeId: TreeId | null }
     /** main → sat: close yourself (a window the main window holds no reference to). */
     | { type: 'close'; to: string };
 
@@ -172,7 +183,7 @@ export interface ChannelLike {
 }
 
 const TYPES = new Set<string>(['hello', 'init', 'tree', 'patch', 'edit', 'edit-result', 'select', 'send-mode', 'undo', 'redo', 'status',
-    'focus-req', 'focused', 'research-action', 'research-action-result', 'research-menu-req', 'research-menu', 'research-state', 'agent-state', 'agent-state-req', 'fan-rod-colors', 'view', 'spawn', 'bye', 'main-bye', 'taking-over', 'link', 'close']);
+    'focus-req', 'focused', 'research-action', 'research-action-result', 'research-menu-req', 'research-menu', 'research-state', 'agent-state', 'agent-state-req', 'fan-rod-colors', 'view', 'spawn', 'bye', 'main-bye', 'taking-over', 'link', 'show-on-map', 'close']);
 
 function isWindowMessage(data: unknown): data is WindowMessage {
     if (!data || typeof data !== 'object') return false;

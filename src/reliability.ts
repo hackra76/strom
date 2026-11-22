@@ -24,7 +24,7 @@
 import type {
     CoupleEvent, LifeEvent, FactPart, FactStatus, FactOriginKind, ImportRecord, Partnership, Person, ResearchFactOrigin, ResearchFactWas, StromData,
 } from './types.js';
-import { personSourceIds } from './types.js';
+import { personSourceIds } from './model-values.js';
 import { CitationHolder, citationQuality } from './citation-quality.js';
 import {
     FactHolder, factImportParts, factParts, factsOf, factValue, importRecordOf, isPartnership,
@@ -143,7 +143,8 @@ export function factStatusOf(holder: FactHolder, fact: string): FactStatus | und
         return (holder.events ?? []).find(e => e?.id === id)?.status;
     }
     if (isPartnership(holder)) return fact === 'marriage' ? holder.startStatus : fact === 'divorce' ? holder.endStatus : undefined;
-    return fact === 'birth' ? holder.birthStatus : fact === 'death' ? holder.deathStatus : undefined;
+    return fact === 'name' ? holder.nameStatus
+        : fact === 'birth' ? holder.birthStatus : fact === 'death' ? holder.deathStatus : undefined;
 }
 
 /** The parts of a fact that have a value now. */

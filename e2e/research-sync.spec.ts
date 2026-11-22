@@ -7,9 +7,20 @@ import {
 
 /**
  * A result of a send that follows an edit is said once the edit's undo pill has stood its 3 s to be
- * read (it carries the pill's Undo): run on Playwright's clock (installed by the test).
+ * read (it carries the pill's Undo): run on Playwright's clock (installed by the test), a quarter of
+ * a second at a time, until a toast of `selector` says `text`. The installed clock also runs in real
+ * time, so on a loaded machine the pill may have stood its 3 s before the send's answer came: the
+ * result then shows at once, and 3 s run in one go would take half of its 6 s to be read (the toast
+ * gone before the check). Stopped where it shows, the toast keeps its own time.
  */
-const pillRead = (page: Page) => page.clock.runFor(3000);
+const pillRead = async (page: Page, text: string, selector = '.toast:not(.toast-held)') => {
+    for (let ran = 0; ran < 3000; ran += 250) {
+        const said = await page.evaluate(([sel, t]) =>
+            [...document.querySelectorAll(sel)].some(e => e.classList.contains('show') && (e.textContent ?? '').includes(t)), [selector, text]);
+        if (said) return;
+        await page.clock.runFor(250);
+    }
+};
 /**
  * The toast said now: one waiting hidden under it (`.toast-held`, toast-slot.ts — the send's
  * "Sending to the research…" under its result, when the send took a moment) is not the one read.
@@ -40,7 +51,7 @@ test.describe('the state of the tree and sending straight', () => {
         await expect(block(page)).toHaveAttribute('data-state', 'unsent');
         await expect(block(page)).toContainText('Not in the research yet');
         await block(page).getByRole('menuitem', { name: 'Send changes' }).click();
-        await pillRead(page);
+        await pillRead(page, 'Sent to the research, 6 changes. Confirm them in the research.');
         await expect(shownToast(page)).toContainText('Sent to the research, 6 changes. Confirm them in the research.');
         await expect(page.locator('#confirmation-modal')).not.toHaveClass(/active/);
         expect(bridge.posts).toHaveLength(1);
@@ -77,14 +88,15 @@ test.describe('the state of the tree and sending straight', () => {
         await openResearch(page, { edit: true });
         const bridge = await fakeBridge(page, { syncReply: { status: 500, body: { error: 'výzkum úpravy nezapsal', reason: 'P0002 already has birth parents in F0001' } } });
         await poll(page);
-        void page.evaluate(() => window.Strom.UI.researchSendNow());
+        // Started, not awaited in the page: the send waits for the dialog's answer, which may come after the test's end.
+        await page.evaluate(() => { void window.Strom.UI.researchSendNow(); });
         const dialog = page.locator('#confirmation-modal');
         await expect(dialog).toContainText("The research didn't accept the changes");
         await expect(dialog).toContainText('Details (to pass on): P0002 already has birth parents in F0001');
         await expect(dialog).not.toContainText('nezapsal');
         bridge.syncReply = { status: 200, body: { ok: true, changes: 6, inbox: true } };
         await dialog.getByRole('button', { name: 'Try again' }).click();
-        await pillRead(page);
+        await pillRead(page, 'Sent to the research, 6 changes');
         await expect(shownToast(page)).toContainText('Sent to the research, 6 changes');
         expect(bridge.posts).toHaveLength(2);
     });
@@ -94,7 +106,8 @@ test.describe('the state of the tree and sending straight', () => {
         await fakeBridge(page, { syncReply: { status: 400, body: { error: 'tohle nevypadá jako rodokmen tohoto výzkumu', code: 'tree.foreign',
             text: "this does not look like the research's family tree" } } });
         await poll(page);
-        void page.evaluate(() => window.Strom.UI.researchSendNow());
+        // Started, not awaited in the page: the send waits for the dialog's answer, which may come after the test's end.
+        await page.evaluate(() => { void window.Strom.UI.researchSendNow(); });
         const dialog = page.locator('#confirmation-modal');
         await expect(dialog).toContainText("The research didn't accept the changes");
         await expect(dialog).toContainText("Reason from the research: this doesn't look like the research's family tree; it can be exported and loaded in the research as another family tree.");
@@ -111,7 +124,7 @@ test.describe('the state of the tree and sending straight', () => {
             skipped: [{ n: 3, kind: 'family', why: 'P0002 already has birth parents in F0001' }] } } });
         await poll(page);
         await page.evaluate(() => window.Strom.UI.researchSendNow());
-        await pillRead(page);
+        await pillRead(page, 'The research wrote the rest but skipped 1 change. Those changes stay only in the app.');
         await expect(shownToast(page)).toContainText('The research wrote the rest but skipped 1 change. Those changes stay only in the app.');
     });
 
@@ -333,7 +346,7 @@ test.describe('the state of the tree and sending straight', () => {
         const bridge = await fakeBridge(page, { lastIntake: { id: 'I0041', at: '2026-09-30T09:00:00Z' } });
         await poll(page);
         await page.evaluate(() => window.Strom.UI.researchSendNow());
-        await pillRead(page);
+        await pillRead(page, 'Sent to the research');
         await expect(shownToast(page)).toContainText('Sent to the research');
         // The user discarded it in the research.
         bridge.inbox = [];
@@ -388,7 +401,7 @@ test.describe('after a send the research wrote', () => {
         const bridge = await fakeBridge(page);
         await poll(page);
         await page.evaluate(() => window.Strom.UI.researchSendNow());
-        await pillRead(page);
+        await pillRead(page, 'Sent to the research');
         await expect(shownToast(page)).toContainText('Sent to the research');
         // Written in the research; no explicit ask from the test — the window coming back asks.
         bridge.inbox = [];
@@ -426,7 +439,7 @@ test.describe('after a send the research wrote', () => {
                 excerpts: (Object.values(d.sources).find((s: any) => s.refn === 'S0001') as any).excerpts?.length ?? 0 };
         });
         await page.evaluate(() => window.Strom.UI.researchSendNow());
-        await pillRead(page);
+        await pillRead(page, 'Sent to the research');
         await expect(shownToast(page)).toContainText('Sent to the research');
         bridge.inbox = [];
         Object.assign(bridge.sends[0], { state: 'written', decidedAt: new Date().toISOString() });
@@ -537,7 +550,7 @@ test.describe('updating over changes the research does not have', () => {
         await expect(dialog).toContainText('the research has a newer version');
         await expect(dialog.locator('.confirm-aside-btn')).toHaveText('Load without changes');
         await dialog.getByRole('button', { name: 'Send, then load' }).click();
-        await pillRead(page);
+        await pillRead(page, 'Sent to the research', '.toast:not(.toast--progress)');
         // The message (the load's progress toast, gone for the question, may still fade beside it).
         await expect(page.locator('.toast:not(.toast--progress)')).toContainText('Sent to the research');
         await expect(pill).toContainText('Confirm the changes in the research, then the new version loads');
@@ -631,7 +644,7 @@ test.describe('Research for this tree and "Transcription verified"', () => {
             dm.updatePerson(jan.id, { birthSourceIds: [src.id] });
         });
         await page.evaluate(() => window.Strom.UI.researchSendNow());
-        await pillRead(page);
+        await pillRead(page, 'Sent to the research');
         await expect(shownToast(page)).toContainText('Sent to the research');
 
         await openResearchMenu(page, { expandMore: true });

@@ -21,7 +21,7 @@ import { TreeRenderer } from '../renderer.js';
 import { Attachment, Person, PersonId, TreeId } from '../types.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { setMaterialsCountProvider } from '../card-signals.js';
-import { personMediaIndex, treeMedia, placeKey, personMediaCount } from '../media.js';
+import { personMediaIndex, treeMedia, placeKey, personMediaCount, personMedia } from '../media.js';
 import { researchPersonRef, parseLiveBridge, researchLinkMark } from '../research-link.js';
 import { storedResearchBridge, announcedResearchScheme, researchLinksEnabled } from '../research-device.js';
 import {
@@ -35,12 +35,14 @@ import {
     clearMaterialsCache, mergeIntoCache, markBatchOpened, materialDate,
 } from '../materials.js';
 import { materialThumbs } from '../material-thumbs.js';
+import { imageLoads, IMAGES_ARRIVED_EVENT, IMAGES_STATE_EVENT } from '../image-loads.js';
+import { setTileState, standInState, waitingTileHtml, type ImgState } from './image-slot.js';
 import { formatBytesShort } from './originals-ui.js';
 import { onComputer } from './research-ui.js';
 import { openImageViewer } from './image-viewer.js';
 import { materialDetailsEdit } from './material-details-ui.js';
 import { uiModule } from './module.js';
-import { canEditPortrait } from './portrait-actions-ui.js';
+import { canEditPortrait, treePortraitCopy } from './portrait-actions-ui.js';
 import { windowAddOffered } from '../materials-overview.js';
 
 const MODAL_ID = 'materials-modal';
@@ -111,6 +113,8 @@ export interface MaterialOpenCtx {
     noSource?: boolean;
     /** Review ended (the viewer closed): how many files were saved. */
     done?: (saved: number) => void;
+    /** The person the items were opened for (their section, the window filtered to them): Use as portrait… is for them. */
+    personId?: PersonId | null;
 }
 
 /** What the materials need to know about the active tree (null: not linked to a research). */
@@ -232,15 +236,15 @@ export function materialItemSha(item: MaterialItem): string | null {
     return item.file?.sha ?? item.attachment?.original?.sha256 ?? null;
 }
 
-/** The second line: kind · date · size (with an agent: its state). */
-function metaLine(item: MaterialItem, agent: boolean): string {
+/** The second line: kind · date · size (with an agent: its state; `waiting`: the words of a file not gone through yet). */
+function metaLine(item: MaterialItem, agent: boolean, waiting: string): string {
     const m = strings.materials;
     const parts = [materialKindLabel(item)];
     if (item.date) parts.push(materialDate(item.date));
     if (item.bytes) parts.push(formatBytesShort(item.bytes));
     if (agent && item.origin !== 'tree') {
         if (item.state === 'processed') parts.push(m.agentDone);
-        else if (item.state === 'new') parts.push(m.agentWaiting);
+        else if (item.state === 'new') parts.push(waiting);
     }
     return parts.join(' · ');
 }
@@ -268,26 +272,39 @@ const DIVIDER_BEFORE: MaterialActionId[] = ['openSystem', 'removeFromTree'];
 
 /** The person's items as drawn in the section (by key), for the ⋯ menu and opening. */
 let sectionItems = new Map<string, MaterialItem>();
-/** An attachment with what the rows show of it (its title, kind, date and note; spec 102 §2). */
-const attachmentKey = (a: Attachment): string => [a.id, a.title ?? '', a.kind ?? '', a.date ?? '', a.note ?? ''].join('\u0001');
+/**
+ * The state of an item's own file of the tree while the tree's images come
+ * (spec 116 §5): 'loading' / 'failed' for a file still on its way (shown
+ * from imageLoads.view), 'none' for any other. Such an item is shown and
+ * opened, never acted on (its record is not in the tree yet).
+ */
+export function materialImageWait(item: Pick<MaterialItem, 'attachment'>): ImgState {
+    return standInState(item.attachment?.dataUrl);
+}
+/** An attachment with what the rows show of it (its title, kind, date and note; spec 102 §2; a file on its way: its state). */
+const attachmentKey = (a: Attachment): string => [a.id, a.title ?? '', a.kind ?? '', a.date ?? '', a.note ?? '', standInState(a.dataUrl)].join('\u0001');
+
+/** The tree's data as the materials show them: with the files still on its way (spec 116 §5; never stored). */
+const shownData = () => imageLoads.view(DataManager.getData());
 
 /** Which files the tree holds and where: a change redraws what shows them (window, section, viewer). */
 export function treeAttachmentsKey(): string {
     const parts: string[] = [];
-    const index = personMediaIndex(DataManager.getData());
+    const data = shownData();
+    const index = personMediaIndex(data);
     for (const p of DataManager.getAllPersons()) {
         const atts = index.get(p.id);
         if (!atts?.length) continue;
         parts.push(`${p.id}|${p.refn ?? ''}|${atts.map(attachmentKey).join(',')}`);
     }
     // Every file with its places (a file only at a source or a union counts too; spec 102 §1).
-    for (const att of treeMedia(DataManager.getData())) parts.push(`${att.id}@${att.places.map(placeKey).join(',')}`);
+    for (const att of treeMedia(data)) parts.push(`${att.id}@${att.places.map(placeKey).join(',')}~${standInState(att.dataUrl)}`);
     return parts.join(';');
 }
 
 /** The attachments the open person's section and list were drawn with (ids). */
 let sectionAttachments = '';
-const personAttachmentIds = (p: Person): string => DataManager.personMedia(p.id).map(attachmentKey).join(',');
+const personAttachmentIds = (p: Person): string => personMedia(shownData(), p.id).map(attachmentKey).join(',');
 /** People whose `?person=` is being asked now (REFN). */
 const personLoading = new Set<string>();
 /** Trees whose whole list was asked in this page (once per page; later answers come per person). */
@@ -326,6 +343,14 @@ export const materialsMethods = uiModule({
             caps: materialCaps({ ...env, ...(links ? {} : { openLinks: false }) }),
             agent: !this.researchAgentlessFor(researchId, ctx.link),
         };
+    },
+
+    /**
+     * A file of the research not gone through yet: "waiting to be processed", or "not sorted" when the research
+     * sorts only on request (spec 130 K1.3, its setting off).
+     */
+    materialWaitingLabel(researchId: string): string {
+        return this.researchIntakeSorting(researchId) === 'manual' ? strings.materials.agentUnsorted : strings.materials.agentWaiting;
     },
 
     /** Materials from the research are shown in this tree (on a computer, a research that lists them). */
@@ -380,7 +405,7 @@ export const materialsMethods = uiModule({
         const person = DataManager.getPerson(personId);
         if (!person) return [];
         const ctx = this.materialsContext();
-        return personMaterials(materialPerson(DataManager.getData(), person), ctx?.caps.list ? cachedMaterialList(ctx.treeId) : null);
+        return personMaterials(materialPerson(shownData(), person), ctx?.caps.list ? cachedMaterialList(ctx.treeId) : null);
     },
 
     /** The person menu's "Materials N" (0: no row; only where materials are shown). */
@@ -455,7 +480,8 @@ export const materialsMethods = uiModule({
                 <div class="modal-content materials-window-body" id="materials-window-body"></div>
             </div>`;
         document.body.appendChild(overlay);
-        overlay.addEventListener('click', (e) => { if (e.target === overlay) this.closeMaterials(); });
+        // A work window: it closes with its × or Esc only, never with a click beside it (filters, a selection
+        // and a search would go with a stray click).
         overlay.querySelector('.close-btn')?.addEventListener('click', () => this.closeMaterials());
         this.pushDialog(MODAL_ID);
         if (batch && archive) {
@@ -531,6 +557,8 @@ export const materialsMethods = uiModule({
     renderMaterialsSection(): void {
         const section = document.getElementById(SECTION_ID);
         if (!section || section.hidden || !this.currentId) return;
+        // The materials came or changed: "Portrait from a photo…" offers what is there now.
+        this.updatePortraitOffer();
         const person = DataManager.getPerson(this.currentId);
         const ctx = this.materialsContext();
         if (!person || !ctx?.caps.list) return;
@@ -596,9 +624,17 @@ export const materialsMethods = uiModule({
         const imgPreview = att && !att.originalOnly && att.mimeType.startsWith('image/') && att.dataUrl;
         const sha = materialItemSha(item);
         const lazy = !imgPreview && !!sha && item.origin !== 'tree' && ['image', 'pdf'].includes(materialType(item.mime, item.title));
-        const thumb = imgPreview
-            ? `<span class="material-thumb"><img src="${esc(att.dataUrl)}" alt=""></span>`
-            : `<span class="material-thumb"${lazy ? ` data-sha="${esc(sha)}"` : ''}><span class="material-row-tile">${esc(materialTileLetters(item))}</span></span>`;
+        const letters = `<span class="material-row-tile">${esc(materialTileLetters(item))}</span>`;
+        // A file on its way after the tree, or a preview that did not come: one look with the tree's photos (spec 116 §5).
+        const waits = materialImageWait(item);
+        const queue = materialThumbs();
+        const thumb = waits !== 'none'
+            ? waitingTileHtml(waits, { tag: 'span', cls: 'material-thumb', px: 48, content: letters })
+            : lazy && queue.isBroken(sha!, THUMB_PX)
+                ? waitingTileHtml('failed', { tag: 'span', cls: 'material-thumb', px: 48 })
+                : imgPreview
+                    ? `<span class="material-thumb"><img src="${esc(att.dataUrl)}" alt=""></span>`
+                    : `<span class="material-thumb"${lazy ? ` data-sha="${esc(sha)}"` : ''}${lazy && queue.isWaiting(sha!, THUMB_PX) ? ' data-img-state="loading"' : ''}>${letters}</span>`;
         // The attachment the person's portrait is cut from (spec 107 §4).
         const owner = this.currentId ? DataManager.getPerson(this.currentId) : null;
         const isSource = !!att && !!owner && this.portraitSourceAttachmentShown(owner) === att.id;
@@ -606,7 +642,7 @@ export const materialsMethods = uiModule({
         const where = `<span class="material-line3"><span class="material-where">${esc(batchFolderLabel(item))}</span>${refn && item.viaBatch.includes(refn) ? `<span class="material-via">${esc(m.viaBatch)}</span>` : ''}${portraitTag}</span>`;
         // A tree attachment keeps its own note field (editable as before); the research's note is shown.
         let note = '';
-        if (item.origin === 'tree' && att && !locked) {
+        if (item.origin === 'tree' && att && !locked && waits === 'none') {
             note = `<input type="text" class="attachment-note-input material-note-input" value="${esc(att.note ?? '')}" placeholder="${esc(strings.attachments.notePlaceholder)}" data-attachment-id="${esc(att.id)}" aria-label="${esc(strings.attachments.notePlaceholder)}">`;
         } else if (item.noteUser) {
             note = `<span class="material-note">${esc(strings.materials.quoted(item.noteUser))}</span>`;
@@ -617,13 +653,13 @@ export const materialsMethods = uiModule({
                 ${thumb}
                 <span class="material-main">
                     <span class="material-title" title="${esc(item.title)}">${esc(item.title)}</span>
-                    <span class="material-meta">${esc(metaLine(item, ctx.agent))}</span>
+                    <span class="material-meta">${esc(metaLine(item, ctx.agent, this.materialWaitingLabel(ctx.researchId)))}</span>
                     ${where}
                     ${note}
                 </span>
                 <span class="material-side">
                     <span class="material-at">${esc(at)}</span>
-                    <button type="button" class="material-more" data-act="menu" aria-haspopup="menu" aria-label="${esc(strings.materials.menu)}: ${esc(item.title)}">⋯</button>
+                    ${waits !== 'none' ? '' : `<button type="button" class="material-more" data-act="menu" aria-haspopup="menu" aria-label="${esc(strings.materials.menu)}: ${esc(item.title)}">⋯</button>`}
                 </span>
             </div>`;
     },
@@ -686,6 +722,8 @@ export const materialsMethods = uiModule({
         } finally {
             personLoading.delete(refn);
             if (this.currentId === personId) this.renderMaterialsSection();
+            // An open "Portrait from a photo" picker: the research's pictures as they came.
+            this.renderPortraitPicker();
         }
     },
 
@@ -694,9 +732,13 @@ export const materialsMethods = uiModule({
         const ctx = this.materialsContext();
         if (!ctx?.caps.list || !ctx.caps.bridgeUp || !ctx.base || fullAsked.has(ctx.treeId)) return;
         fullAsked.add(ctx.treeId);
-        const answer = await fetchMaterial(ctx.base, {});
+        const answer = await fetchMaterial(ctx.base, { trees: ctx.caps.trees });
         if (answer.ok) await saveMaterialList(ctx.treeId, answer.value, { kind: 'all' });
         else fullAsked.delete(ctx.treeId);
+        if (answer.ok) {
+            this.renderPortraitPicker();
+            this.personPagePortraitOfferChanged();
+        }
     },
 
     /** Scroll the open editor to the materials (or the attachments on touch). */
@@ -738,7 +780,7 @@ export const materialsMethods = uiModule({
         const index = all.findIndex(i => i.key === key);
         const person = DataManager.getPerson(this.currentId);
         const label = person ? strings.materials.ctxPerson(`${person.firstName} ${person.lastName}`.trim()) : '';
-        if (index >= 0) this.openMaterialItems(all, index, { where: 'section', label });
+        if (index >= 0) this.openMaterialItems(all, index, { where: 'section', label, personId: this.currentId });
         else this.openMaterial(item);
     },
 
@@ -808,10 +850,12 @@ export const materialsMethods = uiModule({
     showMaterialItemMenu(item: MaterialItem, anchor: HTMLElement, caps: MaterialCaps, opts: { open?: () => void } = {}): void {
         const ctx = this.materialsContext();
         this.closeMaterialsItemMenu();
+        // A file still on its way has no actions until it comes (spec 116 §5).
+        if (materialImageWait(item) !== 'none') return;
         const person = this.currentId ? DataManager.getPerson(this.currentId) : null;
         const refn = researchPersonRef(person?.refn);
         const locked = !!this.currentId && DataManager.isPersonLocked(this.currentId);
-        const actions = materialActions(item, caps, { person: refn, where: 'menu' })
+        const actions = materialActions(item, caps, { person: refn, where: 'menu', treeCopy: (i) => !!treePortraitCopy(i) })
             // Nothing to download from an attachment that is only its original; a locked person keeps its files.
             .filter(a => !(a.id === 'download' && (!item.attachment?.dataUrl || item.attachment.originalOnly)))
             .filter(a => !((a.id === 'removeFromTree' || a.id === 'attach' || a.id === 'makeSource') && (locked || DataManager.isReadOnly())))
@@ -819,7 +863,7 @@ export const materialsMethods = uiModule({
             .filter(a => !(a.id === 'edit' && !['on', 'off'].includes(materialDetailsEdit(item, ctx) ?? '')))
             // Use as portrait: a person who can change, and not the portrait's source already (spec 107 §4).
             .filter(a => !(a.id === 'useAsPortrait' && (!this.currentId || !canEditPortrait(this.currentId)
-                || (!!person && this.portraitSourceAttachmentShown(person) === item.attachment?.id))));
+                || this.materialPortraitShown(item, this.currentId))));
         const menu = document.createElement('div');
         menu.id = MENU_ID;
         menu.className = 'materials-item-menu';
@@ -905,7 +949,7 @@ export const materialsMethods = uiModule({
                 a.remove();
                 break;
             }
-            case 'useAsPortrait': if (item.attachment && this.currentId) void this.useAttachmentAsPortrait(this.currentId, item.attachment.id); break;
+            case 'useAsPortrait': if (this.currentId) void this.useMaterialAsPortrait(this.currentId, item); break;
             case 'removeFromTree': void this.openRemoveFromTreeDialog(item); break;
             case 'attach': this.openAttachDialog([item], { personId: this.currentId }); break;
             case 'makeSource': void this.makeSourceFromMaterial(item, { personId: this.currentId }); break;
@@ -932,11 +976,18 @@ export const materialsMethods = uiModule({
             queue.want(
                 { sha, px: THUMB_PX, mime: item?.mime, name: item?.file?.name ?? item?.title, bytes: item?.bytes, where: strings.materials.title },
                 url => {
-                    if (!url || !el.isConnected) return;
+                    if (!el.isConnected) return;
+                    if (!url) {
+                        // Did not come: the struck-through picture; no preview to be had: the letters (spec 116 §5).
+                        setTileState(el, queue.isBroken(sha, THUMB_PX) ? 'failed' : 'none', 48);
+                        return;
+                    }
                     el.innerHTML = `<img src="${esc(url)}" alt="">`;
+                    el.removeAttribute('data-img-state');
                     el.classList.add('has-thumb');
                 },
                 () => el.isConnected && el.dataset.vis !== '0',
+                () => { if (el.isConnected) setTileState(el, 'loading', 48); },
             );
         };
         if (typeof IntersectionObserver !== 'function') {
@@ -983,6 +1034,11 @@ export const materialsMethods = uiModule({
             if (person && document.getElementById('person-modal')?.classList.contains('active')) this.applyAdvancedFieldVisibility(person);
         }
         this.refreshMaterialsCounts();
+        // The research's pictures in or out of an open portrait picker, its sentence;
+        // "Portrait from a photo…" of the open person dialog.
+        this.renderPortraitPicker();
+        if (this.currentId && document.getElementById('person-modal')?.classList.contains('active')) this.updatePortraitOffer();
+        this.personPagePortraitOfferChanged();
     },
 
     /** The cards' "Materials N": recomputed; the tree redrawn only when what it shows changed. */
@@ -1057,5 +1113,19 @@ export const materialsMethods = uiModule({
         };
         window.addEventListener('strom:tree-switched', prime);
         prime();
+        // The tree's files coming after the tree (spec 116 §5): what shows them follows once a frame.
+        let queued = false;
+        const follow = () => {
+            if (queued) return;
+            queued = true;
+            requestAnimationFrame(() => {
+                queued = false;
+                this.materialsTreeChanged();
+            });
+        };
+        window.addEventListener(IMAGES_ARRIVED_EVENT, follow);
+        window.addEventListener(IMAGES_STATE_EVENT, follow);
+        // The sources' crops the same way (their chips, lists, viewer and editor).
+        this.sourceImagesListen();
     },
 });

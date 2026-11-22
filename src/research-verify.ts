@@ -16,14 +16,14 @@
 
 import {
     LiveStatus, researchTaskRef, researchSourceRef, isResearchHead, cleanText, withAppVersion,
-    TREE_STATE_FEATURE, TREE_KIND_FEATURE,
+    TREE_STATE_FEATURE, TREE_KIND_FEATURE, WORK_TASKS_FEATURE, workTaskIds,
 } from './research-link.js';
 import {
-    VERIFY_FEATURE, VERIFY_BULK_FEATURE, VERIFY_STOP_FEATURE, FACTS_CONFIRM_FEATURE, FACTS_CONFIRM_VALUE_FEATURE, FACT_MARK,
-    researchFactRef, researchPersonRef, researchFamilyRef,
+    VERIFY_FEATURE, VERIFY_BULK_FEATURE, VERIFY_STOP_FEATURE, VERIFY_TRY_FIRST_FEATURE, FACTS_CONFIRM_FEATURE, FACTS_CONFIRM_VALUE_FEATURE, FACT_MARK,
+    researchFactRef, researchBridgeFactRef, researchPersonRef, researchFamilyRef,
 } from './verify.js';
 
-export { VERIFY_FEATURE, VERIFY_BULK_FEATURE, VERIFY_STOP_FEATURE, FACTS_CONFIRM_FEATURE, FACTS_CONFIRM_VALUE_FEATURE, researchFactRef };
+export { VERIFY_FEATURE, VERIFY_BULK_FEATURE, VERIFY_STOP_FEATURE, VERIFY_TRY_FIRST_FEATURE, FACTS_CONFIRM_FEATURE, FACTS_CONFIRM_VALUE_FEATURE, researchFactRef };
 
 /** How long the research has to answer (it may plan the work and commit). */
 export const VERIFY_TIMEOUT_MS = 30_000;
@@ -56,7 +56,7 @@ export function verifyRequestBody(target: VerifyTarget, dry = false): Record<str
     const keys = ['person', 'family', 'fact'].filter(k => t[k] !== undefined);
     if (keys.length !== 1) return null;
     const ref = keys[0] === 'person' ? researchPersonRef(t.person)
-        : keys[0] === 'family' ? researchFamilyRef(t.family) : researchFactRef(t.fact);
+        : keys[0] === 'family' ? researchFamilyRef(t.family) : researchBridgeFactRef(t.fact);
     if (!ref) return null;
     return { [keys[0]]: ref, ...(dry ? { dry: true } : {}) };
 }
@@ -122,7 +122,7 @@ export function verifyStopRequestBody(scope?: VerifyStopScope): { scope?: Verify
  * `txt`: the mark of the value shown (`3 _TXT`, research 1.30.0+).
  */
 export function factConfirmRequestBody(fact: string, confirm: boolean, txt?: string): { fact: string; txt?: string; confirm: boolean } | null {
-    const ref = researchFactRef(fact);
+    const ref = researchBridgeFactRef(fact);
     if (!ref || typeof confirm !== 'boolean') return null;
     if (txt === undefined) return { fact: ref, confirm };
     return FACT_MARK.test(txt) ? { fact: ref, txt: txt.toLowerCase(), confirm } : null;
@@ -157,6 +157,8 @@ export interface VerifyFact {
     how: 'read' | 'search';
     /** The record it goes by (absent: not said). */
     record?: VerifyRecord;
+    /** The fact it is verified together with (a name with the birth or baptism reading the same record, 066 K6.3); absent: not said. */
+    with?: string;
 }
 
 export interface VerifyDone {
@@ -180,6 +182,10 @@ export interface VerifyBulkDone {
     facts: number;
     /** The tasks made (none for `dry`). */
     tasks: string[];
+    /** `verify.tryFirst`: the tasks stand at the head of the queue (a try); absent when not said as a boolean. */
+    first?: boolean;
+    /** `verify.tryFirst`: the research works now (a run or an agent session); absent when not said as a boolean. */
+    working?: boolean;
     /** People left for another round (beyond `try` or `budget`): the research counts the people it did not take, not their facts. */
     left: number;
     estimate: VerifyEstimate;
@@ -313,11 +319,12 @@ export function verifyReply(status: number, body: unknown): VerifyResult {
         const facts: VerifyFact[] = [];
         for (const f of Array.isArray(r.facts) ? r.facts : []) {
             const o = asRecord(f);
-            const fact = researchFactRef(o?.fact);
+            const fact = researchBridgeFactRef(o?.fact);
             const kind = typeof o?.kind === 'string' && /^[A-Z_][A-Z0-9_]{0,30}$/.test(o.kind) ? o.kind : '';
             if (!fact || !kind || (o?.how !== 'read' && o?.how !== 'search')) continue;
             const record = recordOf(o.record);
-            facts.push({ fact, kind, how: o.how, ...(record ? { record } : {}) });
+            const together = researchBridgeFactRef(o.with);
+            facts.push({ fact, kind, how: o.how, ...(record ? { record } : {}), ...(together && together !== fact ? { with: together } : {}) });
         }
         const task = researchTaskRef(r.task);
         // A place in the queue only of a task made (not of a dry run).
@@ -352,6 +359,8 @@ export function verifyBulkReply(status: number, body: unknown): VerifyBulkResult
             people: countOf(r.people) ?? 0,
             facts: countOf(r.facts) ?? 0,
             tasks: [...new Set(tasks)],
+            ...(typeof r.first === 'boolean' ? { first: r.first } : {}),
+            ...(typeof r.working === 'boolean' ? { working: r.working } : {}),
             left: countOf(r.left) ?? 0,
             estimate: estimateOf(r.estimate),
             ...headsOf(r),
@@ -360,11 +369,28 @@ export function verifyBulkReply(status: number, body: unknown): VerifyBulkResult
     return refusalOf(status, body, VERIFY_CODES);
 }
 
+/**
+ * Which message follows a started bulk verification (spec 065 K7.2):
+ * - `plain`: no `verify.tryFirst`, or not a try at the head of the queue — "N facts queued";
+ * - `next`: the research works now — its tasks are next;
+ * - `process`: the research is idle and takes `work?do=tasks&task=` (`work.tasks`) — "Process now";
+ * - `head`: idle, but no such link (or no valid task ids) — the research's next work takes them.
+ */
+export type VerifyBulkStartedKind = 'plain' | 'next' | 'process' | 'head';
+
+export function verifyBulkStartedKind(r: Pick<VerifyBulkDone, 'tasks' | 'first' | 'working'>, features: Features): VerifyBulkStartedKind {
+    if (!bridgeVerifies(features, VERIFY_TRY_FIRST_FEATURE) || r.first !== true) return 'plain';
+    if (r.working === true) return 'next';
+    // Not said whether it works: nothing is offered that could start work beside a running one.
+    if (r.working !== false) return 'head';
+    return bridgeVerifies(features, WORK_TASKS_FEATURE) && workTaskIds(r.tasks) ? 'process' : 'head';
+}
+
 /** The bridge's answer to /facts/confirm, typed (`fact`: the one asked about). */
 export function factConfirmReply(fact: string, status: number, body: unknown): FactConfirmResult {
     const r = asRecord(body);
     if (status >= 200 && status < 300) {
-        const said = r?.fact === undefined ? fact : researchFactRef(r.fact);
+        const said = r?.fact === undefined ? fact : researchBridgeFactRef(r.fact);
         if (!r || r.ok === false || said !== fact) return { ok: false, code: 'unknown', status, reason: '' };
         const owner = researchPersonRef(r.owner) ?? researchFamilyRef(r.owner) ?? '';
         const confirmed = typeof r.confirmed === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(r.confirmed) ? r.confirmed : undefined;

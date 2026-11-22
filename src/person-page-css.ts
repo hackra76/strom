@@ -423,6 +423,9 @@ span.pp-gal-thumb { cursor: default; }
   .pp-ft-story { min-height: 32px; }
   .pp-zoom { width: 44px; height: 44px; }
   .pp-fig-scan a { display: inline-flex; align-items: center; min-height: 44px; }
+  /* A link in the text (a name, a place) is 5 px taller above and below for a finger, without
+     moving the lines: an inline box's padding takes no room, a button's negative margin gives it back. */
+  .pp-link { padding-block: 5px; margin-block: -5px; }
 }
 @media (max-width: 640px) {
   .pp-hero--photo { flex-direction: column; }
@@ -632,3 +635,34 @@ var shut=[];
 window.addEventListener('beforeprint',function(){shut=q('details.pp-ch-fold:not([open])');shut.forEach(function(f){f.open=true})});
 window.addEventListener('afterprint',function(){shut.forEach(function(f){f.open=false});shut=[]});
 })();`;
+
+/**
+ * The app's window only (spec 116 §5): an image of the page still on its
+ * way, or that did not come. A saved page and print never carry a state
+ * (they wait for the images), so this is never part of a file's CSS; the
+ * veil itself is the app's ([data-img-state], index.html).
+ */
+export const PERSON_PAGE_WAIT_CSS = `
+.pp-portrait--wait { display: flex; align-items: center; justify-content: center; cursor: default; }
+.pp-portrait--wait .pp-initials-text { font-family: var(--font-serif); font-size: 30px; line-height: 1; color: var(--text-light); }
+.pp-portrait-col { flex: 0 0 auto; display: flex; flex-direction: column; gap: 2px; width: 128px; }
+.pp-portrait-col .pp-img-msg { margin-top: 4px; }
+/* A person without a portrait who has photos to cut one from (spec 107 §2): the initials and the link open the picker. */
+.pp-portrait-col--pick { align-items: center; gap: 6px; width: auto; max-width: 128px; }
+button.pp-initials--pick { border: 0; padding: 0; margin: 0; cursor: pointer; }
+button.pp-initials--pick:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+.pp-portrait-col .pp-portrait-link { font-size: 13px; line-height: 1.35; padding: 0; text-align: center; overflow-wrap: anywhere; }
+@media (pointer: coarse) { .pp-portrait-col .pp-portrait-link { min-height: 44px; } }
+.pp-img-wait { display: flex; align-items: center; justify-content: center; cursor: default; }
+.pp-fig > .pp-fig-img.pp-img-wait { grid-area: 1 / 1; box-sizing: border-box; }
+@container (max-width: 640px) {
+  .pp-portrait-col { width: auto; max-width: 100%; }
+  .pp-portrait--wait .pp-initials-text { font-size: 23px; }
+}
+/* Printed after "Continue without": what did not come is left out, as in a file (§8). */
+@media print {
+  .pp-fig:has(> .pp-img-wait), .pp-gal-item:has(.pp-img-wait), .sp-clipbox:has(.sp-img-wait),
+  .sp-portrait.sp-img-wait, .pp-img-msg, .pp-portrait-link { display: none !important; }
+  button.pp-initials--pick { cursor: default; }
+}
+`;
