@@ -22,7 +22,7 @@ import {
 } from '../import-next.js';
 import { isMobile, MQ_PHONE_LANDSCAPE } from '../breakpoints.js';
 import { researchBridgeActionLabel, setResearchActionLabel } from './research-open-mark.js';
-import { onComputer } from './research-ui.js';
+import { researchHere } from './research-ui.js';
 import { isHelpOpen } from './help-ui.js';
 import { HELP_LINKS } from '../help/topics.js';
 import { uiModule } from './module.js';
@@ -42,6 +42,8 @@ interface ImportNextPending {
     path: ImportNextPath;
     added?: number;
     updated?: number;
+    /** No data check row: the merge guide's last step offered it (spec 134 §9). */
+    noCheck?: boolean;
 }
 
 type CardMode = 'card' | 'sheet' | 'side';
@@ -112,7 +114,7 @@ export const importNextMethods = uiModule({
      * False: nothing to show (Strom's own GEDCOM, no record) — the caller asks
      * what it asked before.
      */
-    offerImportNextCard(treeId: TreeId, opts: { importId?: string; path?: ImportNextPath; added?: number; updated?: number }): boolean {
+    offerImportNextCard(treeId: TreeId, opts: { importId?: string; path?: ImportNextPath; added?: number; updated?: number; noCheck?: boolean }): boolean {
         const data = DataManager.getCurrentTreeId() === treeId ? DataManager.getData() : null;
         // A merge's new tree is not open yet: its record is checked when it opens.
         if (data && !importNextDue(data, opts.importId)) return false;
@@ -121,14 +123,35 @@ export const importNextMethods = uiModule({
             treeId, importId: opts.importId, path: opts.path ?? 'new',
             ...(opts.added !== undefined ? { added: opts.added } : {}),
             ...(opts.updated !== undefined ? { updated: opts.updated } : {}),
+            ...(opts.noCheck ? { noCheck: true } : {}),
         };
         placesUsed = false;
         if (!switchListener) {
             switchListener = true;
-            window.addEventListener('strom:tree-switched', () => this.waitForImportNextCard());
+            // A switch from the tree switcher says data-changed, a new or imported tree tree-switched.
+            const follow = (): void => this.followImportNextTree();
+            window.addEventListener('strom:tree-switched', follow);
+            window.addEventListener('strom:data-changed', follow);
         }
         this.waitForImportNextCard();
         return true;
+    },
+
+    /**
+     * Another tree opened: the card belongs to its import's tree, so it goes
+     * from the screen (not closed for good: it comes back with its tree). Its
+     * tree deleted: the card is not waited for any more.
+     */
+    followImportNextTree(): void {
+        if (!pending) return;
+        if (!TreeManager.getTreeMetadata(pending.treeId)) {
+            this.hideImportNextCard();
+            pending = null;
+            stopWaiting();
+            return;
+        }
+        if (DataManager.getCurrentTreeId() !== pending.treeId) this.hideImportNextCard();
+        this.waitForImportNextCard();
     },
 
     /** Show the pending card as soon as its tree is open and nothing is in the way. */
@@ -138,6 +161,10 @@ export const importNextMethods = uiModule({
         const started = Date.now();
         const tick = (): boolean => {
             if (!pending) return true;
+            if (!TreeManager.getTreeMetadata(pending.treeId)) {
+                pending = null;
+                return true;
+            }
             if (DataManager.getCurrentTreeId() !== pending.treeId) return Date.now() - started > WAIT_MAX_MS;
             if (this.importNextBlocked()) return Date.now() - started > WAIT_MAX_MS;
             this.showImportNextCard();
@@ -185,9 +212,10 @@ export const importNextMethods = uiModule({
 
         // As the two questions did: the data check and the families, computed now.
         const check = validateTreeData(data);
-        const families = findComponents(data).filter(c => c.count >= 2).length;
+        // After a merge into a tree the guide asked about the unlinked groups itself (§6): no question about families here.
+        const families = p.path === 'merge' ? 0 : findComponents(data).filter(c => c.count >= 2).length;
         const meta = TreeManager.getTreeMetadata(p.treeId);
-        const computer = onComputer();
+        const computer = researchHere();
         const research = importNextResearchState({
             onComputer: computer,
             linked: !!meta?.research,
@@ -199,6 +227,7 @@ export const importNextMethods = uiModule({
             families,
             research,
             verify: importNextVerifyAvailable(researchId ? this.researchStatusOf(researchId)?.features : null),
+            ...(p.noCheck ? { check: false } : {}),
         });
 
         const mode = modeNow();

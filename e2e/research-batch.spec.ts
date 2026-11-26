@@ -257,6 +257,44 @@ test.describe('Add materials', () => {
         await expect(dialog.locator('.batch-list-sub')).toContainText('2 files');
     });
 
+    test('a Strom tree (.json) dropped onto the window opens the import guide, not the batch; another .json is material (K10.2)', async ({ page }) => {
+        await fakeBridge(page, { accepts: BATCH_ACCEPTS });
+        await openResearch(page, { media: true });
+        await poll(page);
+        const tree = JSON.stringify({ version: 26, persons: { j1: { id: 'j1', firstName: 'Amos', lastName: 'Jilm', gender: 'male', isPlaceholder: false, partnerships: [], parentIds: [], childIds: [] } }, partnerships: {} });
+        const drop = (name: string, text: string, stopAt?: 'dragover') => page.evaluate(({ name, text, stopAt }) => {
+            const dt = new DataTransfer();
+            dt.items.add(new File([text], name, { type: 'application/json' }));
+            const fire = (type: string) => window.dispatchEvent(new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true }));
+            fire('dragenter');
+            fire('dragover');
+            if (stopAt) return;
+            fire('drop');
+        }, { name, text, stopAt });
+
+        // While dragging one JSON file: the guide, not "add to materials".
+        await drop('strom-jilmovi.json', tree, 'dragover');
+        const overlay = page.locator('#drop-overlay');
+        await expect(overlay).toHaveClass(/active/);
+        await expect(overlay).toContainText('The import guide opens');
+        await page.evaluate(() => window.dispatchEvent(new DragEvent('dragleave', { bubbles: true, dataTransfer: new DataTransfer() })));
+
+        await drop('strom-jilmovi.json', tree);
+        const wizard = page.locator('#merge-modal');
+        await expect(wizard).toBeVisible();
+        await expect(wizard.locator('#merge-progress [aria-current="step"]')).toHaveAttribute('data-step', '1');
+        await expect(wizard.locator('#merge-route')).toContainText('strom-jilmovi.json →');
+        await expect(page.locator('#batch-modal')).toHaveCount(0);
+        await page.keyboard.press('Escape');
+        await expect(wizard).toBeHidden();
+
+        // A .json that is no tree of the app: material, as before.
+        await drop('mereni.json', '{"teplota": [1, 2]}');
+        await expect(page.locator('#batch-modal .batch-step.is-active')).toHaveText('Review');
+        await expect(page.locator('#batch-modal .batch-list-sub')).toContainText('1 file');
+        await expect(wizard).toBeHidden();
+    });
+
     test('the research stops answering: paused, said why; Continue once it runs goes on and closes the batch; Hide shows the line', async ({ page }) => {
         const b = await fakeBridge(page, { accepts: BATCH_ACCEPTS });
         await openResearch(page, { media: true });
@@ -666,6 +704,40 @@ test.describe('Sorting a closed batch', () => {
         const toast = page.locator('.toast', { hasText: 'Sent to the research' });
         await expect(toast).toContainText('Sent to the research: 1 file for Jan Fíšek. The research will create a task.');
         await expect(toast.locator('.toast-action', { hasText: 'Sort with the agent' })).toHaveCount(0);
+    });
+
+    test('Also add as an attachment: its box beside its text; the note under it says at once whether the files go into the tree too', async ({ page }) => {
+        await setup(page, { features: [...SORT_FEATURES, 'intake.auto'], intake: fakeIntake(true) });
+        const dialog = await sendOne(page);
+        const check = dialog.locator('#material-attach');
+        const label = dialog.locator('.material-attach .confirm-check-label');
+        await expect(label).toHaveText('Also add as an attachment in the tree');
+        // The box sits on the text's first line, left of it (not on a line of its own above it).
+        const c = (await check.boundingBox())!;
+        const t = (await label.boundingBox())!;
+        expect(c.x + c.width).toBeLessThanOrEqual(t.x);
+        expect(c.y).toBeLessThan(t.y + t.height);
+        expect(c.y + c.height).toBeGreaterThan(t.y);
+        const box = dialog.locator('.material-box');
+        await expect(check).not.toBeChecked();
+        await expect(box).toContainText('Nothing is added to the tree. The research stores the files with the person and creates a task for the agent.');
+        await check.check();
+        await expect(box).toContainText("The files are also added to the tree as the person's attachments. The research stores them with the person and creates a task for the agent.");
+        await check.uncheck();
+        await expect(box).toContainText('Nothing is added to the tree.');
+        // Ticked, it stays so over a redraw (another file picked), and so does the note.
+        await check.check();
+        await dialog.locator('#material-input').setInputFiles({ name: 'dopis2.jpg', mimeType: 'image/jpeg', buffer: Buffer.from('druha strana') });
+        await expect(dialog.locator('.material-item')).toHaveCount(2);
+        await expect(check).toBeChecked();
+        await expect(box).toContainText("The files are also added to the tree as the person's attachments.");
+    });
+
+    test('Also add as an attachment, files waiting in Materials: the note says they go into the tree too', async ({ page }) => {
+        await setup(page, { features: [...SORT_FEATURES, 'intake.auto'], intake: fakeIntake(false) });
+        const dialog = await sendOne(page);
+        await dialog.locator('#material-attach').check();
+        await expect(dialog.locator('.material-box')).toContainText("The files are also added to the tree as the person's attachments. The research stores them with the person. They wait in Materials; the agent goes through them only on request.");
     });
 
     test('a single file, an older research (no intake.auto): the texts of before', async ({ page }) => {

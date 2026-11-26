@@ -7,16 +7,19 @@
  * the list follows hello, bye and closed windows; the selection does not loop.
  */
 
+import { noteImageMeta } from '../../image-meta.js';
+import { imagesInterned } from '../../image-intern.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { DataManager } from '../../data.js';
 import { TreeManager } from '../../tree-manager.js';
 import { AuditLogManager } from '../../audit-log.js';
 import { UndoManager } from '../../undo.js';
-import { type StromData, type TreeId, type Person } from '../../types.js';
+import { type StromData, type TreeId, type Person, type PersonId } from '../../types.js';
 import { LAST_FOCUSED } from '../../model-values.js';
 import { WindowBus, createMemoryHub, type WindowMessage } from '../window-bus.js';
-import { WindowRegistry, dataManagerHost, PATCH_INTERVAL_MS } from '../window-registry.js';
+import { WindowRegistry, dataManagerHost, PATCH_INTERVAL_MS, IMAGES_SETTLE_MAX_MS } from '../window-registry.js';
 import { IMAGES_ARRIVED_EVENT } from '../../image-loads.js';
+import { StorageManager } from '../../storage.js';
 
 const last = <T>(xs: T[]): T | undefined => xs[xs.length - 1];
 
@@ -93,13 +96,15 @@ afterEach(() => {
 async function connect(initial?: unknown) {
     const id = registry.openSatellite('table', initial)!;
     const sat = listener(hub, id);
-    sat.bus.post({ type: 'hello', windowId: id, kind: 'table', treeId: TREE });
+    sat.bus.post({ type: 'hello', takesData: true, windowId: id, kind: 'table', treeId: TREE });
     await settle();
     return { id, ...sat };
 }
 
-function treeOf(json: string): StromData {
-    return JSON.parse(json) as StromData;
+/** The tree a `tree`/`patch` message carries (an object the channel cloned, never one JSON string). */
+function treeOf(data: unknown): StromData {
+    expect(typeof data).toBe('object');
+    return data as StromData;
 }
 
 describe('opening and hello', () => {
@@ -125,7 +130,7 @@ describe('opening and hello', () => {
         const tree = sat.of('tree');
         expect(tree).toHaveLength(1);
         expect(tree[0]).toMatchObject({ to: sat.id, treeId: TREE, name: 'Okurkovi', revision: registry.revision });
-        expect(Object.values(treeOf(tree[0].json).persons).map(p => (p as Person).firstName)).toEqual(['Zdislava']);
+        expect(Object.values(treeOf(tree[0].data).persons).map(p => (p as Person).firstName)).toEqual(['Zdislava']);
         expect(sat.got.findIndex(m => m.type === 'init')).toBeLessThan(sat.got.findIndex(m => m.type === 'tree'));
         expect(last(sat.of('status'))).toMatchObject({ treeId: TREE, treeExists: true, live: false, locked: false, windows: [sat.id] });
         expect(other.of('tree')).toHaveLength(0);
@@ -142,7 +147,7 @@ describe('opening and hello', () => {
 
     it('the starting state goes once: a reloaded satellite keeps its own', async () => {
         const sat = await connect({ rowType: 'persons' });
-        sat.bus.post({ type: 'hello', windowId: sat.id, kind: 'table', treeId: TREE });
+        sat.bus.post({ type: 'hello', takesData: true, windowId: sat.id, kind: 'table', treeId: TREE });
         await settle();
         expect(sat.of('init')).toHaveLength(1);
         expect(sat.of('tree')).toHaveLength(2);
@@ -161,7 +166,7 @@ describe('the main window\'s person with the tree', () => {
         });
         registry.start();
         const sat = listener(hub, 'sat-f5');
-        sat.bus.post({ type: 'hello', windowId: 'sat-f5', kind: 'family', treeId: TREE });
+        sat.bus.post({ type: 'hello', takesData: true, windowId: 'sat-f5', kind: 'family', treeId: TREE });
         await settle();
         expect(sat.of('tree')[0]).toMatchObject({ to: 'sat-f5', treeId: TREE, focus: { personId: 'p-zdislava', depthUp: 2, depthDown: 1 } });
 
@@ -174,7 +179,7 @@ describe('the main window\'s person with the tree', () => {
 
         // No person here: the tree goes without one.
         focus = null;
-        sat.bus.post({ type: 'hello', windowId: 'sat-f5', kind: 'family', treeId: 'reg-tree-2' as TreeId });
+        sat.bus.post({ type: 'hello', takesData: true, windowId: 'sat-f5', kind: 'family', treeId: 'reg-tree-2' as TreeId });
         await settle();
         expect(last(sat.of('tree'))).not.toHaveProperty('focus');
     });
@@ -186,7 +191,7 @@ describe('edits from a satellite', () => {
         const other = listener(hub, 'sat-b');
         const base = sat.of('tree')[0].revision;
         saveSpy.mockClear();
-        const next = treeOf(sat.of('tree')[0].json);
+        const next = treeOf(sat.of('tree')[0].data);
         const p = Object.values(next.persons)[0] as Person;
         p.firstName = 'Zdislava Marie';
         sat.bus.post({ type: 'edit', windowId: sat.id, editId: 'e1', treeId: TREE, baseRevision: base, json: JSON.stringify(next), label: 'editing Zdislava Okurková' });
@@ -203,7 +208,7 @@ describe('edits from a satellite', () => {
         const patch = other.of('patch');
         expect(patch).toHaveLength(1);
         expect(patch[0].revision).toBe(base + 1);
-        expect((treeOf(patch[0].json).persons[p.id] as Person).firstName).toBe('Zdislava Marie');
+        expect((treeOf(patch[0].data).persons[p.id] as Person).firstName).toBe('Zdislava Marie');
 
         // Undo here takes it back.
         DataManager.undo();
@@ -215,7 +220,7 @@ describe('edits from a satellite', () => {
         const other = await connect();
         const base = sat.of('tree')[0].revision;
         DataManager.createPerson({ firstName: 'Bořivoj', lastName: 'Hrachovec', gender: 'male' });   // the main window changed meanwhile
-        const stale = treeOf(sat.of('tree')[0].json);
+        const stale = treeOf(sat.of('tree')[0].data);
         sat.bus.post({ type: 'edit', windowId: sat.id, editId: 'e2', treeId: TREE, baseRevision: base, json: JSON.stringify(stale), label: 'x' });
         const treesOther = other.of('tree').length;
         await settle();
@@ -223,7 +228,7 @@ describe('edits from a satellite', () => {
         expect(sat.of('edit-result')).toEqual([expect.objectContaining({ ok: false, reason: 'revision', revision: base + 1 })]);
         const fresh = last(sat.of('tree'))!;
         expect(fresh.to).toBe(sat.id);
-        expect(Object.keys(treeOf(fresh.json).persons)).toHaveLength(2);
+        expect(Object.keys(treeOf(fresh.data).persons)).toHaveLength(2);
         expect(other.of('tree')).toHaveLength(treesOther);
         expect(DataManager.getAllPersons()).toHaveLength(2);
     });
@@ -241,7 +246,7 @@ describe('edits from a satellite', () => {
     it('while following a research a satellite\'s change of the lists alone is taken: only the lists, a list\'s step undone (N2)', async () => {
         const sat = await connect();
         DataManager.setLiveTree(TREE);
-        const copy = treeOf(last(sat.of('tree'))!.json);
+        const copy = treeOf(last(sat.of('tree'))!.data);
         const list = { id: 'pl_1', name: 'Picked', dynamic: false, personIds: Object.keys(copy.persons), created: '2026-11-12T10:00:00.000Z', updated: '2026-11-12T10:00:00.000Z' };
         // Anything else in the copy (a person renamed) is not taken with the lists.
         const pid = Object.keys(copy.persons)[0];
@@ -273,7 +278,7 @@ describe('edits from a satellite', () => {
         expect(DataManager.getAllPersons()).toHaveLength(1);
         const patch = sat.of('patch');
         expect(patch.length).toBe(before + 1);
-        expect(Object.keys(treeOf(last(patch)!.json).persons)).toHaveLength(1);
+        expect(Object.keys(treeOf(last(patch)!.data).persons)).toHaveLength(1);
         expect(last(sat.of('status'))).toMatchObject({ canUndo: false, canRedo: true });
     });
 
@@ -284,7 +289,40 @@ describe('edits from a satellite', () => {
         for (let i = 0; i < 5; i++) DataManager.createPerson({ firstName: `Bořivoj ${i}`, lastName: 'Hrachovec', gender: 'male' });
         await settle(PATCH_INTERVAL_MS);
         expect(sat.of('patch').length).toBe(before + 1);
-        expect(Object.keys(treeOf(last(sat.of('patch'))!.json).persons)).toHaveLength(6);
+        expect(Object.keys(treeOf(last(sat.of('patch'))!.data).persons)).toHaveLength(6);
+    });
+
+    it('no window holds the tree: saves copy nothing; a window saying hello then gets the whole tree, later saves a patch — never as one JSON string', async () => {
+        const stringified = vi.spyOn(DataManager, 'storedDataJson');
+        const json = vi.spyOn(DataManager, 'storedWindowData');
+        for (let i = 0; i < 5; i++) {
+            DataManager.createPerson({ firstName: `Bořivoj ${i}`, lastName: 'Hrachovec', gender: 'male' });
+            await settle(PATCH_INTERVAL_MS);
+        }
+        await settle(3000);
+        // The revision still follows every change (a satellite's edit is checked against it).
+        expect(registry.revision).toBeGreaterThan(Date.now() - 60_000);
+        expect(json).not.toHaveBeenCalled();
+
+        const sat = await connect();
+        expect(json).toHaveBeenCalledTimes(1);
+        expect(Object.keys(treeOf(sat.of('tree')[0].data).persons)).toHaveLength(6);
+        expect(sat.of('tree')[0].revision).toBe(registry.revision);
+        DataManager.createPerson({ firstName: 'Kunhuta', lastName: 'Hrachovcová', gender: 'female' });
+        await settle(PATCH_INTERVAL_MS);
+        expect(sat.of('patch')).toHaveLength(1);
+        expect(Object.keys(treeOf(sat.of('patch')[0].data).persons)).toHaveLength(7);
+        expect(sat.of('tree')).toHaveLength(1);
+        expect([...sat.of('tree'), ...sat.of('patch')].some(m => 'json' in m)).toBe(false);
+        expect(stringified).not.toHaveBeenCalled();
+
+        // The last window went: nothing copied again.
+        sat.bus.post({ type: 'bye', windowId: sat.id });
+        await settle();
+        json.mockClear();
+        DataManager.createPerson({ firstName: 'Ctibor', lastName: 'Hrachovec', gender: 'male' });
+        await settle(PATCH_INTERVAL_MS);
+        expect(json).not.toHaveBeenCalled();
     });
 
     it('where the work stands here (focus, default person, default view) is no change: the edit made meanwhile passes, and the main window keeps its own', async () => {
@@ -298,7 +336,7 @@ describe('edits from a satellite', () => {
         await settle(PATCH_INTERVAL_MS);
         expect(registry.revision).toBe(base);
 
-        const next = treeOf(sat.of('tree')[0].json);
+        const next = treeOf(sat.of('tree')[0].data);
         (next.persons[zdislava.id] as Person).birthPlace = 'Lhota';
         sat.bus.post({ type: 'edit', windowId: sat.id, editId: 'e9', treeId: TREE, baseRevision: base, json: JSON.stringify(next), label: 'editing Zdislava Okurková' });
         await settle();
@@ -329,7 +367,7 @@ describe('the list of windows', () => {
     it('close: the reference closes the window; one without a reference is asked to close itself', async () => {
         const a = await connect();
         const foreign = listener(hub, 'foreign1');
-        foreign.bus.post({ type: 'hello', windowId: 'foreign1', kind: 'table', treeId: TREE });
+        foreign.bus.post({ type: 'hello', takesData: true, windowId: 'foreign1', kind: 'table', treeId: TREE });
         await settle();
         registry.closeAll();
         await settle();
@@ -371,7 +409,7 @@ describe('the windows\' own following of the agent (spec 097 §7)', () => {
         expect(changes).not.toHaveBeenCalled();
         // The status says it at once, not only with the next heartbeat (a main window closing meanwhile).
         expect(last(a.of('status'))?.agents).toEqual({ [a.id]: 'detached' });
-        a.bus.post({ type: 'hello', windowId: a.id, kind: 'table', treeId: TREE, agent: 'paused' });
+        a.bus.post({ type: 'hello', takesData: true, windowId: a.id, kind: 'table', treeId: TREE, agent: 'paused' });
         await settle();
         expect(registry.list()[0].agent).toBe('paused');
         // The status names it for every window (the order of taking over).
@@ -481,7 +519,7 @@ describe('the fan\'s family-line colours (spec 114 §3)', () => {
         // A fan window opened later: the memory with its hello, to it alone.
         const id = registry.openSatellite('fan')!;
         const fan = listener(hub, id);
-        fan.bus.post({ type: 'hello', windowId: id, kind: 'fan', treeId: TREE });
+        fan.bus.post({ type: 'hello', takesData: true, windowId: id, kind: 'fan', treeId: TREE });
         await settle();
         expect(fan.of('fan-rod-colors')).toEqual([expect.objectContaining({ to: id, treeId: TREE, memory: mem })]);
         expect(table.of('fan-rod-colors')).toHaveLength(1);
@@ -495,7 +533,7 @@ describe('the fan\'s family-line colours (spec 114 §3)', () => {
         expect(last(fan.of('fan-rod-colors'))).toMatchObject({ memory: [] });
         const id2 = registry.openSatellite('fan')!;
         const fan2 = listener(hub, id2);
-        fan2.bus.post({ type: 'hello', windowId: id2, kind: 'fan', treeId: TREE });
+        fan2.bus.post({ type: 'hello', takesData: true, windowId: id2, kind: 'fan', treeId: TREE });
         await settle();
         expect(fan2.of('fan-rod-colors')).toHaveLength(0);
     });
@@ -523,12 +561,231 @@ describe('images that came after the tree (spec 116, I6)', () => {
             window.dispatchEvent(new CustomEvent(IMAGES_ARRIVED_EVENT, { detail: { treeId: TREE, seq: 1, keys: [`person:${id}:photo`] } }));
             await settle(PATCH_INTERVAL_MS);
             expect(sat.of('patch').length).toBe(before + 1);
-            expect(treeOf(last(sat.of('patch'))!.json).persons[id].photo).toBe(url);
+            expect(treeOf(last(sat.of('patch'))!.data).persons[id].photo).toBe(url);
             expect(saveSpy).not.toHaveBeenCalled();
             expect(UndoManager.canUndo()).toBe(false);
         } finally {
             registry.stop();
             vi.unstubAllGlobals();
         }
+    });
+});
+
+describe('pooled images to the satellites (spec 135, D8)', () => {
+    const photo = 'data:image/jpeg;base64,' + 'Q'.repeat(4000);
+    const plainId = 'p:' + 'ab'.repeat(20);
+    const lockedId = 'e:' + 'ef'.repeat(20);
+    const meta = { len: photo.length, head: 'data:image/jpeg;base64,', bytes: 3000, w: 10, h: 20, token: 'img:t', mtok: 'm' };
+
+    function withPool(): ReturnType<typeof vi.spyOn> {
+        noteImageMeta({ [plainId]: meta });
+        return vi.spyOn(StorageManager, 'getMany').mockImplementation(async (_store: string, keys: string[]) =>
+            new Map(keys.map(k => [k, k === plainId || k === lockedId ? { text: photo } : null])) as never);
+    }
+
+    function setRef(id: string): PersonId {
+        const pid = DataManager.getAllPersons()[0].id;
+        (DataManager.getPerson(pid) as Person).photo = '\u0000sm:' + id;
+        return pid;
+    }
+
+    async function hello(kind: 'overview' | 'table', poolRefs: boolean) {
+        const id = registry.openSatellite(kind)!;
+        const sat = listener(hub, id);
+        sat.bus.post({ type: 'hello', takesData: true, windowId: id, kind, treeId: TREE, ...(poolRefs ? { poolRefs: true as const } : {}) });
+        await settle();
+        return { id, ...sat };
+    }
+
+    it('the tree and every patch carry the references as they are (an encrypted pool\'s too), with their catalog entries', async () => {
+        const getMany = withPool();
+        const pid = setRef(plainId);
+        const other = DataManager.createPerson({ firstName: 'Kunhuta', lastName: 'Okurková', gender: 'female' });
+        (DataManager.getPerson(other.id) as Person).photo = '\u0000sm:' + lockedId;
+        await settle(PATCH_INTERVAL_MS);
+        const a = await hello('overview', true);
+        const b = await hello('table', true);
+        const tree = a.of('tree')[0];
+        expect(treeOf(tree.data).persons[pid].photo).toBe('\u0000sm:' + plainId);
+        expect(treeOf(tree.data).persons[other.id].photo).toBe('\u0000sm:' + lockedId);
+        expect(tree.imageMeta).toEqual({ [plainId]: meta });
+        expect(treeOf(b.of('tree')[0].data).persons[pid].photo).toBe('\u0000sm:' + plainId);
+        DataManager.createPerson({ firstName: 'Ludmila', lastName: 'Okurková', gender: 'female' });
+        await settle(PATCH_INTERVAL_MS);
+        const patch = last(a.of('patch'))!;
+        expect(treeOf(patch.data).persons[pid].photo).toBe('\u0000sm:' + plainId);
+        expect(patch.imageMeta).toEqual({ [plainId]: meta });
+        expect(patch.images).toBeUndefined();
+        expect(JSON.stringify(patch)).not.toContain('QQQQ');
+        // Nothing read from the pool for them.
+        expect(getMany).not.toHaveBeenCalled();
+    });
+
+    it('a window that reads no references (a 3.32 beta before the pool) gets every image whole, and so do all while it is open', async () => {
+        withPool();
+        const pid = setRef(plainId);
+        DataManager.createPerson({ firstName: 'Kunhuta', lastName: 'Okurková', gender: 'female' });
+        await settle(PATCH_INTERVAL_MS);
+        const reads = await hello('overview', true);
+        const plain = await hello('table', false);
+        await vi.waitFor(() => expect(plain.of('tree')).toHaveLength(1));
+        expect(treeOf(plain.of('tree')[0].data).persons[pid].photo).toBe(photo);
+        DataManager.createPerson({ firstName: 'Ludmila', lastName: 'Okurková', gender: 'female' });
+        await settle(PATCH_INTERVAL_MS);
+        await vi.waitFor(() => expect(reads.of('patch').length).toBeGreaterThan(0));
+        expect(treeOf(last(reads.of('patch'))!.data).persons[pid].photo).toBe(photo);
+        // The tree here keeps the reference.
+        expect(DataManager.getPerson(pid)!.photo).toBe('\u0000sm:' + plainId);
+    });
+
+    it('a window that does not reach this one\'s pool asks for images: their Blobs, read here (also an encrypted pool\'s)', async () => {
+        vi.spyOn(StorageManager, 'getMany').mockImplementation(async (_store: string, keys: string[]) =>
+            new Map(keys.map(k => [k, k === plainId ? { head: 'data:image/png;base64,', bytes: new Uint8Array([1, 2, 3, 4]).buffer } : null])) as never);
+        const sat = await hello('overview', true);
+        sat.bus.post({ type: 'images-req', windowId: sat.id, reqId: 'r1', ids: [plainId, lockedId, 'not-an-id'] });
+        await settle();
+        await vi.waitFor(() => expect(sat.of('images')).toHaveLength(1));
+        const answer = sat.of('images')[0];
+        expect(answer).toMatchObject({ to: sat.id, reqId: 'r1' });
+        expect(Object.keys(answer.blobs).sort()).toEqual([plainId, lockedId].sort());
+        expect(answer.blobs[plainId]?.size).toBe(4);
+        expect(answer.blobs[lockedId]).toBeNull();
+    });
+
+    it('a new image (not in the pool yet) goes whole; while a save under way pools it the patch waits for its reference, at most a while', async () => {
+        let settling = false;
+        registry.stop();
+        registry = new WindowRegistry({
+            bus: new WindowBus('main-settle', hub.channel()),
+            host: dataManagerHost({ treeName: () => treeName, treeExists: () => true, focusSelf: () => {}, hasFocus: () => true, imagesSettling: () => settling }),
+            openWindow: () => fakeWindow() as unknown as Window,
+            geometry: () => null,
+        });
+        registry.start();
+        const sat = await hello('overview', true);
+        const pid = DataManager.getAllPersons()[0].id;
+        settling = true;
+        DataManager.updatePerson(pid, { photo });
+        await settle(PATCH_INTERVAL_MS * 3);
+        expect(sat.of('patch')).toHaveLength(0);
+        // The save put it into the pool: the tree holds its reference now.
+        withPool();
+        (DataManager.getPerson(pid) as Person).photo = '\u0000sm:' + plainId;
+        settling = false;
+        await settle(PATCH_INTERVAL_MS);
+        expect(sat.of('patch')).toHaveLength(1);
+        expect(treeOf(sat.of('patch')[0].data).persons[pid].photo).toBe('\u0000sm:' + plainId);
+        // A save that does not settle: the image goes whole after IMAGES_SETTLE_MAX_MS.
+        settling = true;
+        DataManager.updatePerson(pid, { photo });
+        await settle(IMAGES_SETTLE_MAX_MS - PATCH_INTERVAL_MS);
+        expect(sat.of('patch')).toHaveLength(1);
+        await settle(PATCH_INTERVAL_MS * 2);
+        expect(sat.of('patch')).toHaveLength(2);
+        expect(treeOf(sat.of('patch')[1].data).persons[pid].photo).toBe(photo);
+    });
+
+    it('new images sent whole and pooled afterwards: the same revision once more, with their references', async () => {
+        const sat = await hello('overview', true);
+        const pid = DataManager.getAllPersons()[0].id;
+        DataManager.updatePerson(pid, { photo });
+        await settle(PATCH_INTERVAL_MS);
+        const sent = last(sat.of('patch'))!;
+        expect(treeOf(sent.data).persons[pid].photo).toBe(photo);
+        // The save pools it (image-intern.ts): the tree in memory holds its reference.
+        withPool();
+        imagesInterned(TREE, new Map([[photo, '\u0000sm:' + plainId]]));
+        await settle(PATCH_INTERVAL_MS);
+        const again = last(sat.of('patch'))!;
+        expect(again).not.toBe(sent);
+        expect(again).toMatchObject({ revision: sent.revision, images: true });
+        expect(treeOf(again.data).persons[pid].photo).toBe('\u0000sm:' + plainId);
+        // A change after it: a plain patch of the next revision.
+        DataManager.createPerson({ firstName: 'Ludmila', lastName: 'Okurková', gender: 'female' });
+        await settle(PATCH_INTERVAL_MS);
+        expect(last(sat.of('patch'))!.revision).toBeGreaterThan(sent.revision);
+        expect(last(sat.of('patch'))!.images).toBeUndefined();
+    });
+
+    it('an edit of a satellite with a new image: the patch held back for the save carries the reference, marked for the window that holds that revision', async () => {
+        let settling = false;
+        registry.stop();
+        registry = new WindowRegistry({
+            bus: new WindowBus('main-settle2', hub.channel()),
+            host: dataManagerHost({ treeName: () => treeName, treeExists: () => true, focusSelf: () => {}, hasFocus: () => true, imagesSettling: () => settling }),
+            openWindow: () => fakeWindow() as unknown as Window,
+            geometry: () => null,
+        });
+        registry.start();
+        const sat = await hello('overview', true);
+        const pid = DataManager.getAllPersons()[0].id;
+        const copy = structuredClone(DataManager.getData());
+        copy.persons[pid].photo = photo;
+        settling = true;
+        sat.bus.post({ type: 'edit', windowId: sat.id, editId: 'e1', treeId: TREE, baseRevision: registry.revision, json: JSON.stringify(copy), label: 'Photo' });
+        await settle(PATCH_INTERVAL_MS * 2);
+        const result = sat.of('edit-result')[0];
+        expect(result).toMatchObject({ ok: true });
+        expect(sat.of('patch')).toHaveLength(0);
+        withPool();
+        settling = false;
+        imagesInterned(TREE, new Map([[photo, '\u0000sm:' + plainId]]));
+        await settle(PATCH_INTERVAL_MS);
+        const patch = last(sat.of('patch'))!;
+        expect(patch).toMatchObject({ revision: result.revision, images: true });
+        expect(treeOf(patch.data).persons[pid].photo).toBe('\u0000sm:' + plainId);
+    });
+});
+
+describe('a satellite of an older version (3.31 and before) among the windows (1122)', () => {
+    it('gets the tree as one JSON string with its images, and so do the others while it is open; then data again', async () => {
+        const pid = DataManager.getAllPersons()[0].id;
+        const photo = 'data:image/jpeg;base64,' + 'Q'.repeat(4000);
+        DataManager.updatePerson(pid, { photo });
+        await settle(PATCH_INTERVAL_MS);
+        const fresh = await connect();
+        const id = registry.openSatellite('overview')!;
+        const old = listener(hub, id);
+        old.bus.post({ type: 'hello', windowId: id, kind: 'overview', treeId: TREE });
+        await settle();
+        const tree = old.of('tree')[0] as unknown as { json?: string; data?: unknown };
+        expect(tree.data).toBeUndefined();
+        expect((JSON.parse(tree.json!) as StromData).persons[pid].photo).toBe(photo);
+        DataManager.createPerson({ firstName: 'Kunhuta', lastName: 'Okurková', gender: 'female' });
+        await settle(PATCH_INTERVAL_MS);
+        const patch = last(fresh.of('patch'))! as unknown as { json?: string; data?: unknown };
+        expect(patch.data).toBeUndefined();
+        expect(Object.keys((JSON.parse(patch.json!) as StromData).persons)).toHaveLength(2);
+        old.bus.post({ type: 'bye', windowId: id });
+        await settle();
+        DataManager.createPerson({ firstName: 'Ludmila', lastName: 'Okurková', gender: 'female' });
+        await settle(PATCH_INTERVAL_MS);
+        expect(treeOf(last(fresh.of('patch'))!.data).persons[pid].photo).toBe(photo);
+    });
+
+    it('a pooled image in the tree reaches it whole, read from the pool; the messages after the tree keep their order (135)', async () => {
+        const pid = DataManager.getAllPersons()[0].id;
+        const bytes = new Uint8Array(3000).map((_, i) => (i * 13) & 0xFF);
+        const head = 'data:image/jpeg;base64,';
+        const photo = head + Buffer.from(bytes).toString('base64');
+        const poolId = 'p:' + 'c4'.repeat(20);
+        const getMany = vi.spyOn(StorageManager, 'getMany').mockImplementation(async (_store: string, keys: string[]) =>
+            new Map(keys.map(k => [k, k === poolId ? { head, bytes: bytes.slice().buffer } : null])) as never);
+        // In memory as a tree read from storage holds it once images stay in the pool (135 D6).
+        (DataManager as unknown as { data: StromData }).data.persons[pid].photo = '\u0000sm:' + poolId;
+        const id = registry.openSatellite('overview')!;
+        const old = listener(hub, id);
+        old.bus.post({ type: 'hello', windowId: id, kind: 'overview', treeId: TREE });
+        await settle();
+        await vi.waitFor(() => expect(old.of('tree')).toHaveLength(1));
+        const tree = old.of('tree')[0] as unknown as { json?: string };
+        expect(tree.json).not.toContain('sm:p:');
+        expect((JSON.parse(tree.json!) as StromData).persons[pid].photo).toBe(photo);
+        expect(getMany).toHaveBeenCalled();
+        // The status the registry sent after the tree comes after it.
+        const order = old.got.filter(m => m.type === 'tree' || m.type === 'status').map(m => m.type);
+        expect(order.indexOf('tree')).toBeLessThan(order.lastIndexOf('status'));
+        // The tree in memory keeps its reference.
+        expect(DataManager.getData().persons[pid].photo).toBe('\u0000sm:' + poolId);
     });
 });

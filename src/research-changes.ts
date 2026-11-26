@@ -8,12 +8,14 @@
 import { StromData, Person, Partnership, PartnershipId, Source, EventParticipant, PersonId, LifeEvent, Attachment, PlaceGeo } from './types.js';
 import { isPrimaryName, personSourceIds } from './model-values.js';
 import { isPurePlaceholder } from './single-parent.js';
+import { isLegacyCensus } from './events.js';
 import { mediaPersonIds, mediaSourceId, mediaSourceIds, personMediaIndex, placePersonId, placeSourceId, samePlace } from './media.js';
 import { collectPlaces } from './places.js';
 import { factValueSignature, handedConfirmations } from './verify.js';
 import type { FactHolder } from './import-origin.js';
 import { getStringsForLang, SUPPORTED_LANGUAGES } from './strings.js';
 import { composePage, sourcePlaceDiffers, sourcePlaceKey } from './source-location.js';
+import { imageLengthMark } from './image-meta.js';
 
 export type ChangeKind =
     | 'added' | 'deleted' | 'name' | 'gender' | 'birth' | 'death' | 'marriage' | 'event'
@@ -51,13 +53,15 @@ const CITATION_FIELDS: (keyof Person)[] = ['sourceIds', 'birthSourceIds', 'death
 /** Not the user's: the research's own knowledge and statuses, and what the app keeps for itself. */
 const IGNORED_FIELDS = new Set<string>(['research', 'birthStatus', 'deathStatus', 'nameStatus', 'marriedNameStatus', 'photoOriginalName', 'photoDate', 'photoOriginal', 'partnerships', 'childIds', 'isLocked',
     'dismissedMarriedSuggestion', 'importId', 'importedValues', 'importedParents', 'researchOrigins', 'originalIds', 'gedcomExtra', 'alsoChildOf',
-    'confirmed', 'researchVerify']);
+    'confirmed', 'researchVerify',
+    // The time of the person's last change in this app (spec 136 D4): local bookkeeping, not a change of its own.
+    'changedAt']);
 const MARRIAGE_FIELDS: (keyof Partnership)[] = ['status', 'startDate', 'startPlace', 'endDate', 'endPlace', 'address', 'ages', 'note'];
 
 /** JSON with sorted keys and images reduced to their length (two copies of one tree compare equal). */
 export function stable(value: unknown): string {
     return JSON.stringify(value, (_k, v) => {
-        if (typeof v === 'string' && v.length >= 256 && v.startsWith('data:')) return `img:${v.length}`;
+        if (typeof v === 'string') return imageLengthMark(v, 256) ?? v;
         if (v && typeof v === 'object' && !Array.isArray(v)) {
             return Object.keys(v).sort().reduce<Record<string, unknown>>((o, k) => { o[k] = (v as Record<string, unknown>)[k]; return o; }, {});
         }
@@ -99,7 +103,7 @@ export function baseCopy(data: StromData): StromData {
             // The rejected spelling suggestions: what the research holds of them (its "not sent yet").
             surnameRejections: data.surnameRejections ?? [] };
     return JSON.parse(JSON.stringify(kept,
-        (_k, v) => typeof v === 'string' && v.length >= 256 && v.startsWith('data:') ? `img:${v.length}` : v)) as StromData;
+        (_k, v) => typeof v === 'string' ? imageLengthMark(v, 256) ?? v : v)) as StromData;
 }
 
 /**
@@ -565,6 +569,20 @@ export function diffOther(base: StromData | null, current: StromData): OtherChan
     const lineage = lineageItems.length ? { count: lineageItems.length, items: lineageItems } : undefined;
 
     return { sources, couples, ...(places ? { places } : {}), ...(surnameVariants ? { surnameVariants } : {}), ...(lineage ? { lineage } : {}) };
+}
+
+/**
+ * The numbers of "What will be sent" (134 V-N5): its sections' heads and the
+ * lead after a merge count the same rows. `added`: the people new for the
+ * research (a "?" stand-in is none, it has no row); `changed`: the other
+ * people's rows (a new partner, child or parent, a detail, a deletion);
+ * `couples`: the couples' own rows (a new couple is told at its partners).
+ */
+export interface SendCounts { persons: number; added: number; changed: number; sources: number; couples: number }
+
+export function sendCounts(list: readonly PersonChange[], other: OtherChanges | null): SendCounts {
+    const added = list.filter(ch => ch.kinds.includes('added')).length;
+    return { persons: list.length, added, changed: list.length - added, sources: other?.sources.length ?? 0, couples: other?.couples.length ?? 0 };
 }
 
 /** Rows beyond the people (the places and the surname variants are one row each). */
@@ -1254,13 +1272,15 @@ export function pairEvents(here: readonly LifeEvent[], there: readonly LifeEvent
             left.delete(t);
         }
     };
+    // A custom event named only "Census" is the census the tree stores it as (data v20): the same kind.
+    const kind = (e: LifeEvent): string[] => isLegacyCensus(e) ? ['census', ''] : [e.type, str(e.customLabel)];
     take(e => `id\u0000${e.id}`);
-    take(e => [e.type, e.customLabel, e.date, e.place, e.note, e.address].map(str).join('\u0000'));
-    take(e => [e.type, e.customLabel, e.date].map(str).join('\u0000'));
+    take(e => [...kind(e), e.date, e.place, e.note, e.address].map(str).join('\u0000'));
+    take(e => [...kind(e), e.date].map(str).join('\u0000'));
     // One of a type left on each side: the same event, its values changed.
     const restHere = here.filter(h => !out.has(h));
     for (const h of restHere) {
-        const same = (e: LifeEvent): boolean => e.type === h.type && str(e.customLabel) === str(h.customLabel);
+        const same = (e: LifeEvent): boolean => kind(e).join('\u0000') === kind(h).join('\u0000');
         const theirs = [...left].filter(same);
         if (theirs.length === 1 && restHere.filter(same).length === 1) {
             out.set(h, theirs[0]);

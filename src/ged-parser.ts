@@ -77,7 +77,7 @@ import { localAge } from './recorded-age';
 import { isGedcomDateFormOf } from './gedcom-date-form';
 import { placeKey } from './places';
 import { isPlaceRecordId, sanitizePlaceRecord, PLACE_TEXT_LIMITS } from './place-records';
-import { coupleEventTypeOfTag, eventValueIsOnTag } from './events';
+import { convertLegacyCensusEvents, coupleEventTypeOfTag, eventValueIsOnTag } from './events';
 import {
     applyShareMark, convertGedShares, isHouseholdShareRole, type PendingCoupleShars, type PendingPersonShars, type RawRoleAt,
     type RawShareMark, roleAtEventId, roleAtEventType, roleAtRole, roleAtTypeOfTag, sharRoleWord, LINK_REJECTED_TAG,
@@ -98,7 +98,7 @@ function surnameNoteGroups(noteLines: readonly string[] | null): string[][] {
 import { excerptFromDataUrl } from './excerpts';
 import { unionCitations } from './citation-quality';
 import { cleanSourceEvents } from './citation-order';
-import { imageRefSha, resolveImageFile, type ImageRef } from './research-image-refs';
+import { imageRefSha, resolveImageFile, imageFileHead, isImageFile, imageFileBytes, type ImageRef } from './research-image-refs';
 import { normalizeSha256 } from './sha256';
 import { isConfirmDay, isTranscriptMark } from './source-confirm';
 import { ORIGINAL_ONLY_DATA_URL } from './validation';
@@ -108,6 +108,7 @@ import { parseName, readGedcomName, PRIMARY_NAME_TAG, type GedcomNameParts } fro
 import { appUnknownIsNoSurname } from './app-version';
 import { lastMarriageSurnameIndex } from './married-suggestion';
 import { researchClaimValue } from './research-claim';
+import { addEmails, isContactAddressLabel, isContactResidence } from './person-contact.js';
 import {
     addGedcomExtra, addOriginalIds, CITE_TAG, gedcomHtmlText, joinedBlock, NOTED_TAG, notedBlock, notedStructures, type ExtraHolder, withoutCiteLines, mediaDateValue, cleanImportOrigin, cleanOriginalIdLine, cleanOriginalIds, factPartOf, ID_ENTRIES_MAX, ID_LINES_MAX,
     IMPORT_TAG, markFactImported, markTreeImported, XID_TAG,
@@ -1086,8 +1087,6 @@ const NOTED_SILENT_TAGS = new Set(['TYPE']);
 
 /** The parts of an address structure (ADDR > ADR1 …), read where the ADDR line has no value. */
 const ADDRESS_PART_TAGS = new Set(['ADR1', 'ADR2', 'ADR3', 'CITY', 'STAE', 'POST', 'CTRY']);
-/** A field's label written as its value (`3 ADR1 Email`, MyHeritage): no address. */
-const ADDRESS_PART_LABEL = /^e-?mail$/i;
 
 /** A fact being read: its value on the tag line, its date and place below it. */
 interface RawNoteFact {
@@ -1270,7 +1269,7 @@ interface RawEvent {
     typeText?: string;
     /** 2 _STROM_STATUS: the research's status of the event. */
     status?: FactStatus;
-    /** 2 EMAIL under the event as written (LifeEvent.gedcomEmails). */
+    /** 2 EMAIL under the event as written: the person's contact (Person.emails). */
     emails?: string[];
     /** The value written on the event's own line, where Strom has no field for it (LifeEvent.gedcomValue). */
     lineValue?: string;
@@ -1851,6 +1850,14 @@ interface GedcomFamily {
 }
 
 /** Parsed GEDCOM data */
+/** A kind of line of a loaded file the tree does not take over (the import's "not taken" list). */
+export interface GedcomDroppedTag {
+    tag: string;
+    count: number;
+    example: string;
+    label?: string;
+}
+
 export interface ParsedGedcom {
     /**
      * The QUAY of each citation, by the list its pointer is in (the very
@@ -1872,6 +1879,8 @@ export interface ParsedGedcom {
     repositories: Map<string, string>;
     /** Tags our data model cannot represent, with occurrence counts. */
     droppedTags: Map<string, number>;
+    /** The first value written on a line of each not carried over tag, with the person's name when under a person. */
+    droppedTagExamples?: Map<string, string>;
     /** Coordinates read from PLAC > MAP > LATI/LONG, keyed by placeKey(). */
     places: Map<string, PlaceGeo>;
     /** Strom Research's place records (`0 @L0012@ _STROM_PLACE`), by id; only valid ones. */
@@ -2005,6 +2014,12 @@ export interface GedcomConversionResult {
         unsupportedTags: number;
         /** Human-readable breakdown, e.g. "TITL ×3, SSN ×2". Empty when none. */
         droppedTagSummary: string;
+        /**
+         * The same tags one by one, most frequent first: how many lines and an
+         * example (the first value written, "Name: value" under a person; '' when
+         * no line had a value). `label` is a reader's name of the tag, when known.
+         */
+        droppedTags: GedcomDroppedTag[];
         /** Individuals with SEX other than M/F (SEX U or none): imported with the sex unknown, never guessed. */
         unknownSexPersons: number;
         /**
@@ -2622,6 +2637,29 @@ export function imageHeldReason(value: string): SourceImageHeld {
     return why === 'scope' || why === 'limit' || why === 'later' || why === 'missing' ? why : 'other';
 }
 
+/** A person's name for an example of a not taken over line ('' for "?" or none). */
+function personNameText(first: string | undefined, last: string | undefined): string {
+    return [first, last].filter(n => n && n !== '?').join(' ').trim();
+}
+
+/** A GEDCOM NAME value as read ("Jan /Novák/" → "Jan Novák"). */
+function gedNameText(name: string | undefined): string {
+    const text = (name ?? '').replace(/\//g, ' ').replace(/\s+/g, ' ').trim();
+    return text === '?' ? '' : text;
+}
+
+/** The value of a raw GEDCOM line ("1 _TAG value" → "value"). */
+function extraLineValue(line: string): string {
+    return line.replace(/^\s*\d+\s+(?:@[^@]+@\s+)?\S+ ?/, '');
+}
+
+/** An example of a not taken over line: its value, after the person's name ("Name: value"); '' for no value, a pointer or a data URL. */
+function droppedExample(value: string, name: string): string {
+    const v = value.trim();
+    if (!v || GED_POINTER.test(v) || DATA_URL_IN_LINE.test(v)) return '';
+    return name ? `${name}: ${v}` : v;
+}
+
 /**
  * Pure bookkeeping tags (platform sync ids, change stamps). Ignored WITHOUT
  * counting them as unsupported — a MyHeritage export carries three of these
@@ -3099,7 +3137,20 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
         if (c && ref && c.id === ref && q >= 0 && q <= 3 && c.quay === undefined) c.quay = q;
     };
     const droppedTags = new Map<string, number>();
-    const count = (tag: string): void => { droppedTags.set(tag, (droppedTags.get(tag) ?? 0) + 1); };
+    /** The first value of a not carried over tag, with the person it was under. */
+    const droppedTagExamples = new Map<string, string>();
+    /** The value of the line being read (for droppedTagExamples). */
+    let lineValue = '';
+    /** `value`: the counted line's own value when it is not the line being read (a kept block counted at its end). */
+    const count = (tag: string, value = lineValue): void => {
+        droppedTags.set(tag, (droppedTags.get(tag) ?? 0) + 1);
+        if (droppedTagExamples.has(tag)) return;
+        const indi = currentType === 'INDI' ? currentRecord as GedcomIndividual | null : null;
+        // The person's first and last name are read when the record ends; until then its NAME line says it.
+        const name = indi ? ([indi.firstName, indi.lastName].filter(n => n && n !== '?').join(' ').trim() || gedNameText(indi.name)) : '';
+        const example = droppedExample(value, name);
+        if (example) droppedTagExamples.set(tag, example);
+    };
     /** The level of the line being read, and where it is in the file. */
     let lineLevel = 0;
     let lineIndex = -1;
@@ -3525,7 +3576,7 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
         if (!block.pointer && validExtraBlock(raw) && !raw.some(l => DATA_URL_IN_LINE.test(l))) {
             (block.target.extras ??= []).push({ tag: block.tag, lines: raw, ...(block.quiet ? { quiet: true } : {}) });
         } else if (!block.quiet) {
-            count(block.tag);
+            count(block.tag, extraLineValue(raw[0] ?? ''));
         }
     };
 
@@ -3649,6 +3700,7 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
         let value = rec.value;
         lineLevel = level;
         lineIndex = rec.src;
+        lineValue = value;
 
         // Another program's own level-1 tag being kept (spec 066 G8): the
         // lines under it are taken from the file as written, nothing reads them.
@@ -3782,7 +3834,7 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
             }
             if (level <= openDetail.level) flushDetail();
             else if (level === openDetail.level + 1 && openDetail.parts && ADDRESS_PART_TAGS.has(tag)
-                && value.trim() && !ADDRESS_PART_LABEL.test(value.trim())) {
+                && value.trim() && !isContactAddressLabel(value)) {
                 openDetail.parts.push(value.trim());
             }
         }
@@ -5059,11 +5111,9 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
                             }
                             currentEvent.note = (currentEvent.note ?? '') + more;
                         } else if (tag === 'EMAIL' && value) {
-                            // MyHeritage keeps contact e-mail under RESI: a line of
-                            // the note to read, the address itself to go back.
-                            const line = strings.gedcomNotes.email(value);
-                            currentEvent.note = currentEvent.note
-                                ? `${currentEvent.note}\n${line}` : line;
+                            // An e-mail in the event's address structure (MyHeritage's
+                            // RESI): the person's contact (spec 134 K0.10), never a
+                            // line of the event's note.
                             (currentEvent.emails ??= []).push(value.trim());
                         } else if (tag === 'ASSO' && value) {
                             // Godparent/witness who has a record of their own.
@@ -5564,7 +5614,7 @@ export function* parseGedcomSteps(content: string): Generator<GedcomStep, Parsed
     const surnameMarkers = { groups: surnameNoteLines.groups !== null, rejections: surnameNoteLines.rejections !== null };
 
     return {
-        individuals, families, sources, repositories, droppedTags, places, surnameGroups,
+        individuals, families, sources, repositories, droppedTags, droppedTagExamples, places, surnameGroups,
         ...(placeRecords.size > 0 ? { placeRecords } : {}),
         ...(placeRefs.size > 0 ? { placeRefs } : {}),
         ...(surnameRejections.length > 0 ? { surnameRejections } : {}),
@@ -5604,6 +5654,15 @@ export function convertToStrom(gedcom: ParsedGedcom, options: GedcomConvertOptio
 /** `convertToStrom` in parts: a step every few hundred persons and families (§8, C52), the same result. */
 export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConvertOptions = {}): Generator<GedcomStep, GedcomConversionResult, void> {
     const { individuals, families, sources: gedSources, droppedTags } = gedcom;
+    /** Examples of the not taken over lines: the parser's, and those of the lines counted here. */
+    const droppedExamples = new Map(gedcom.droppedTagExamples ?? []);
+    /** Count another program's own tag that is not carried over, with its first value as the example. */
+    const dropExtra = (e: RawExtra, name: string): void => {
+        droppedTags.set(e.tag, (droppedTags.get(e.tag) ?? 0) + 1);
+        if (droppedExamples.has(e.tag)) return;
+        const example = droppedExample(extraLineValue(e.lines[0] ?? ''), name);
+        if (example) droppedExamples.set(e.tag, example);
+    };
     /** A file the app or the research wrote keeps the import marks it carries (spec 066). */
     const ownFile = !!(gedcom.stromApp || gedcom.stromResearch);
     const readMarks = !!options.importOrigin && ownFile;
@@ -5689,7 +5748,7 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
     const fileKeysOf = (media: RawMedia): string[] => [
         ...(media.ref ? [`ref:${media.ref}`] : []),
         ...(media.sha ? [`sha:${media.sha.toLowerCase()}`] : []),
-        ...(media.file.startsWith('data:') ? [`url:${media.file}`] : []),
+        ...(isImageFile(media.file) ? [`url:${media.file}`] : []),
     ];
     /**
      * A file of the tree at `place` (with the sources its `_SOUR` names):
@@ -5701,10 +5760,11 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
         const keys = fileKeysOf(media);
         let att = keys.map(k => fileByKey.get(k)).find((a): a is Attachment => !!a);
         const name = (fallback: string): string => media.name?.trim() || media.title || fallback;
-        if (media.file.startsWith('data:')) {
-            if (!SAFE_ATTACHMENT_DATA_URL.test(media.file)) return false;
-            const mimeType = media.file.slice(5, media.file.indexOf(';')) || 'application/octet-stream';
-            const sizeBytes = Math.round((media.file.length - media.file.indexOf(',') - 1) * 0.75);
+        if (isImageFile(media.file)) {
+            const head = imageFileHead(media.file);
+            if (!SAFE_ATTACHMENT_DATA_URL.test(head)) return false;
+            const mimeType = head.slice(5, head.indexOf(';')) || 'application/octet-stream';
+            const sizeBytes = imageFileBytes(media.file);
             if (att?.originalOnly) {
                 // The file itself where its record had only its original.
                 delete att.originalOnly;
@@ -5753,7 +5813,7 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
         const resolved = imageRefSha(linked.file) ? { ...linked, file: resolveImageFile(linked.file, options.images, options.pendingImages) } : linked;
         // A file the archive names only (its name and hash, spec 108 §5) that this browser holds (the
         // tree's own attachment, found by its hash): the file itself, as the tree had it.
-        const heldFile = resolved.file && !resolved.file.startsWith('data:') && resolved.sha && resolved.stromKind !== 'photo'
+        const heldFile = resolved.file && !isImageFile(resolved.file) && resolved.sha && resolved.stromKind !== 'photo'
             ? options.images?.get(resolved.sha.toLowerCase()) : undefined;
         return heldFile && SAFE_ATTACHMENT_DATA_URL.test(heldFile)
             ? { ...resolved, file: heldFile, title: resolved.title || resolved.file.split(/[\\/]/).pop() || resolved.file } : resolved;
@@ -5825,7 +5885,7 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
             if (!linked) { skipMedia(); continue; }
             // An image named by its hash: the image itself (or left out).
             const media = imageRefSha(linked.file) ? { ...linked, file: resolveImageFile(linked.file, options.images, options.pendingImages) } : linked;
-            const exc = media.file.startsWith('data:')
+            const exc = isImageFile(media.file)
                 ? excerptFromDataUrl(media.file, { caption: media.title, pageUrl: media.pageUrl, clip: media.clip, originalSha: media.sha, orient: media.orient })
                 : null;
             // Its place on the original: re-linked to the page attachment once persons are in.
@@ -5963,7 +6023,7 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
         if (dateForms) person.gedcomDates = dateForms;
         // Facts with no field of their own join the note, labelled, ahead of
         // whatever free text the file wrote (see NOTED_INDI_TAGS).
-        const factLines = indi.noteFacts.map(factToNoteLine);
+        const factLines = indi.noteFacts.filter(f => f.tag !== 'EMAIL').map(factToNoteLine);
         const allNotes = [...factLines, ...(indi.notes ? [indi.notes] : [])];
         // What the file wrote in place of a name ("Mrtvě narozený"), kept as
         // written — after the rest, and only once.
@@ -6003,8 +6063,20 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
             };
         };
 
-        if (indi.events.length > 0) {
-            person.events = indi.events.map((ev): LifeEvent => {
+        // The person's contact (spec 134 K0.10): the e-mails under the
+        // events and right under the person (`1 EMAIL`). A RESI of a contact
+        // alone is no residence (isContactResidence): no event of it.
+        const emails = [...indi.events.flatMap(ev => ev.emails ?? []),
+            ...indi.noteFacts.filter(f => f.tag === 'EMAIL').map(f => f.value)];
+        if (emails.length > 0) addEmails(person, emails);
+        const ownEvents = indi.events.filter(ev => ev.type !== 'residence' || !isContactResidence({
+            date: ev.date, place: ev.place, address: ev.address, cause: ev.cause, age: ev.age,
+            note: [ev.note, ev.lineValue, ev.tagValue, ev.typeText].filter(Boolean).join('\n'),
+            sources: ev.sourceRefs?.length, files: ev.media?.length, participants: (ev.participants?.length ?? 0) + (ev.shars?.length ?? 0),
+            other: !!(ev.share || ev.roleAt || ev.customLabel || (ev.status && ev.status !== 'lead')), emails: ev.emails,
+        }));
+        if (ownEvents.length > 0) {
+            person.events = ownEvents.map((ev): LifeEvent => {
                 const out: LifeEvent = { id: generateLifeEventId(), type: ev.type };
                 if (ev.media?.length) eventIdOfRaw.set(ev, out.id);
                 if (ev.customLabel) out.customLabel = ev.customLabel;
@@ -6015,7 +6087,8 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
                 if (ev.address) out.address = ev.address;
                 if (ev.note) out.note = ev.note;
                 if (ev.status) out.status = ev.status;
-                if (ev.emails?.length && ev.note) out.gedcomEmails = ev.emails;
+                // Where the file wrote the contact's e-mail, for "Back to {prog}".
+                if (ev.emails?.length) out.gedcomEmails = ev.emails;
                 if (ev.lineValue && ev.note && (ev.note === ev.lineValue || ev.note.startsWith(`${ev.lineValue}\n`))) {
                     out.gedcomValue = ev.lineValue;
                 }
@@ -6160,13 +6233,13 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
             if (!linked) { skipMedia(); continue; }
             const media = fileMedia(link)!;
             if (!media.file && linked.file) { skipMedia(); continue; }
-            if (media.file.startsWith('data:')) {
+            if (isImageFile(media.file)) {
                 // Only the formats the app itself stores come in: a portrait
                 // is a raster image, a document an image or a PDF. Anything
                 // else (SVG, HTML, script …) could run when opened, so it is
                 // skipped — and counted, so the summary says so.
                 const wantsPhoto = media.stromKind === 'photo';
-                if (!(wantsPhoto ? SAFE_PHOTO_DATA_URL : SAFE_ATTACHMENT_DATA_URL).test(media.file)) {
+                if (!(wantsPhoto ? SAFE_PHOTO_DATA_URL : SAFE_ATTACHMENT_DATA_URL).test(imageFileHead(media.file))) {
                     skipMedia();
                     continue;
                 }
@@ -6239,11 +6312,11 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
             if (!media?.file) continue;
             const file = imageRefSha(media.file) ? resolveImageFile(media.file, options.images, options.pendingImages) : media.file;
             if (!file) continue;
-            if (file.startsWith('data:')) {
-                if (!SAFE_PHOTO_DATA_URL.test(file)) continue;
+            if (isImageFile(file)) {
+                if (!SAFE_PHOTO_DATA_URL.test(imageFileHead(file))) continue;
                 // Its original by its hash (`_STROM_SHA`, spec 108 K2.4): the research holds it.
                 const original: MediaOriginal | undefined = media.sha ? {
-                    sha256: media.sha, name: media.title || 'photo', mimeType: file.slice(5, file.indexOf(';')) || 'image/jpeg', bytes: 0,
+                    sha256: media.sha, name: media.title || 'photo', mimeType: imageFileHead(file).slice(5, imageFileHead(file).indexOf(';')) || 'image/jpeg', bytes: 0,
                     ...(media.orient ? { orientation: media.orient } : {}),
                 } : undefined;
                 familyPhotos.set(gedFamId, { photo: file, ...(media.title ? { title: media.title } : {}), ...(media.date ? { date: media.date } : {}),
@@ -6270,7 +6343,7 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
             // The family's other files in the app's and the research's own files (`_PRIM N`, spec 102): files
             // of the union, taken once the unions are; another program's stay as written. An image named by
             // its hash (`?images=ref`) is one too: fileMedia resolves it as at a person.
-            if (ownFile && media && (media.file.startsWith('data:') || !!imageRefSha(media.file) || !!media.sha)) {
+            if (ownFile && media && (isImageFile(media.file) || !!imageRefSha(media.file) || !!media.sha)) {
                 laterFiles.push({ media: link, place: () => { const u = famPartnership.get(gedFamId); return u ? { partnershipId: u.id } : null; } });
                 if (link.extra) fam.extras = fam.extras?.filter(e => e !== link.extra);
                 if (link.ref) { fam.keptMedia = fam.keptMedia?.filter(r => r !== link.ref); usedMedia.add(link.ref); }
@@ -7045,8 +7118,11 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
     // Another program's own tags with no import to keep them for (the file is
     // not loaded as an import): not carried over, so counted.
     if (!extrasKept) {
-        for (const raw of [...individuals.values(), ...families.values(), ...gedSources.values()]) {
-            for (const e of raw.extras ?? []) if (!e.quiet) droppedTags.set(e.tag, (droppedTags.get(e.tag) ?? 0) + 1);
+        for (const indi of individuals.values()) {
+            for (const e of indi.extras ?? []) if (!e.quiet) dropExtra(e, personNameText(indi.firstName, indi.lastName));
+        }
+        for (const raw of [...families.values(), ...gedSources.values()]) {
+            for (const e of raw.extras ?? []) if (!e.quiet) dropExtra(e, '');
         }
     }
 
@@ -7060,17 +7136,20 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
      */
     function applyFileExtras(from?: string): void {
         extrasKept = true;
-        const put = (holder: ExtraHolder | undefined, mark: string | undefined, extras: RawExtra[] | undefined): void => {
+        const put = (holder: ExtraHolder | undefined, mark: string | undefined, extras: RawExtra[] | undefined, name = ''): void => {
             for (const e of extras ?? []) {
                 const to = from ?? mark;
-                if (!holder || !to) { if (!e.quiet) droppedTags.set(e.tag, (droppedTags.get(e.tag) ?? 0) + 1); continue; }
+                if (!holder || !to) {
+                    if (!e.quiet) dropExtra(e, name);
+                    continue;
+                }
                 addGedcomExtra(holder, { from: to, lines: e.lines });
                 if (!e.quiet) keptTags.set(e.tag, (keptTags.get(e.tag) ?? 0) + 1);
             }
         };
         for (const [gedId, indi] of individuals) {
             const pid = personIdMap.get(gedId);
-            put(pid ? persons[pid] : undefined, indi.importMark, indi.extras);
+            put(pid ? persons[pid] : undefined, indi.importMark, indi.extras, personNameText(indi.firstName, indi.lastName));
         }
         for (const [gedFamId, fam] of families) put(famPartnership.get(gedFamId), fam.importMark, fam.extras);
         for (const [gedId, raw] of gedSources) {
@@ -7299,6 +7378,13 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
     // an edited file, is an ordinary event), roles of persons in the tree.
     cleanEventShares(data);
 
+    // A person's custom event named only "Census" (`1 EVEN` / `2 TYPE
+    // Sčítání lidu`, as a research may write one) is a census, as the tree
+    // stores it (data v20, migrateData): the research's version shown before
+    // a load and compared with the tree is the one the load saves, so the
+    // same file read again pairs with what the tree holds (K052).
+    convertLegacyCensusEvents(data);
+
     // A file the user imports: every portrait is in a record of the tree's
     // files (data v25), as a tree read from storage has it; the same picture
     // at several people is one record. A research tree's person with its
@@ -7321,6 +7407,9 @@ export function* convertToStromSteps(gedcom: ParsedGedcom, options: GedcomConver
                 .sort((a, b) => b[1] - a[1])
                 .map(([tag, n]) => `${tag} ×${n}`)
                 .join(', '),
+            droppedTags: [...droppedTags.entries()]
+                .sort((a, b) => b[1] - a[1])
+                .map(([tag, n]) => ({ tag, count: n, example: droppedExamples.get(tag) ?? '' })),
             unknownSexPersons,
             skippedMedia,
             keptTags: [...keptTags.values()].reduce((a, b) => a + b, 0),

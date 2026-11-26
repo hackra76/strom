@@ -30,13 +30,13 @@ import { TreeManager } from '../tree-manager.js';
 import { strings } from '../strings.js';
 import { storedResearchBridge, announcedResearchScheme } from '../research-device.js';
 import {
-    LIVE_IDLE_FEATURE, LIVE_START_FEATURE, LIVE_STOP_FEATURE, parseLiveBridge, researchSchemeUrl, type LiveStatus,
+    LIVE_IDLE_FEATURE, LIVE_START_FEATURE, LIVE_STOP_FEATURE, parseLiveBridge, researchDeviceAgentLink, researchSchemeUrl, type LiveStatus,
 } from '../research-link.js';
 import {
     LIVE_IDLE_FOREVER, LIVE_IDLE_TWO_HOURS, liveEndKind, liveFeaturesWord, noteLiveEnded, noteLiveStatus, postLiveIdle, postLiveStop,
     storedLiveState, type LiveWriteRefusal,
 } from '../research-live.js';
-import { el, onComputer } from './research-ui.js';
+import { el, researchHere } from './research-ui.js';
 import { startPend, endPend, dropPend, pendOf, applyPend, pendStatusEl } from './switch-pend.js';
 import { busySpinHtml } from './busy.js';
 import { onBridgeStatus } from './research-sync-ui.js';
@@ -169,6 +169,11 @@ export const researchLiveMethods = uiModule({
     beginRunWork(url: string, scope?: string): void {
         const rid = this.activeResearchId();
         if (!rid) return;
+        // A device of the home network: started through the gateway, its state kept by device-agent.ts (spec 094 K3.15).
+        if (researchDeviceAgentLink(url)) {
+            void this.startAgentFromDevice(url, { tree: rid });
+            return;
+        }
         const at = this.queueWorkMenuState()?.state as { working?: readonly unknown[]; features?: readonly string[] | null } | undefined;
         // An older research where someone works already: no session can prove this start, the link's own state says it
         // (a toast). With runs side by side (`run.lines`) the start always shows in Now.
@@ -217,7 +222,7 @@ export const researchLiveMethods = uiModule({
 
     /** A tree's switch state (null: no switch here). */
     researchLiveState(treeId: string): SwitchState | null {
-        if (!onComputer() || DataManager.isViewMode()) return null;
+        if (!researchHere() || DataManager.isViewMode()) return null;
         const link = TreeManager.getTreeMetadata(treeId as TreeId)?.research;
         if (!link?.id || link.copy || !bridgeBase(link.id)) return null;
         const rid = link.id;
@@ -508,7 +513,7 @@ export const researchLiveMethods = uiModule({
         const group = document.getElementById('settings-group-research-live');
         const body = group?.querySelector<HTMLElement>('.settings-group-body');
         if (!group || !body) return;
-        const show = onComputer() && !DataManager.isViewMode() && TreeManager.getTrees().some(t => !!t.research?.id && !t.research.copy);
+        const show = researchHere() && !DataManager.isViewMode() && TreeManager.getTrees().some(t => !!t.research?.id && !t.research.copy);
         group.hidden = !show;
         if (!show) {
             body.replaceChildren();

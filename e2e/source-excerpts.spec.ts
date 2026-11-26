@@ -1,5 +1,5 @@
 import { test, expect, Page } from '@playwright/test';
-import { openApp, createFirstPerson, cardAction, personModal } from './helpers.js';
+import { openApp, createFirstPerson, cardAction, personModal, mergeCreateNewTree } from './helpers.js';
 
 /**
  * Register entries on sources: excerpt thumbnails on citation chips, the
@@ -202,7 +202,7 @@ test.describe('the excerpt block in the editor', () => {
         await expect(editor(page).locator('#input-source-title')).toHaveValue('Křest');
 
         await editor(page).getByRole('button', { name: 'Save' }).click();
-        const exc = await page.evaluate(() => Object.values(window.Strom.DataManager.getData().sources as Record<string, any>)[0].excerpts[0]);
+        const exc = await page.evaluate(() => window.Strom.Images.expandedData(Object.values(window.Strom.DataManager.getData().sources as Record<string, any>)[0].excerpts[0]));
         expect(exc.dataUrl.startsWith('data:image/jpeg')).toBe(true);
         expect(exc.width).toBe(1200);
         expect(exc.height).toBe(200);
@@ -221,7 +221,7 @@ test.describe('the excerpt block in the editor', () => {
         await expect(cropper(page)).toHaveCount(0);
         await expect(editor(page).locator('.excerpt-item')).toHaveCount(1);
         await editor(page).getByRole('button', { name: 'Save' }).click();
-        const exc = await page.evaluate(() => Object.values(window.Strom.DataManager.getData().sources as Record<string, any>)[0].excerpts[0]);
+        const exc = await page.evaluate(() => window.Strom.Images.expandedData(Object.values(window.Strom.DataManager.getData().sources as Record<string, any>)[0].excerpts[0]));
         expect(exc.dataUrl.startsWith('data:image/jpeg')).toBe(true);
         expect(Math.max(exc.width, exc.height)).toBeLessThanOrEqual(1200);
         expect(exc.fromAttachmentId).toBeUndefined();
@@ -434,19 +434,18 @@ test.describe('leaving images out of an import', () => {
         '0 TRLR',
     ].join('\n');
 
-    test('GEDCOM result: excerpts tile, checkbox with size; unchecked → text only', async ({ page }) => {
+    test('GEDCOM import guide: excerpts tile, checkbox with size; unchecked → text only', async ({ page }) => {
         await openApp(page);
         const jpeg = await jpegDataUrl(page, 200, 40);
         await page.evaluate((text) => window.Strom.UI.openGedcomText(text), excerptGed(jpeg));
-        const dlg = page.locator('#gedcom-result-modal');
+        const dlg = page.locator('#merge-modal');
         await expect(dlg).toBeVisible();
         await expect(dlg.locator('#gedcom-stat-excerpts')).toHaveText('1');
         await expect(dlg.locator('#gedcom-images-row')).toBeVisible();
         await expect(dlg.locator('#gedcom-images-size')).toContainText('MB');
         await dlg.locator('#gedcom-import-images').uncheck();
         await expect(dlg.locator('#gedcom-stat-excerpts-item')).toHaveClass(/muted/);
-        await dlg.locator('#gedcom-new-tree-btn').click();
-        await page.locator('#import-tree-modal').getByRole('button', { name: /Import/ }).last().click();
+        await mergeCreateNewTree(page, dlg);
         const src = await page.evaluate(() => Object.values(window.Strom.DataManager.getData().sources as Record<string, any>)[0]);
         expect(src.excerpts).toBeUndefined();
         expect(src.transcript).toBe('Jan, syn Josefa');
@@ -458,7 +457,7 @@ test.describe('leaving images out of an import', () => {
         await openApp(page);
         await page.evaluate(() => window.Strom.UI.openGedcomText(
             '0 HEAD\n1 CHAR UTF-8\n0 @I1@ INDI\n1 NAME Karel /Bez/\n1 SEX M\n0 TRLR'));
-        await expect(page.locator('#gedcom-result-modal')).toBeVisible();
+        await expect(page.locator('#merge-modal')).toBeVisible();
         await expect(page.locator('#gedcom-images-row')).toBeHidden();
     });
 });
@@ -494,7 +493,7 @@ test.describe('a research update', () => {
         await check.uncheck();
         await dlg.getByRole('button', { name: 'Update' }).click();
         await expect(page.locator('.toast')).toContainText('Research version loaded.');
-        const src = await page.evaluate(() => Object.values(window.Strom.DataManager.getData().sources as Record<string, any>)[0]);
+        const src = await page.evaluate(() => window.Strom.Images.expandedData(Object.values(window.Strom.DataManager.getData().sources as Record<string, any>)[0]));
         expect(src.title).toBe('Křest Josefa');
         // No new images came in; the excerpt the tree had stays.
         expect(src.excerpts).toHaveLength(1);

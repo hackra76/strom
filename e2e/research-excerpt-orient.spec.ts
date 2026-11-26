@@ -1,5 +1,5 @@
 import { test, expect, Page } from '@playwright/test';
-import { openApp, card } from './helpers.js';
+import { openApp, card, mergeCreateNewTree } from './helpers.js';
 
 /**
  * A crop Strom Research sends back lies as its original is stored; its
@@ -37,16 +37,29 @@ async function setup(page: Page, orient: string | null): Promise<string> {
         return dt;
     }, ged);
     for (const type of ['dragenter', 'dragover', 'drop']) await page.dispatchEvent('#tree-container', type, { dataTransfer });
-    await page.locator('.modal-overlay.active').getByText('Import as a new tree', { exact: true }).first().click();
-    await page.locator('.modal-overlay.active button.primary', { hasText: 'Import' }).click();
+    await mergeCreateNewTree(page, page.locator('#merge-modal'));
     await expect(card(page, 'Anna')).toBeVisible();
     return jpeg;
 }
 
-const shownSize = (page: Page, selector: string) => page.locator(selector).first().evaluate(async (img: HTMLImageElement) => {
-    await img.decode().catch(() => undefined);
-    return { w: img.naturalWidth, h: img.naturalHeight };
-});
+/** The 1 × 1 GIF a pooled image shows until the hydrator puts its object URL in (image-ref.ts). */
+const PLACEHOLDER = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+
+/**
+ * The size an <img> shows once its picture is in: the import pools the crop,
+ * so the viewer's <img> carries the placeholder until the hydrator fills it.
+ */
+async function shownSize(page: Page, selector: string): Promise<{ w: number; h: number }> {
+    const img = page.locator(selector).first();
+    await expect.poll(() => img.evaluate((i: HTMLImageElement, placeholder) => {
+        const src = i.getAttribute('src') ?? '';
+        return src !== '' && src !== placeholder;
+    }, PLACEHOLDER), { message: `${selector} filled` }).toBe(true);
+    return img.evaluate(async (i: HTMLImageElement) => {
+        await i.decode().catch(() => undefined);
+        return { w: i.naturalWidth, h: i.naturalHeight };
+    });
+}
 
 const openViewer = (page: Page) => page.evaluate(() => {
     const id = Object.keys(window.Strom.DataManager.getData().sources ?? {})[0];
@@ -61,7 +74,7 @@ test.describe('a research crop turned by its original\'s orientation', () => {
         expect(await shownSize(page, '#source-viewer-modal img[data-excerpt-index]')).toEqual({ w: 100, h: 400 });
         const kept = await page.evaluate(() => {
             const src = Object.values(window.Strom.DataManager.getData().sources ?? {})[0] as { excerpts: { dataUrl: string; orient?: number }[] };
-            return src.excerpts[0];
+            return window.Strom.Images.expandedData(src.excerpts[0]);
         });
         expect(kept.dataUrl).toBe(jpeg);
         expect(kept.orient).toBe(6);

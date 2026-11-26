@@ -1,6 +1,6 @@
 import { test, expect, Page } from '@playwright/test';
 import { readFileSync } from 'node:fs';
-import { openApp } from './helpers.js';
+import { openApp, mergeCreateNewTree } from './helpers.js';
 
 /**
  * Images through GEDCOM, the way a user does it: a tree with a portrait, a
@@ -89,16 +89,11 @@ async function exportGedcom(page: Page): Promise<string> {
 
 async function importGedcom(page: Page, gedPath: string, name: string, withImages: boolean): Promise<void> {
     await page.locator('#gedcom-input').setInputFiles(gedPath);
-    const result = page.locator('#gedcom-result-modal');
+    const result = page.locator('#merge-modal');
     await expect(result).toBeVisible();
     const images = result.locator('#gedcom-import-images');
     if ((await images.isChecked()) !== withImages) await images.setChecked(withImages);
-    await result.locator('#gedcom-new-tree-btn').click();
-    const dialog = page.locator('#import-tree-modal');
-    await expect(dialog).toBeVisible();
-    await dialog.locator('#import-tree-name').fill(name);
-    await dialog.getByRole('button', { name: 'Import' }).click();
-    await expect(dialog).toBeHidden();
+    await mergeCreateNewTree(page, result, name);
 }
 
 /** The imported person (by name) with the images the open tree holds for it. */
@@ -108,7 +103,8 @@ async function readBack(page: Page, first: string, last: string) {
         const p = Object.values(data.persons).find(x => x.firstName === f && x.lastName === l)!;
         const sources = Object.values(data.sources ?? {});
         const src = sources.find(s => (p.sourceIds ?? []).includes(s.id));
-        return {
+        // The pictures whole: the tree holds a stored one as its pool reference (spec 135).
+        return window.Strom.Images.expandedData({
             photo: p.photo ?? null,
             photoName: p.photoOriginalName ?? null,
             // The portrait's own record (data v25): the same picture, apart from the attachments.
@@ -121,7 +117,7 @@ async function readBack(page: Page, first: string, last: string) {
                 title: src.title, reference: src.reference ?? null, transcript: src.transcript ?? null,
                 excerpts: (src.excerpts ?? []).map(e => ({ dataUrl: e.dataUrl, width: e.width, height: e.height })),
             } : null,
-        };
+        });
     }, [first, last] as const);
 }
 

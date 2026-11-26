@@ -5,17 +5,20 @@
 
 import { parseFlexDate, yearOf } from '../dates.js';
 import { PersonId, Person, Partnership, StromData } from '../types.js';
+import { sameImageSync } from '../image-equal.js';
 import { gendersCompatible } from '../model-values.js';
 import { sameSurname, withSurnameRules } from '../surnames.js';
-import { detectPartnershipConflicts, AUTO_CONFIRM_SCORE } from './executor.js';
-import { idEvidence, sameFileRecord, strongIdIndex, StrongIdIndex } from './id-match.js';
+import { detectPartnershipConflicts, AUTO_CONFIRM_SCORE, incomingAddedAsNew, existingTargetOf } from './executor.js';
+import { fileRecordKeys, idEvidence, sameFileRecord, strongIdIndex, StrongIdIndex } from './id-match.js';
 import {
     PersonMatch,
     MatchConfidence,
     MatchReason,
     FieldConflict,
     MergeState,
-    MergeStats
+    MergeStats,
+    MergeTarget,
+    MatchDecision
 } from './types.js';
 
 // ==================== ONE MATCHING PASS ====================
@@ -70,7 +73,19 @@ function memo2<V>(table: Map<string, Map<string, V>>, a: string, b: string, comp
  */
 export function inMatchPass<T>(trees: StromData[], fn: () => T): T {
     if (matchPass) return fn();
-    matchPass = { normalized: new Map(), similarity: new Map(), firstNames: new Map(), lastNames: new Map(), sameSurname: new Map(), bestLastNames: new Map(), signatures: new WeakMap(), firstNameBound: new Map(), strongIds: new Map() };
+    return runInPass(newMatchPass(), trees, fn);
+}
+
+function newMatchPass(): MatchPass {
+    return { normalized: new Map(), similarity: new Map(), firstNames: new Map(), lastNames: new Map(), sameSurname: new Map(), bestLastNames: new Map(), signatures: new WeakMap(), firstNameBound: new Map(), strongIds: new Map() };
+}
+
+/**
+ * Run `fn` in the given pass (a pass resumed part by part by findMatchesAsync
+ * keeps what it worked out; between the parts no pass runs).
+ */
+function runInPass<T>(pass: MatchPass, trees: StromData[], fn: () => T): T {
+    matchPass = pass;
     try {
         const run = trees.reduceRight<() => T>((inner, data) => () => withSurnameRules(data, inner), fn);
         return run();
@@ -549,19 +564,138 @@ export function findMatches(
     existingData: StromData,
     incomingData: StromData
 ): PersonMatch[] {
-    return inMatchPass([existingData, incomingData], () => findMatchesInPass(existingData, incomingData));
+    return inMatchPass([existingData, incomingData], () => {
+        const steps = findMatchesSteps(existingData, incomingData, { done: 0 });
+        for (;;) {
+            const step = steps.next();
+            if (step.done) return step.value;
+        }
+    });
 }
 
-function findMatchesInPass(
+/** How far a matching run is: work units done (each incoming person with a name counts twice, see findMatchesAsync). */
+interface MatchProgress {
+    done: number;
+}
+
+/** Options of findMatchesAsync. */
+export interface FindMatchesAsyncOptions {
+    /** Called between the parts: `done` of `total` work units (each incoming person with a name twice: the scored pass and the relaxed one). */
+    onProgress?: (done: number, total: number) => void;
+    /** Stops the run: the promise rejects with an AbortError, nothing of the caller changes. */
+    signal?: AbortSignal;
+    /** The most incoming persons compared in one part (a part also ends after about 40 ms). */
+    chunk?: number;
+}
+
+/** A part of an asynchronous matching run ends after this long, so the window keeps answering. */
+const MATCH_SLICE_MS = 40;
+
+function abortError(): Error {
+    try {
+        return new DOMException('The comparison was stopped', 'AbortError');
+    } catch {
+        const e = new Error('The comparison was stopped');
+        e.name = 'AbortError';
+        return e;
+    }
+}
+
+/**
+ * findMatches in parts (spec 134 K3.5): the same result, with the event loop
+ * free between the parts (a 10 000-person tree no longer freezes the window).
+ * `onProgress` reports work units; `signal` stops it (AbortError). The trees
+ * must not change while it runs.
+ */
+export async function findMatchesAsync(
     existingData: StromData,
-    incomingData: StromData
-): PersonMatch[] {
+    incomingData: StromData,
+    options: FindMatchesAsyncOptions = {}
+): Promise<PersonMatch[]> {
+    const { onProgress, signal, chunk = 250 } = options;
+    const total = 2 * Object.values(incomingData.persons).filter(p => !p.isPlaceholder).length;
+    const progress: MatchProgress = { done: 0 };
+    const pass = newMatchPass();
+    const trees = [existingData, incomingData];
+    const steps = findMatchesSteps(existingData, incomingData, progress);
+    try {
+        for (;;) {
+            if (signal?.aborted) throw abortError();
+            const started = Date.now();
+            const result = runInPass(pass, trees, () => {
+                for (let i = 0; i < Math.max(1, chunk); i++) {
+                    const step = steps.next();
+                    if (step.done) return step;
+                    if (Date.now() - started >= MATCH_SLICE_MS) break;
+                }
+                return null;
+            });
+            if (result) {
+                onProgress?.(total, total);
+                return result.value;
+            }
+            onProgress?.(Math.min(progress.done, total), total);
+            await new Promise<void>(resolve => setTimeout(resolve, 0));
+        }
+    } finally {
+        steps.return([]);
+    }
+}
+
+/**
+ * The pairs findMatches gives for two trees do not depend on any decision,
+ * so the comparison of a merge (step 1's, in parts) serves the later
+ * recalculations of the same merge (K3.3): a decision on a 10 000-person tree
+ * recalculates its undecided pairs without matching the trees again. Kept per
+ * merge state while it stands over the same two trees of the same size;
+ * handed out as copies (a pair's differences take answers).
+ */
+const matchMemo = new WeakMap<MergeState, { existing: StromData; incoming: StromData; size: string; matches: PersonMatch[] }>();
+
+function treesSize(existingData: StromData, incomingData: StromData): string {
+    const n = (d: StromData): string => `${Object.keys(d.persons).length}/${Object.keys(d.partnerships).length}`;
+    return `${n(existingData)}|${n(incomingData)}`;
+}
+
+function copyMatch(m: PersonMatch): PersonMatch {
+    return { ...m, reasons: [...m.reasons], conflicts: m.conflicts.map(c => ({ ...c })) };
+}
+
+/** The pairs of the merge's two trees, from its comparison when it stands over the same trees. */
+function matchesOf(state: MergeState): PersonMatch[] {
+    const memo = matchMemo.get(state);
+    if (memo && memo.existing === state.existingData && memo.incoming === state.incomingData
+        && memo.size === treesSize(state.existingData, state.incomingData)) {
+        return memo.matches.map(copyMatch);
+    }
+    const found = findMatches(state.existingData, state.incomingData);
+    rememberMatches(state, found);
+    return found;
+}
+
+function rememberMatches(state: MergeState, found: readonly PersonMatch[]): void {
+    matchMemo.set(state, {
+        existing: state.existingData, incoming: state.incomingData,
+        size: treesSize(state.existingData, state.incomingData), matches: found.map(copyMatch),
+    });
+}
+
+/** findMatches as steps: a step after each incoming person of the two scoring passes (the work of a pass runs in its caller's match pass). */
+function* findMatchesSteps(
+    existingData: StromData,
+    incomingData: StromData,
+    progress: MatchProgress
+): Generator<void, PersonMatch[], void> {
     const matches: PersonMatch[] = [];
     const usedExisting = new Set<PersonId>();
     const usedIncoming = new Set<PersonId>();
 
+    // Phase 0: the people an earlier merge of the same source brought or
+    // joined are those people again (K1.5), whatever their details score.
+    matches.push(...matchMergedBefore(existingData, incomingData, usedExisting, usedIncoming));
+
     // Phase 1: Find direct matches (high confidence first)
-    const directMatches = findDirectMatches(existingData, incomingData, usedExisting, usedIncoming);
+    const directMatches = yield* findDirectMatches(existingData, incomingData, usedExisting, usedIncoming, progress);
     matches.push(...directMatches);
 
     // Phase 2: Propagate from confirmed matches (partner/family suggestions).
@@ -612,9 +746,23 @@ function findMatchesInPass(
     // parent pairs with the "?" of that very family record in the tree.
     matches.push(...matchFamilyRecordStandIns(existingData, incomingData, matches, usedExisting, usedIncoming));
 
+    // Phase 2d (spec 134 K10.6): the partner of a joined person whose shared
+    // children are joined too is the tree's partner of those children, even
+    // under another surname (birth × after marriage) — offered, never joined
+    // by this alone. A weaker pair without that evidence gives way (its
+    // persons are free again for Phase 3); a pair found here seeds the
+    // propagation again.
+    const joined = new Map<PersonId, PersonId>();
+    for (const m of matches) if (m.score >= AUTO_CONFIRM_SCORE) joined.set(m.incomingId, m.existingId);
+    let familySeeds = applySharedChildrenSpouses(existingData, incomingData, joined, matches, usedExisting, usedIncoming, mayGiveWay);
+    for (let round = 0; round < maxRounds && familySeeds.length; round++) {
+        familySeeds = propagateFromMatches(existingData, incomingData, familySeeds, usedExisting, usedIncoming);
+        matches.push(...familySeeds);
+    }
+
     // Phase 3: Find remaining matches with lower threshold
-    const remainingMatches = findRemainingMatches(
-        existingData, incomingData, usedExisting, usedIncoming
+    const remainingMatches = yield* findRemainingMatches(
+        existingData, incomingData, usedExisting, usedIncoming, progress
     );
     matches.push(...remainingMatches);
 
@@ -679,12 +827,84 @@ function matchFamilyRecordStandIns(
 /**
  * Phase 1: Find direct matches using multiple strategies
  */
-function findDirectMatches(
+/** A person an earlier merge of the same source brought or joined (Phase 0). */
+const MERGED_BEFORE_SCORE = 100;
+
+/**
+ * Phase 0 (spec 134 K1.5, K0.7): the people an earlier merge of the same
+ * source brought into the tree or joined with its people. The tree's merge
+ * records name the source's id of each (MergeRecord.joined, .from; an added
+ * person without an entry kept its id): the incoming person of that id is
+ * the tree's person again — a name alone, or a pair added as new after
+ * step 2, would otherwise be offered to decide once more, and adding it as
+ * new would duplicate it. A file read again gives its people new ids: there
+ * the record's people pair by the record of the file they came from
+ * (program + xref) when the file is the same (its import's SHA-256 is the
+ * record's fingerprint). Only while both persons are there (an undone merge,
+ * a person removed since: no pair), the sex and the "?" agree; the latest
+ * merge first, each person pairs once.
+ */
+function matchMergedBefore(
     existingData: StromData,
     incomingData: StromData,
     usedExisting: Set<PersonId>,
-    usedIncoming: Set<PersonId>
+    usedIncoming: Set<PersonId>,
 ): PersonMatch[] {
+    const records = (existingData.merges ?? []).filter(r => r.state !== 'undone')
+        .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
+    if (records.length === 0) return [];
+    const out: PersonMatch[] = [];
+    const pair = (treeId: PersonId, incomingId: PersonId): void => {
+        if (usedExisting.has(treeId) || usedIncoming.has(incomingId)) return;
+        const existing = existingData.persons[treeId];
+        const incoming = incomingData.persons[incomingId];
+        if (!existing || !incoming || !!existing.isPlaceholder !== !!incoming.isPlaceholder) return;
+        if (!gendersCompatible(existing.gender, incoming.gender)) return;
+        out.push({
+            existingId: treeId,
+            incomingId,
+            confidence: scoreToConfidence(MERGED_BEFORE_SCORE),
+            reasons: ['merged_before'],
+            score: MERGED_BEFORE_SCORE,
+            existingPerson: existing,
+            incomingPerson: incoming,
+            conflicts: detectConflicts(existing, incoming),
+        });
+        usedExisting.add(treeId);
+        usedIncoming.add(incomingId);
+    };
+    const shas = new Set((incomingData.imports ?? []).map(r => r.sha).filter((sha): sha is string => !!sha));
+    let incomingKeys: Array<[PersonId, Set<string>]> | null = null;
+    for (const record of records) {
+        for (const [treeId, sourceId] of record.joined) pair(treeId, sourceId);
+        for (const treeId of record.added) pair(treeId, (record.from?.[treeId] ?? treeId) as PersonId);
+        if (!record.source.fingerprint || !shas.has(record.source.fingerprint)) continue;
+        const byKey = new Map<string, PersonId>();
+        for (const treeId of [...record.added, ...record.joined.map(([id]) => id)]) {
+            const person = existingData.persons[treeId];
+            if (!person || usedExisting.has(treeId)) continue;
+            for (const key of fileRecordKeys(person, existingData)) if (!byKey.has(key)) byKey.set(key, treeId);
+        }
+        if (byKey.size === 0) continue;
+        incomingKeys ??= Object.values(incomingData.persons).map(p => [p.id, fileRecordKeys(p, incomingData)]);
+        for (const [incomingId, keys] of incomingKeys) {
+            if (usedIncoming.has(incomingId)) continue;
+            for (const key of keys) {
+                const treeId = byKey.get(key);
+                if (treeId && !usedExisting.has(treeId)) { pair(treeId, incomingId); break; }
+            }
+        }
+    }
+    return out;
+}
+
+function* findDirectMatches(
+    existingData: StromData,
+    incomingData: StromData,
+    usedExisting: Set<PersonId>,
+    usedIncoming: Set<PersonId>,
+    progress: MatchProgress
+): Generator<void, PersonMatch[], void> {
     const matches: PersonMatch[] = [];
 
     // A strong id both files give a person decides first: a name match of
@@ -729,6 +949,8 @@ function findDirectMatches(
     // Process each incoming person
     for (const incoming of incomingPersons) {
         if (incoming.isPlaceholder) continue;
+        progress.done++;
+        yield;
         if (usedIncoming.has(incoming.id)) continue;
 
         const candidates: MatchCandidate[] = [];
@@ -945,6 +1167,181 @@ function propagateFromMatches(
     }
 
     return propagated;
+}
+
+/**
+ * The least score of a partner offered through shared joined children
+ * (spec 134 K10.6): 'medium', in Maybe the same; never above the
+ * auto-confirm bar (a person decides).
+ */
+const SHARED_CHILDREN_SPOUSE_SCORE = 60;
+/** What shared joined children add to the pair's own score. */
+const SHARED_CHILDREN_BONUS = 20;
+
+/** A pair of a weaker kind than shared joined children: it gives way to them (Phase 2d). */
+function mayGiveWay(m: PersonMatch): boolean {
+    return m.score < AUTO_CONFIRM_SCORE && !m.reasons.includes('id') && !m.reasons.includes('merged_before')
+        && !m.reasons.includes('partner_shared_children') && !m.reasons.includes('manual');
+}
+
+/**
+ * The surname one of a couple carries is the other's (Modřínová of a
+ * Modřín): the surname after marriage, whatever field holds it.
+ */
+function surnameOfPartner(person: Person, partner: Person, data: StromData): boolean {
+    const own = [person.lastName, person.marriedSurname ?? ''].filter(Boolean);
+    return !!partner.lastName && own.some(s => sameSurnameIn(s, partner.lastName, data) || normalizeName(s) === normalizeName(partner.lastName));
+}
+
+/** A tree's person and an import's person a K10.6 pairing proposes, with the number of shared joined children. */
+interface SharedChildrenSpouse {
+    existing: Person;
+    incoming: Person;
+    children: number;
+}
+
+/**
+ * The partners the shared children of joined persons name (spec 134 K10.6).
+ * For every joined person of the import, each of their children that is
+ * joined to a child of the joined counterpart names the child's other parent
+ * on both sides: the import's parent and the tree's. An import's person
+ * named so is proposed with the tree's person the most such children name
+ * (a tie between two of the tree: none), when neither is joined already,
+ * neither is a "?", their sex may be the same and their given names agree
+ * (one of the given names the same, or one given name the start of the
+ * other: an initial or a short form). A given name agreeing only as a start
+ * also needs the surnames to agree: alike, or one of them the surname of the
+ * person's partner there (the surname after marriage against the birth one).
+ * A person of the tree proposed for two of the import: the one with more
+ * children, a tie: none. Only the partners of joined persons are visited.
+ */
+function sharedChildrenSpouses(
+    existingData: StromData,
+    incomingData: StromData,
+    joined: ReadonlyMap<PersonId, PersonId>
+): SharedChildrenSpouse[] {
+    const joinedTargets = new Set(joined.values());
+    const named = new Map<PersonId, Map<PersonId, number>>();
+    /** The import's partner of each proposed person, for the surname check (one joined parent the pair shares). */
+    const partnersOf = new Map<string, [Person, Person]>();
+    for (const [incomingId, existingId] of joined) {
+        const incomingParent = incomingData.persons[incomingId];
+        const existingParent = existingData.persons[existingId];
+        if (!incomingParent || !existingParent) continue;
+        for (const childId of incomingParent.childIds) {
+            const existingChildId = joined.get(childId);
+            const child = incomingData.persons[childId];
+            const existingChild = existingChildId ? existingData.persons[existingChildId] : undefined;
+            if (!child || !existingChild || !existingChild.parentIds.includes(existingParent.id)) continue;
+            const incomingOthers = child.parentIds.filter(id => id !== incomingId);
+            const existingOthers = existingChild.parentIds.filter(id => id !== existingParent.id);
+            if (incomingOthers.length !== 1 || existingOthers.length !== 1) continue;
+            const [incomingOther] = incomingOthers;
+            const [existingOther] = existingOthers;
+            if (joined.has(incomingOther) || joinedTargets.has(existingOther)) continue;
+            let counts = named.get(incomingOther);
+            if (!counts) named.set(incomingOther, counts = new Map());
+            counts.set(existingOther, (counts.get(existingOther) ?? 0) + 1);
+            partnersOf.set(`${incomingOther}\u0000${existingOther}`, [incomingParent, existingParent]);
+        }
+    }
+    const proposals: SharedChildrenSpouse[] = [];
+    for (const [incomingId, counts] of named) {
+        let best: PersonId | null = null;
+        let bestCount = 0;
+        let tie = false;
+        for (const [existingId, n] of counts) {
+            if (n > bestCount) { best = existingId; bestCount = n; tie = false; }
+            else if (n === bestCount) tie = true;
+        }
+        if (!best || tie) continue;
+        const incoming = incomingData.persons[incomingId];
+        const existing = existingData.persons[best];
+        if (!incoming || !existing || incoming.isPlaceholder || existing.isPlaceholder) continue;
+        if (!gendersCompatible(existing.gender, incoming.gender)) continue;
+        const given = firstNamesMatch(existing.firstName, incoming.firstName);
+        if (!given.exact && !given.firstWord && !given.anyWord) {
+            if (!given.prefix) continue;
+            const [incomingPartner, existingPartner] = partnersOf.get(`${incomingId}\u0000${best}`)!;
+            const surnamesAgree = bestLastNameMatch(existing, incoming, existingData, incomingData).similar
+                || surnameOfPartner(existing, existingPartner, existingData)
+                || surnameOfPartner(incoming, incomingPartner, incomingData);
+            if (!surnamesAgree) continue;
+        }
+        proposals.push({ existing, incoming, children: bestCount });
+    }
+    // One person of the tree for one person of the import.
+    const byExisting = new Map<PersonId, SharedChildrenSpouse[]>();
+    for (const p of proposals) {
+        const list = byExisting.get(p.existing.id);
+        if (list) list.push(p); else byExisting.set(p.existing.id, [p]);
+    }
+    const out: SharedChildrenSpouse[] = [];
+    for (const list of byExisting.values()) {
+        list.sort((a, b) => b.children - a.children);
+        if (list.length > 1 && list[0].children === list[1].children) continue;
+        out.push(list[0]);
+    }
+    return out;
+}
+
+/**
+ * Phase 2d (spec 134 K10.6): the pairs sharedChildrenSpouses proposes, put
+ * into `matches`. A pair already there gets the reason in front and at least
+ * the offer's score (below the auto-confirm bar). Otherwise a pair of either
+ * person that `mayGiveWay` lets go leaves `matches` (its other person is free
+ * again); a pair it does not let go keeps the proposal out. Returns the new
+ * pairs.
+ */
+function applySharedChildrenSpouses(
+    existingData: StromData,
+    incomingData: StromData,
+    joined: ReadonlyMap<PersonId, PersonId>,
+    matches: PersonMatch[],
+    usedExisting: Set<PersonId>,
+    usedIncoming: Set<PersonId>,
+    giveWay: (m: PersonMatch) => boolean
+): PersonMatch[] {
+    const proposals = sharedChildrenSpouses(existingData, incomingData, joined);
+    if (proposals.length === 0) return [];
+    const added: PersonMatch[] = [];
+    for (const { existing, incoming } of proposals) {
+        const ofIncoming = matches.find(m => m.incomingId === incoming.id);
+        const ofExisting = matches.find(m => m.existingId === existing.id);
+        if (ofIncoming && ofIncoming === ofExisting) {
+            if (ofIncoming.score >= AUTO_CONFIRM_SCORE || !giveWay(ofIncoming)) continue;
+            ofIncoming.reasons = ['partner_shared_children', ...ofIncoming.reasons.filter(r => r !== 'partner_of_matched')];
+            ofIncoming.score = Math.min(Math.max(ofIncoming.score, SHARED_CHILDREN_SPOUSE_SCORE), offerOnlyCap());
+            ofIncoming.confidence = scoreToConfidence(ofIncoming.score);
+            continue;
+        }
+        if ((ofIncoming && !giveWay(ofIncoming)) || (ofExisting && !giveWay(ofExisting))) continue;
+        if (!ofIncoming && usedIncoming.has(incoming.id)) continue;
+        if (!ofExisting && usedExisting.has(existing.id)) continue;
+        for (const m of [ofIncoming, ofExisting]) {
+            if (!m) continue;
+            matches.splice(matches.indexOf(m), 1);
+            usedIncoming.delete(m.incomingId);
+            usedExisting.delete(m.existingId);
+        }
+        const base = calculateMatchScore(existing, incoming, existingData, incomingData);
+        const score = Math.min(Math.max(base.score + SHARED_CHILDREN_BONUS, SHARED_CHILDREN_SPOUSE_SCORE), offerOnlyCap());
+        const match: PersonMatch = {
+            existingId: existing.id,
+            incomingId: incoming.id,
+            confidence: scoreToConfidence(score),
+            reasons: ['partner_shared_children', ...base.reasons.filter(r => r !== 'partner_of_matched')],
+            score,
+            existingPerson: existing,
+            incomingPerson: incoming,
+            conflicts: detectConflicts(existing, incoming)
+        };
+        matches.push(match);
+        added.push(match);
+        usedExisting.add(existing.id);
+        usedIncoming.add(incoming.id);
+    }
+    return added;
 }
 
 /**
@@ -1203,18 +1600,21 @@ function matchUnknownNamedRelatives(
 /**
  * Phase 3: Find remaining matches with more relaxed criteria
  */
-function findRemainingMatches(
+function* findRemainingMatches(
     existingData: StromData,
     incomingData: StromData,
     usedExisting: Set<PersonId>,
-    usedIncoming: Set<PersonId>
-): PersonMatch[] {
+    usedIncoming: Set<PersonId>,
+    progress: MatchProgress
+): Generator<void, PersonMatch[], void> {
     const matches: PersonMatch[] = [];
     const existingPersons = Object.values(existingData.persons);
 
     for (const incoming of Object.values(incomingData.persons)) {
         if (incoming.isPlaceholder) continue;
+        progress.done++;
         if (usedIncoming.has(incoming.id)) continue;
+        yield;
 
         const candidates: MatchCandidate[] = [];
 
@@ -1309,10 +1709,13 @@ function calculateMatchScore(
     // Full name similarity for traditional matching
     const fullNameSimilarity = (firstNameSimilarity + lastNameMatch.similarity) / 2;
 
-    // Calculate name score with improved strategies
-    if (fullNameSimilarity >= 0.95) {
+    // Calculate name score with improved strategies. A reason names only
+    // what both records give (134 N3): an exact name is "exact name" until
+    // the birth dates say more below.
+    const exactName = fullNameSimilarity >= 0.95;
+    if (exactName) {
         score += 40;
-        reasons.push('exact_name_gender_birthdate');
+        reasons.push('exact_name');
     } else if (fullNameSimilarity >= 0.85) {
         score += 32;
     } else if (fullNameSimilarity >= 0.7) {
@@ -1361,15 +1764,18 @@ function calculateMatchScore(
         // different people with the same name are vanishingly rare. Promote
         // straight to the high-confidence band (name 40 + date 35 = 75 would
         // otherwise land in 'medium' and demand a manual look every time).
-        if (fullNameSimilarity >= 0.95 && existing.birthDate!.length >= 10) {
+        if (exactName && existing.birthDate!.length >= 10) {
             score = Math.max(score, 85);
         }
-        if (!reasons.includes('exact_name_gender_birthdate')) {
-            reasons.push('exact_name_gender_birthdate');
-        }
+        // Both give the birth date (a year alone: the birth year) — with an
+        // exact name, "exact name and birth date".
+        const fullDate = parseFlexDate(existing.birthDate)?.day !== undefined;
+        if (exactName) reasons[reasons.indexOf('exact_name')] = fullDate ? 'exact_name_gender_birthdate' : 'name_gender_birthyear';
+        else reasons.push('name_gender_birthyear');
     } else if (yearsMatch(existing.birthDate, incoming.birthDate)) {
         score += 22;
-        reasons.push('name_gender_birthyear');
+        if (exactName) reasons[reasons.indexOf('exact_name')] = 'name_gender_birthyear';
+        else reasons.push('name_gender_birthyear');
     } else if (yearsClose(existing.birthDate, incoming.birthDate, 2)) {
         // Birth year within 2 years - could be uncertainty in records
         score += 12;
@@ -1647,8 +2053,8 @@ function calculatePartnerMatchScore(
  * Detect conflicting fields between two persons
  */
 /**
- * Suggest which side of a conflict is objectively MORE INFORMATIVE, so the
- * default resolution is not a blind keep-existing:
+ * Suggest which side of a conflict is objectively MORE INFORMATIVE — a hint
+ * the conflict dialog shows, never the default (the default keeps existing):
  * - dates: same year, but one side has more precision (day > month > year) or
  *   no ~/</> qualifier — prefer it; contradicting components stay for a human;
  * - names/places: one normalized value contains the other ("Praha" vs
@@ -1718,14 +2124,18 @@ export function detectConflicts(existing: Person, incoming: Person): FieldConfli
         if (field === 'gender' && (existingValue === 'unknown' || incomingValue === 'unknown')) continue;
 
         // Conflict if both have values and they differ
-        if (existingValue && incomingValue && existingValue !== incomingValue) {
+        // A portrait the same picture in either form (the tree's pooled reference, the file's data URL) is no difference.
+        const differs = field === 'photo' ? !sameImageSync(existingValue, incomingValue) : existingValue !== incomingValue;
+        if (existingValue && incomingValue && differs) {
+            // The suggestion is a hint only: an undecided difference keeps the
+            // existing value (spec 134 K0.3).
             const suggestion = suggestResolution(field, existingValue, incomingValue);
             conflicts.push({
                 field,
                 existingValue,
                 incomingValue,
-                resolution: suggestion.resolution,
-                ...(suggestion.reason ? { suggestedReason: suggestion.reason } : {})
+                resolution: 'keep_existing',
+                ...(suggestion.reason ? { suggestedReason: suggestion.reason, suggested: suggestion.resolution } : {})
             });
         }
         // Not a conflict if only one has value (can be merged)
@@ -1950,13 +2360,16 @@ export function quickMatchScore(p1: Person, p2: Person, data1?: StromData, data2
 // ==================== MERGE STATE HELPERS ====================
 
 /**
- * Create initial merge state from data
+ * Create initial merge state from data. With `match: false` nobody is
+ * compared yet (the guide's step 1, spec 134 §3): the comparison runs when
+ * it is asked for (`rebaseMergeState` over the chosen target).
  */
 export function createMergeState(
     existingData: StromData,
-    incomingData: StromData
+    incomingData: StromData,
+    opts: { match?: boolean } = {},
 ): MergeState {
-    const matches = findMatches(existingData, incomingData);
+    const matches = opts.match === false ? [] : findMatches(existingData, incomingData);
 
     // Find unmatched persons
     const matchedExisting = new Set(matches.map(m => m.existingId));
@@ -2004,20 +2417,10 @@ export function calculateMergeStats(state: MergeState): MergeStats {
         if (decision.type === 'skip') skipped++;
     }
 
-    // Truthful "will add N new persons" count. updateOnly adds nothing; per-match
-    // skip and manual matches never add. An unmatched person with no decision is
-    // added as new; a rejected match ("not the same person") is added as new.
-    let willAdd = 0;
-    if (!state.updateOnly) {
-        for (const id of state.unmatchedIncoming) {
-            const decision = state.decisions.get(id);
-            // A rejected match lands here after reanalyzeMatches: still added.
-            if (!decision || decision.type === 'reject') willAdd++;
-        }
-        for (const match of state.matches) {
-            if (state.decisions.get(match.incomingId)?.type === 'reject') willAdd++;
-        }
-    }
+    // Truthful "will add N new persons" count: exactly whom the executor adds
+    // (updateOnly adds nothing; skip and manual matches never add; a rejected
+    // match and an undecided one below the auto-confirm score are added).
+    const willAdd = incomingAddedAsNew(state).length;
 
     return {
         total: Object.keys(state.incomingData.persons).length,
@@ -2040,7 +2443,7 @@ export function calculateMergeStats(state: MergeState): MergeStats {
 export function updateMatchDecision(
     state: MergeState,
     incomingId: PersonId,
-    decision: 'confirm' | 'reject' | 'skip' | { type: 'manual_match'; targetId: PersonId }
+    decision: 'confirm' | 'reject' | 'skip' | Extract<MatchDecision, { type: 'manual_match' }>
 ): void {
     if (typeof decision === 'string') {
         state.decisions.set(incomingId, { type: decision });
@@ -2074,7 +2477,9 @@ export function updateConflictResolution(
  * Re-analyze matches after user changes
  * Preserves manual matches and propagates from them
  */
-export function reanalyzeMatches(state: MergeState): void {
+export function reanalyzeMatches(state: MergeState, found?: readonly PersonMatch[]): void {
+    // The pairs of a comparison just made (findMatchesAsync over these trees): kept for the merge's recalculations.
+    if (found) rememberMatches(state, found);
     // Get rejected and confirmed matches
     const rejectedIncoming = new Set<PersonId>();
     const manualMatches: PersonMatch[] = [];
@@ -2124,7 +2529,7 @@ export function reanalyzeMatches(state: MergeState): void {
     }
 
     // Find new automatic matches
-    const autoMatches = findMatches(state.existingData, state.incomingData)
+    const autoMatches = matchesOf(state)
         .filter(m => !rejectedIncoming.has(m.incomingId))
         .filter(m => !usedExisting.has(m.existingId))
         .filter(m => !usedIncoming.has(m.incomingId));
@@ -2142,6 +2547,20 @@ export function reanalyzeMatches(state: MergeState): void {
         }
     }
 
+    // A partner of persons joined now (confirmed, picked by hand or joined
+    // by the comparison) through shared joined children (spec 134 K10.6):
+    // an undecided pair gives way as in the comparison; a decided one and a
+    // person told "not the same" stay as they are.
+    const joinedNow = new Map<PersonId, PersonId>();
+    for (const m of uniqueMatches) {
+        const decided = state.decisions.get(m.incomingId)?.type;
+        if (decided === 'manual_match' || decided === 'confirm' || m.score >= AUTO_CONFIRM_SCORE) joinedNow.set(m.incomingId, m.existingId);
+    }
+    const takenExisting = new Set(uniqueMatches.map(m => m.existingId));
+    const takenIncoming = new Set([...uniqueMatches.map(m => m.incomingId), ...rejectedIncoming]);
+    applySharedChildrenSpouses(state.existingData, state.incomingData, joinedNow, uniqueMatches, takenExisting, takenIncoming,
+        m => !state.decisions.has(m.incomingId) && mayGiveWay(m));
+
     // Update state
     state.matches = uniqueMatches;
 
@@ -2153,6 +2572,248 @@ export function reanalyzeMatches(state: MergeState): void {
         .filter(id => !matchedIncoming.has(id as PersonId))
         .filter(id => !state.incomingData.persons[id as PersonId].isPlaceholder)
         .map(id => id as PersonId);
+}
+
+/**
+ * The merge over the target tree as it is now (spec 134 K0.6: a saved merge
+ * resumed after the tree changed). The matching runs again over `target`;
+ * the answers stay where their people still exist: not the same / leave out
+ * always, a match confirmed or picked by hand when its person of the tree is
+ * still there, an answered difference when both values are still the same.
+ * The given state is not changed.
+ */
+export function rebaseMergeState(state: MergeState, target: StromData, targetOf?: MergeTarget, found?: readonly PersonMatch[]): MergeState {
+    const decisions = new Map<PersonId, MatchDecision>();
+    const confirmed: PersonMatch[] = [];
+    for (const [incomingId, decision] of state.decisions) {
+        if (!state.incomingData.persons[incomingId]) continue;
+        if (decision.type === 'manual_match' && !target.persons[decision.targetId]) continue;
+        if (decision.type === 'confirm') {
+            const match = state.matches.find(m => m.incomingId === incomingId);
+            const existing = match ? target.persons[match.existingId] : undefined;
+            if (!match || !existing) continue;
+            confirmed.push({ ...match, existingPerson: existing, conflicts: detectConflicts(existing, match.incomingPerson) });
+        }
+        decisions.set(incomingId, decision);
+    }
+    const rebased: MergeState = {
+        ...state,
+        existingData: target,
+        matches: confirmed,
+        decisions,
+        conflictResolutions: new Map(),
+        partnershipResolutions: new Map(state.partnershipResolutions ?? []),
+        ...(targetOf ? { target: targetOf } : {}),
+    };
+    reanalyzeMatches(rebased, found);
+    const matched = new Set(rebased.matches.map(m => m.existingId));
+    rebased.unmatchedExisting = (Object.keys(target.persons) as PersonId[]).filter(id => !matched.has(id));
+    // An answered difference keeps its answer while both of its values are the same.
+    for (const match of rebased.matches) {
+        const answered = state.conflictResolutions.get(match.incomingId);
+        if (!answered) continue;
+        let kept = false;
+        for (const conflict of match.conflicts) {
+            const was = answered.find(c => c.field === conflict.field
+                && c.existingValue === conflict.existingValue && c.incomingValue === conflict.incomingValue);
+            if (!was) continue;
+            conflict.resolution = was.resolution;
+            if (was.resolvedValue !== undefined) conflict.resolvedValue = was.resolvedValue;
+            kept = true;
+        }
+        if (kept) rebased.conflictResolutions.set(match.incomingId, match.conflicts);
+    }
+    return rebased;
+}
+
+// ==================== WHO IS WHO (spec 134 §4) ====================
+
+/**
+ * After a decision, the undecided pairs again (spec 134 K3.3) over
+ * reanalyzeMatches: a decided person never changes — its pair stays as it
+ * was (a person left out or told "not the same" keeps the pair it was
+ * offered). `changed` = the undecided incoming persons whose offer changed
+ * (another person of the tree, another score, an offer gained or lost).
+ */
+export function recalcUndecided(state: MergeState, decidedId: PersonId): { changed: PersonId[] } {
+    const offerOf = (m: PersonMatch | undefined): string => m ? `${m.existingId}\u0000${m.score}` : '';
+    const before = new Map(state.matches.map(m => [m.incomingId, m] as const));
+    reanalyzeMatches(state);
+    const again = new Map(state.matches.map(m => [m.incomingId, m] as const));
+    // Decided persons keep their pairs as they were; the person just decided
+    // with a person of the tree picked by hand ("Another person…", another
+    // candidate) gets that pair.
+    const decidedPairs: PersonMatch[] = [];
+    for (const [id, d] of state.decisions) {
+        let was = before.get(id);
+        if (id === decidedId && d.type === 'manual_match' && was?.existingId !== d.targetId) was = again.get(id) ?? was;
+        if (was) decidedPairs.push(was);
+    }
+    const undecided = state.matches.filter(m => !state.decisions.has(m.incomingId));
+    state.matches = [...decidedPairs, ...undecided];
+    const matched = new Set(state.matches.map(m => m.incomingId));
+    state.unmatchedIncoming = (Object.keys(state.incomingData.persons) as PersonId[])
+        .filter(id => !matched.has(id) && !state.incomingData.persons[id].isPlaceholder);
+    const after = new Map(state.matches.map(m => [m.incomingId, m] as const));
+    const changed: PersonId[] = [];
+    for (const id of new Set([...before.keys(), ...after.keys()])) {
+        if (id === decidedId || state.decisions.has(id)) continue;
+        if (offerOf(before.get(id)) !== offerOf(after.get(id))) changed.push(id);
+    }
+    return { changed };
+}
+
+/** Why a candidate is not offered first (spec 134 K3.3): another generation, or a death before a child's birth. */
+export interface TimeConflict {
+    reason: 'generation' | 'deathBeforeChild';
+}
+
+/** Birth years further apart than this are more than one generation. */
+const GENERATION_GAP_YEARS = 50;
+
+/** The generation of `to` minus that of `from` in one tree (parents −1, children +1), within a few steps; null when not related so. */
+function generationOffset(data: StromData, from: PersonId, to: PersonId, maxSteps = 8): number | null {
+    if (from === to) return 0;
+    const seen = new Map<PersonId, number>([[from, 0]]);
+    let frontier: PersonId[] = [from];
+    for (let step = 0; step < maxSteps && frontier.length; step++) {
+        const next: PersonId[] = [];
+        for (const id of frontier) {
+            const p = data.persons[id];
+            if (!p) continue;
+            const gen = seen.get(id)!;
+            const around: Array<[PersonId, number]> = [
+                ...p.parentIds.map(x => [x, gen - 1] as [PersonId, number]),
+                ...p.childIds.map(x => [x, gen + 1] as [PersonId, number]),
+                ...p.partnerships.map(u => data.partnerships[u]).filter(u => !!u)
+                    .map(u => [u.person1Id === id ? u.person2Id : u.person1Id, gen] as [PersonId, number]),
+            ];
+            for (const [other, g] of around) {
+                if (seen.has(other)) continue;
+                if (other === to) return g;
+                seen.set(other, g);
+                next.push(other);
+            }
+        }
+        frontier = next;
+    }
+    return null;
+}
+
+/**
+ * Whether the tree's person `existing` cannot be the import's `incoming` by
+ * time (spec 134 K3.3): more than a generation apart (by the relatives the
+ * import's person has that are already joined, or by birth years more than
+ * 50 years apart), or one of them died before a child of the other was born
+ * while the other's own record has that parent alive then.
+ * Null when nothing speaks against it.
+ */
+export function timeConflict(existing: Person, incoming: Person, state: MergeState): TimeConflict | null {
+    const tree = state.existingData;
+    const file = state.incomingData;
+    // A joined relative says in which generation of the tree the person is.
+    const relatives: Array<[PersonId, number]> = [
+        ...incoming.parentIds.map(id => [id, 1] as [PersonId, number]),
+        ...incoming.childIds.map(id => [id, -1] as [PersonId, number]),
+        ...incoming.partnerships.map(u => file.partnerships[u]).filter(u => !!u)
+            .map(u => [u.person1Id === incoming.id ? u.person2Id : u.person1Id, 0] as [PersonId, number]),
+    ];
+    for (const [relId, expected] of relatives) {
+        const at = existingTargetOf(state, relId);
+        if (!at || at === existing.id) continue;
+        const off = generationOffset(tree, at, existing.id);
+        if (off !== null && Math.abs(off - expected) > 1) return { reason: 'generation' };
+    }
+    const born = [birthOrBaptismYear(existing), birthOrBaptismYear(incoming)];
+    if (born[0] !== null && born[1] !== null && Math.abs(born[0] - born[1]) > GENERATION_GAP_YEARS) return { reason: 'generation' };
+    // Died before a child of the other was born (a father up to a year
+    // before). Only a contradiction between the two counts: when the
+    // child's own parent died as early in its own file (or the tree already
+    // has that child under this person), the records agree with each other.
+    const late = (died: number | null, born: number | null): boolean => died !== null && born !== null && born > died + 1;
+    const diedBeforeChild = (person: Person, other: Person, data: StromData, skip: (child: PersonId) => boolean): boolean => {
+        const died = yearOf(person.deathDate);
+        if (died === null) return false;
+        const otherDied = yearOf(other.deathDate);
+        return other.childIds.some(id => {
+            const child = data.persons[id];
+            const childBorn = child ? birthOrBaptismYear(child) : null;
+            return late(died, childBorn) && !late(otherDied, childBorn) && !skip(id);
+        });
+    };
+    const knownChild = (id: PersonId): boolean => {
+        const at = existingTargetOf(state, id);
+        return !!at && existing.childIds.includes(at);
+    };
+    if (diedBeforeChild(existing, incoming, file, knownChild) || diedBeforeChild(incoming, existing, tree, () => false)) {
+        return { reason: 'deathBeforeChild' };
+    }
+    return null;
+}
+
+/** A person of the tree offered for an incoming person (spec 134 §4, rámec 4b). */
+export interface MatchCandidateInfo {
+    existingId: PersonId;
+    score: number;
+    reasons: MatchReason[];
+    /** How many of the incoming person's relatives are joined with this candidate's relatives of the same kind. */
+    relativesJoined: number;
+    /** Set when the candidate is not offered first: another period. */
+    timeConflict: TimeConflict | null;
+}
+
+/**
+ * The tree's persons that could be the incoming person, best first, at most
+ * `max`: a candidate whose relatives are joined with the import person's
+ * relatives comes first, one that does not fit the time (timeConflict) never
+ * comes first, otherwise by score. Persons of the tree another incoming
+ * person is joined with are not offered.
+ */
+export function candidatesFor(incomingId: PersonId, state: MergeState, max = 3): MatchCandidateInfo[] {
+    const incoming = state.incomingData.persons[incomingId];
+    if (!incoming) return [];
+    const tree = state.existingData;
+    const file = state.incomingData;
+    const taken = new Set<PersonId>();
+    for (const m of state.matches) {
+        if (m.incomingId === incomingId) continue;
+        const at = existingTargetOf(state, m.incomingId);
+        if (at) taken.add(at);
+    }
+    for (const [id, d] of state.decisions) if (id !== incomingId && d.type === 'manual_match') taken.add(d.targetId);
+    // The incoming person's relatives where they are joined in the tree, by kind.
+    const joined = (ids: readonly PersonId[]): Set<PersonId> =>
+        new Set(ids.map(id => existingTargetOf(state, id)).filter((id): id is PersonId => !!id));
+    const partnersOf = (p: Person, data: StromData): PersonId[] => p.partnerships.map(u => data.partnerships[u]).filter(u => !!u)
+        .map(u => u.person1Id === p.id ? u.person2Id : u.person1Id);
+    const parentsIn = joined(incoming.parentIds);
+    const childrenIn = joined(incoming.childIds);
+    const partnersIn = joined(partnersOf(incoming, file));
+    const out: MatchCandidateInfo[] = [];
+    inMatchPass([tree, file], () => {
+        for (const existing of Object.values(tree.persons)) {
+            if (existing.isPlaceholder !== incoming.isPlaceholder && (existing.isPlaceholder || incoming.isPlaceholder)) continue;
+            if (taken.has(existing.id)) continue;
+            const result = calculateMatchScore(existing, incoming, tree, file);
+            const current = state.matches.find(m => m.incomingId === incomingId && m.existingId === existing.id);
+            if (result.score < 35 && !current) continue;
+            const relativesJoined = existing.parentIds.filter(id => parentsIn.has(id)).length
+                + existing.childIds.filter(id => childrenIn.has(id)).length
+                + partnersOf(existing, tree).filter(id => partnersIn.has(id)).length;
+            out.push({
+                existingId: existing.id,
+                score: current ? Math.max(current.score, result.score) : result.score,
+                reasons: current?.reasons ?? result.reasons,
+                relativesJoined,
+                timeConflict: timeConflict(existing, incoming, state),
+            });
+        }
+    });
+    out.sort((a, b) => (a.timeConflict ? 1 : 0) - (b.timeConflict ? 1 : 0)
+        || (b.relativesJoined > 0 ? 1 : 0) - (a.relativesJoined > 0 ? 1 : 0)
+        || b.score - a.score
+        || b.relativesJoined - a.relativesJoined);
+    return out.slice(0, Math.max(0, max));
 }
 
 // ==================== DUPLICATE SUGGESTIONS ====================

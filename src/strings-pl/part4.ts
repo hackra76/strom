@@ -53,6 +53,7 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         photoRecrop: 'Edytuj kadr',
         maidenName: 'Nazwisko rodowe',
         refn: 'Numer referencyjny',
+        emails: 'E-mail',
         question: 'Otwarte pytanie',
         // Partnership dates - used based on status
         startDateMarried: 'Data ślubu',
@@ -93,6 +94,7 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         lastName: 'Nazwisko',
         maidenName: 'Nazwisko z urodzenia',
         refn: 'np. karton archiwalny 12 lub id z innego programu',
+        emails: 'np. imie@example.org, kolejne oddzielone przecinkami',
         question: 'np. czy ktoś wie, kiedy się urodziła?',
         flexDateShort: 'np. 1880',
         flexDate: '15.5.1880 · 5.1880 · 1880 · ok. 1880'
@@ -137,6 +139,7 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         archives: 'Szukaj w archiwach…',
         toList: 'Dodaj do listy',
         newListWith: 'Nowa lista z tą osobą…',
+        listFromFamily: 'Lista z rodziny tej osoby…',
         newListWithMany: 'Nowa lista z tymi osobami…',
         autoListsNote: 'Listy automatyczne wypełniają się same według reguły.',
         moreLists: 'Więcej list…',
@@ -796,7 +799,7 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         contentPlacesEx: '* 22.11.1888 Kessenau',
         contentNamesEx: 'Wenzel Quellmayer',
         portraits: 'Portrety',
-        portraitsSub: 'W środku, u rodziców i dziadków',
+        portraitsSub: 'Przodkowie i potomkowie tam, gdzie jest miejsce; przybliżenie pokaże kolejne',
         portraitsLoading: (k: number, n: number) => `Wczytywanie portretów (${k} / ${n})`,
         portraitsNone: 'Nikt w wachlarzu nie ma jeszcze portretu.',
         lookDiffers: 'Różni się od domyślnego wyglądu.',
@@ -899,6 +902,7 @@ export const plPart4: Pick<StringsType, 'csv' | 'zoomControls' | 'labels' | 'too
         sumScans: (n: number) => nPl(n, 'skan', 'skany', 'skanów'),
         sumPhoto: 'zdjęcie',
         sumNote: 'notatka',
+        sumEmail: 'e-mail',
         sumNone: 'puste',
     },
 

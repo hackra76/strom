@@ -73,6 +73,7 @@ import { relationshipsPanelMethods } from './relationships-panel.js';
 import { searchMethods } from './search.js';
 import { importExportMethods, type AfterImportOptions } from './import-export.js';
 import { mergeUiMethods } from './merge-ui.js';
+import { mergeHistoryMethods } from './merge-history-ui.js';
 import { encryptionUiMethods } from './encryption-ui.js';
 import { treeStatsMethods } from './tree-stats.js';
 import { treeManagementMethods } from './tree-management.js';
@@ -93,6 +94,7 @@ import { hypothesisWaitingMethods } from './hypothesis-waiting-ui.js';
 import { conflictPanelMethods } from './conflict-panel-ui.js';
 import { researchAdoptMethods } from './research-adopt-ui.js';
 import { researchInstallMethods } from './research-install-ui.js';
+import { researchDetachedMethods } from './research-detached-ui.js';
 import { materialMethods } from './material-ui.js';
 import { materialsMethods } from './materials-ui.js';
 import { materialsWindowMethods } from './materials-window.js';
@@ -110,6 +112,15 @@ import { researchUpdateMethods } from './research-update-ui.js';
 import { researchChangesMethods } from './research-changes-ui.js';
 import { batchMethods } from './batch-ui.js';
 import { phoneMethods } from './phone-ui.js';
+import { deviceStartMethods } from './device-start-ui.js';
+import { deviceConnMethods } from './device-conn-ui.js';
+import { devicePhotosMethods } from './device-photos-ui.js';
+import { deviceModeMethods } from './device-mode-ui.js';
+import { phoneResearchMethods } from './phone-research-ui.js';
+import { deviceAgentMethods } from './device-agent-ui.js';
+import { deviceOfflineMethods } from './device-offline-ui.js';
+import { deviceProgressMethods } from './device-progress-ui.js';
+import { deviceDecideMethods } from './device-decide-ui.js';
 import { readDocumentMethods } from './read-document-ui.js';
 import { readProposeMethods } from './read-propose-ui.js';
 import { researchImagesMethods } from './research-images-ui.js';
@@ -123,8 +134,10 @@ import { mapScopeMethods } from './map-scope-ui.js';
 import { scopeSegMethods } from './scope-seg-ui.js';
 import { timelineScopeMethods } from './timeline-scope-ui.js';
 import { treeOverviewMethods } from './tree-overview.js';
+import { statsWindowMethods } from './tree-stats-ui.js';
 import { personListsMethods } from './person-lists-ui.js';
 import { personListNewMethods } from './person-list-new-ui.js';
+import { personListRuleMethods } from './person-list-rule-ui.js';
 import { personListAddMethods } from './person-list-add.js';
 import { cardSignalsUiMethods } from './card-signals-ui.js';
 import { researchOverviewMethods } from './research-overview-ui.js';
@@ -174,6 +187,8 @@ import { waitingAsideMethods } from './waiting-aside-ui.js';
 import type { PlaceStateFilter } from '../place-identity.js';
 import type { PlacesSort } from '../places.js';
 import { splitMethods } from './split-ui.js';
+import { structureMethods } from './structure-ui.js';
+import { structureSelectMethods } from './structure-select-ui.js';
 import { splitFamiliesMethods } from './split-families-ui.js';
 import { surnamesMethods } from './surnames-ui.js';
 import { surnameSuggestMethods } from './surname-suggest-ui.js';
@@ -243,6 +258,10 @@ export class UIClass {
     gedcomFileInfo: { name: string; sha: string; at: string } | null = null;
     /** A new tree from a GEDCOM file waits for the import dialog's OK: the file's import record. */
     pendingGedcomImport: { importId?: string } | null = null;
+    /** The name of the JSON file read last (readJsonImportText): a new tree of it names it (spec 139 §7.2). */
+    jsonImportFileName: string | null = null;
+    /** A new tree from a JSON file waits for the import dialog's OK: the file's name. */
+    importTreeFileName: string | null = null;
     /** What the last import brought (the import summary reads it). */
     lastImport: ({ treeId: TreeId } & AfterImportOptions) | null = null;
     /** State of the optional checkbox of the last showChoice() dialog. */
@@ -255,14 +274,6 @@ export class UIClass {
 
     // Tree management state
     renameTreeId: TreeId | null = null;
-    duplicateTreeId: TreeId | null = null;
-    mergeSourceTreeId: TreeId | null = null;
-    mergeTargetTreeId: TreeId | null = null;
-    // In-memory source for "Merge this view into…" (Primitive 3): the extracted
-    // subtree of the current view. When set, the merge-trees picker targets it
-    // instead of a source tree. Cleared when the picker closes.
-    mergeViewSourceData: StromData | null = null;
-    mergeViewSourceLabel: string | undefined = undefined;
     importTreeData: StromData | null = null;
     /** The `research` tie named by the JSON file being imported (restored on the new tree). */
     pendingImportResearch: { id: string; head?: string } | null = null;
@@ -315,6 +326,8 @@ export class UIClass {
         nameVariants: string;
         refn: string;
         question: string;
+        /** The contact's e-mails as typed (comma-separated). */
+        emails: string;
         /** Quick-entry event fields (occupation note / residence place). */
         occupation: string;
         residence: string;
@@ -609,6 +622,8 @@ export class UIClass {
 
     // Import-as-new-tree flag
     importToCurrentTree: boolean = false;
+    /** A Strom file chosen to add to this (open) tree through the merge guide (Change structure… › Add from a file, spec 139 §6.2). */
+    importIntoTreeId: TreeId | null = null;
 
     // Relationship calculator picker
     kinshipPicker: PersonPicker | null = null;
@@ -729,6 +744,10 @@ type MergeUiMethods = typeof mergeUiMethods;
 export interface UIClass extends MergeUiMethods {}
 Object.assign(UIClass.prototype, mergeUiMethods);
 
+type MergeHistoryMethods = typeof mergeHistoryMethods;
+export interface UIClass extends MergeHistoryMethods {}
+Object.assign(UIClass.prototype, mergeHistoryMethods);
+
 type EncryptionUiMethods = typeof encryptionUiMethods;
 export interface UIClass extends EncryptionUiMethods {}
 Object.assign(UIClass.prototype, encryptionUiMethods);
@@ -808,6 +827,10 @@ type ResearchInstallMethods = typeof researchInstallMethods;
 export interface UIClass extends ResearchInstallMethods {}
 Object.assign(UIClass.prototype, researchInstallMethods);
 
+type ResearchDetachedMethods = typeof researchDetachedMethods;
+export interface UIClass extends ResearchDetachedMethods {}
+Object.assign(UIClass.prototype, researchDetachedMethods);
+
 type MaterialMethods = typeof materialMethods;
 export interface UIClass extends MaterialMethods {}
 Object.assign(UIClass.prototype, materialMethods);
@@ -875,6 +898,35 @@ Object.assign(UIClass.prototype, batchMethods);
 type PhoneMethods = typeof phoneMethods;
 export interface UIClass extends PhoneMethods {}
 Object.assign(UIClass.prototype, phoneMethods);
+
+type DeviceStartMethods = typeof deviceStartMethods;
+export interface UIClass extends DeviceStartMethods {}
+Object.assign(UIClass.prototype, deviceStartMethods);
+
+type DeviceConnMethods = typeof deviceConnMethods;
+export interface UIClass extends DeviceConnMethods {}
+Object.assign(UIClass.prototype, deviceConnMethods);
+type DevicePhotosMethods = typeof devicePhotosMethods;
+export interface UIClass extends DevicePhotosMethods {}
+Object.assign(UIClass.prototype, devicePhotosMethods);
+type DeviceModeMethods = typeof deviceModeMethods;
+export interface UIClass extends DeviceModeMethods {}
+Object.assign(UIClass.prototype, deviceModeMethods);
+type PhoneResearchMethods = typeof phoneResearchMethods;
+export interface UIClass extends PhoneResearchMethods {}
+Object.assign(UIClass.prototype, phoneResearchMethods);
+type DeviceAgentMethods = typeof deviceAgentMethods;
+export interface UIClass extends DeviceAgentMethods {}
+Object.assign(UIClass.prototype, deviceAgentMethods);
+type DeviceOfflineMethods = typeof deviceOfflineMethods;
+export interface UIClass extends DeviceOfflineMethods {}
+Object.assign(UIClass.prototype, deviceOfflineMethods);
+type DeviceProgressMethods = typeof deviceProgressMethods;
+export interface UIClass extends DeviceProgressMethods {}
+Object.assign(UIClass.prototype, deviceProgressMethods);
+type DeviceDecideMethods = typeof deviceDecideMethods;
+export interface UIClass extends DeviceDecideMethods {}
+Object.assign(UIClass.prototype, deviceDecideMethods);
 
 type ReadDocumentMethods = typeof readDocumentMethods;
 export interface UIClass extends ReadDocumentMethods {}
@@ -970,12 +1022,18 @@ Object.assign(UIClass.prototype, timelineScopeMethods);
 type TreeOverviewMethods = typeof treeOverviewMethods;
 export interface UIClass extends TreeOverviewMethods {}
 Object.assign(UIClass.prototype, treeOverviewMethods);
+type StatsWindowMethods = typeof statsWindowMethods;
+export interface UIClass extends StatsWindowMethods {}
+Object.assign(UIClass.prototype, statsWindowMethods);
 type PersonListsMethods = typeof personListsMethods;
 export interface UIClass extends PersonListsMethods {}
 Object.assign(UIClass.prototype, personListsMethods);
 type PersonListNewMethods = typeof personListNewMethods;
 export interface UIClass extends PersonListNewMethods {}
 Object.assign(UIClass.prototype, personListNewMethods);
+type PersonListRuleMethods = typeof personListRuleMethods;
+export interface UIClass extends PersonListRuleMethods {}
+Object.assign(UIClass.prototype, personListRuleMethods);
 type PersonListAddMethods = typeof personListAddMethods;
 export interface UIClass extends PersonListAddMethods {}
 Object.assign(UIClass.prototype, personListAddMethods);
@@ -1155,6 +1213,14 @@ Object.assign(UIClass.prototype, waitingAsideMethods);
 type SplitMethods = typeof splitMethods;
 export interface UIClass extends SplitMethods {}
 Object.assign(UIClass.prototype, splitMethods);
+
+type StructureMethods = typeof structureMethods;
+export interface UIClass extends StructureMethods {}
+Object.assign(UIClass.prototype, structureMethods);
+
+type StructureSelectMethods = typeof structureSelectMethods;
+export interface UIClass extends StructureSelectMethods {}
+Object.assign(UIClass.prototype, structureSelectMethods);
 
 type SplitFamiliesMethods = typeof splitFamiliesMethods;
 export interface UIClass extends SplitFamiliesMethods {}

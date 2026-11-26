@@ -15,6 +15,8 @@
  * See src/ui/module.ts for the composition pattern.
  */
 
+import { imgSrcAttr } from '../image-src.js';
+import { saveImageValue } from './image-file.js';
 import { researchActionLabel, researchMarkFlags } from './research-open-mark.js';
 import { DataManager } from '../data.js';
 import { TreeRenderer } from '../renderer.js';
@@ -38,10 +40,11 @@ import { materialThumbs } from '../material-thumbs.js';
 import { imageLoads, IMAGES_ARRIVED_EVENT, IMAGES_STATE_EVENT } from '../image-loads.js';
 import { setTileState, standInState, waitingTileHtml, type ImgState } from './image-slot.js';
 import { formatBytesShort } from './originals-ui.js';
-import { onComputer } from './research-ui.js';
+import { researchReachable } from './research-ui.js';
 import { openImageViewer } from './image-viewer.js';
 import { materialDetailsEdit } from './material-details-ui.js';
 import { uiModule } from './module.js';
+import { openBridgeFile } from '../device/device-bridge.js';
 import { canEditPortrait, treePortraitCopy } from './portrait-actions-ui.js';
 import { windowAddOffered } from '../materials-overview.js';
 
@@ -333,7 +336,7 @@ export const materialsMethods = uiModule({
         const live = this.researchStatusOf(researchId)?.features;
         const features = live ?? rememberedMaterialFeatures(researchId);
         const bridgeUp = this.researchBridgeUp(researchId);
-        const env: MaterialEnv = { features, linked: true, onComputer: onComputer(), bridgeUp };
+        const env: MaterialEnv = { features, linked: true, onComputer: researchReachable(), bridgeUp };
         const links = researchLinksEnabled();
         return {
             treeId: ctx.treeId,
@@ -385,7 +388,7 @@ export const materialsMethods = uiModule({
         if (ctx?.caps.list) return ctx;
         const treeId = DataManager.getCurrentTreeId();
         if (!treeId || !this.materialsWindowOn()) return null;
-        const env: MaterialEnv = { features: null, linked: false, onComputer: onComputer(), bridgeUp: false };
+        const env: MaterialEnv = { features: null, linked: false, onComputer: researchReachable(), bridgeUp: false };
         return { treeId, researchId: '', base: null, env, caps: materialCaps(env), agent: !!ctx?.agent };
     },
 
@@ -633,7 +636,7 @@ export const materialsMethods = uiModule({
             : lazy && queue.isBroken(sha!, THUMB_PX)
                 ? waitingTileHtml('failed', { tag: 'span', cls: 'material-thumb', px: 48 })
                 : imgPreview
-                    ? `<span class="material-thumb"><img src="${esc(att.dataUrl)}" alt=""></span>`
+                    ? `<span class="material-thumb"><img ${imgSrcAttr(att.dataUrl)} alt=""></span>`
                     : `<span class="material-thumb"${lazy ? ` data-sha="${esc(sha)}"` : ''}${lazy && queue.isWaiting(sha!, THUMB_PX) ? ' data-img-state="loading"' : ''}>${letters}</span>`;
         // The attachment the person's portrait is cut from (spec 107 §4).
         const owner = this.currentId ? DataManager.getPerson(this.currentId) : null;
@@ -824,13 +827,13 @@ export const materialsMethods = uiModule({
             return;
         }
         if (mime === 'application/pdf') {
-            window.open(fileUrl(ctx.base, file.sha), '_blank', 'noopener');
+            openBridgeFile(fileUrl(ctx.base, file.sha));
             return;
         }
         // Anything the browser does not show: the system's program, through the research.
         const link = ctx.caps.openLinks !== false ? materialSystemLink(ctx.researchId, file.sha, announcedResearchScheme()) : null;
         if (link) this.launchResearchLink(link);
-        else window.open(fileUrl(ctx.base, file.sha), '_blank', 'noopener');
+        else openBridgeFile(fileUrl(ctx.base, file.sha));
     },
 
     // ==================== THE ⋯ MENU ====================
@@ -855,10 +858,13 @@ export const materialsMethods = uiModule({
         const person = this.currentId ? DataManager.getPerson(this.currentId) : null;
         const refn = researchPersonRef(person?.refn);
         const locked = !!this.currentId && DataManager.isPersonLocked(this.currentId);
+        // Link to… is offered in a tree that follows a research too: its dialog says why it waits (1123).
+        const attachLocked = !!this.currentId && DataManager.isPersonLocked(this.currentId, { exceptFollow: true });
         const actions = materialActions(item, caps, { person: refn, where: 'menu', treeCopy: (i) => !!treePortraitCopy(i) })
             // Nothing to download from an attachment that is only its original; a locked person keeps its files.
             .filter(a => !(a.id === 'download' && (!item.attachment?.dataUrl || item.attachment.originalOnly)))
-            .filter(a => !((a.id === 'removeFromTree' || a.id === 'attach' || a.id === 'makeSource') && (locked || DataManager.isReadOnly())))
+            .filter(a => !((a.id === 'removeFromTree' || a.id === 'makeSource') && (locked || DataManager.isReadOnly())))
+            .filter(a => !(a.id === 'attach' && (attachLocked || DataManager.isReadOnly())))
             // Title and details: where they can change here (spec 102 §2).
             .filter(a => !(a.id === 'edit' && !['on', 'off'].includes(materialDetailsEdit(item, ctx) ?? '')))
             // Use as portrait: a person who can change, and not the portrait's source already (spec 107 §4).
@@ -941,12 +947,7 @@ export const materialsMethods = uiModule({
             case 'download': {
                 const att = item.attachment;
                 if (!att?.dataUrl || att.originalOnly) break;
-                const a = document.createElement('a');
-                a.href = att.dataUrl;
-                a.download = att.name;
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
+                void saveImageValue(att.dataUrl, att.name);
                 break;
             }
             case 'useAsPortrait': if (this.currentId) void this.useMaterialAsPortrait(this.currentId, item); break;

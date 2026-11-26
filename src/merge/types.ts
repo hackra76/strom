@@ -3,7 +3,7 @@
  * Types for smart merge import functionality
  */
 
-import { PersonId, PartnershipId, Person, StromData } from '../types.js';
+import { PersonId, PartnershipId, Person, StromData, TreeId } from '../types.js';
 
 // ==================== VALIDATION ====================
 
@@ -22,7 +22,8 @@ export type MatchConfidence = 'high' | 'medium' | 'low';
 
 /** Reason for match */
 export type MatchReason =
-    | 'exact_name_gender_birthdate'   // High: name + gender + date
+    | 'exact_name_gender_birthdate'   // High: name + gender + date (both records give the date)
+    | 'exact_name'                    // The exact name, no birth date or year on both sides
     | 'name_gender_birthyear'         // Medium: name + gender + year
     | 'name_gender_parents'           // Medium: name + gender + parents
     | 'name_similarity_relationships' // Low: similar name + relationships
@@ -30,6 +31,7 @@ export type MatchReason =
     | 'first_name_birthyear'          // First name + birth year (relaxed)
     | 'lastname_birthyear'            // Last name + birth year (could be relative)
     | 'partner_of_matched'            // Partner of already matched person
+    | 'partner_shared_children'       // Partner of a joined person, with shared joined children (spec 134 K10.6)
     | 'child_of_matched'              // Child of already matched person
     | 'parent_of_matched'             // Parent of already matched person
     | 'sibling_of_matched'            // Sibling of already matched person (through parents of no name)
@@ -37,6 +39,7 @@ export type MatchReason =
     | 'partner_similarity'            // Partners have similar names
     | 'unknown_name_relative'         // Unknown given name, paired through a matched relative
     | 'id'                            // The same id in the loaded files (_UID, _FSFTID…; xref/RIN of one program)
+    | 'merged_before'                 // Brought or joined by an earlier merge of the same source (spec 134 K1.5)
     | 'manual';                       // Manual assignment
 
 /** Person match between existing and incoming data */
@@ -63,6 +66,12 @@ export interface FieldConflict {
      * suggestResolution). Absent = plain keep-existing default, no opinion.
      */
     suggestedReason?: 'more_precise_date' | 'more_complete';
+    /**
+     * The side the heuristics recommend (with suggestedReason). Only a hint
+     * the dialog shows: `resolution` starts as keep_existing and changes only
+     * by a person's choice, so nothing existing is replaced without one.
+     */
+    suggested?: 'keep_existing' | 'use_incoming';
 }
 
 /** Partnership fields that can conflict when both trees know the same union. */
@@ -99,7 +108,13 @@ export type MatchDecision =
     | { type: 'confirm' }
     | { type: 'reject' }
     | { type: 'skip' }
-    | { type: 'manual_match'; targetId: PersonId };
+    | {
+        type: 'manual_match'; targetId: PersonId;
+        /** Joined by "Same person" on a conflict of relations in step 4 (spec 134 K10.7). */
+        via?: 'step4';
+        /** The decision "Same person" replaced (absent: none): Undo puts it back. */
+        prev?: MatchDecision;
+    };
 
 // ==================== MERGE STATE ====================
 
@@ -131,6 +146,65 @@ export interface MergeState {
      * without this field default to false.
      */
     updateOnly?: boolean;
+    /**
+     * What a merged (joined) person of the tree takes from the import (the
+     * plan's scope, spec 134 K2.3). Absent = everything as today (missing
+     * values filled, differences by their resolution, notes, events and
+     * citations joined). 'empty': only what the tree's person lacks (a note
+     * only when it has none; differences keep the tree's value). 'none':
+     * nothing of the person's or the couple's details changes; only links to
+     * the people the import brings, the files and the record ids come along.
+     */
+    joinedDetails?: 'none' | 'empty';
+    /**
+     * What the conflicts of relations decided (spec 134 K5.5), when the
+     * import guide's plan has any. Absent: every couple and parent link of
+     * the import comes as before.
+     */
+    relations?: MergeRelations;
+    /**
+     * The tree the merge goes into and the fingerprint of its data when the
+     * matching ran (contentFingerprint). A resumed merge compares it with the
+     * tree as it is now (spec 134 K0.6). Optional: older sessions lack it.
+     */
+    target?: MergeTarget;
+    /**
+     * The import guide's place and choices (spec 134 §1), saved with the
+     * merge so a resumed one opens at its step. Optional: older sessions lack it.
+     */
+    wizard?: MergeWizardState;
+}
+
+/**
+ * The write's part of the conflicts of relations (spec 134 K5.5): what of
+ * the import is not written ("Keep mine") and what of the tree the import's
+ * version replaces ("From the import").
+ */
+export interface MergeRelations {
+    /** Couples of the import not written (the import's ids). */
+    leftUnions?: PartnershipId[];
+    /** Parent links of the import not written: `${child}<${parent}`, the import's ids. */
+    leftLinks?: string[];
+    /** Couples of the tree removed (the tree's ids); their files stay with the two persons. */
+    dropUnions?: PartnershipId[];
+    /** Parent links of the tree removed: `${child}<${parent}`, the tree's ids. */
+    dropLinks?: string[];
+}
+
+/** Where the import guide stands: its step, the furthest step reached, its choices. */
+export interface MergeWizardState {
+    step: 1 | 2 | 3 | 4 | 5 | 6;
+    /** The furthest step reached: a reached step can be entered again from the step list. */
+    reached: 1 | 2 | 3 | 4 | 5 | 6;
+    /** The comparison of step 1 ran: the plan exists from here on. */
+    compared: boolean;
+    choices: import('./plan.js').WizardChoices;
+}
+
+/** The target of a merge: its tree and the fingerprint of the data the matching ran over. */
+export interface MergeTarget {
+    treeId: TreeId;
+    fingerprint: string;
 }
 
 // ==================== ID MAPPING ====================
@@ -142,6 +216,17 @@ export interface IdMapping {
 }
 
 // ==================== MERGE RESULT ====================
+
+/**
+ * Where the merge put each record of the incoming tree: a person's id in the
+ * merged tree (an existing one when merged), a couple's (the tree's own or
+ * its new copy) and a source's when it joined one the tree holds.
+ */
+export interface MergeTrace {
+    persons: ReadonlyMap<PersonId, PersonId>;
+    partnerships: ReadonlyMap<PartnershipId, PartnershipId>;
+    sources: ReadonlyMap<string, string>;
+}
 
 /** Result of merge execution */
 export interface MergeResult {
@@ -159,12 +244,17 @@ export interface MergeResult {
     errors?: string[];
     /** Incoming import record id -> its id in the merged tree (spec 066). */
     importMap?: Map<string, string>;
+    /** Where the incoming records went (see MergeTrace). */
+    trace?: MergeTrace;
+    /**
+     * The check before saving (spec 134 K0.2). When it fails, `success` is
+     * false, `mergedData` is the tree as it was and `problems` say what would
+     * have gone wrong (mergeCheckMessage in merge-check.ts).
+     */
+    check?: import('./merge-check.js').MergeCheckResult;
 }
 
 // ==================== UI STATE ====================
-
-/** Filter for match review UI */
-export type MatchFilter = 'all' | 'high' | 'medium' | 'low' | 'unmatched' | 'conflicts';
 
 /** Stats for merge review */
 export interface MergeStats {

@@ -92,6 +92,8 @@ export interface TreeLoadRun {
     readonly watch: TreeDownloadWatch;
     /** Cancelled by the person (nothing changed). */
     readonly cancelled: boolean;
+    /** Cancel it (as its toast's Cancel, while the file downloads): nothing changed. */
+    cancel(): void;
     /** The file is in: its people are being processed (Cancel goes). */
     processing(persons: number): Promise<void>;
     /** A question is asked on the way: the toast goes meanwhile. */
@@ -182,7 +184,10 @@ export function startTreeLoad(opts: { el?: HTMLElement | null; retry?: () => voi
             if (ended) return;
             const why = busyErrFromBridge(err, { timeoutMs: 120_000 }).text;
             if (!toast) open();
-            toast?.fail(`${why} ${b.treeUnchanged}`, opts.retry ? { label: b.retry, run: opts.retry } : undefined, { title: b.loadFailed });
+            const t = toast as ProgressToastHandle | null;
+            t?.fail(`${why} ${b.treeUnchanged}`, opts.retry ? { label: b.retry, run: opts.retry } : undefined, { title: b.loadFailed });
+            // Still the load's toast: over a device's start screen (its chooser of trees) as its progress was.
+            if (t) t.el.dataset.kind = 'tree-load';
             toast = null;
             end();
         },

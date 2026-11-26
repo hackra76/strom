@@ -8,7 +8,9 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import {
     RESEARCH_LINK_ACTIONS, RESEARCH_LINK_MARKS, RESEARCH_ACTION_MARKS, researchLinkMark, researchUrlMark, researchSchemeUrl,
-    RESEARCH_BRIDGE_ACTIONS, RESEARCH_BRIDGE_MARKS,
+    RESEARCH_BRIDGE_ACTIONS, RESEARCH_BRIDGE_MARKS, researchBridgeMark, setResearchDeviceState, researchDeviceAllows,
+    researchDeviceMark, deviceAllows, deviceActionOfBridgeWrite, noteResearchDeviceRefused, researchDeviceLinkAllows,
+    researchDeviceAgentLink, DEVICE_AGENT_START, DEVICE_AGENT_BRIDGE,
 } from '../research-link.js';
 import { researchActionLabel, researchBridgeActionLabel, researchBridgeAgentLabel, researchLinkFlags } from '../ui/research-open-mark.js';
 import { syncActionMark } from '../ui/research-sync-ui.js';
@@ -133,6 +135,169 @@ describe('the map of research actions to their marks', () => {
         expect(bulk).not.toContain('research-open-mark');
         expect(researchBridgeActionLabel(strings.verify.scan, 'fact-confirm')).toBe(strings.verify.scan);
         expect(researchBridgeActionLabel(strings.verify.stop, 'verify-stop')).toBe(strings.verify.stop);
+    });
+});
+
+describe('on a device of the home network (spec 094 §6)', () => {
+    afterEach(() => setResearchDeviceState(null));
+    const device = (actions: string[] = []) => setResearchDeviceState({ origin: 'http://192.168.1.20:47800', trees: [TREE], computer: 'Pracovna', actions });
+
+    it('draws what it does through the bridge with no mark, and nothing that opens a terminal or starts an agent', () => {
+        device(['conflict.decide', 'hypothesis.decide', 'sync.undo']);
+        for (const a of RESEARCH_LINK_ACTIONS) {
+            expect(researchLinkMark(a)).toBe('none');
+            expect(researchDeviceMark(a)).toBe(researchDeviceAllows(a) ? 'none' : 'hidden');
+        }
+        for (const a of RESEARCH_BRIDGE_ACTIONS) expect(researchBridgeMark(a)).toBe('none');
+        expect(researchUrlMark(researchSchemeUrl('chat', { tree: TREE })!)).toBe('none');
+        expect(researchLinkFlags(researchSchemeUrl('open', { tree: TREE })!)).toEqual({ research: false, ai: false });
+        expect(researchBridgeActionLabel(strings.verify.start, 'verify')).toBe(strings.verify.start);
+    });
+
+    it('allows only the actions of the table: the tree\'s own through the bridge, decisions the gateway announced', () => {
+        device([]);
+        for (const a of ['send', 'excerpt', 'media', 'app', 'live', 'book', 'direction', 'fact-confirm', 'verify-stop',
+            'sources-split', 'run-stop', 'waiting-answer'] as const) expect(researchDeviceAllows(a)).toBe(true);
+        for (const a of ['open', 'chat', 'work', 'places', 'history', 'story', 'review', 'sessions', 'experiment', 'setup',
+            'update', 'fixes', 'doctor', 'seal', 'archive', 'finish', 'task', 'new', 'research', 'sync-undo', 'verify',
+            'verify-bulk', 'material-sort', 'run-limit', 'read-document', 'devices', 'research-tools', 'tree-settings',
+            'load-version', 'direction-new', 'direction-work', 'conflict-agent'] as const) expect(researchDeviceAllows(a)).toBe(false);
+        // A decision only once the gateway announces it in status.device.actions.
+        for (const a of ['conflict', 'hypothesis', 'hypotheses', 'sync-undo-this'] as const) expect(researchDeviceAllows(a)).toBe(false);
+        expect(deviceAllows('conflict', ['conflict.decide'])).toBe(true);
+        expect(deviceAllows('hypothesis', ['hypothesis.decide'])).toBe(true);
+        expect(deviceAllows('sync-undo-this', ['sync.undo'])).toBe(true);
+        expect(deviceAllows('sync-undo', ['sync.undo'])).toBe(false);
+    });
+
+    it('hides an action the gateway refused as the computer\'s only (403 device.computer-only), until the mode is left', () => {
+        expect(deviceActionOfBridgeWrite('POST', 'runs/stop')).toBe('run-stop');
+        expect(deviceActionOfBridgeWrite('POST', 'waiting/T0001')).toBe('waiting-answer');
+        expect(deviceActionOfBridgeWrite('PUT', 'media/ab12', true)).toBe('waiting-answer');
+        expect(deviceActionOfBridgeWrite('PUT', 'media/ab12')).toBe('media');
+        expect(deviceActionOfBridgeWrite('POST', 'directions/G0001/state')).toBe('direction');
+        // The gateway's own decisions (spec 094 §2.7).
+        expect(deviceActionOfBridgeWrite('POST', 'device/conflict/X0003')).toBe('conflict');
+        expect(deviceActionOfBridgeWrite('POST', 'device/hypothesis/H0002')).toBe('hypothesis');
+        expect(deviceActionOfBridgeWrite('POST', 'device/sync/I0007/undo')).toBe('sync-undo-this');
+        expect(deviceActionOfBridgeWrite('GET', 'waiting/T0001/fix')).toBeNull();
+        expect(deviceActionOfBridgeWrite('POST', 'status')).toBeNull();
+        device();
+        expect(researchDeviceAllows('run-stop')).toBe(true);
+        noteResearchDeviceRefused('run-stop');
+        expect(researchDeviceAllows('run-stop')).toBe(false);
+        expect(researchDeviceAllows('waiting-answer')).toBe(true);
+        setResearchDeviceState(null);
+        expect(researchDeviceAllows('run-stop')).toBe(true);
+        device();
+        expect(researchDeviceAllows('run-stop')).toBe(true);
+        // Outside the device mode nothing is noted.
+        setResearchDeviceState(null);
+        noteResearchDeviceRefused('waiting-answer');
+        expect(researchDeviceAllows('waiting-answer')).toBe(true);
+    });
+
+    it('with agent.start draws the agent\'s work with the same mark as the computer, and nothing else of the terminal (K3.15)', () => {
+        device([DEVICE_AGENT_START]);
+        for (const a of RESEARCH_LINK_ACTIONS) expect(researchLinkMark(a)).toBe(RESEARCH_LINK_MARKS[a] === 'agent' ? 'agent' : 'none');
+        // Refined by what is asked: a conversation about a task or a conflict, a paid fix (not its undo).
+        expect(researchLinkMark('task', { taskDo: 'chat' })).toBe('agent');
+        expect(researchLinkMark('task', { taskDo: 'park' })).toBe('none');
+        expect(researchLinkMark('conflict', { conflictDo: 'agent' })).toBe('agent');
+        expect(researchLinkMark('conflict', { conflictDo: 'decide' })).toBe('none');
+        expect(researchLinkMark('fixes', { fixPaid: true })).toBe('agent');
+        expect(researchLinkMark('fixes', { fixPaid: true, fixDo: 'undo' })).toBe('none');
+        expect(researchLinkMark('fixes')).toBe('none');
+        // Drawn: the agent's links; hidden: the same actions where they only ask in the terminal.
+        for (const a of ['work', 'chat', 'places', 'history'] as const) {
+            expect(researchDeviceAllows(a)).toBe(true);
+            expect(researchDeviceMark(a)).toBe('agent');
+        }
+        expect(researchDeviceMark('task', { taskDo: 'chat' })).toBe('agent');
+        expect(researchDeviceMark('task')).toBe('hidden');
+        expect(researchDeviceMark('conflict', { conflictDo: 'agent' })).toBe('agent');
+        expect(researchDeviceMark('conflict')).toBe('hidden');
+        expect(researchDeviceMark('fixes', { fixPaid: true })).toBe('agent');
+        expect(researchDeviceMark('fixes')).toBe('hidden');
+        expect(researchDeviceLinkAllows('fixes', { fixPaid: true, fixDo: 'undo' })).toBe(false);
+        for (const a of ['direction-work', 'conflict-agent', 'task', 'fixes'] as const) expect(researchDeviceAllows(a)).toBe(true);
+        // Still the computer's only: a person's terminal, settings, approvals.
+        for (const a of ['open', 'review', 'setup', 'seal', 'experiment', 'story', 'direction-new', 'run-limit', 'tree-settings'] as const) {
+            expect(researchDeviceAllows(a)).toBe(false);
+        }
+        // The bridge's agent needs agent.bridge: without it no mark and not drawn.
+        for (const a of ['verify', 'verify-bulk', 'material-sort', 'read-document'] as const) expect(researchDeviceAllows(a)).toBe(false);
+        for (const a of RESEARCH_BRIDGE_ACTIONS) expect(researchBridgeMark(a)).toBe('none');
+        // A ready link: its flags as on the computer for the agent's work, none for the rest.
+        expect(researchLinkFlags(researchSchemeUrl('chat', { tree: TREE })!)).toEqual({ research: true, ai: true });
+        expect(researchLinkFlags(researchSchemeUrl('open', { tree: TREE })!)).toEqual({ research: false, ai: false });
+        expect(researchLinkFlags('strom-research://later?tree=x')).toEqual({ research: false, ai: false });
+        expect(researchActionLabel(strings.live.queueWork, researchLinkMark('work'))).toContain('research-ai-badge');
+    });
+
+    it('with agent.bridge draws the bridge\'s agent with the AI badge alone (K3.15)', () => {
+        device([DEVICE_AGENT_BRIDGE]);
+        for (const a of RESEARCH_BRIDGE_ACTIONS) expect(researchBridgeMark(a)).toBe(RESEARCH_BRIDGE_MARKS[a]);
+        for (const a of ['verify', 'verify-bulk', 'material-sort', 'read-document'] as const) expect(researchDeviceAllows(a)).toBe(true);
+        const sort = researchBridgeActionLabel(strings.materials.agentSort.sort, 'material-sort');
+        expect(sort).toContain('research-ai-badge');
+        expect(sort).not.toContain('research-open-mark');
+        // agent.bridge alone starts no terminal.
+        for (const a of ['work', 'chat', 'places', 'history', 'fixes', 'task'] as const) expect(researchDeviceAllows(a)).toBe(false);
+        expect(researchLinkMark('work')).toBe('none');
+        // A refusal of the bridge's agent hides it (403 device.computer-only of its write).
+        expect(deviceActionOfBridgeWrite('POST', 'verify')).toBe('verify');
+        expect(deviceActionOfBridgeWrite('POST', 'verify/bulk')).toBe('verify-bulk');
+        expect(deviceActionOfBridgeWrite('POST', 'material/sort')).toBe('material-sort');
+        expect(deviceActionOfBridgeWrite('POST', 'read')).toBe('read-document');
+        expect(deviceActionOfBridgeWrite('POST', 'read/D0004/again')).toBe('read-document');
+        expect(deviceActionOfBridgeWrite('POST', 'sources/read')).toBe('read-document');
+        expect(deviceActionOfBridgeWrite('POST', 'sources/S0002/read/D0004/task')).toBe('read-document');
+        noteResearchDeviceRefused('verify');
+        expect(researchDeviceAllows('verify')).toBe(false);
+        expect(researchDeviceAllows('verify-bulk')).toBe(true);
+    });
+
+    it('sends a ready link through the gateway only for the agent\'s work with agent.start (K3.15)', () => {
+        const url = (action: Parameters<typeof researchSchemeUrl>[0], p: Omit<Parameters<typeof researchSchemeUrl>[1], 'tree'> = {}) =>
+            researchSchemeUrl(action, { tree: TREE, ...p })!;
+        // Outside the device mode: the computer opens its links itself.
+        expect(researchDeviceAgentLink(url('work', { workDo: 'loop' }))).toBe(false);
+        device([]);
+        expect(researchDeviceAgentLink(url('work', { workDo: 'loop' }))).toBe(false);
+        device([DEVICE_AGENT_START]);
+        expect(researchDeviceAgentLink(url('work', { workDo: 'loop' }))).toBe(true);
+        expect(researchDeviceAgentLink(url('work', { workDo: 'tasks', n: 5 }))).toBe(true);
+        expect(researchDeviceAgentLink(url('chat', { research: 'G0001' }))).toBe(true);
+        expect(researchDeviceAgentLink(url('task', { task: 'T0001', taskDo: 'chat' }))).toBe(true);
+        expect(researchDeviceAgentLink(url('conflict', { conflict: 'X0007', conflictDo: 'agent' }))).toBe(true);
+        expect(researchDeviceAgentLink(url('places', { placesDo: 'run' }))).toBe(true);
+        expect(researchDeviceAgentLink(`strom-research-beta://work?tree=${TREE}&do=loop`)).toBe(true);
+        // A fix: only a paid one, said by the app (the link does not say it).
+        expect(researchDeviceAgentLink(url('fixes', { fix: 'dates' }))).toBe(false);
+        expect(researchDeviceAgentLink(url('fixes', { fix: 'dates' }), { fixPaid: true })).toBe(true);
+        expect(researchDeviceAgentLink(url('fixes', { fix: 'dates', fixDo: 'undo' }), { fixPaid: true })).toBe(false);
+        // Not the agent's: a person's terminal, a task only asked, an unknown action, another scheme.
+        expect(researchDeviceAgentLink(url('open'))).toBe(false);
+        expect(researchDeviceAgentLink(url('task', { task: 'T0001', taskDo: 'park' }))).toBe(false);
+        expect(researchDeviceAgentLink('strom-research://later?tree=x')).toBe(false);
+        expect(researchDeviceAgentLink('https://example.org/work?do=loop')).toBe(false);
+        // Refused by the gateway as the computer's only: not any more on this page.
+        noteResearchDeviceRefused('work');
+        expect(researchDeviceAgentLink(url('work', { workDo: 'loop' }))).toBe(false);
+        expect(researchDeviceMark('work')).toBe('hidden');
+    });
+
+    it('outside the device mode changes nothing: every action allowed, every mark its own', () => {
+        for (const a of RESEARCH_LINK_ACTIONS) {
+            expect(researchDeviceAllows(a)).toBe(true);
+            expect(researchDeviceMark(a)).toBe(RESEARCH_LINK_MARKS[a]);
+        }
+        for (const a of RESEARCH_BRIDGE_ACTIONS) expect(researchBridgeMark(a)).toBe(RESEARCH_BRIDGE_MARKS[a]);
+        expect(researchLinkFlags(researchSchemeUrl('chat', { tree: TREE })!)).toEqual({ research: true, ai: true });
+        expect(researchLinkFlags('strom-research://later?tree=x')).toEqual({ research: true, ai: false });
+        expect(researchDeviceLinkAllows('task', { taskDo: 'park' })).toBe(true);
+        expect(researchDeviceMark('fixes')).toBe('terminal');
     });
 });
 

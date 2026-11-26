@@ -2,7 +2,7 @@ import type { StringsType } from '../strings.js';
 import { nPl, plPl } from './helpers.js';
 
 export const plPart1: Pick<StringsType, 'toolbar' | 'treeSwitcher' | 'menu' | 'mobileMenu' | 'emptyState' | 'demo' | 'book'
-    | 'fileCopy' | 'snapshots' | 'split' | 'splitFamilies' | 'advanced' | 'surnames' | 'lineage' | 'surnameSuggest'
+    | 'memoryLimit' | 'fileCopy' | 'snapshots' | 'split' | 'splitFamilies' | 'advanced' | 'surnames' | 'lineage' | 'surnameSuggest'
     | 'fields' | 'events' | 'factStatus' | 'reliability' | 'verify' | 'origin' | 'partnerEvents' | 'sources'> = {
     toolbar: {
         title: 'Strom',
@@ -299,6 +299,19 @@ export const plPart1: Pick<StringsType, 'toolbar' | 'treeSwitcher' | 'menu' | 'm
         },
     },
 
+    // The memory one page may use (spec 135)
+    memoryLimit: {
+        title: 'Pamięci może nie wystarczyć',
+        notice: (name: string) => `Drzewo „${name}” zbliża się do granicy pamięci, którą ta przeglądarka daje aplikacji; aplikacja może wtedy przestać działać. Więcej miejsca da zamknięcie innych okien aplikacji i usunięcie niepotrzebnych obrazów.`,
+        output: (name: string, size: string) => `Plik z obrazami drzewa „${name}” (${size}) może wymagać więcej pamięci, niż ta przeglądarka daje aplikacji; aplikacja może wtedy przestać działać. Przed kontynuacją warto zamknąć inne okna aplikacji lub usunąć niepotrzebne obrazy.`,
+        outputAll: (size: string) => `Plik z obrazami wszystkich drzew (${size}) może wymagać więcej pamięci, niż ta przeglądarka daje aplikacji; aplikacja może wtedy przestać działać. Przed kontynuacją warto zamknąć inne okna aplikacji lub usunąć niepotrzebne obrazy.`,
+        book: (name: string, size: string) => `Książka z obrazami drzewa „${name}” (${size}) może wymagać więcej pamięci, niż ta przeglądarka daje aplikacji; aplikacja może wtedy przestać działać. Przed kontynuacją warto zamknąć inne okna aplikacji lub usunąć niepotrzebne obrazy.`,
+        poster: (size: string) => `Plakat z portretami (${size}) może wymagać więcej pamięci, niż ta przeglądarka daje aplikacji; aplikacja może wtedy przestać działać. Przed kontynuacją warto zamknąć inne okna aplikacji lub pokazać mniej portretów.`,
+        leaveOut: 'Pominąć obrazy w pliku',
+        import: (name: string, size: string) => `Wczytanie pliku „${name}” (${size}) może wymagać więcej pamięci, niż ta przeglądarka daje aplikacji; aplikacja może wtedy przestać działać. Przed kontynuacją warto zamknąć inne okna aplikacji.`,
+        continue: 'Kontynuuj',
+    },
+
     // Versioned backups
     fileCopy: {
         indicatorTitle: 'Zmiany są tylko w przeglądarce, jeszcze nie w pliku – przeglądarka może je usunąć',
@@ -365,7 +378,7 @@ export const plPart1: Pick<StringsType, 'toolbar' | 'treeSwitcher' | 'menu' | 'm
         deleted: 'Usunięto kopię zapasową',
         persistenceSave: 'Eksportuj',
         autoLabel: 'Automatyczne kopie zapasowe tego drzewa',
-        autoHint: 'Codziennie oraz przed importem lub scaleniem. Wyłączenie opłaca się przy drzewie zapisanym gdzie indziej albo przy drzewie, którego skany powiększają kopie; „Utwórz kopię zapasową teraz” działa nadal.',
+        autoHint: 'Codziennie; przed importem i scaleniem zawsze. Wyłączenie opłaca się przy drzewie zapisanym gdzie indziej albo przy drzewie, którego skany powiększają kopie; „Utwórz kopię zapasową teraz” działa nadal.',
         autoOffTitle: 'Wyłączyć automatyczne kopie zapasowe?',
         autoOffMessage: (count: number, size: string) => `Drzewo ma ${nPl(count, 'kopię zapasową', 'kopie zapasowe', 'kopii zapasowych')}${size ? ` (${size})` : ''}. Zachować je czy usunąć i zwolnić miejsce?`,
         autoOffKeep: 'Zachowaj kopie',
@@ -393,6 +406,7 @@ export const plPart1: Pick<StringsType, 'toolbar' | 'treeSwitcher' | 'menu' | 'm
             manual: 'Ręczna',
             'pre-import': 'Przed importem',
             'pre-merge': 'Przed scaleniem',
+            'pre-merge-undo': 'Przed cofnięciem scalenia',
             'other-window': 'To okno, zanim nadpisało je inne',
             'pre-research-load': 'Przed wczytaniem wersji z badania',
             'pre-first-send': 'Przed pierwszym wysłaniem do badania',

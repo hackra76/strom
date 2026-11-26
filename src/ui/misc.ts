@@ -7,6 +7,7 @@ import { canvasBusy } from './canvas-busy.js';
 import { busyButtonHtml } from './busy.js';
 import { refreshWindowControls } from '../windows/window-open.js';
 import { initDialogFocus } from './dialog-focus.js';
+import { renderMergeRulesSetting } from './merge-rules-settings.js';
 import { initClosedPopups } from './closed-popups.js';
 import { initSheetSlide } from './sheet-slide.js';
 import { initKeyboardAccess } from './keyboard-access.js';
@@ -70,6 +71,8 @@ import { FAN_STYLES } from '../fan-colors.js';
 import { syncControlBlock } from './minimap.js';
 import { addLender, cancelWaiting, removeLender, watchToasts, whenFree } from '../toast-slot.js';
 import { defaultFocusKey, focusDefaultPerson, isDefaultFocusContext, updateDefaultFocusButtons } from './default-focus.js';
+import { syncMergeHold } from '../merge/research-hold.js';
+import { inDeviceMode } from './device-mode-ui.js';
 
 
 
@@ -414,6 +417,7 @@ export const miscMethods = uiModule({
 
         const importImagesToggle = document.getElementById('import-images-toggle') as HTMLInputElement | null;
         if (importImagesToggle) importImagesToggle.checked = SettingsManager.isImportImages();
+        renderMergeRulesSetting();
         const advancedToggle = document.getElementById('advanced-fields-toggle') as HTMLInputElement | null;
         if (advancedToggle) advancedToggle.checked = SettingsManager.isAdvancedFields();
 
@@ -533,6 +537,11 @@ export const miscMethods = uiModule({
     // ==================== DISPLAY VIEW MODE (family / descendants) ====================
 
     setDisplayViewMode(mode: ViewMode): void {
+        // A phone's Research screen (spec 094 §7): a view is the tree's, opened from the screen first.
+        if (this.phoneResearchActive()) {
+            void this.phoneOpenTree({ view: mode });
+            return;
+        }
         // The Research overview open without following closes with a switch, as by its ⤡.
         const from = TreeRenderer.getViewMode();
         if (mode === from) return;
@@ -582,10 +591,12 @@ export const miscMethods = uiModule({
         refreshWindowControls();
         // Mobile bottom bar: three primary view tabs plus "More" (fan, map and
         // timeline live in the More sheet, so More lights up while one is active; spec 082 K1.1).
-        document.getElementById('bb-view-family')?.classList.toggle('active', mode === 'family');
-        document.getElementById('bb-view-descendants')?.classList.toggle('active', mode === 'descendants');
-        document.getElementById('bb-view-table')?.classList.toggle('active', mode === 'table');
-        document.getElementById('bb-view-more')?.classList.toggle('active', mode === 'fan' || mode === 'map' || mode === 'timeline');
+        // A phone's Research screen seen: its own tab is the one marked (spec 094 §1 point 3).
+        const tree = !this.phoneResearchActive();
+        document.getElementById('bb-view-family')?.classList.toggle('active', tree && mode === 'family');
+        document.getElementById('bb-view-descendants')?.classList.toggle('active', tree && mode === 'descendants');
+        document.getElementById('bb-view-table')?.classList.toggle('active', tree && mode === 'table');
+        document.getElementById('bb-view-more')?.classList.toggle('active', tree && (mode === 'fan' || mode === 'map' || mode === 'timeline'));
 
         const badge = document.getElementById('descendants-badge');
         const text = document.getElementById('descendants-badge-text');
@@ -729,6 +740,10 @@ export const miscMethods = uiModule({
         this.updateTreeSwitcher();
         this.updateEncryptionStatus();
         this.retranslateNewerDataNotice();
+        // The toolbar's Selection choice now, with the rest of the bar: not left to the render's beat
+        // (asynchronous; a render overtaken or failed kept its old language).
+        const pick = document.getElementById('view-rod-picker');
+        if (pick && !pick.hidden && pick.querySelector('details.sp-rodpick')) this.renderSelectionPickerHost();
         TreeRenderer.render();
         // Panels drawn from code: the live research panel and its overview,
         // the research menu, the highlight pill, "Show on card".
@@ -737,6 +752,8 @@ export const miscMethods = uiModule({
         this.renderEvidencePill();
         this.renderCardSignalSettings();
         this.renderResearchEdgeSettings();
+        // A device's quiet line of the home-screen icon (spec 094 §2); the switcher's second line comes with updateTreeSwitcher.
+        this.retranslateDeviceHomeLine();
         // Settings drawn from code while open (the originals waiting, the change history's state): the new language
         // at once, not at the next opening (J4 of the language round).
         if (document.getElementById('settings-modal')?.classList.contains('active')) this.showSettingsDialog();
@@ -907,6 +924,11 @@ export const miscMethods = uiModule({
                 }
                 // The Places dialog's menu, preview and selection close one at a time first.
                 if (this.topActiveOverlay()?.id === 'places-modal' && this.placesEscape()) return;
+                // Change structure…: one screen back, from its options back to the dialog it was opened from.
+                if (this.topActiveOverlay()?.id === 'structure-modal' && this.isStructureDialogOpen()) {
+                    this.structureEscape();
+                    return;
+                }
                 // New list / Save as list: its person choice, then the dialog (over Lists of people).
                 if (this.isNewPersonListOpen() && ['person-list-new', 'person-list-save'].includes(this.topActiveOverlay()?.id ?? '')) {
                     this.newPersonListEscape();
@@ -1129,6 +1151,11 @@ export const miscMethods = uiModule({
 
                     // Dynamic overlays (built per-open): full close removes the
                     // element + its stack entry, not just the 'active' class.
+                    if (currentDialog === 'tree-stats-modal') {
+                        if (this.closeTreeStatsPopover()) return;
+                        this.dismissTreeStats();
+                        return;
+                    }
                     if (currentDialog === 'tree-overview-modal') {
                         if (this.closeTreeOverviewPopover()) return;
                         this.dismissTreeOverview();
@@ -1213,6 +1240,14 @@ export const miscMethods = uiModule({
                         this.closePhoneDialog();
                         return;
                     }
+                    if (currentDialog === 'device-conn-modal') {
+                        this.closeDeviceConnection();
+                        return;
+                    }
+                    if (currentDialog === 'device-home-modal') {
+                        this.closeDeviceHomeHow();
+                        return;
+                    }
                     if (currentDialog === 'research-update-modal') {
                         this.closeResearchUpdateHelp();
                         return;
@@ -1231,6 +1266,10 @@ export const miscMethods = uiModule({
                     }
                     if (currentDialog === 'research-adopt-modal') {
                         this.cancelResearchAdoptDialog();
+                        return;
+                    }
+                    if (currentDialog === 'copy-research-modal') {
+                        this.closeCopyResearchDialog();
                         return;
                     }
                     if (currentDialog === 'research-tree-settings-modal') {
@@ -1456,7 +1495,8 @@ export const miscMethods = uiModule({
             // view copy keeps the browser default.
             const saveMod = this.isMacPlatform() ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
             if (saveMod && !e.altKey && !e.shiftKey && (e.key === 's' || e.key === 'S')) {
-                if (DataManager.isViewMode() || DataManager.isLocked() || !DataManager.getCurrentTreeId()) return;
+                // A device of the home network has no file of its own to save into (spec 094 §3).
+                if (DataManager.isViewMode() || DataManager.isLocked() || !DataManager.getCurrentTreeId() || inDeviceMode()) return;
                 e.preventDefault();
                 this.saveTreeCopy();
                 return;
@@ -1591,6 +1631,8 @@ export const miscMethods = uiModule({
     openDialogById(dialogId: string | undefined): void {
         if (!dialogId) return;
         document.getElementById(dialogId)?.classList.add('active');
+        // Change structure… drawn again on return: a copy or a split made meanwhile changes its options.
+        if (dialogId === 'structure-modal') this.structureRender();
     },
 
     /**
@@ -2031,6 +2073,7 @@ export const miscMethods = uiModule({
         }
         const result = DataManager.undo();
         if (!result) return;
+        syncMergeHold(DataManager.getCurrentTreeId()!, DataManager.getData());   // a merge undone or back (spec 134 §11)
         void TreeRenderer.renderAsync();
         // Undo can add/remove/rename people — the picker's cached list too.
         this.refreshSearch();
@@ -2051,6 +2094,7 @@ export const miscMethods = uiModule({
         }
         const result = DataManager.redo();
         if (!result) return;
+        syncMergeHold(DataManager.getCurrentTreeId()!, DataManager.getData());   // a merge undone or back (spec 134 §11)
         void TreeRenderer.renderAsync();
         this.refreshSearch();
         this.refreshUndoRedoToolbar();  // R3

@@ -14,14 +14,16 @@ import { exportToGedcom } from '../ged-exporter.js';
 import { stripMedia } from '../attachments.js';
 import { researchGedcom } from '../ui/research-ui.js';
 import {
-    findImageRefs, imageRefSha, resolveImageFile, imagesUrlOf, refTreeUrl, fetchImagesByHash, resolveImageRefs,
-    forgetHeldImages, heldImageShas, ImagesNotResolved, IMAGE_BATCH, IMAGE_RETRY_MS, sha256Hex,
+    findImageRefs, imageRefSha, resolveImageFile, imagesUrlOf, refTreeUrl, fetchImagesByHash, fetchImageBatch, resolveImageRefs,
+    forgetHeldImages, heldImageShas, internHeldImages, ImagesNotResolved, IMAGE_BATCH, IMAGE_ASK_BYTES, IMAGE_RETRY_MS, sha256Hex,
     type ImageFetchDeps, type ImageRef, type ImageResolveDeps,
 } from '../research-image-refs.js';
 import { storedTreeEtag, bridgeGivesImagesByHash, treeReplyImages } from '../research-tree-file.js';
 import type { StromData } from '../types.js';
 import { allMedia } from '../media.js';
 import { migrateData } from '../data.js';
+import { setImageMeta, clearImageMeta } from '../image-meta.js';
+import { POOL_REF } from '../image-ref.js';
 
 /** A small JPEG of `width` × `height`; `salt` makes its bytes (and hash) its own. */
 function jpeg(width: number, height: number, salt: number): Buffer {
@@ -115,6 +117,26 @@ describe('references in the file', () => {
         expect(resolveImageFile(`strom-image:${'ab'.repeat(32)}`, map)).toBe('data:image/jpeg;base64,QUJD');
         expect(resolveImageFile(`strom-image:${'cd'.repeat(32)}`, map)).toBe('');
         expect(resolveImageFile('photos/a.jpg', map)).toBe('photos/a.jpg');
+    });
+
+    it('an image resolved to a pooled image\'s reference is read as that image, its sizes from the image catalog (spec 135)', () => {
+        clearImageMeta();
+        const sizes = new Map([[IMG_A, [400, 100]], [IMG_B, [300, 500]], [IMG_C, [120, 80]]] as const);
+        const refs = new Map<string, string>();
+        for (const [img, [w, h]] of sizes) {
+            const id = `p:${shaOf(img).slice(0, 40)}`;
+            setImageMeta(id, { len: dataUrlOf(img).length, head: 'data:image/jpeg;base64,', bytes: img.length, w, h, token: 't', mtok: 'm', sha: shaOf(img) });
+            refs.set(shaOf(img), POOL_REF + id);
+        }
+        const whole = read(SLIM, ALL_IMAGES);
+        const pooled = read(SLIM, refs);
+        const excerpts = (d: StromData) => Object.values(d.sources ?? {}).flatMap(src => (src.excerpts ?? []).map(e => ({ ...e, id: '' })));
+        const back = new Map([...refs].map(([sha, ref]) => [ref, ALL_IMAGES.get(sha)!]));
+        expect(excerpts(pooled).length).toBe(4);
+        expect(excerpts(pooled).every(e => e.dataUrl.startsWith(POOL_REF))).toBe(true);
+        // The same records as with the images whole (the crop turned a quarter keeps its crossed size).
+        expect(excerpts(pooled).map(e => ({ ...e, dataUrl: back.get(e.dataUrl) }))).toEqual(excerpts(whole));
+        clearImageMeta();
     });
 
     it('addresses: the images beside the tree, the file asked by reference with the rest kept', () => {
@@ -302,6 +324,24 @@ describe('the images from the bridge', () => {
         expect(b.asks.length).toBeGreaterThan(3);
     });
 
+    it('photos whose sizes the file says go in asks of a size an answer takes, two at a time from the start', async () => {
+        // 40 photos of 1 MB as the file says them (`_BYTES`): never one ask answered 8 MB at a time through `more`.
+        const imgs = many(40);
+        const MB = 1024 * 1024;
+        const b = bridge(storeOf(imgs));
+        const got = await fetchImagesByHash(URL_IMAGES, imgs.map(img => ({ ...refOf(img), bytes: MB })), b.deps);
+        expect(got.size).toBe(40);
+        const per = Math.floor(IMAGE_ASK_BYTES / MB);
+        expect(b.asks.map(a => a.shas.length)).toEqual([...Array(Math.floor(40 / per)).fill(per), ...(40 % per ? [40 % per] : [])]);
+        expect(b.maxInFlight()).toBe(2);
+        // Each once, in the file's order.
+        expect(b.asks.flatMap(a => a.shas)).toEqual(imgs.map(shaOf));
+        // A photo bigger than an answer still goes, alone.
+        const big = bridge(storeOf(imgs.slice(0, 3)));
+        await fetchImagesByHash(URL_IMAGES, imgs.slice(0, 3).map(img => ({ ...refOf(img), bytes: 2 * IMAGE_ASK_BYTES })), big.deps);
+        expect(big.asks.map(a => a.shas.length)).toEqual([1, 1, 1]);
+    });
+
     it('a network error, a 5xx and an answer cut short are asked again after a wait', async () => {
         const imgs = many(3);
         const b = bridge(storeOf(imgs), {
@@ -346,6 +386,23 @@ describe('the images from the bridge', () => {
 
         const always = bridge(storeOf(imgs), { corrupt: sha => sha === target ? IMG_C : null });
         await expect(fetchImagesByHash(URL_IMAGES, imgs.map(refOf), always.deps)).rejects.toThrow(/does not give its hash/);
+    });
+
+    it('through a sealed channel (a device\'s tunnel) an image is taken under the hash the research named, not hashed again', async () => {
+        const imgs = many(3);
+        const b = bridge(storeOf(imgs));
+        const hashed: number[] = [];
+        const deps: ImageFetchDeps = { ...b.deps, sha256Hex: async (bytes) => { hashed.push(bytes.length); return sha256Hex(bytes); },
+            sealed: url => url === URL_IMAGES };
+        const got = await fetchImagesByHash(URL_IMAGES, imgs.map(refOf), deps);
+        expect([...got.values()]).toEqual(imgs.map(dataUrlOf));
+        expect(hashed).toEqual([]);
+        const batch = await fetchImageBatch(URL_IMAGES, imgs.map(refOf), deps);
+        expect(batch.images.size).toBe(3);
+        expect(hashed).toEqual([]);
+        // Any other bridge: every image hashed.
+        await fetchImagesByHash(URL_IMAGES, imgs.map(refOf), { ...deps, sealed: () => false });
+        expect(hashed).toHaveLength(3);
     });
 
     it('an image not asked for is never taken; one never answered fails', async () => {
@@ -421,6 +478,50 @@ describe('images already held are never asked again', () => {
         const got = await resolveImageRefs({ researchId: UUID, refs: findImageRefs(SLIM), imagesUrl: URL_IMAGES }, resolveDeps(b, [dataUrlOf(IMG_B)]));
         expect(got).toMatchObject({ seeded: 1, fetched: 2 });
         expect(b.asks[0].shas.sort()).toEqual([shaOf(IMG_A), shaOf(IMG_C)].sort());
+    });
+
+    it('images pooled here (the image catalog knows their hash) are taken as references: nothing read, hashed or downloaded (spec 135)', async () => {
+        clearImageMeta();
+        forgetHeldImages();
+        const b = bridge(storeOf([IMG_A, IMG_B, IMG_C]));
+        const refOfImg = (img: Buffer): string => `${POOL_REF}p:${shaOf(img).slice(0, 40)}`;
+        for (const img of [IMG_A, IMG_B, IMG_C]) {
+            setImageMeta(`p:${shaOf(img).slice(0, 40)}`, { len: dataUrlOf(img).length, head: 'data:image/jpeg;base64,', bytes: img.length, token: 't', mtok: 'm', sha: shaOf(img) });
+        }
+        const hashed: string[] = [];
+        let treeRead = false;
+        const deps: ImageResolveDeps = {
+            ...resolveDeps(b, [], hashed),
+            treeImages: async () => { treeRead = true; return []; },
+            pooledBySha: async shas => new Map(shas.map(sh => [sh, `${POOL_REF}p:${sh.slice(0, 40)}`])),
+        };
+        const got = await resolveImageRefs({ researchId: UUID, refs: findImageRefs(SLIM), imagesUrl: URL_IMAGES }, deps);
+        expect(got).toMatchObject({ held: 0, seeded: 3, fetched: 0 });
+        expect(got.images.get(shaOf(IMG_A))).toBe(refOfImg(IMG_A));
+        expect(treeRead).toBe(false);
+        expect(hashed).toEqual([]);
+        expect(b.asks.length).toBe(0);
+        // Held as references, taken again as they are.
+        const again = await resolveImageRefs({ researchId: UUID, refs: findImageRefs(SLIM), imagesUrl: URL_IMAGES }, resolveDeps(b));
+        expect(again).toMatchObject({ held: 3, fetched: 0 });
+        clearImageMeta();
+    });
+
+    it('downloaded images held for a research take their references once stored (spec 135)', async () => {
+        clearImageMeta();
+        forgetHeldImages();
+        const b = bridge(storeOf([IMG_A, IMG_B, IMG_C]));
+        const refOfImg = (img: Buffer): string => `${POOL_REF}p:${shaOf(img).slice(0, 40)}`;
+        const first = await resolveImageRefs({ researchId: UUID, refs: findImageRefs(SLIM), imagesUrl: URL_IMAGES }, resolveDeps(b));
+        expect(first).toMatchObject({ fetched: 3 });
+        for (const img of [IMG_A, IMG_B, IMG_C]) {
+            setImageMeta(`p:${shaOf(img).slice(0, 40)}`, { len: dataUrlOf(img).length, head: 'data:image/jpeg;base64,', bytes: img.length, token: 't', mtok: 'm', sha: shaOf(img) });
+        }
+        internHeldImages(new Map([IMG_A, IMG_B, IMG_C].map(img => [dataUrlOf(img), refOfImg(img)])));
+        const again = await resolveImageRefs({ researchId: UUID, refs: findImageRefs(SLIM), imagesUrl: URL_IMAGES }, resolveDeps(b));
+        expect(again).toMatchObject({ held: 3, fetched: 0 });
+        expect([...again.images.values()].sort()).toEqual([refOfImg(IMG_A), refOfImg(IMG_B), refOfImg(IMG_C)].sort());
+        clearImageMeta();
     });
 
     it('failing keeps nothing new and says so (the caller loads the whole file)', async () => {

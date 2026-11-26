@@ -7,6 +7,8 @@ import { PersonId, PartnershipId, StromData } from '../types.js';
 import {
     MergeState,
     MergePhase,
+    MergeTarget,
+    MergeWizardState,
     PersonMatch,
     FieldConflict,
     MatchDecision,
@@ -14,6 +16,7 @@ import {
     ConflictResolution
 } from './types.js';
 import { detectPartnershipConflicts } from './executor.js';
+import { planCounts, wizardPlan } from './plan.js';
 import { StorageManager } from '../storage.js';
 
 // ==================== IDB KEYS ====================
@@ -37,6 +40,10 @@ export interface SerializableMergeState {
     phase: MergePhase;
     /** "Update existing only" mode (Primitive 1). Optional: old sessions lack it. */
     updateOnly?: boolean;
+    /** The target tree and its data's fingerprint at the matching (spec 134 K0.6). Optional: old sessions lack it. */
+    target?: MergeTarget;
+    /** The guide's step, reached step, comparison done and choices (spec 134 §1). Optional: old sessions lack it. */
+    wizard?: MergeWizardState;
 }
 
 /** Saved merge session metadata */
@@ -46,6 +53,12 @@ export interface SavedMergeSession {
     incomingFileName?: string;
     /** Target tree name (tree being merged into) */
     targetTreeName?: string;
+    /**
+     * The tree being merged into, when known (spec 139 §9.1: Manage trees
+     * shows the session under that tree's row). Older sessions: read from
+     * their state, else matched by targetTreeName.
+     */
+    targetTreeId?: string;
     /** Source tree name (tree being merged from, for tree-to-tree merge) */
     sourceTreeName?: string;
     stats: {
@@ -53,6 +66,12 @@ export interface SavedMergeSession {
         reviewed: number;
         resolved: number;
         conflicts: number;
+        /**
+         * The guide's "to decide" (planCounts().pending of wizardPlan, the
+         * number of step 2), when the comparison ran (134 S-P2). Absent in
+         * sessions of older versions and before the comparison.
+         */
+        pending?: number;
     };
     state: SerializableMergeState;
 }
@@ -70,11 +89,26 @@ function serializeState(state: MergeState): SerializableMergeState {
         conflictResolutions: Array.from(state.conflictResolutions.entries()),
         partnershipResolutions: Array.from(state.partnershipResolutions?.entries() ?? []),
         phase: state.phase,
-        updateOnly: state.updateOnly
+        updateOnly: state.updateOnly,
+        ...(state.target ? { target: state.target } : {}),
+        ...(state.wizard ? { wizard: structuredClone(state.wizard) } : {})
     };
 }
 
 function deserializeState(serialized: SerializableMergeState): MergeState {
+    // A session saved before suggestions stopped being the default holds them
+    // as resolutions: on a person nobody answered for, a suggested
+    // "use the import" goes back to keeping the existing value (spec 134 K0.3).
+    const answered = new Set(serialized.conflictResolutions.map(([id]) => id));
+    for (const match of serialized.matches) {
+        if (answered.has(match.incomingId)) continue;
+        for (const conflict of match.conflicts) {
+            if (conflict.suggestedReason && conflict.resolution === 'use_incoming') {
+                conflict.suggested ??= 'use_incoming';
+                conflict.resolution = 'keep_existing';
+            }
+        }
+    }
     return {
         existingData: serialized.existingData,
         incomingData: serialized.incomingData,
@@ -86,7 +120,9 @@ function deserializeState(serialized: SerializableMergeState): MergeState {
         partnershipResolutions: new Map(serialized.partnershipResolutions ?? []),
         phase: serialized.phase,
         // Old saved sessions predate the flag → default to normal mode.
-        updateOnly: serialized.updateOnly ?? false
+        updateOnly: serialized.updateOnly ?? false,
+        ...(serialized.target ? { target: serialized.target } : {}),
+        ...(serialized.wizard ? { wizard: serialized.wizard } : {})
     };
 }
 
@@ -111,7 +147,18 @@ function calculateStats(state: MergeState): SavedMergeSession['stats'] {
         }
     }
 
-    return { total, reviewed, resolved, conflicts };
+    const pending = pendingOf(state);
+    return { total, reviewed, resolved, conflicts, ...(pending !== undefined ? { pending } : {}) };
+}
+
+/** The guide's "to decide" of a merge (step 2), or undefined before its comparison. */
+function pendingOf(state: MergeState): number | undefined {
+    try {
+        const plan = wizardPlan(state);
+        return plan ? planCounts(plan).pending : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 // ==================== CURRENT MERGE (AUTO-SAVE) ====================
@@ -179,6 +226,7 @@ export async function saveMergeSession(
             incomingFileName: fileName,
             targetTreeName,
             sourceTreeName,
+            ...(stateTargetId(state) ? { targetTreeId: stateTargetId(state) ?? undefined } : {}),
             stats: calculateStats(state),
             state: serializeState(state)
         };
@@ -195,6 +243,32 @@ export async function saveMergeSession(
     } catch (error) {
         console.error('Failed to save merge session:', error);
         throw error;
+    }
+}
+
+/**
+ * Store the state of a resumed saved merge under its own session (spec 134
+ * K0.6): the session stays until the merge is written or thrown away, its
+ * name as it was. False when the session is gone or the write failed.
+ */
+export async function updateMergeSession(id: string, state: MergeState, names?: { targetTreeName?: string; sourceTreeName?: string }): Promise<boolean> {
+    try {
+        const sessions = await listMergeSessions();
+        const session = sessions.find(s => s.id === id);
+        if (!session) return false;
+        session.savedAt = new Date().toISOString();
+        // The target chosen since (or named wrong by an older version, 134 V-N4): the row says the tree merged into.
+        if (names?.targetTreeName) session.targetTreeName = names.targetTreeName;
+        if (names?.sourceTreeName) session.sourceTreeName = names.sourceTreeName;
+        const targetId = stateTargetId(state);
+        if (targetId) session.targetTreeId = targetId;
+        session.stats = calculateStats(state);
+        session.state = serializeState(state);
+        await StorageManager.set('merge', SESSIONS_KEY, sessions);
+        return true;
+    } catch (error) {
+        console.error('Failed to update merge session:', error);
+        return false;
     }
 }
 
@@ -247,14 +321,31 @@ export async function listMergeSessions(): Promise<SavedMergeSession[]> {
 
 export async function listMergeSessionsInfo(): Promise<Array<Omit<SavedMergeSession, 'state'>>> {
     const sessions = await listMergeSessions();
-    return sessions.map(({ id, savedAt, incomingFileName, targetTreeName, sourceTreeName, stats }) => ({
+    return sessions.map(({ id, savedAt, incomingFileName, targetTreeName, targetTreeId, sourceTreeName, stats, state }) => ({
         id,
         savedAt,
         incomingFileName,
         targetTreeName,
+        // An older session: the target its state names.
+        targetTreeId: targetTreeId ?? stateTargetId(state) ?? undefined,
         sourceTreeName,
-        stats
+        // A session saved by an older version: its "to decide" from its guide's state.
+        stats: stats.pending === undefined && state?.wizard ? { ...stats, ...pendingStat(state) } : stats
     }));
+}
+
+/** The tree a merge state writes into, when it names one. */
+function stateTargetId(state: Pick<MergeState, 'target' | 'wizard'> | undefined): string | null {
+    return state?.target?.treeId ?? state?.wizard?.choices?.targetTreeId ?? null;
+}
+
+function pendingStat(serialized: SerializableMergeState): { pending?: number } {
+    try {
+        const pending = pendingOf(deserializeState(serialized));
+        return pending !== undefined ? { pending } : {};
+    } catch {
+        return {};
+    }
 }
 
 export async function hasPendingMerges(): Promise<boolean> {

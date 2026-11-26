@@ -16,16 +16,18 @@ import { uniqueIdSuffix } from './ids.js';
 import { StorageManager } from './storage.js';
 import { SettingsManager } from './settings.js';
 import { CryptoSession, EncryptedData } from './crypto.js';
+import type { ImageMetaRecord } from './image-meta.js';
 import {
-    withPoolLock, collectPoolable, storeImages, stringifyPooled, unpoolJson, notePoolSizes,
+    withPoolLock, poolImages, stringifyPooled, unpoolJson, notePoolSizes, packImageMeta, unpackImageMeta,
     collectPoolGarbageLocked, registerPoolReferences, bytesToBase64, base64ToBytes,
 } from './media-pool.js';
+import { treeImages, settleStoredImages } from './image-intern.js';
 
 /** `other-window`: this window's state when another window (an older app too) saved over its tree. */
 /** `pre-research-load` / `pre-first-send`: before the research's version replaced the tree, before its first send. */
 /** `closed-tab`: a window's state rescued as it closed, which another window's later save outdated. */
 /** `pre-migration`: before a newer app changed the stored tree to its data version (spec 077, v19). */
-export type SnapshotReason = 'auto' | 'manual' | 'pre-import' | 'pre-merge' | 'other-window' | 'pre-research-load' | 'pre-first-send' | 'closed-tab' | 'pre-migration';
+export type SnapshotReason = 'auto' | 'manual' | 'pre-import' | 'pre-merge' | 'pre-merge-undo' | 'other-window' | 'pre-research-load' | 'pre-first-send' | 'closed-tab' | 'pre-migration';
 
 export interface SnapshotMeta {
     id: string;
@@ -42,6 +44,22 @@ export interface SnapshotMeta {
      * a restore puts it back, so the next send names that head (N61-3).
      */
     research?: SnapshotResearchBase;
+    /**
+     * The merge this backup belongs to ("Before merge", spec 134 K6.6): the
+     * rotation never deletes it (planRetention), only a delete by hand does.
+     */
+    keepFor?: string;
+}
+
+/** Options of createSnapshot. */
+export interface SnapshotOptions {
+    /** See SnapshotMeta.keepFor. */
+    keepFor?: string;
+    /**
+     * 'skip': no rotation at this backup, the tree may stay over the limits
+     * until its next one ("Keep both (over the limit)", spec 134 §8 8e).
+     */
+    retention?: 'normal' | 'skip';
 }
 
 /** The research link a snapshot's data built on: the research's id, the base, and the copy it was that one plus edits of (`_STROM_SINCE`). */
@@ -58,6 +76,8 @@ interface StoredSnapshot {
     encrypted?: EncryptedData;   // encryption on → same path as tree data
     gzip?: string;               // base64(gzip(JSON))
     plain?: string;              // uncompressed JSON (fallback)
+    /** Catalog entries of its pooled images (image-meta.ts), encrypted with an encrypted payload. */
+    imageMeta?: ImageMetaRecord | EncryptedData;
 }
 
 /** Keep at most this many snapshots per tree (oldest dropped). */
@@ -132,11 +152,15 @@ function dayKey(ms: number): string {
 async function writeSnapshot(data: StromData, meta: SnapshotMeta): Promise<SnapshotMeta> {
     const encrypted = SettingsManager.isEncryptionEnabled() && CryptoSession.isUnlocked();
     for (const m of await allMetas()) notePoolSizes(m.media);
-    const { ids, media } = await storeImages(collectPoolable(data), encrypted, meta.treeId);
+    // New images into the pool, references named as they are (another kind's stored again, image-intern.ts).
+    const images = treeImages(data);
+    const { ids, media, meta: imageMeta } = await poolImages(images.urls, images.refIds, encrypted, meta.treeId);
     const json = stringifyPooled(data, ids);
     const stored: StoredSnapshot = { meta: { ...meta, sizeBytes: 0 } };
     delete stored.meta.media;
     if (Object.keys(media).length) stored.meta.media = media;
+    const packed = await packImageMeta(imageMeta, encrypted);
+    if (packed) stored.imageMeta = packed;
     if (encrypted) {
         stored.encrypted = await CryptoSession.encrypt(json);
         stored.meta.sizeBytes = JSON.stringify(stored.encrypted).length;
@@ -156,7 +180,8 @@ async function writeSnapshot(data: StromData, meta: SnapshotMeta): Promise<Snaps
  * plain if compression is unavailable). Enforces retention before returning.
  */
 export function createSnapshot(
-    treeId: string, data: StromData, reason: SnapshotReason, now: number, research?: SnapshotResearchBase | null
+    treeId: string, data: StromData, reason: SnapshotReason, now: number, research?: SnapshotResearchBase | null,
+    opts: SnapshotOptions = {}
 ): Promise<SnapshotMeta> {
     if (SettingsManager.isEncryptionEnabled() && !CryptoSession.isUnlocked()) {
         // Defense in depth: with encryption on but the session locked, the
@@ -168,8 +193,11 @@ export function createSnapshot(
     return withPoolLock(async () => {
         const personCount = Object.values(data.persons).filter(p => !p.isPlaceholder).length;
         const id = `snap_${now}_${uniqueIdSuffix()}`;
-        const meta = await writeSnapshot(data, { id, treeId, createdAt: now, personCount, sizeBytes: 0, reason, ...(research ? { research } : {}) });
-        await enforceRetention(treeId);
+        const meta = await writeSnapshot(data, {
+            id, treeId, createdAt: now, personCount, sizeBytes: 0, reason,
+            ...(research ? { research } : {}), ...(opts.keepFor ? { keepFor: opts.keepFor } : {}),
+        });
+        if (opts.retention !== 'skip') await enforceRetention(treeId);
         await collectPoolGarbageLocked();
         // Automatic backups finish in the background: an open backups list
         // must learn about them.
@@ -253,25 +281,49 @@ export function snapshotCosts(metas: SnapshotMeta[], free: Iterable<string> = []
  * Which snapshots to keep (metas newest first, after the one-auto-per-day
  * merge): at most MAX_SNAPSHOTS_PER_TREE, and — beyond the newest
  * MIN_SNAPSHOTS_KEPT — only while their total fits `budget`. Images the
- * stored tree (`free`) or a newer kept snapshot has cost nothing. Pure, for tests.
+ * stored tree (`free`) or a newer kept snapshot has cost nothing. A backup
+ * kept for a merge (`keepFor`) is never dropped: it counts towards the limits,
+ * so the others go first, and alone it may leave the tree over them.
+ * `ignoreKeep`: as if nothing were kept for a merge (what the rotation would
+ * take without it, spec 134 §8 8e). Pure, for tests.
  */
-export function planRetention(metas: SnapshotMeta[], budget: number, free: Iterable<string> = []): { keep: SnapshotMeta[]; dropCount: number; dropSpace: number } {
-    const keep: SnapshotMeta[] = [];
+export function planRetention(
+    metas: SnapshotMeta[], budget: number, free: Iterable<string> = [], opts: { ignoreKeep?: boolean } = {}
+): { keep: SnapshotMeta[]; dropCount: number; dropSpace: number } {
+    const kept = (m: SnapshotMeta): boolean => !!m.keepFor && !opts.ignoreKeep;
     const seen = new Set<string>(free);
+    /** What `m` adds to the space beyond the images already counted. */
+    const cost = (m: SnapshotMeta): { size: number; fresh: string[] } => {
+        const fresh = Object.keys(m.media ?? {}).filter(id => !seen.has(id));
+        return { size: fresh.reduce((sum, id) => sum + m.media![id], m.sizeBytes || 0), fresh };
+    };
+    // The backups kept for a merge first: their place and space are taken before the others'.
+    const keepIds = new Set<string>();
     let used = 0;
+    for (const m of metas) {
+        if (!kept(m)) continue;
+        const { size, fresh } = cost(m);
+        for (const id of fresh) seen.add(id);
+        used += size;
+        keepIds.add(m.id);
+    }
+    let count = keepIds.size;
+    /** The others kept so far: the newest MIN_SNAPSHOTS_KEPT of them stay whatever the space. */
+    let others = 0;
     let dropCount = 0;
     let dropSpace = 0;
     for (const m of metas) {
-        if (keep.length >= MAX_SNAPSHOTS_PER_TREE) { dropCount++; continue; }
-        let size = m.sizeBytes || 0;
-        const fresh = Object.keys(m.media ?? {}).filter(id => !seen.has(id));
-        for (const id of fresh) size += m.media![id];
-        if (keep.length >= MIN_SNAPSHOTS_KEPT && used + size > budget) { dropSpace++; continue; }
-        keep.push(m);
+        if (kept(m)) continue;
+        if (count >= MAX_SNAPSHOTS_PER_TREE) { dropCount++; continue; }
+        const { size, fresh } = cost(m);
+        if (others >= MIN_SNAPSHOTS_KEPT && used + size > budget) { dropSpace++; continue; }
         for (const id of fresh) seen.add(id);
         used += size;
+        count++;
+        others++;
+        keepIds.add(m.id);
     }
-    return { keep, dropCount, dropSpace };
+    return { keep: metas.filter(m => keepIds.has(m.id)), dropCount, dropSpace };
 }
 
 /**
@@ -294,20 +346,10 @@ async function enforceRetention(treeId: string): Promise<void> {
     const list = await metasForTree(treeId);
 
     // Collapse auto snapshots to one per calendar day (keep the newest).
-    const seenAutoDays = new Set<string>();
-    const afterDaily: SnapshotMeta[] = [];
-    for (const m of list) {
-        if (m.reason === 'auto') {
-            const key = dayKey(m.createdAt);
-            if (seenAutoDays.has(key)) { await removeSnapshotRecords(m.id); continue; }
-            seenAutoDays.add(key);
-        }
-        afterDaily.push(m);
-    }
+    const { kept: afterDaily, dropped } = collapseDailyAutos(list);
+    for (const m of dropped) await removeSnapshotRecords(m.id);
 
-    const ratio = await storageUsageRatio();
-    const storageFull = ratio !== null && ratio > STORAGE_PRESSURE_RATIO;
-    const budget = await snapshotBudgetBytes();
+    const { storageFull, budget } = await retentionLimits();
     const free = await treeImageIds(treeId);
     const plan = planRetention(afterDaily, storageFull ? 0 : budget, free);
     const kept = new Set(plan.keep.map(m => m.id));
@@ -325,6 +367,49 @@ async function enforceRetention(treeId: string): Promise<void> {
     }
 }
 
+/** Auto snapshots collapsed to the newest per calendar day (metas newest first). */
+function collapseDailyAutos(list: SnapshotMeta[]): { kept: SnapshotMeta[]; dropped: SnapshotMeta[] } {
+    const seenAutoDays = new Set<string>();
+    const kept: SnapshotMeta[] = [];
+    const dropped: SnapshotMeta[] = [];
+    for (const m of list) {
+        if (m.reason === 'auto') {
+            const key = dayKey(m.createdAt);
+            if (seenAutoDays.has(key)) { dropped.push(m); continue; }
+            seenAutoDays.add(key);
+        }
+        kept.push(m);
+    }
+    return { kept, dropped };
+}
+
+/** The space the rotation allows now, and whether the browser's storage is nearly full. */
+async function retentionLimits(): Promise<{ storageFull: boolean; budget: number }> {
+    const ratio = await storageUsageRatio();
+    return { storageFull: ratio !== null && ratio > STORAGE_PRESSURE_RATIO, budget: await snapshotBudgetBytes() };
+}
+
+/**
+ * A backup kept for a merge (`keepFor`) that the rotation would delete, were
+ * it not kept, once one more backup of the tree came (`next`: its size, the
+ * newest backup's when not given): the oldest such, or null (spec 134 §8 8e,
+ * the question Keep both / Delete the oldest other backup).
+ */
+export async function keptBackupAtRisk(treeId: string, next?: Pick<SnapshotMeta, 'sizeBytes' | 'media'>): Promise<SnapshotMeta | null> {
+    const list = await metasForTree(treeId);
+    if (!list.some(m => m.keepFor)) return null;
+    const incoming: SnapshotMeta = {
+        id: 'snap_next', treeId, createdAt: Date.now(), personCount: 0, reason: 'pre-merge',
+        sizeBytes: next?.sizeBytes ?? list[0]?.sizeBytes ?? 0, ...(next?.media ? { media: next.media } : {}),
+    };
+    const { kept } = collapseDailyAutos([incoming, ...list]);
+    const { storageFull, budget } = await retentionLimits();
+    const plan = planRetention(kept, storageFull ? 0 : budget, await treeImageIds(treeId), { ignoreKeep: true });
+    const stays = new Set(plan.keep.map(m => m.id));
+    const lost = kept.filter(m => m.keepFor && !stays.has(m.id));
+    return lost.length ? lost[lost.length - 1] : null;
+}
+
 /** List a tree's snapshots, newest first. */
 export async function listSnapshots(treeId: string): Promise<SnapshotMeta[]> {
     return metasForTree(treeId);
@@ -337,6 +422,24 @@ export async function listSnapshots(treeId: string): Promise<SnapshotMeta[]> {
 export async function treeImageIds(treeId: string): Promise<string[]> {
     const raw = await StorageManager.get<{ pooled?: number; media?: Record<string, number> }>('trees', treeId);
     return raw?.pooled === 1 ? Object.keys(raw.media ?? {}) : [];
+}
+
+/**
+ * The trees (of `ids`: a tree's pooled image ids, treeImageIds) that have an
+ * image another of them has too: their sizes count the shared images each
+ * (Manage trees, 134 S-P1).
+ */
+export function sharedImageTrees(ids: ReadonlyMap<string, readonly string[]>): Set<string> {
+    const owner = new Map<string, string>();
+    const shared = new Set<string>();
+    for (const [tree, list] of ids) {
+        for (const img of new Set(list)) {
+            const first = owner.get(img);
+            if (first === undefined) owner.set(img, tree);
+            else if (first !== tree) { shared.add(first); shared.add(tree); }
+        }
+    }
+    return shared;
 }
 
 /** Space a tree's snapshots take (shared images counted once). */
@@ -369,15 +472,29 @@ async function readSnapshotText(s: StoredSnapshot): Promise<string | null> {
 }
 
 /**
- * Decode a snapshot back to the tree's JSON (decrypt / gunzip / plain, images
- * put back). `missingImages` counts images the pool no longer had.
+ * Decode a snapshot back to the tree's JSON (decrypt / gunzip / plain).
+ * `images`: 'whole' puts the images back (a file of the backup), 'refs'
+ * keeps them as references for the tree in memory (a restore, spec 135 D6;
+ * image-intern.ts settleStoredImages). `missingImages` counts images the
+ * pool no longer had.
  */
-export async function getSnapshotPayload(id: string): Promise<{ json: string; missingImages: number; research?: SnapshotResearchBase; createdAt?: number } | null> {
+export async function getSnapshotPayload(id: string, o: { images?: 'whole' | 'refs' } = {}): Promise<{ json: string; missingImages: number; research?: SnapshotResearchBase; createdAt?: number } | null> {
     const s = await StorageManager.get<StoredSnapshot>('snapshots', id);
     if (!s) return null;
     const text = await readSnapshotText(s);
     if (text === null) return null;
-    const { json, missing } = await unpoolJson(text);
+    await unpackImageMeta(s.imageMeta);
+    // The images it names are this browser's own: its references pass the load sanitizer (validation.ts).
+    notePoolSizes(s.meta?.media);
+    let json: string;
+    let missing: number;
+    if (o.images === 'refs') {
+        const data = JSON.parse(text) as StromData;
+        missing = (await settleStoredImages(data)).missing;
+        json = JSON.stringify(data);
+    } else {
+        ({ json, missing } = await unpoolJson(text));
+    }
     return {
         json, missingImages: missing,
         ...(s.meta?.research ? { research: s.meta.research } : {}),
@@ -431,14 +548,18 @@ export function reencodeAllSnapshots(): Promise<number> {
             try {
                 const text = await readSnapshotText(s);
                 if (text === null) { failed++; continue; }
-                const { json } = await unpoolJson(text);
-                await writeSnapshot(JSON.parse(json) as StromData, s.meta);
+                // Its references stay: writeSnapshot stores their images again under the new kind, a batch at a time.
+                notePoolSizes(s.meta.media);
+                const data = JSON.parse(text) as StromData;
+                await settleStoredImages(data);
+                await writeSnapshot(data, s.meta);
             } catch (err) {
                 console.error('Snapshot re-encoding failed', s.meta.id, err);
                 failed++;
             }
         }
-        await collectPoolGarbageLocked();
+        // The images of the old kind go at once (no plaintext copy left after encryption is switched on).
+        await collectPoolGarbageLocked(Date.now(), { dropKind: encryptionOn ? 'p:' : 'e:' });
         return failed;
     });
 }

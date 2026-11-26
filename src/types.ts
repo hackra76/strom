@@ -141,9 +141,11 @@ export interface LifeEvent {
     status?: FactStatus;
     /**
      * The e-mail addresses the GEDCOM file gave under the event (`2 EMAIL`,
-     * MyHeritage's contact under RESI), as written. Each is also a line of
-     * the note ("E-mail: …"), which is what the app shows; "Back to {prog}"
-     * writes it back as `2 EMAIL` while that line is still in the note.
+     * MyHeritage's contact under RESI), as written. They are the person's
+     * contact (Person.emails, data v26); "Back to {prog}" writes each back as
+     * `2 EMAIL` under this event while the contact still has it. A tree of an
+     * older app had each as a line of the note ("E-mail: …") too, written
+     * back while that line was still there.
      */
     gedcomEmails?: string[];
     /**
@@ -203,8 +205,11 @@ export interface LifeEvent {
  */
 export interface PortraitCrop {
     /**
-     * The frame (a square in pixels) in fractions 0–1 of the image after the
+     * The frame (a square in pixels) in fractions of the image after the
      * mirror and the quarter turns, from the top left: w × width = h × height.
+     * w, h ≤ 1; the frame may reach past the image's edge (x < 0, x + w > 1…)
+     * as long as its centre lies on the image — the part off the image is
+     * PORTRAIT_EMPTY_FILL in the portrait.
      */
     region: { x: number; y: number; w: number; h: number };
     /** Clockwise turn in quarter turns (none = upright). */
@@ -649,6 +654,13 @@ export interface Person {
      */
     question?: string;
     /**
+     * The person's e-mail addresses (data version 26, spec 134 K0.10): the
+     * contact a GEDCOM file gives as `1 RESI` / `2 EMAIL` (MyHeritage) or
+     * `1 EMAIL`, or one typed in the person editor. A contact, not an event:
+     * written out as `1 RESI` / `2 EMAIL` (see src/person-contact.ts).
+     */
+    emails?: string[];
+    /**
      * Other written forms of this person's name: how the registers actually
      * spell it (Fischek / Fíšek / Fissek), an alias, or the Czech "jméno po
      * chalupě" — the farm a family was known by, which on a village identified
@@ -670,6 +682,13 @@ export interface Person {
      * written to GEDCOM.
      */
     addedAt?: string;
+    /**
+     * When the person was last changed (ISO; spec 136 D4): written by the
+     * DataManager on every edit of the person, their events, unions and
+     * citations. Absent for people not changed since it is recorded (and for
+     * people only added: their time is `addedAt`). Never written to GEDCOM.
+     */
+    changedAt?: string;
     /**
      * Explicit override of the "is this person alive?" heuristic used by the
      * living-privacy export filter. true = deceased, false = definitely alive,
@@ -1681,7 +1700,127 @@ export interface PersonList {
     builtin?: 'added30';
     /** ISO time of the last change. */
     updated: string;
+    /**
+     * A custom rule (spec 136): conditions and groups. When set, `rule` is
+     * absent and the list is stored with `dynamic: false` and `personIds` =
+     * the last worked-out people, so an older app sees a fixed list.
+     * `auto` = kept up to date ("automatic"); false = a fixed list made from it.
+     */
+    custom?: CustomRule & { auto: boolean };
+    /**
+     * A custom rule this app cannot read whole (a newer version, a condition
+     * it does not know), kept exactly as it came (spec 136 K1.8): the list is
+     * fixed with its stored people meanwhile, and an app that reads the rule
+     * takes it back as `custom` when it loads the tree. Never set together
+     * with a readable `custom` (that one wins).
+     */
+    customUnknown?: Record<string, unknown>;
+    /** Where the list came from (spec 136 K1.10); absent = made by hand. */
+    origin?: PersonListOrigin;
 }
+
+/**
+ * Where a list of people came from (spec 136 K1.10). `template` is the
+ * stable id of a built-in template (src/person-list-templates.ts) or
+ * `own:<id>` for a template saved on the device; `name` its name then.
+ */
+export type PersonListOrigin =
+    | { by: 'template'; template: string; name: string; at: string }
+    | { by: 'agent'; at: string; agent?: string };
+
+/**
+ * The stable, language-independent names of the conditions of a custom list
+ * rule (spec 136 K1.10). Never translated, never renamed: they are stored in
+ * the tree and read by the research and by agents.
+ */
+export type RuleCondName =
+    | 'family' | 'ancestors' | 'descendants' | 'rod' | 'line' | 'list'
+    | 'born' | 'died' | 'married' | 'livedIn' | 'deathAge' | 'alive'
+    | 'near' | 'gender' | 'occupation' | 'has' | 'count' | 'text'
+    | 'added' | 'changed' | 'tableFilter';
+
+/** A year period of a condition; at least one end is set. Both ends are included. */
+export interface RuleYears { from?: number; to?: number }
+
+/** A period back from now (`hours` / `days`) or from a day on (`since`, YYYY-MM-DD). */
+export type RulePeriod = { hours: 24 } | { days: number } | { since: string };
+
+/** A generation count or 'all'. */
+export type RuleDepth = number | 'all';
+
+/** What `has` asks about (spec 136 §3.2). `conflict` and `openTask` are about a research tree. */
+export type RuleHasWhat =
+    | 'birthDate' | 'birthPlace' | 'deathDate' | 'deathPlace' | 'photo' | 'source'
+    | 'parents' | 'partner' | 'children' | 'story' | 'note' | 'material' | 'conflict' | 'openTask';
+
+/** The kinds of event `near` looks at. */
+export type RuleNearEvent = 'birth' | 'death' | 'marriage' | 'residence';
+
+/**
+ * The parameters of each condition (spec 136 §3.2), by condition name.
+ * Names of people, places and lists are kept beside their ids so the
+ * condition can still be described when they are gone ("missing").
+ * - family: a person's family by axes (§4): `up` generations through both
+ *   parents or the father's / mother's side only, `down` generations, sideways
+ *   the direct line, siblings or cousins (`cousins` = degree, 1 = first
+ *   cousins), and spouses (none, spouses, spouses' families).
+ * - ancestors / descendants: as the one-condition rule (`generations` absent = all).
+ * - rod: family lines (rody) by id; line: a research line.
+ * - list: the people of another list.
+ * - born / died / married / livedIn / deathAge: years (deathAge: whole years of age).
+ * - near: a place (`placeKey`, src/places.ts) and its surroundings in km (0 = the
+ *   place and the parts of its town), `below` also the places under its record.
+ * - occupation: `values` folded (foldText), `labels` as shown.
+ * - count: at least (`min`) or at most (`max`) `n`.
+ * - text: in the story, the notes or both, ignoring case and accents.
+ * - added / changed: a period (RulePeriod).
+ * - tableFilter: a copy of a saved Table view's filter and sort.
+ */
+export interface RuleParamsMap {
+    family: {
+        personId: PersonId; personName: string;
+        up: RuleDepth; via: 'both' | 'father' | 'mother'; down: RuleDepth;
+        width: 'line' | 'siblings' | 'cousins'; cousins?: RuleDepth;
+        spouses: 'none' | 'spouses' | 'families';
+    };
+    ancestors: { personId: PersonId; personName: string; generations?: number };
+    descendants: { personId: PersonId; personName: string; generations?: number };
+    rod: { rodIds: string[]; rodName: string };
+    line: { directionId: string; lineName: string };
+    list: { listId: string; listName: string };
+    born: RuleYears;
+    died: RuleYears;
+    married: RuleYears;
+    livedIn: RuleYears;
+    deathAge: RuleYears;
+    alive: { value: 'living' | 'deceased' };
+    near: { placeKey: string; placeName: string; events: RuleNearEvent[]; km: number; below?: true };
+    gender: { value: 'male' | 'female' | 'unknown' };
+    occupation: { values: string[]; labels: string[] };
+    has: { have: boolean; what: RuleHasWhat };
+    count: { what: 'children' | 'marriages' | 'sources'; cmp: 'min' | 'max'; n: number };
+    text: { query: string; where: 'story' | 'note' | 'both' };
+    added: RulePeriod;
+    changed: RulePeriod;
+    tableFilter: { viewName: string; rowType: 'persons' | 'unions'; filter: TableView['filter']; sort: TableView['sort'] };
+}
+
+/** The parameters of a condition (a union discriminated by the condition's name). */
+export type RuleParams = RuleParamsMap[RuleCondName];
+
+/** One condition of a custom rule; `not` = "except" (taken away from its group). */
+export type RuleCond = { [C in RuleCondName]: { t: 'cond'; c: C; p: RuleParamsMap[C]; not?: true } }[RuleCondName];
+
+/** A group of a custom rule: all (intersection) or any (union) of its items, minus the items with `not`. */
+export interface RuleGroup { t: 'group'; op: 'all' | 'any'; items: RuleNode[]; not?: true }
+
+export type RuleNode = RuleCond | RuleGroup;
+
+/** A custom rule (spec 136 v1). The root is always a group; depth at most 3 (the root = 1). */
+export interface CustomRule { v: 1; root: RuleGroup }
+
+/** A custom list rule template saved on the device (spec 136 D5). */
+export interface ListTemplate { id: string; name: string; root: RuleGroup; created: string }
 
 /**
  * Manual corrections of the lineages (rody, see src/lineage.ts), by person id.
@@ -1834,6 +1973,108 @@ export interface PlaceRecord {
     needs?: string;
 }
 
+// ==================== MERGE HISTORY (spec 134 §0.3) ====================
+
+/** Where a merge's people came from (spec 134 §0.2): the plan's source, kept in the merge's record. */
+export interface PlanSource {
+    kind: 'ged' | 'json' | 'tree' | 'view' | 'share';
+    /** File name or tree name ("rodokmen-Jilmovi.ged", "Jilmovi – zkouška"). */
+    label: string;
+    program?: string;
+    fileDate?: string;
+    /** The source's import record id (GEDCOM), when it has one. */
+    importId?: string;
+    /** A fingerprint of the source (the file's SHA-256, or contentFingerprint of a tree), for a repeated merge (§13, K1.5). */
+    fingerprint?: string;
+    treeId?: TreeId;
+    /** The source is a tree linked to a research: its link and numbers do not carry over (spec 134 11g/11h, merge/research-marks.ts). */
+    research?: true;
+    /** Persons of the source, its "?" stand-ins aside (buildPlan counts them). */
+    persons: number;
+}
+
+export interface PlanCounts {
+    joined: number;
+    added: number;
+    skipped: number;
+    pending: number;
+    /** Persons of the source ("?" aside): joined + added + skipped + pending. */
+    total: number;
+    /** Details the write changes (field items on, the value differs). */
+    fieldChanges: number;
+    /** Other empty details of joined persons the write fills (fill items, 134 S-N1); 0 in a record of an older version. */
+    fieldFills: number;
+    /** Differences where the tree's value stays. */
+    differencesKept: number;
+    /** Differences where the import's value is kept alongside the tree's ("Keep both", K5.3). */
+    alongside: number;
+    partnerships: number;
+    links: number;
+    /** Sources of the import joined with a source the tree already has (not added again, 134 S-N3); 0 in a record of an older version. */
+    sourcesJoined: number;
+}
+
+/**
+ * One change a merge made to a record the tree already had, for its undo
+ * (src/merge/undo-plan.ts): key `key` of record `id` of collection `in`
+ * ('persons', 'partnerships', 'sources', 'media', 'places', …; '' = a key of
+ * the tree's data itself), its value before and after the merge (absent =
+ * none). `key` '' = the whole record (one the merge removed, or a value that
+ * is not an object). Values as JSON; a picture's data URL is never kept, only
+ * a token of it (src/merge/record.ts), so a picture the merge replaced comes
+ * back from the backup "Before merge".
+ */
+export interface MergeEdit {
+    in: string;
+    id: string;
+    key: string;
+    before?: unknown;
+    after?: unknown;
+}
+
+/**
+ * The record of a merge (spec 134 §0.3, data version 26): what one merge
+ * brought into the tree, kept in StromData.merges (the Merge history, the
+ * undo). Travels with the tree's data: a backup and a JSON export keep it,
+ * a GEDCOM export does not write it.
+ */
+export interface MergeRecord {
+    id: string;
+    at: string;
+    source: PlanSource;
+    target: { name: string; newTree: boolean };
+    counts: PlanCounts;
+    state: 'valid' | 'partial' | 'undone';
+    /** Ids in the tree of every person the merge added ("?" included). */
+    added: PersonId[];
+    /** [the tree's id, the source's id] of every joined person. */
+    joined: Array<[PersonId, PersonId]>;
+    /**
+     * The source's id of each added person whose id in the tree differs
+     * (tree id → source id; absent: the same id), so that a later merge of the
+     * same source knows the people this one brought (spec 134 K1.5).
+     */
+    from?: Record<string, string>;
+    /** Details of joined persons the write changed (ids in the tree), as text. */
+    fields: Array<{ person: PersonId; field: string; before: string; after: string }>;
+    partnerships: string[];
+    sources: string[];
+    places: string[];
+    media: string[];
+    /** Every change to a record the tree already had, for the undo (absent: none). */
+    edits?: MergeEdit[];
+    /** A print of each added person as the merge left it (src/merge/record.ts personPrint), to tell a later change. */
+    prints?: Record<string, string>;
+    backupId?: string;
+    /** The research's input (I…) of the send that took the merge there (spec 134 §11). */
+    sentToResearch?: string;
+    /** When the merge went to the research (ISO), and the mark of that send (`intake`), to read its input from the research's sends. */
+    sentAt?: string;
+    sentIntake?: string;
+    /** The undos so far: when, and the items undone (src/merge/undo-plan.ts item ids). */
+    undone?: Array<{ at: string; items: string[] }>;
+}
+
 export interface StromData {
     /** Data format version for migration support */
     version?: number;
@@ -1943,6 +2184,13 @@ export interface StromData {
      * oldest first. People, facts, links and sources name them by id.
      */
     imports?: ImportRecord[];
+
+    /**
+     * The merges into this tree (data version 26, spec 134 §0.3), oldest
+     * first: what each brought, for the Merge history and the undo. Absent
+     * or empty = none.
+     */
+    merges?: MergeRecord[];
 
     // Last focused state (used when defaultPersonId === LAST_FOCUSED)
     lastFocusPersonId?: PersonId;
@@ -2239,6 +2487,11 @@ export interface AppSettings {
      * 'view' | 'sel' | 'tree'; a view's default (Map, Timeline 'view', Table 'tree') is not stored.
      */
     scopeByTree?: Record<string, { map?: string; timeline?: string; table?: string }>;
+    /**
+     * Per tree (spec 140 K1.4): how the overview's "What the research knows" is grouped, 'line' | 'tree';
+     * 'none' (the default) is not stored. A view setting of this device, never tree data.
+     */
+    knowsGroupByTree?: Record<string, string>;
     historyKindRegion?: boolean;  // default: true - the card's timeline shows regional history (spec 1028 §6)
     historyKindPlace?: boolean;   // default: true - the card's timeline shows the history of a place (with history.place)
     historyKindLocal?: boolean;   // default: true - the card's timeline shows findings from the research's sources
@@ -2273,6 +2526,30 @@ export interface AppSettings {
     fileCopyReminders?: boolean;     // default: true - notice when edits are only in a storage the browser may clear
     importImages?: boolean;          // default: true - imports bring photos, attachments and source excerpts
     recentSourceIds?: Record<string, string[]>;  // per tree id: last cited sources, newest first (source picker)
+    mergeRules?: Record<string, SavedMergeRule>;  // per program (mergeRuleKey): the import guide's saved scope and rule (spec 134 K10.4)
+    /**
+     * Custom list rule templates saved on this device (spec 136 D5), usable in any tree.
+     * Without people, places, lists, family lines and research lines (stripTemplateParams).
+     */
+    listTemplates?: ListTemplate[];
+}
+
+/**
+ * The import guide's choices remembered for files of one program (spec 134
+ * K10.4): the scope of step 1 and who is right (step 4) for the whole merge
+ * and by kind of detail. Rules by person or value belong to one tree's
+ * people and are never saved. Stored in this device's settings, never in a tree.
+ */
+export interface SavedMergeRule {
+    /** The program as the file names it ("MyHeritage Family Tree Builder"). */
+    program: string;
+    scope: 'a' | 'b' | 'c' | 'd';
+    rules: {
+        all: 'mine' | 'import' | 'both' | 'precise' | 'each';
+        kind?: Partial<Record<'name' | 'birth' | 'death' | 'places' | 'events' | 'notes' | 'photos' | 'sex' | 'marriage', 'mine' | 'import' | 'both' | 'precise' | 'each'>>;
+    };
+    /** ISO time it was saved. */
+    savedAt: string;
 }
 
 // ==================== MULTI-TREE STORAGE ====================
@@ -2320,6 +2597,46 @@ export interface TreeMetadata {
      * this tree instead of creating a duplicate.
      */
     research?: ResearchLink;
+    /**
+     * A copy of a tree with a research (Duplicate, "Open as a new copy", a
+     * second import of the research's file): the tree it was copied from and
+     * its name then. The copy itself has no research (spec 139 K5.1, K5.2):
+     * it is described as "copy of the tree <name> · no research".
+     */
+    copyOf?: { treeId: TreeId; name: string };
+    /**
+     * A tree made of a selection of another tree (Change structure › From a
+     * selection, spec 139 §4.2): that tree, its name then and what was
+     * selected ("Jesenský line"). Like a copy it has no research (K2.4).
+     */
+    fromTree?: { treeId: TreeId; name: string; what: string };
+    /**
+     * The file the tree was imported from (Manage trees row, spec 139 §7.2):
+     * written when the tree is made of a file, for an older tree from the last
+     * StromData.imports record with a file when it is opened. The row reads it
+     * without reading the tree's data.
+     */
+    importedFrom?: { file: string; kind: 'gedcom' | 'json' };
+    /**
+     * How many merges the tree's data records (StromData.merges), kept with
+     * every save and opening: the row's "Merge history (n)" without reading
+     * the data (spec 139 §9.2). Missing: none (or not known yet).
+     */
+    mergeCount?: number;
+    /**
+     * The one-time repair of trees sharing one research (package 134 point
+     * 13, TreeManager.repairSharedResearchTies) took this tree off its
+     * research: the tie as it was (kept, nothing else of it is), the tree
+     * that keeps the research, when, and the copy's last send there when it
+     * went after the copy was made. `noticed`: the notice was shown (once).
+     */
+    researchDetached?: {
+        link: ResearchLink;
+        keeper: { treeId: TreeId; name: string };
+        at: string;
+        sentAfterCopy?: { at: string; state: string };
+        noticed?: true;
+    };
     /**
      * "Start research with this tree" is under way: the one-time token the
      * research brings back (?adopt=) to name this tree. Valid for an hour.
@@ -2395,8 +2712,10 @@ export interface ResearchLink {
     head?: string;
     /**
      * An older copy of the research (the tree kept by "Open as a new copy", a
-     * duplicate, a second import): offered when sending changes back, never
-     * updated from the research — only the tree without `copy` is.
+     * duplicate, a second import): only a mark of where the tree came from.
+     * A copy is a tree without research — it sends nothing there and is never
+     * updated from it; only the tree without `copy` is (spec 139 K5.1,
+     * src/research-owner.ts).
      */
     copy?: boolean;
     /** The last send straight to the bridge and what became of it (a research that announces `accepts`). */
@@ -2443,6 +2762,14 @@ export interface ResearchLink {
      * Survives updates from the research.
      */
     previewDue?: true;
+    /**
+     * A merge written into the tree is not in the research yet (spec 134
+     * §11, K9.2): nothing goes by itself until it is sent ("Send to the
+     * research…") or undone. `mergeId`: the newest such merge's record,
+     * `at`: when the first of them was written, `persons`: the people they
+     * added. Survives updates from the research.
+     */
+    mergeHold?: { mergeId: string; at: string; persons: number };
     /**
      * Send original files to the research (the tree keeps a preview); false
      * turns it off for this tree. Missing = on. Survives updates from the research.
@@ -2595,5 +2922,7 @@ export interface TreeIndex {
     // Default tree settings (exports with "Export All")
     defaultTreeId?: TreeId | LastFocusedMarker;  // undefined = first tree, LAST_FOCUSED = where user left off, TreeId = specific
     lastTreeId?: TreeId;  // used when defaultTreeId === LAST_FOCUSED
+    /** When the one-time repair of trees sharing one research ran (ISO; TreeManager.repairSharedResearchTies). */
+    researchTiesRepaired?: string;
 }
 

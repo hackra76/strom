@@ -14,7 +14,8 @@
 
 import {
     cleanText, isResearchHead, researchPersonRef, researchSchemeUrl, withAppVersion, type ResearchExperiment, type ResearchHypothesesDecide,
-    sanitizeBooksSettings, sanitizeCensus, sanitizeIntakeSetting, type LiveBooksSettings, type LiveCensus, type LiveIntakeSetting,
+    sanitizeBooksSettings, sanitizeCensus, sanitizeIntakeSetting, sanitizeSortSetting, type LiveBooksSettings, type LiveCensus, type LiveIntakeSetting,
+    type LiveSortSetting, type SortConfirm,
 } from './research-link.js';
 import { writeHeldOfRefusal, type ResearchWriteHeld } from './research-write-held.js';
 import { READ_TASK_NAMES, READ_TASK_SETTING_PATH, readTaskSettingBody, sanitizeTaskSetting, type ReadTaskSetting } from './research-read-task.js';
@@ -777,6 +778,107 @@ export function intakeReply(status: number, body: unknown, features: readonly st
 export async function postBridgeIntake(base: string, auto: boolean, features: readonly string[] | null | undefined): Promise<IntakeWriteResult> {
     const res = await postWrite(base, '/intake', { auto });
     return res ? intakeReply(res.status, res.body, features) : { ok: false, code: 'network', status: 0, reason: '', bridgeCode: '' };
+}
+
+// ==================== SORTING WITHOUT ASKING (spec 102 U8) ====================
+
+/**
+ * Why `POST /settings/sort {confirm}` did not go: `raise` 403 sort.raise (`no` is the person's in the research's
+ * terminal: `command`, when it looks like one); `invalid` 400 sort.body; `archive` 409 sort.archive (an archive, or
+ * a research waiting for its agent); the rest as `POST /intake` (500 sort.failed: `unknown` with the bridge's sentence).
+ */
+export type SortConfirmWriteError = IntakeWriteError | 'raise';
+
+/**
+ * Who a refused raise to `no` came from (spec 123 P2): `device` a device of the research's gateway (switching on goes
+ * only on the research's computer), `browser` not the app's page in a browser (the terminal's command then).
+ */
+export type ConfirmRaiseReason = 'device' | 'browser';
+
+export type SortConfirmWriteResult =
+    | { ok: true; sort: LiveSortSetting | null; head: string; parent: string }
+    | {
+        ok: false; code: SortConfirmWriteError; status: number; reason: string; bridgeCode: string; held?: ResearchWriteHeld; command?: string;
+        raiseReason?: ConfirmRaiseReason;
+    };
+
+/** A 403 `*.raise`'s extras: the terminal's command (only when it looks like one of the research's) and who it came from. */
+function raiseExtras(r: Record<string, unknown>): { command?: string; raiseReason?: ConfirmRaiseReason } {
+    const command = cleanText(r.command, 120);
+    return {
+        ...(/^strom [A-Za-z0-9 ._=-]{1,100}$/.test(command) ? { command } : {}),
+        ...(r.reason === 'device' || r.reason === 'browser' ? { raiseReason: r.reason } : {}),
+    };
+}
+
+/** The reply to `POST /settings/sort`, typed: the setting the research keeps now (null: not said validly) and its commit. */
+export function sortConfirmReply(status: number, body: unknown, features: readonly string[] | null | undefined): SortConfirmWriteResult {
+    const r = asRecord(body) ?? {};
+    if (status >= 200 && status < 300) return { ok: true, sort: sanitizeSortSetting(r.sort), ...headsOf(body) };
+    const reason = bridgeSentence(body);
+    const code = bridgeCode(body);
+    const out = (c: SortConfirmWriteError, extra: { held?: ResearchWriteHeld; command?: string; raiseReason?: ConfirmRaiseReason } = {}): SortConfirmWriteResult =>
+        ({ ok: false, code: c, status, reason, bridgeCode: code, ...extra });
+    if (status === 403 && code === 'sort.raise') return out('raise', raiseExtras(r));
+    const held = writeHeldOfRefusal(code, r.error, features, r.params);
+    if (held) return out('held', { held });
+    if (status === 400) return out('invalid');
+    if (status === 409 && code === 'sort.archive') return out('archive');
+    if (status === 503 || code === 'research.busy' || code === 'busy') return out('busy');
+    if (status === 423 || code === 'locked') return out('locked');
+    if (status === 507 || code === 'disk.full') return out('full');
+    return out('unknown');
+}
+
+/**
+ * Sort with the agent without asking for the cost, or asking again (`POST <token>/settings/sort {"confirm": …}`),
+ * no terminal. `ask` is written from anywhere; `no` only with `sort.confirm.app` from the app's page on the research's
+ * computer (spec 123 P2), else 403 `sort.raise` with the terminal's command and `reason`.
+ */
+export async function postBridgeSortConfirm(base: string, confirm: SortConfirm, features: readonly string[] | null | undefined): Promise<SortConfirmWriteResult> {
+    const res = await postWrite(base, '/settings/sort', { confirm });
+    return res ? sortConfirmReply(res.status, res.body, features) : { ok: false, code: 'network', status: 0, reason: '', bridgeCode: '' };
+}
+
+// ==================== STARTING THE AGENT WITHOUT CONFIRMING (spec 123 P2) ====================
+
+/**
+ * Why `POST /settings/run {confirm}` did not go: `raise` 403 run.raise (with `command` and `reason`); `invalid` 400
+ * run.body; `archive` 409 run.archive (an archive, or a research waiting for its agent); `busy` 503 research.busy;
+ * `network` no answer; `unknown` anything else (403 app.only, 500 run.failed: the bridge's sentence in `reason`).
+ */
+export type RunConfirmWriteError = 'raise' | 'invalid' | 'archive' | 'busy' | 'network' | 'unknown';
+
+/** The computer's setting written: no commit (the user's config, not the tree), so no `head`. */
+export type RunConfirmWriteResult =
+    | { ok: true; confirm: SortConfirm | null }
+    | { ok: false; code: RunConfirmWriteError; status: number; reason: string; bridgeCode: string; command?: string; raiseReason?: ConfirmRaiseReason };
+
+/** The reply to `POST /settings/run`, typed: the value the computer keeps now (null: not said validly). */
+export function runConfirmReply(status: number, body: unknown, _features?: readonly string[] | null): RunConfirmWriteResult {
+    const r = asRecord(body) ?? {};
+    if (status >= 200 && status < 300) {
+        const run = asRecord(r.run);
+        return { ok: true, confirm: run?.confirm === 'ask' || run?.confirm === 'no' ? run.confirm : null };
+    }
+    const reason = bridgeSentence(body);
+    const code = bridgeCode(body);
+    const out = (c: RunConfirmWriteError, extra: { command?: string; raiseReason?: ConfirmRaiseReason } = {}): RunConfirmWriteResult =>
+        ({ ok: false, code: c, status, reason, bridgeCode: code, ...extra });
+    if (status === 403 && code === 'run.raise') return out('raise', raiseExtras(r));
+    if (status === 400) return out('invalid');
+    if (status === 409 && code === 'run.archive') return out('archive');
+    if (status === 503 || code === 'research.busy' || code === 'busy') return out('busy');
+    return out('unknown');
+}
+
+/**
+ * The app's actions that start the agent ask in the research's terminal first (`ask`) or start at once (`no`), for
+ * all researches of the computer (`POST <token>/settings/run {"confirm": …}`), no terminal.
+ */
+export async function postBridgeRunConfirm(base: string, confirm: SortConfirm, features: readonly string[] | null | undefined): Promise<RunConfirmWriteResult> {
+    const res = await postWrite(base, '/settings/run', { confirm });
+    return res ? runConfirmReply(res.status, res.body, features) : { ok: false, code: 'network', status: 0, reason: '', bridgeCode: '' };
 }
 
 // ==================== KINDS OF EVENTS (spec 035) ====================

@@ -32,6 +32,7 @@ import { runBusy, runHeavy, activatedElement, nextPaint, busyButtonHtml, type Bu
 import { computeUnder } from './canvas-busy.js';
 import { SPLIT_SHOWN_AT_ONCE } from './split-ui.js';
 import { busyProg } from './busy-prog.js';
+import { modalBackHtml, wireModalBack } from './modal-back.js';
 
 /** Everything the shared split-families dialog needs, whatever opened it. */
 interface SplitFamiliesRun {
@@ -73,9 +74,10 @@ export const splitFamiliesMethods = uiModule({
     /**
      * Live entry (actions menu / mobile sheet): split the ACTIVE tree. The focus
      * is the person on screen — it only decides which family is listed first; the
-     * partition is the same whatever it is.
+     * partition is the same whatever it is. `parentDialogId`: the dialog it
+     * returns to on close (Change structure…).
      */
-    showSplitFamiliesDialog(): Promise<void> {
+    showSplitFamiliesDialog(parentDialogId?: string): Promise<void> {
         if (DataManager.isReadOnly()) return Promise.resolve();
         const treeId = DataManager.getCurrentTreeId();
         const data = DataManager.getData();
@@ -91,6 +93,7 @@ export const splitFamiliesMethods = uiModule({
             treeId,
             data,
             focusPersonId: focus,
+            parentDialogId,
         }), { label: strings.busy.findingFamilies, atOnce: realCount >= SPLIT_SHOWN_AT_ONCE }).then(() => undefined);
     },
 
@@ -191,6 +194,7 @@ export const splitFamiliesMethods = uiModule({
         overlay.innerHTML = `
             <div class="modal splitfam-modal modal--lg" role="dialog" data-dialog-kind="form" aria-modal="true">
                 <div class="modal-header">
+                    ${modalBackHtml(this.splitFamiliesParentDialog)}
                     <h2>${s.title}</h2>
                     <button class="close-btn" id="splitfam-close-x" aria-label="${strings.buttons.close}">&times;</button>
                 </div>
@@ -219,6 +223,8 @@ export const splitFamiliesMethods = uiModule({
         const close = (): void => this.closeSplitFamiliesDialog();
         (overlay.querySelector('#splitfam-cancel') as HTMLButtonElement).onclick = close;
         (overlay.querySelector('#splitfam-close-x') as HTMLButtonElement).onclick = close;
+        // From Change structure…: "‹ Change structure" returns there (§5.2).
+        wireModalBack(overlay, close);
         const go = overlay.querySelector('#splitfam-go') as HTMLButtonElement;
         // One working state from the click (§8): painted first, each tree's step said; a second click makes nothing more.
         // 8b: the button says "Creating…", the step with "k/n" and a bar above the footer; the end ✓ "Created" and the
@@ -504,7 +510,7 @@ export const splitFamiliesMethods = uiModule({
             const subtree = structuredClone(src);
             subtree.defaultPersonId = component.defaultPersonId;
             createdPersons += Object.keys(subtree.persons).length;
-            TreeManager.createTreeFromImport(subtree, this.readSplitFamilyName(index), false);
+            TreeManager.createTreeFromPart(splitTreeId, subtree, this.readSplitFamilyName(index));
         }
 
         // The split copies; restore the tree the user was on (createTreeFromImport
@@ -551,6 +557,6 @@ export const splitFamiliesMethods = uiModule({
         this.splitFamiliesTreeId = null;
         this.splitFamiliesComponents = [];
         this.splitFamiliesShown = [];
-        if (parent) document.getElementById(parent)?.classList.add('active');
+        if (parent) this.openDialogById(parent);
     },
 });

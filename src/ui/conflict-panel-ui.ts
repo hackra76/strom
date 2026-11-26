@@ -16,6 +16,8 @@ import { isHelpOpen } from './help-ui.js';
 import { helpMark } from './help-mark.js';
 import { DataManager } from '../data.js';
 import { strings } from '../strings.js';
+import { inDeviceMode } from './device-mode-ui.js';
+import { conflictKeepWords } from '../conflict-devices.js';
 import { PersonId, ResearchConflict, ResearchConflictValue } from '../types.js';
 import { researchConflictRef, ResearchConflictTake, researchLinkMark } from '../research-link.js';
 import { canDecideInApp, conflictSides } from '../research-decide.js';
@@ -211,7 +213,7 @@ export const conflictPanelMethods = uiModule({
         } else if (view.notice) {
             const n = view.notice;
             const text = n.text === 'sendFirst' ? k.sendFirst
-                : n.text === 'remote' ? k.remote
+                : n.text === 'remote' ? (inDeviceMode() ? strings.device.onlyComputer : k.remote)
                 : n.text === 'errBusy' ? k.errBusy
                 : n.text === 'errLocked' ? k.errLocked
                 : n.text === 'noEdit' ? k.noEdit
@@ -229,6 +231,8 @@ export const conflictPanelMethods = uiModule({
         const o = strings.origin;
         const kind = c.kind === 'import' || c.kind === 'user' ? c.kind : null;
         const importSource = kind === 'import' ? this.originConflictImportSource(personId, c) : '';
+        // A conflict between two sends (spec 094 K2.4): each side by the device its edit came from.
+        const devices = this.researchConflictDevices(c);
         const keepLabel = kind === 'import' ? o.keepImport : null;
         const takeLabel = kind ? o.accept : null;
         const sourceLink = (v: ResearchConflictValue): string => {
@@ -247,18 +251,19 @@ export const conflictPanelMethods = uiModule({
             if (view.choices === 'buttons') {
                 const label = which === 'user' ? keepLabel : takeLabel;
                 choice = `<button type="button" class="prc-panel-choice${kind && which === 'research' ? ' prc-kind-choice--primary' : ''}" data-decide="${which}" data-focus="choice-${which}"
-                    aria-label="${esc(label ?? (which === 'user' ? k.keep : k.take))}"${busy ? ' aria-busy="true" aria-disabled="true"' : ''}${off ? ' disabled' : ''}${notes ? ` aria-describedby="${noteId}"` : ''}>${busy
-                    ? `<i class="busy-spin s12" aria-hidden="true"></i>${esc(k.busyTag)}` : esc(label ?? (which === 'user' ? k.keepShort : k.takeShort))}</button>`;
+                    aria-label="${esc(label ?? (devices ? conflictKeepWords(devices, which) : which === 'user' ? k.keep : k.take))}"${busy ? ' aria-busy="true" aria-disabled="true"' : ''}${off ? ' disabled' : ''}${notes ? ` aria-describedby="${noteId}"` : ''}>${busy
+                    ? `<i class="busy-spin s12" aria-hidden="true"></i>${esc(k.busyTag)}` : esc(label ?? (devices?.short ? conflictKeepWords(devices, which) : which === 'user' ? k.keepShort : k.takeShort))}</button>`;
             } else if (view.choices === 'links') {
                 choice = `<button type="button" class="prc-panel-choice" data-take="${which}" data-focus="choice-${which}"
-                    aria-label="${esc(`${(which === 'user' ? keepLabel : takeLabel) ?? (which === 'user' ? k.keepLink : k.takeLink)}, ${strings.research.opensInResearchSr}`)}"${off ? ' disabled' : ''}${notes ? ` aria-describedby="${noteId}"` : ''}>${researchActionLabel((which === 'user' ? keepLabel : takeLabel) ?? (which === 'user' ? k.keepShort : k.takeShort), researchLinkMark('conflict', { conflictDo: 'decide' }), { sr: false })}</button>`;
+                    aria-label="${esc(`${(which === 'user' ? keepLabel : takeLabel) ?? (devices ? conflictKeepWords(devices, which) : which === 'user' ? k.keepLink : k.takeLink)}, ${strings.research.opensInResearchSr}`)}"${off ? ' disabled' : ''}${notes ? ` aria-describedby="${noteId}"` : ''}>${researchActionLabel((which === 'user' ? keepLabel : takeLabel) ?? (which === 'user' ? k.keepShort : k.takeShort), researchLinkMark('conflict', { conflictDo: 'decide' }), { sr: false })}</button>`;
             }
             const was = kind === 'import' && which === 'research' ? this.originConflictWas(c) : '';
-            const note = notes ? `<p class="prc-panel-note" id="${noteId}">${esc(which === 'user' ? k.keepNote : was ? o.acceptNote(was) : this.researchConflictTakeNote(c))}</p>` : '';
+            const note = notes ? `<p class="prc-panel-note" id="${noteId}">${esc(which === 'user' ? (devices ? k.keepNoteFrom(devices.user, devices.research) : k.keepNote) : was ? o.acceptNote(was) : this.researchConflictTakeNote(c, devices))}</p>` : '';
             return `
                 <div class="prc-panel-row" data-side="${which}">
                     <div class="prc-panel-main">
-                        <span class="prc-side-label">${esc(which === 'research' ? (kind ? o.sideProposal : k.sideResearch)
+                        <span class="prc-side-label">${esc(devices ? k.sideFrom(devices[which])
+                            : which === 'research' ? (kind ? o.sideProposal : k.sideResearch)
                             : kind === 'import' ? o.sideImport : kind === 'user' ? o.sideUser : k.sideApp)}</span>
                         <span class="prc-panel-value">${conflictValueHtml(value)}</span>
                         ${which === 'research' ? sourceLink(v) : importSource ? `<span class="prc-panel-meta">${esc(importSource)}</span>` : retractedSourceHtml(v, '')}

@@ -1,9 +1,9 @@
-import { test, expect, Page } from '@playwright/test';
-import { openApp, createFirstPerson, card, openTreeStructure } from './helpers.js';
+import { test, expect, Page, Locator } from '@playwright/test';
+import { openApp, createFirstPerson, card } from './helpers.js';
 
-/** The open tree's sheet (More → Tree: {name}), menu 1020 §3.1: headings and rows (Change structure folded). */
+/** The open tree's sheet (More → Tree: {name}), menu 1020 §3.1: headings and rows (Change structure… one row). */
 const TREE_SHEET_HEADERS = ['Research', 'Tree settings'];
-const TREE_SHEET_KEYS = ['overview', 'overview-quality', 'snapshots', 'researchInfo',
+const TREE_SHEET_KEYS = ['overview', 'stats', 'overview-quality', 'snapshots', 'researchInfo',
     'rename', 'defaultPerson', 'startup', 'lifeline', 'places', 'surnames', 'structure',
     'visibility', 'lock', 'delete', 'manageTrees'];
 
@@ -201,7 +201,7 @@ test('the "More" sheet (menu 1020 §7): Undo|Redo tiles, content, For the family
     // The window's selection under the View tiles in every tree (spec 098 §10).
     expect(rows).toEqual(['Anniversaries', 'Lists of people', 'Export…', 'For the family ›', 'Selection No selection ›', 'Full screen', 'Tree: My Family Tree ›', 'Add family…']);
     await expect(pairs.nth(1)).toHaveAttribute('aria-label', 'View');
-    await expect(pairs.nth(1).locator('.bottom-sheet-item')).toHaveText(['Fan', 'Map', 'Timeline']);
+    await expect(pairs.nth(1).locator('.bottom-sheet-item')).toHaveText(['Fan', 'Map', 'Timeline', 'Statistics']);
     await expect(pairs.nth(2).locator('.bottom-sheet-item')).toHaveText(['Settings', 'How Strom works', 'About Strom']);
     // Tree management left the first level (Tree › and the tree switcher carry it).
     await expect(sheet.locator('.bottom-sheet-item', { hasText: 'Manage trees' })).toHaveCount(0);
@@ -316,11 +316,54 @@ test.describe('More on a small phone and held sideways', () => {
         // Full screen joins the View line as a fourth tile (spec 082 K1.3), the window's selection closes it
         // (spec 098 §10): no extra row to scroll to.
         await expect(sheet.locator('.bottom-sheet-pair[aria-label="View"] .bottom-sheet-item'))
-            .toHaveText(['Fan', 'Map', 'Timeline', 'Full screen', /^Selection\s*No selection\s*›$/]);
+            .toHaveText(['Fan', 'Map', 'Timeline', 'Statistics', 'Full screen', /^Selection\s*No selection\s*›$/]);
         await expect(sheet.locator(':scope > .bottom-sheet-items > .more-rod-row')).toHaveCount(0);
         await expect.poll(() => sheet.evaluate(el => el.scrollHeight - el.clientHeight)).toBeLessThanOrEqual(1);
     });
 });
+
+/** Each word of a tile's name narrower than the name's box: no word broken inside the tile. */
+async function tileWordsFit(tile: Locator): Promise<{ text: string; fits: boolean; lines: number; overflow: number }> {
+    return tile.locator('.bottom-sheet-label').evaluate(el => {
+        const probe = document.createElement('span');
+        probe.style.cssText = 'position:absolute;visibility:hidden;white-space:nowrap';
+        el.appendChild(probe);
+        const words = (el.firstChild?.textContent ?? '').trim().split(/\s+/);
+        const widest = Math.max(...words.map(w => { probe.textContent = w; return probe.getBoundingClientRect().width; }));
+        probe.remove();
+        const r = el.getBoundingClientRect();
+        const line = parseFloat(getComputedStyle(el).lineHeight) || 18;
+        return { text: el.textContent ?? '', fits: widest <= r.width + 0.5, lines: Math.round(r.height / line), overflow: el.scrollWidth - el.clientWidth };
+    });
+}
+
+for (const touch of [true, false]) {
+    test.describe(`More, German, 360 × 640 ${touch ? 'by touch' : 'with a mouse'}: Undo | Redo`, () => {
+        test.use({ viewport: { width: 360, height: 640 }, hasTouch: touch, isMobile: touch });
+        test('neither "Rückgängig" nor "Wiederholen" breaks inside the word, the tiles keep 44 px', async ({ page }) => {
+            await openApp(page);
+            await createFirstPerson(page, 'Jan', 'Novak');
+            await page.evaluate(() => window.Strom.UI.setLanguage('de' as never));
+            await page.locator('#bb-view-more').click();
+            const sheet = page.locator('.bottom-sheet-menu');
+            await expect(sheet.locator('#sheet-redo .bottom-sheet-label')).toHaveText('↷ Wiederholen');
+            // With a mouse the shortcut chips stand in the tiles too.
+            await expect(sheet.locator('#sheet-redo .menu-kbd')).toBeVisible({ visible: !touch });
+            for (const id of ['#sheet-undo', '#sheet-redo']) {
+                const tile = sheet.locator(id);
+                const m = await tileWordsFit(tile);
+                expect(m.fits, `${m.text}: a word broken inside`).toBe(true);
+                expect(m.lines).toBeLessThanOrEqual(2);
+                expect(m.overflow).toBeLessThanOrEqual(0);
+                const box = (await tile.boundingBox())!;
+                expect(box.height).toBeGreaterThanOrEqual(44);
+                expect(box.height).toBeLessThanOrEqual(48);
+            }
+            const items = sheet.locator(':scope > .bottom-sheet-items');
+            expect(await items.evaluate(el => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(0);
+        });
+    });
+}
 
 test('the Tree row opens the tree-actions sheet: name, summary, the groups of the one list as 48px rows', async ({ page }) => {
     await openApp(page);
@@ -337,17 +380,16 @@ test('the Tree row opens the tree-actions sheet: name, summary, the groups of th
     await expect(sheet.locator('.tree-actions-summary')).toContainText('edited');
 
     // Menu 1020 §3.1: no Export, Save to file nor Send changes here (one level up / the manager's ⋯);
-    // the structure actions fold under "Change structure ⌄"; Manage trees… last.
+    // the structure actions are one row, Change structure…; Manage trees… last.
     await expect(sheet.locator('.bottom-sheet-section')).toHaveText(TREE_SHEET_HEADERS);
     // Sentence case as in design 3d (not the uppercase labels of other sheets).
     expect(await sheet.locator('.bottom-sheet-section').first().evaluate(el => getComputedStyle(el).textTransform)).toBe('none');
     await expect(sheet.locator('[data-action="defaultPerson"] .tree-actions-value')).toHaveText('First person');
     const keys = () => sheet.locator('.tree-actions-row:visible').evaluateAll(els => els.map(el => (el as HTMLElement).dataset.action));
     expect(await keys()).toEqual(TREE_SHEET_KEYS);
-    await openTreeStructure(page, sheet);
-    expect(await keys()).toEqual([...TREE_SHEET_KEYS.slice(0, TREE_SHEET_KEYS.indexOf('structure') + 1),
-        'makeTree', 'mergeView', 'splitFamilies', 'split', 'mergeInto', 'duplicate',
-        ...TREE_SHEET_KEYS.slice(TREE_SHEET_KEYS.indexOf('structure') + 1)]);
+    // Spec 139 §1: one row leading on (›) to the Change structure… dialog.
+    await expect(sheet.locator('[data-action="structure"]')).toContainText('Change structure…');
+    await expect(sheet.locator('[data-action="structure"] .tree-actions-chevron')).toHaveText('›');
     for (const box of await sheet.locator('.tree-actions-row:visible').evaluateAll(els => els.map(el => el.getBoundingClientRect().height))) {
         expect(Math.round(box)).toBeGreaterThanOrEqual(48); // subpixel layout
     }
@@ -377,10 +419,10 @@ test('the tree manager on a phone: ⋯ opens the sheet over it; another tree has
     await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
     const manager = page.locator('#tree-manager-modal');
 
-    // The open tree's row: a label instead of Open; Close gives way to × and the drag.
+    // The open tree's row: its chip at the name, no Open (spec 139 §7.2); Close gives way to × and the drag.
     const active = manager.locator('.tree-manager-item.active');
-    await expect(active.locator('.tree-opened-label')).toBeVisible();
-    await expect(active.locator('.tree-open-btn')).toBeHidden();
+    await expect(active.locator('.active-badge')).toBeVisible();
+    await expect(active.locator('.tree-open-btn')).toHaveCount(0);
     await expect(manager.locator('.tree-manager-footer [data-dismiss]')).toBeHidden();
     const more = (await active.locator('.tree-row-menu-btn').boundingBox())!;
     expect(more.width).toBeGreaterThanOrEqual(44);
@@ -404,6 +446,37 @@ test('the tree manager on a phone: ⋯ opens the sheet over it; another tree has
     await page.keyboard.press('Escape');
     await expect(sheet).toHaveCount(0);
     await expect(manager).toHaveClass(/active/);
+});
+
+// Spec 139 §10.1–10.2: a phone's row has Open and ⋯ only (44 px, ⋯ 48 wide); the ⋯ sheet starts with
+// Change structure… and Export…, Delete tree… last.
+test('the tree manager on a phone: Open and ⋯ 44 px, the sheet starts with Change structure… and Export…', async ({ page }) => {
+    await openApp(page);
+    await createFirstPerson(page, 'Vojtěch', 'Jesenský');
+    await page.evaluate(() => window.Strom.DataManager.importAsNewTree({ persons: {}, partnerships: {} } as never, 'Jesenští'));
+    await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
+    const manager = page.locator('#tree-manager-modal');
+    const other = manager.locator('.tree-manager-item:not(.active)').first();
+    await expect(other.locator('[data-row-action="structure"]')).toBeHidden();
+    await expect(other.locator('[data-row-action="export"]')).toBeHidden();
+    const open = (await other.locator('.tree-open-btn').boundingBox())!;
+    const more = (await other.locator('.tree-row-menu-btn').boundingBox())!;
+    expect(open.height).toBeGreaterThanOrEqual(44);
+    expect(more.height).toBeGreaterThanOrEqual(44);
+    expect(more.width).toBeGreaterThanOrEqual(48);
+    // One column: Open under the facts.
+    const info = (await other.locator('.tree-manager-item-info').boundingBox())!;
+    expect(open.y).toBeGreaterThanOrEqual(info.y + info.height - 1);
+    expect(await other.locator('.tree-manager-item-stats-row').evaluate(el => getComputedStyle(el).fontSize)).toBe('13.5px');
+
+    await other.locator('.tree-row-menu-btn').tap();
+    const sheet = page.locator('.bottom-sheet-tree-actions');
+    await expect(sheet).toBeVisible();
+    const rows = sheet.locator('.tree-actions-list [data-action]');
+    expect((await rows.evaluateAll(els => els.map(el => (el as HTMLElement).dataset.action))).slice(0, 2)).toEqual(['structure', 'export']);
+    await expect(rows.nth(0)).toContainText('Change structure…');
+    await expect(rows.nth(1)).toContainText('Export…');
+    await expect(rows.last()).toHaveAttribute('data-action', 'delete');
 });
 
 // The top bar ⋯ opening the same "More" sheet: toolbar-responsive.spec.ts

@@ -5,7 +5,7 @@
  * messages. Invented data only.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { changeKind, changeAdds, sanitizeLiveLog, textKind, textPersonRefs, textWithoutRefs,
     readResearchHeader, parseLoopbackUrl, parseLiveBridge, contentFingerprint, fingerprintLike,
     decideResearchOpen, stabilizeIds, keepTitles, carryOverMedia, sanitizeLiveStatus, sanitizeLiveChange, sanitizeLiveEnd,
@@ -257,6 +257,43 @@ describe('create / update / ask', () => {
         expect(decideResearchOpen({ fingerprint: legacy }, fingerprintLike(data, legacy))).toBe('update');
         expect(fingerprintLike(data, contentFingerprint(data))).toBe(contentFingerprint(data));
         expect(contentFingerprint(data).startsWith('v2-')).toBe(true);
+    });
+});
+
+describe('contentFingerprint on a phone without JIT: as little hashing as it can', () => {
+    const tree = (n: number): StromData => {
+        const persons: Record<string, unknown> = {};
+        for (let i = 0; i < n; i++) persons['p' + i] = { id: 'p' + i, firstName: 'Václav ' + i, lastName: 'Pýchavka', gender: i % 2 ? 'female' : 'male', partnerships: [], notes: 'Žluťoučký kůň '.repeat(i) };
+        return { version: 11, persons, partnerships: {}, sources: { s1: { id: 's1', title: 'Matrika' } } } as unknown as StromData;
+    };
+
+    it('gives what it gave before (stored fingerprints keep matching)', () => {
+        expect(contentFingerprint(tree(40))).toBe('v2-bvb-1wrct4v-15gwigx');
+        expect(fingerprintLike(tree(40), 'abc')).toBe('bvb-1wrct4v-15gwigx');
+    });
+
+    it('hashes a new tree in one pass, and the same tree again not at all', () => {
+        const data = tree(400);
+        const charCodeAt = vi.spyOn(String.prototype, 'charCodeAt');
+        try {
+            const first = contentFingerprint(data);
+            const once = charCodeAt.mock.calls.length;
+            const textLength = parseInt(first.split('-')[1], 36);
+            // One pass over the text (two passes before: one per offset basis).
+            expect(once).toBeLessThan(textLength * 1.1);
+            expect(once).toBeGreaterThanOrEqual(textLength);
+            charCodeAt.mockClear();
+            // Unchanged (the same object or an equal copy): the text compared, not hashed.
+            expect(contentFingerprint(data)).toBe(first);
+            expect(contentFingerprint(structuredClone(data))).toBe(first);
+            expect(fingerprintLike(data, first)).toBe(first);
+            expect(charCodeAt.mock.calls.length).toBeLessThan(100);
+            // A change is hashed anew.
+            (data.persons['p1' as PersonId] as { firstName: string }).firstName = 'Jan';
+            expect(contentFingerprint(data)).not.toBe(first);
+        } finally {
+            charCodeAt.mockRestore();
+        }
     });
 });
 
@@ -838,7 +875,7 @@ describe('send bridge', () => {
     });
 
     it('the reply and the JSON field are checked', () => {
-        const none = { head: '', applied: null, pending: false, conflicts: null, conflictPersons: [], conflictIds: [], conflictTakeIds: [], kept: null, reason: '', skipped: [], code: '', undoneSince: [], takenBack: null, notWritten: [], ids: null, readings: [], personConflicts: [], media: [], mediaCount: 0, retracted: [] };
+        const none = { head: '', applied: null, pending: false, conflicts: null, conflictPersons: [], conflictIds: [], conflictTakeIds: [], kept: null, reason: '', skipped: [], code: '', undoneSince: [], takenBack: null, notWritten: [], ids: null, readings: [], personConflicts: [], media: [], mediaCount: 0, retracted: [], conflictSent: [] };
         expect(sanitizeSyncReply({ ok: true, input: 'I1', changes: 12 })).toEqual({ ok: true, changes: 12, error: '', inbox: null, intake: '', ...none });
         // Written at once: the commit it made and what of the changes was written.
         expect(sanitizeSyncReply({ ok: true, inbox: false, changes: 8, applied: 7, head: 'ABCDEF1234', input: 'I0042', intake: 'R1' }))
@@ -933,6 +970,11 @@ describe('strom-research:// links', () => {
         expect(researchNewUrl('short')).toBeNull();
         expect(researchNewUrl('x'.repeat(44))).toBeNull();
         expect(researchNewUrl('a'.repeat(21) + '&')).toBeNull();
+        // A copy's own research (spec 139 §11.4): the folder's name it suggests, one line, encoded, at most 120 characters.
+        expect(researchNewUrl(token, 'chrome', undefined, undefined, '  Rodina Kalinovských\n(kopie) & spol. '))
+            .toBe(`strom-research://new?app=${token}&browser=chrome&name=${encodeURIComponent('Rodina Kalinovských (kopie) & spol.')}`);
+        expect(researchNewUrl(token, undefined, undefined, undefined, '   ')).toBe(`strom-research://new?app=${token}`);
+        expect(researchNewUrl(token, undefined, undefined, undefined, 'x'.repeat(200))).toBe(`strom-research://new?app=${token}&name=${'x'.repeat(120)}`);
         expect(researchAdoptToken('a'.repeat(22))).toBe('a'.repeat(22));
         expect(researchSchemeUrl('new', { tree: UUID })).toBeNull();
 

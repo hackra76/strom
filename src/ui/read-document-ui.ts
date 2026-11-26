@@ -11,6 +11,7 @@
  * what they read with when it is not the default (`read.with`, spec 059).
  */
 
+import { imgSrcAttr } from '../image-src.js';
 import { tileFailedHtml, TILE_NOTE_MIN_PX } from './image-slot.js';
 import { researchActionLabel, researchBridgeAgentLabel } from './research-open-mark.js';
 import { barHtml } from './prog-bar.js';
@@ -47,7 +48,7 @@ import {
 import { resultPlaces, lineMarksHtml, checkHtml, placePopHtml, sortPlaces, sortedCounts, type ResultMarks, type ShownPlace } from './read-result-view.js';
 import { gedcomTagEventType } from '../ged-parser.js';
 import { formatBytesShort } from './originals-ui.js';
-import { onComputer, bridgeFailure } from './research-ui.js';
+import { bridgeFailure, researchHere } from './research-ui.js';
 import { onBridgeStatus } from './research-sync-ui.js';
 import { uiModule } from './module.js';
 import { helpMark } from './help-mark.js';
@@ -614,7 +615,7 @@ export const readDocumentMethods = uiModule({
     readDocumentAccepts(): ReadAccepts | null {
         this.ensureReadListener();
         const link = this.researchOriginalsLink();
-        if (!link || !onComputer() || bridgeFailure(null) === 'safari') return null;
+        if (!link || !researchHere() || bridgeFailure(null) === 'safari') return null;
         if (this.activeResearchArchive() || this.activeResearchAgentAway()) return null;
         return this.researchStatusOf(link.researchId)?.accepts?.read ?? null;
     },
@@ -1046,7 +1047,7 @@ export const readDocumentMethods = uiModule({
     /** Why a source's reading cannot be fetched now at all (null: ask the research). */
     readSourceBlocked(): SourceWhy | null {
         const link = this.researchOriginalsLink();
-        if (!link) return this.researchSyncLink() && researchLinksEnabled() && !onComputer() ? 'computer' : 'unlinked';
+        if (!link) return this.researchSyncLink() && researchLinksEnabled() && !researchHere() ? 'computer' : 'unlinked';
         if (this.activeResearchAgentless()) return 'archive';
         if (!this.researchBridgeUp(link.researchId) || !this.readBridgeBase(link.researchId)) return 'down';
         // An older research has no reading results to give (`GET read/<id>` is an unknown path there).
@@ -1309,7 +1310,7 @@ export const readDocumentMethods = uiModule({
         const what = [again.excerpt ? capitalized(t.sourceExcerpt(again.excerpt)) : '', again.title].filter(Boolean).join(' · ');
         return `
                 <div class="read-source-preview">
-                    ${again.thumb ? `<img class="read-source-thumb" src="${esc(again.thumb)}" alt="">` : ''}
+                    ${again.thumb ? `<img class="read-source-thumb" ${imgSrcAttr(again.thumb)} alt="">` : ''}
                     <div class="read-source-preview-text">
                         <span class="read-source-what">${esc(what)}</span>
                         <p class="read-source-gloss"><strong>${esc(t.sourceLead)}</strong> ${esc(t.sourceRest)}</p>
@@ -2465,7 +2466,7 @@ export const readDocumentMethods = uiModule({
             ...(s.decided ? { decided: s.decided } : {}),
             ...(s.openTask ? { openTask: s.openTask } : {}),
             confirmed: !!src && !!this.sourceConfirmState(src).conf,
-            computer: onComputer(),
+            computer: researchHere(),
             counts: this.readSourceCounts(res),
             canOpenTask: this.researchLinkAvailable('task'),
             // Uncertain places to hand over (spec 059 P8): only a research that says it takes them.

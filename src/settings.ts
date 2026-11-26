@@ -4,7 +4,8 @@
  */
 
 import { personMediaCount } from './media.js';
-import { AppSettings, BranchMarker, ThemeMode, SurnameDisplay, LanguageSetting, CardDensity, TreeSpacing, StromData, CardPhotoSize, CardPhotoShape } from './types.js';
+import { AppSettings, BranchMarker, ThemeMode, SurnameDisplay, LanguageSetting, CardDensity, TreeSpacing, StromData, CardPhotoSize, CardPhotoShape, SavedMergeRule, ListTemplate } from './types.js';
+import { sanitizeCustomRule } from './person-lists-data.js';
 import { CARD_SIZE, NORMAL_PHOTO_BOX } from './layout-config.js';
 import { BRANCH_MARKERS, SURNAME_DISPLAYS, SETTINGS_KEY, personSourceIds } from './model-values.js';
 import { CardFieldSettings, normalizeCardFields, customCardSize, normalizeCardDensity, effectiveCardFields, normalizeCardPhoto } from './card-fields.js';
@@ -13,6 +14,7 @@ import { MapKind, MAP_KINDS, isMapKind, readPlacesSort, type PlacesSort } from '
 import { HISTORY_KINDS, isHistoryKind, type HistoryKind } from './history.js';
 import { sameSelectionRef, sanitizeSelectionRef, type SelectionRef } from './view-selection-ref.js';
 import { isViewScope, scopeDefault, type ScopedView, type ViewScope } from './view-scope.js';
+import { isKnowsGroup, type KnowsGroup } from './knows-group.js';
 
 /** How many recently cited sources the picker remembers per tree. */
 export const RECENT_SOURCES_MAX = 5;
@@ -128,6 +130,36 @@ export function migrateRodByTree(settings: AppSettings): boolean {
 }
 
 /** Per device, apart from the other settings. */
+/** The key a program's saved merge rule is stored under: trimmed, spaces folded, lower case ('' for no program). */
+export function mergeRuleKey(program: string): string {
+    return program.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+const MERGE_SCOPES: readonly string[] = ['a', 'b', 'c', 'd'];
+const MERGE_RULE_CHOICES: readonly string[] = ['mine', 'import', 'both', 'precise', 'each'];
+const MERGE_RULE_KINDS: readonly string[] = ['name', 'birth', 'death', 'places', 'events', 'notes', 'photos', 'sex', 'marriage'];
+
+/** A stored merge rule as it can be used, or null when it is not one (an older or hand-edited store). */
+export function sanitizeMergeRule(value: unknown): SavedMergeRule | null {
+    if (!value || typeof value !== 'object') return null;
+    const v = value as Record<string, unknown>;
+    const rules = v.rules as Record<string, unknown> | undefined;
+    if (typeof v.program !== 'string' || !v.program.trim() || !MERGE_SCOPES.includes(v.scope as string)
+        || !rules || !MERGE_RULE_CHOICES.includes(rules.all as string)) return null;
+    const kind: Record<string, string> = {};
+    if (rules.kind && typeof rules.kind === 'object') {
+        for (const [k, c] of Object.entries(rules.kind as Record<string, unknown>)) {
+            if (MERGE_RULE_KINDS.includes(k) && MERGE_RULE_CHOICES.includes(c as string)) kind[k] = c as string;
+        }
+    }
+    return {
+        program: v.program.trim(),
+        scope: v.scope as SavedMergeRule['scope'],
+        rules: { all: rules.all as SavedMergeRule['rules']['all'], ...(Object.keys(kind).length ? { kind: kind as SavedMergeRule['rules']['kind'] } : {}) },
+        savedAt: typeof v.savedAt === 'string' ? v.savedAt : '',
+    };
+}
+
 export const CARD_SIGNALS_KEY = 'strom-card-signals';
 
 /** The kinds of places the map shows (spec 031 §1), per device, apart from the other settings. */
@@ -159,6 +191,9 @@ class SettingsManagerClass {
     /** The map's kinds changed in a read-only window: kept here, never stored. */
     private localMapKinds: MapKind[] | null = null;
 
+    /** The grouping of "What the research knows" chosen in a read-only window, per tree: kept here, never stored. */
+    private localKnowsGroups: Map<string, KnowsGroup> | null = null;
+
     init(): void {
         this.load();
         this.applyTheme();
@@ -171,7 +206,7 @@ class SettingsManagerClass {
     /** Settings only read in this window (spec 079 §0); set before init. */
     setReadOnly(on: boolean): void {
         this.readOnly = on;
-        if (!on) { this.localCardSignals = null; this.localMapKinds = null; }
+        if (!on) { this.localCardSignals = null; this.localMapKinds = null; this.localKnowsGroups = null; }
     }
 
     isReadOnly(): boolean {
@@ -191,6 +226,7 @@ class SettingsManagerClass {
             // What the main window stores wins over a change made here, as for the other settings.
             this.localCardSignals = null;
             this.localMapKinds = null;
+            this.localKnowsGroups = null;
             this.load();
             this.applyTheme();
             onChange({ languageBefore });
@@ -385,7 +421,8 @@ class SettingsManagerClass {
     forgetLifelineDefaults(treeId: string): void {
         // The tree's selection and map scope go with it (spec 039 §3.5, 098 §7).
         let changed = false;
-        for (const all of [this.settings.selectionByTree, this.settings.scopeByTree]) {
+        // And the grouping of "What the research knows" (spec 140 K1.4).
+        for (const all of [this.settings.selectionByTree, this.settings.scopeByTree, this.settings.knowsGroupByTree]) {
             if (all?.[treeId]) { delete all[treeId]; changed = true; }
         }
         if (!this.settings.lifelineByTree?.[treeId]) { if (changed) this.save(); return; }
@@ -436,6 +473,33 @@ class SettingsManagerClass {
         else delete entry[view];
         if (Object.keys(entry).length) all[treeId] = entry;
         else delete all[treeId];
+        this.save();
+    }
+
+    /** How "What the research knows" is grouped for a tree (spec 140 K1.4); 'none' when never chosen. */
+    getKnowsGroupForTree(treeId: string | null): KnowsGroup {
+        if (!treeId) return 'none';
+        const local = this.localKnowsGroups?.get(treeId);
+        if (local) return local;
+        const v = this.settings.knowsGroupByTree?.[treeId];
+        return isKnowsGroup(v) ? v : 'none';
+    }
+
+    /**
+     * Remember how "What the research knows" is grouped for a tree ('none':
+     * forgotten). Stored by the main window only; a read-only window keeps
+     * its choice here until the main window's settings change.
+     */
+    setKnowsGroupForTree(treeId: string, group: KnowsGroup): void {
+        if (this.getKnowsGroupForTree(treeId) === group) return;
+        if (this.readOnly) {
+            (this.localKnowsGroups ??= new Map()).set(treeId, group);
+            return;
+        }
+        const all = (this.settings.knowsGroupByTree ??= {});
+        if (group === 'none') delete all[treeId];
+        else all[treeId] = group;
+        if (Object.keys(all).length === 0) delete this.settings.knowsGroupByTree;
         this.save();
     }
 
@@ -590,6 +654,60 @@ class SettingsManagerClass {
 
     setImportImages(enabled: boolean): void {
         this.settings.importImages = enabled;
+        this.save();
+    }
+
+    /** The import guide's rule saved for files of `program` (spec 134 K10.4), or null. */
+    getMergeRule(program: string): SavedMergeRule | null {
+        const key = mergeRuleKey(program);
+        return key ? sanitizeMergeRule(this.settings.mergeRules?.[key]) : null;
+    }
+
+    /** Every saved merge rule with its key, by program name. */
+    getMergeRules(): Array<{ key: string; rule: SavedMergeRule }> {
+        return Object.entries(this.settings.mergeRules ?? {})
+            .flatMap(([key, value]) => {
+                const rule = sanitizeMergeRule(value);
+                return rule ? [{ key, rule }] : [];
+            })
+            .sort((a, b) => a.rule.program.localeCompare(b.rule.program));
+    }
+
+    /** Save the rule for files of its program (one per program: a newer one replaces it). */
+    setMergeRule(rule: SavedMergeRule): void {
+        const key = mergeRuleKey(rule.program);
+        const clean = sanitizeMergeRule(rule);
+        if (!key || !clean) return;
+        (this.settings.mergeRules ??= {})[key] = clean;
+        this.save();
+    }
+
+    /** Forget a saved merge rule (Settings › Remove). */
+    removeMergeRule(key: string): void {
+        if (!this.settings.mergeRules?.[key]) return;
+        delete this.settings.mergeRules[key];
+        if (!Object.keys(this.settings.mergeRules).length) delete this.settings.mergeRules;
+        this.save();
+    }
+
+    /**
+     * The list rule templates saved on this device (spec 136 D5), oldest
+     * first; one the app cannot read whole is left out.
+     */
+    getListTemplates(): ListTemplate[] {
+        const raw: unknown = this.settings.listTemplates;
+        if (!Array.isArray(raw)) return [];
+        return raw.flatMap((t: Partial<ListTemplate>) => {
+            if (!t || typeof t.id !== 'string' || !t.id || typeof t.name !== 'string' || !t.name.trim()) return [];
+            const rule = sanitizeCustomRule({ v: 1, root: t.root });
+            return rule ? [{ id: t.id, name: t.name.trim(), root: rule.root, created: typeof t.created === 'string' ? t.created : '' }] : [];
+        });
+    }
+
+    /** Store the device's list templates (none: the key is dropped). */
+    setListTemplates(templates: readonly ListTemplate[]): void {
+        if (templates.length) this.settings.listTemplates = templates.map(t => structuredClone(t));
+        else delete this.settings.listTemplates;
         this.save();
     }
 

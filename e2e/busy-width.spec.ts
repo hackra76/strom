@@ -2,14 +2,14 @@
  * A button keeps its width while it works (waiting buttons §1.2): its working words are drawn with it from the
  * start (`.bl`), so the state that comes after 120 ms does not widen it. The places of the heavy computations
  * (§8): Validation details in the tree overview (C102), another cut of Split into families (B211), the Table's
- * Export (C99), Start merge and Re-analyze (C23/C86), Accept changes and Review in detail of a packet (C84/C85).
+ * Export (C99), Re-analyze (C23/C86), Accept changes and Review in detail of a packet (C84/C85).
  * German (the longest words) and a wide font (CI's fonts are wider than a Mac's).
  *
  * The state is held while it is measured: requestAnimationFrame waits while `window.__holding` (the work waits for
  * its painted frame), so the button stays working until the test lets it go.
  */
 import { test, expect, type Page, type Locator } from '@playwright/test';
-import { openApp, openTreeStructure } from './helpers.js';
+import { openApp, openStructureDialog, mergeTreeInto, mergeShowCopy } from './helpers.js';
 
 function mk(id: string, first: string, last: string, gender: string, birth: string,
     partnerships: string[], parentIds: string[], childIds: string[]) {
@@ -152,19 +152,17 @@ for (const wide of [false, true]) {
             await expect(btn).toHaveAttribute('data-busy', 'idle');
         });
 
-        test('Start merge and Re-analyze (C23/C86)', async ({ page }) => {
+        test('Re-analyze (C23/C86)', async ({ page }) => {
             const targetId = await loadTree(page, 1440, wide);
             const sourceId = await page.evaluate(async (data) => window.Strom.DataManager.importAsNewTree(data as never, 'Kopie') as Promise<string>, TREE);
-            await page.evaluate((id) => window.Strom.UI.showMergeTreesDialog(id), sourceId);
-            await expect(page.locator('#merge-trees-modal')).toBeVisible();
-            await page.evaluate((id) => window.Strom.UI.selectMergeTarget(id), targetId);
-            const start = page.locator('#merge-trees-btn');
-            const a = await workingWidth(page, start);
-            expect(Math.abs(a.working - a.rest)).toBeLessThanOrEqual(1);
-            expect(a.words).toBe('Wird analysiert…');
-            await release(page);
+            // The guide opens at once with the tree as the import (spec 134 §2); its comparison shows its progress in step 2.
+            await mergeTreeInto(page, sourceId, targetId);
             const wizard = page.locator('#merge-modal');
-            await expect(wizard).toBeVisible({ timeout: 30_000 });
+            // Re-analyze stands in step 2's list of pairs: the guide compares first.
+            await wizard.locator('#merge-next').click();
+            await expect(wizard.locator('#merge-progress [aria-current="step"]')).toHaveAttribute('data-step', '2', { timeout: 30_000 });
+            // The import is a copy of the tree (13b): its list stands behind Show the comparison.
+            await mergeShowCopy(wizard);
             const again = wizard.getByRole('button', { name: 'Neu analysieren' });
             const footer = wizard.locator('.merge-actions');
             const footerHeight = (await footer.boundingBox())!.height;
@@ -260,20 +258,20 @@ test.describe('on a phone (390, de)', () => {
     });
 });
 
-test.describe('a working element hidden in its closed menu', () => {
-    test('Split into families from a tree manager row says its state in a progress toast (B210: its menu closed, the item kept hidden)', async ({ page }) => {
+test.describe('a working element in Change structure…', () => {
+    test('Split into families from a tree manager row, through Change structure…: the option stays on screen and carries the working state (spec 139; B210 needed a toast while the row menu hid the item)', async ({ page }) => {
         await loadTree(page, 1440, false);
         await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
         const active = page.locator('.tree-manager-item.active');
-        await active.locator('.tree-row-menu-btn').click();
-        const structure = await openTreeStructure(page, active.locator('.tree-row-menu.open'));
+        // Change structure… is a button in the row (spec 139 §8.1).
+        const structure = await openStructureDialog(page, active.locator('.tree-manager-item-actions'));
         await hold(page);
-        await structure.locator('.tree-row-menu-item', { hasText: 'In Familien aufteilen' }).click();
-        const toast = page.locator('.toast--progress');
-        await expect(toast).toBeVisible();
-        await expect(toast).toContainText('Familien werden gesucht…');
+        const families = structure.locator('.menu-option[data-action="families"]', { hasText: 'In Familien…' });
+        await families.click();
+        await expect(families).toHaveAttribute('aria-busy', 'true');
+        await expect(page.locator('.toast--progress')).toHaveCount(0);
         await release(page);
         await expect(page.locator('#split-families-modal')).toBeVisible();
-        await expect(toast).toBeHidden();
+        await expect(structure).toBeHidden();
     });
 });

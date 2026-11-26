@@ -7,10 +7,10 @@
  */
 
 import {
-    LiveBook, LiveBooks, LiveWaiting, WAITING_SECTIONS, WaitingGroup, WaitingInbox, WaitingLinkAction, WaitingSection, imageNumber, researchTaskRef,
+    LiveBook, LiveBooks, LiveWaiting, WAITING_SECTIONS, WaitingGroup, WaitingInbox, WaitingLinkAction, WaitingRetry, WaitingSection, imageNumber, researchTaskRef,
 } from './research-link.js';
 import { bookTitle, bookWebUrl, bookWholeOnDisk, sortBooksMost } from './research-books.js';
-import type { strings } from './strings.js';
+import { getStringsForLang, type strings, type Language } from './strings.js';
 import type { WaitingWrites } from './research-waiting-write.js';
 
 export type WaitingPhase = 'todo' | 'sent';
@@ -219,22 +219,32 @@ export function waitingPhaseLines<T extends LiveWaiting>(groups: readonly Waitin
 /**
  * The order of Awaiting action (spec 083 K5.1): the research's (phases,
  * places, lines), or by when an item has waited since (`at`); with the
- * research's books (spec 105 §2) also "Most tasks" — the books by their tasks.
+ * research's books (spec 105 §2) also "Most tasks" — the books by their tasks;
+ * with the items' gains (`waiting.gain`, spec 105 K4.1) "Most helpful" — by
+ * what doing an item gains the research.
  */
-export type WaitingOrder = 'recommended' | 'newest' | 'oldest' | 'most';
+export type WaitingOrder = 'recommended' | 'newest' | 'oldest' | 'most' | 'gain';
 /** The orders of every research (without its books). */
 export const WAITING_ORDERS: readonly WaitingOrder[] = ['recommended', 'newest', 'oldest'];
 /** Every order there is (a kept one is checked against it). */
-export const ALL_WAITING_ORDERS: readonly WaitingOrder[] = [...WAITING_ORDERS, 'most'];
+export const ALL_WAITING_ORDERS: readonly WaitingOrder[] = [...WAITING_ORDERS, 'most', 'gain'];
 
-/** The orders offered: "Most tasks" only when the research says its books (booksOn). */
-export function waitingOrdersFor(books: boolean): readonly WaitingOrder[] {
-    return books ? ALL_WAITING_ORDERS : WAITING_ORDERS;
+/** The orders offered: "Most helpful" only when the research says the gains, "Most tasks" only when it says its books (booksOn). */
+export function waitingOrdersFor(books: boolean, gain = false): readonly WaitingOrder[] {
+    return ALL_WAITING_ORDERS.filter(o => (o !== 'most' || books) && (o !== 'gain' || gain));
 }
 
 /** An order by when the items have waited since (its time beside the rows and after the groups' names). */
 export function isTimeOrder(order: WaitingOrder): order is 'newest' | 'oldest' {
     return order === 'newest' || order === 'oldest';
+}
+
+/**
+ * An order that sorts the items themselves (by time, by gain): each group
+ * where its first item stands, or (the groups off) one list without them.
+ */
+export function isSortedOrder(order: WaitingOrder): order is 'newest' | 'oldest' | 'gain' {
+    return isTimeOrder(order) || order === 'gain';
 }
 /** The key of a phase's one list without groups (it has no heading). */
 export const FLAT_GROUP = '*';
@@ -261,14 +271,30 @@ export function sortWaitingByTime<T extends LiveWaiting>(items: readonly T[], or
         .map(x => x.w);
 }
 
-/** One phase's rows in an order: in groups, or (a time order only) one list without them. */
+/**
+ * Items by what doing them gains (spec 105 K4.1): the highest score first,
+ * an equal one in the research's order; items without a gain last, in the
+ * research's order.
+ */
+export function sortWaitingByGain<T extends LiveWaiting>(items: readonly T[]): T[] {
+    return orderWaiting(items).map((w, i) => ({ w, i, g: w.gain?.score ?? 0 }))
+        .sort((a, b) => b.g - a.g || a.i - b.i)
+        .map(x => x.w);
+}
+
+/** Items in a sorted order (by time, by gain). */
+export function sortWaiting<T extends LiveWaiting>(items: readonly T[], order: 'newest' | 'oldest' | 'gain'): T[] {
+    return order === 'gain' ? sortWaitingByGain(items) : sortWaitingByTime(items, order);
+}
+
+/** One phase's rows in an order: in groups, or (a sorted order only) one list without them. */
 function phaseRows<T extends LiveWaiting>(items: readonly T[], order: WaitingOrder, groups: boolean, opts: WaitingGroupOpts): WaitingGroupRows<T>[] {
     // "Most tasks" is always by book: the books by their tasks, the rest by place, all within in the research's order.
     if (order === 'most') return groupWaiting(items, { ...opts, by: 'book' }, true);
     if (order === 'recommended') return groupWaiting(items, opts);
-    const sorted = sortWaitingByTime(items, order);
+    const sorted = sortWaiting(items, order);
     if (!groups) return sorted.length > 0 ? [{ key: FLAT_GROUP, group: null, items: sorted }] : [];
-    // Each group where its newest (oldest) item stands; "Other" and "Places" too, not kept at the bottom.
+    // Each group where its newest (oldest, most helpful) item stands; "Other" and "Places" too, not kept at the bottom.
     const list = groupInOrder(sorted, opts);
     return booksFirst(list.filter(g => g.book), list.filter(g => !g.book), opts.by === 'book');
 }
@@ -450,7 +476,7 @@ export function textWithLinks(text: string): TextPiece[] {
  * What an item waiting for images, a website or a check offers: images sent
  * from the app, its website, an answer, a talk with the agent, its folder.
  */
-export type WaitAction = 'images' | 'web' | 'answer' | 'chat' | 'folder';
+export type WaitAction = 'retry' | 'images' | 'web' | 'answer' | 'chat' | 'folder';
 
 /**
  * One action as shown: how it goes (its mark: `bridge` none, `terminal` the
@@ -463,10 +489,14 @@ export interface WaitActionView {
     ai: boolean;
 }
 
-/** Images of a book: "Add images" leads, its website right beside (UIX O2 = A, Milan 4 Nov 2026). */
-export const IMAGES_ORDER: readonly WaitAction[] = ['images', 'web', 'answer', 'chat', 'folder'];
-/** A website without a book and a check: the answer leads. */
-export const ANSWER_ORDER: readonly WaitAction[] = ['answer', 'web', 'chat', 'folder'];
+/**
+ * Images of a book: "Add images" leads, its website right beside (UIX O2 = A, Milan 4 Nov 2026).
+ * "Retry with the agent" (spec 089 §1.2) leads before all when it is the main action (waitingRetryMain),
+ * else it stands right after the first action.
+ */
+export const IMAGES_ORDER: readonly WaitAction[] = ['retry', 'images', 'web', 'answer', 'chat', 'folder'];
+/** A website without a book and a check: the answer leads (after a main "Retry with the agent"). */
+export const ANSWER_ORDER: readonly WaitAction[] = ['retry', 'answer', 'web', 'chat', 'folder'];
 /** Actions shown beside the main one (the rest under "More actions"); a wide item (≥ 760 px) one more. */
 export const MAX_SECONDARY = 2;
 export const MAX_SECONDARY_WIDE = 3;
@@ -475,7 +505,14 @@ export const PHONE_SECONDARY = 1;
 
 export interface WaitActionsContext {
     /** What the bridge takes here now (none when no bridge answers on this page). */
-    writes: Pick<WaitingWrites, 'answer' | 'images'>;
+    writes: Pick<WaitingWrites, 'answer' | 'images'> & Partial<Pick<WaitingWrites, 'retry'>>;
+    /**
+     * "Retry with the agent" may stand among the actions (spec 089 §1.2): the
+     * overview's item without the Deliver block only — never the small panel,
+     * whose one action is the first, nor an item drawn with the Deliver block
+     * (its own row there, waitingRetryEl). Default false.
+     */
+    retry?: boolean;
     /** The research's task links open from here (this computer, its own research). */
     links: boolean;
     /** The phone layout (the overview's sheet). */
@@ -508,7 +545,9 @@ export function waitingActions(w: LiveWaiting, ctx: WaitActionsContext): WaitAct
     const terminal = ctx.links && !ctx.phone;
     const out: WaitActionView[] = [];
     for (const key of images ? ctx.order ?? IMAGES_ORDER : ANSWER_ORDER) {
-        if (key === 'web') {
+        if (key === 'retry') {
+            continue;
+        } else if (key === 'web') {
             if (w.url) out.push({ key, via: 'web', ai: false });
         } else if (key === 'images') {
             if (images && ctx.writes.images && !ctx.phone && offers('images')) out.push({ key, via: 'bridge', ai: false });
@@ -521,7 +560,22 @@ export function waitingActions(w: LiveWaiting, ctx: WaitActionsContext): WaitAct
             out.push({ key, via: 'terminal', ai: key === 'chat' });
         }
     }
+    // Back to the agent through the bridge (no mark, no agent starts here): first when it is the main
+    // action, else right after the first one; never on a phone.
+    if (ctx.retry && ctx.writes.retry && !ctx.phone && w.retry?.can && task) {
+        out.splice(waitingRetryMain(w.retry) ? 0 : Math.min(1, out.length), 0, { key: 'retry', via: 'bridge', ai: false });
+    }
     return out;
+}
+
+/**
+ * "Retry with the agent" is the item's main action (spec 089 §1.2): the
+ * agent can do it now (held, stopped, ready, read on screen, or a reason the
+ * app does not know); with the extension not connected or the agent without a
+ * browser it is an outlined one beside the main action.
+ */
+export function waitingRetryMain(r: Pick<WaitingRetry, 'why'>): boolean {
+    return r.why !== 'no-extension' && r.why !== 'agent-without-browser';
 }
 
 /**
@@ -693,12 +747,15 @@ export const GROUP_TITLE_LINES = 3;
  * action (spec 105 U4 §1, §2): its title, one more line for every ~70
  * characters up to the cap; a book of the research's list its archive, its
  * facts and its actions; a place its actions under the title and the images
- * its items miss. Guessed by the text's length, never measured.
+ * its items miss; "Retry all with the agent" (spec 089 §8, `retry`) one line
+ * and one more kept for its confirmation beforehand (opening it never splits
+ * the columns anew), the Now line its items share (`now`) one. Guessed by the
+ * text's length, never measured.
  */
-export function waitingGroupBandLines(title: string, head: { book?: boolean; listed?: boolean; missing?: boolean }): number {
+export function waitingGroupBandLines(title: string, head: { book?: boolean; listed?: boolean; missing?: boolean; retry?: boolean; now?: boolean }): number {
     const titleLines = Math.min(GROUP_TITLE_LINES, Math.max(1, Math.ceil(title.trim().length / GROUP_TITLE_LINE_CHARS)));
     if (head.book) return titleLines + (head.listed ? 3 : 0);
-    return titleLines + 1 + (head.missing ? 1 : 0);
+    return titleLines + 1 + (head.missing ? 1 : 0) + (head.retry ? 2 : 0) + (head.now ? 1 : 0);
 }
 
 /** Files a task takes as images of its book (`<input accept>`; the research reads PDF page by page). */
@@ -717,13 +774,119 @@ export function taskImageProblem(file: { name: string; size?: number }, maxBytes
     return (file.size ?? 0) > maxBytes ? 'size' : null;
 }
 
-/** The image number a file's name says: its last group of digits ("DA_4-12_0058.tif" → 58), or null. */
-export function imageNumberOfName(name: string): number | null {
-    const base = name.replace(/\.[A-Za-z0-9]{1,8}$/, '');
-    const groups = base.match(/\d+/g);
-    if (!groups) return null;
-    const last = groups[groups.length - 1];
-    return last.length <= 6 ? imageNumber(Number(last)) : null;
+/**
+ * What a file manager adds to the name of a copy at its end (the research's
+ * `copyless`): Finder's " 2", " copy", " copy 2" (" kopie", " Kopie", " kopia"
+ * in its languages), Explorer's " - Copy", " - Copy (2)", " – kopie" and a
+ * browser's " (1)". A word of a copy; a number in parentheses only when a
+ * number is left before it; a bare " 2" … " 9" only after a name that is a
+ * number alone, or a number and a zoomed-in part's letter ("33a 2.jpg").
+ */
+const COPY_WORD = /(?:\s*[-–—]\s*|\s+)(?:copy|kopie|kopia|kopija|copia|copie|копия|копія)(?:\s+\p{Nd}+|\s*\(\p{Nd}+\))?$/iu;
+const COPY_PAREN = /\s*\(\p{Nd}+\)$/u;
+const COPY_BARE = /^(\p{Nd}+\p{L}?)\s+[2-9]$/u;
+
+/** A file's name without its folder, its extension and a copy's suffix (COPY_WORD), NFC. */
+function nameStem(name: string): string {
+    const base = name.slice(Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\')) + 1);
+    const dot = base.lastIndexOf('.');
+    let stem = (dot > 0 ? base.slice(0, dot) : base).normalize('NFC').trim();
+    const word = stem.replace(COPY_WORD, '');
+    if (word !== stem && /\p{Nd}/u.test(word)) return word.trim();
+    const paren = stem.replace(COPY_PAREN, '');
+    if (paren !== stem && /\p{Nd}/u.test(paren)) stem = paren.trim();
+    const bare = COPY_BARE.exec(stem);
+    return bare ? bare[1] : stem;
+}
+
+/**
+ * A date in a name (a screenshot's, a camera's: "2026-11-04 10.07",
+ * "4.11.2026", "IMG_20261104_100723"): its numbers are never an image's.
+ */
+const DATED = [
+    /(?<!\p{Nd})(?:19|20)[0-9]{2}([-._ ])(?:0?[1-9]|1[0-2])\1(?:0?[1-9]|[12][0-9]|3[01])(?!\p{Nd})/u,
+    /(?<!\p{Nd})(?:0?[1-9]|[12][0-9]|3[01])([-._ ])(?:0?[1-9]|1[0-2])\1(?:19|20)[0-9]{2}(?!\p{Nd})/u,
+    /(?<!\p{Nd})(?:19|20)[0-9]{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12][0-9]|3[01])(?!\p{Nd})/u,
+];
+
+/** Four digits that look like a year (1500–2099): of a name with other numbers too, not taken by rule 5 when which images is not known. */
+const YEAR = /^(?:1[5-9]|20)[0-9]{2}$/u;
+
+/** The image numbers of files' names, and the files whose name gives two images asked for (not guessed). */
+export interface ImageNamesRead {
+    numbers: (number | null)[];
+    ambiguous: { index: number; numbers: number[] }[];
+}
+
+/**
+ * The image number each file's name gives, by the research's rules (its
+ * `readNumbers`, so the app sends the number the research would read of the
+ * same name), the first rule that gives one:
+ *   1. one group of digits ("33", "IMG_0057", "snímek 8", "__0236");
+ *   2. of several groups, the one number that is an image asked for (`want`):
+ *      "CZ-SOA_1784_0236", "fond12_kniha3_236" — two asked for in one name
+ *      ("0012_0236" of a task waiting for 12 and 236) are not guessed;
+ *   3. the place of the group that changes from file to file of those given
+ *      (all with as many groups; of images asked for, each one of them):
+ *      "Lhota_11__025", "Lhota_11__125";
+ *   4. the one zero-padded counter of three digits at least among other
+ *      numbers ("…_00141_sign-4411.jpg");
+ *   5. the last number before the extension — an image asked for, or any when
+ *      which ones is not known but one that looks like a year (YEAR: "33 1784"
+ *      is not guessed).
+ * A name with a date (a screenshot's "2026-11-04 10.07") only by 1 and 4;
+ * digits of another script are not read. A number outside 1–999999: none.
+ */
+export function readImageNumbers(names: readonly string[], want?: readonly number[] | null): ImageNamesRead {
+    const wanted = new Set(want ?? []);
+    const known = wanted.size > 0;
+    const asked = (n: number): boolean => !known || wanted.has(n);
+    const read = names.map(name => {
+        const stem = nameStem(name);
+        const groups = stem.match(/\p{Nd}+/gu) ?? [];
+        return { groups: groups.every(g => /^[0-9]+$/.test(g)) ? groups : [], dated: DATED.some(d => d.test(stem)) };
+    });
+    const ambiguous: ImageNamesRead['ambiguous'] = [];
+    const unsure = new Set<number>();
+    const numbers: (number | undefined)[] = read.map(({ groups, dated }, i) => {
+        if (groups.length === 1) return Number(groups[0]);
+        if (groups.length < 2 || dated || !known) return undefined;
+        const hits = [...new Set(groups.map(Number).filter(n => wanted.has(n)))];
+        if (hits.length === 1) return hits[0];
+        if (hits.length > 1) {
+            ambiguous.push({ index: i, numbers: hits.sort((a, b) => a - b) });
+            unsure.add(i);
+        }
+        return undefined;
+    });
+    // 3. The group that changes from file to file.
+    const many = read.map((_, i) => i).filter(i => read[i].groups.length > 1 && !read[i].dated);
+    const n = many.length ? read[many[0]].groups.length : 0;
+    if (many.length > 1 && many.every(i => read[i].groups.length === n)) {
+        const varying = [...Array(n).keys()].filter(k => new Set(many.map(i => Number(read[i].groups[k]))).size > 1);
+        const k = varying[varying.length - 1];
+        if (k !== undefined && many.every(i => asked(Number(read[i].groups[k])))) {
+            for (const i of many) if (numbers[i] === undefined && !unsure.has(i)) numbers[i] = Number(read[i].groups[k]);
+        }
+    }
+    read.forEach(({ groups, dated }, i) => {
+        if (numbers[i] !== undefined || unsure.has(i) || groups.length < 2) return;
+        // 4. A counter of three digits at least (a date's "04", a time's "07" are no counter).
+        const padded = groups.filter(g => g.length > 2 && g.startsWith('0'));
+        if (padded.length === 1) numbers[i] = Number(padded[0]);
+        // 5. The last number before the extension, never of a date; which images not known,
+        // never one that looks like a year among other numbers ("33 1784", "kniha_33_1784").
+        else {
+            const last = groups[groups.length - 1];
+            if (!dated && asked(Number(last)) && (known || !YEAR.test(last))) numbers[i] = Number(last);
+        }
+    });
+    return { numbers: numbers.map(v => v === undefined ? null : imageNumber(v)), ambiguous };
+}
+
+/** The image number one file's name says (readImageNumbers), or null. */
+export function imageNumberOfName(name: string, want?: readonly number[] | null): number | null {
+    return readImageNumbers([name], want).numbers[0];
 }
 
 /**
@@ -780,9 +943,11 @@ export function assignImages(files: readonly { name: string; size?: number }[], 
     opts: { chosen?: readonly (number | null | undefined)[]; maxBytes?: number; next?: number } = {}): ImagesAssigned {
     const wanted = want ? new Set(want) : null;
     const saved = new Set(have);
+    // The names read together, as the research reads a folder's files (a number that changes from file to file).
+    const named = readImageNumbers(files.map(f => f.name), want).numbers;
     const out: ImageAssignment[] = files.map((f, index) => {
         const problem = opts.maxBytes !== undefined ? taskImageProblem(f, opts.maxBytes) : TASK_IMAGE_EXT.includes(fileExt(f.name)) ? null : 'format';
-        const nameNum = imageNumberOfName(f.name);
+        const nameNum = named[index];
         return {
             index, num: null, how: null, nameNum, unwanted: !!wanted && nameNum !== null && !wanted.has(nameNum), replace: 'no',
             ...(problem ? { problem } : {}),
@@ -892,4 +1057,192 @@ export function imageSlotOptions(assigned: ImagesAssigned, index: number, want: 
     return [...new Set(want)].sort((x, y) => x - y).map(n => ({
         n, saved: have.includes(n), ...(at.has(n) ? { takenBy: at.get(n)! } : {}),
     }));
+}
+
+// ==================== BACK TO THE AGENT (spec 089) ====================
+
+/** The Now line of an item that can go back to the agent: its text, and whether the extension's link follows it. */
+export interface WaitingRetryReason {
+    text: string;
+    extLink: boolean;
+}
+
+function sameDayOf(a: Date, b: Date): boolean {
+    return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+
+/** "yesterday" / "tomorrow" in the UI language, capital-free. */
+function nearDay(offset: -1 | 1, lang: Language): string {
+    try {
+        return new Intl.RelativeTimeFormat(lang, { numeric: 'auto' }).format(offset, 'day');
+    } catch {
+        const words: Record<Language, [string, string]> = {
+            en: ['yesterday', 'tomorrow'], cs: ['včera', 'zítra'], de: ['gestern', 'morgen'], pl: ['wczoraj', 'jutro'],
+        };
+        return words[lang][offset < 0 ? 0 : 1];
+    }
+}
+
+/**
+ * When an item went back last or can go back again (spec 089 §6): "18:40"
+ * today, "yesterday 18:40", "tomorrow 9:12", any other day with its day and
+ * month ("22. 11. 18:40", as waitingSentDay). '' for a time not given.
+ */
+export function retryWhenText(iso: string | undefined, now: number, lang: Language): string {
+    const ts = iso ? Date.parse(iso) : NaN;
+    if (!Number.isFinite(ts)) return '';
+    const d = new Date(ts);
+    const today = new Date(now);
+    const time = new Intl.DateTimeFormat(lang, { hour: 'numeric', minute: '2-digit' }).format(d);
+    if (sameDayOf(d, today)) return time;
+    if (sameDayOf(d, new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1))) return `${nearDay(-1, lang)} ${time}`;
+    if (sameDayOf(d, new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1))) return `${nearDay(1, lang)} ${time}`;
+    return `${d.toLocaleDateString(lang, { day: 'numeric', month: 'numeric' })} ${time}`;
+}
+
+/**
+ * The Now line of an item with `retry` (spec 089 §2, §6), in the UI
+ * language: why it waits now by `why` (held with its host or "the archive's
+ * website", stopped, ready, read on screen; the extension not connected —
+ * the browser's sentence, "once connected…" and the extension's link; the
+ * agent without a browser), ended by "– retried 18:40, held back again" /
+ * "…waiting again" when it went back already. An unknown `why`: the
+ * research's own `says` (its language, as it is); without it, no line (null).
+ */
+export function waitingRetryReason(w: Pick<LiveWaiting, 'retry'>, lang: Language, now: number = Date.now()): WaitingRetryReason | null {
+    const r = w.retry;
+    if (!r) return null;
+    const S = getStringsForLang(lang);
+    const R = S.live.waitingRetry;
+    const B = S.research.browser;
+    let text: string;
+    let extLink = false;
+    switch (r.why) {
+        case 'held': text = r.host ? R.held(r.host) : R.heldNoHost; break;
+        case 'stopped': text = R.stopped; break;
+        case 'ready': text = R.ready; break;
+        case 'screen': text = R.screen; break;
+        case 'no-extension': text = `${B.waitNoExt} ${R.afterExt}`; extLink = true; break;
+        case 'agent-without-browser': text = B.waitAgent; break;
+        default: return r.says ? { text: r.says, extLink: false } : null;
+    }
+    const at = retryWhenText(r.again?.at, now, lang);
+    if (at) text = `${text.replace(/[.!]$/, '')} ${r.why === 'held' ? R.againHeld(at) : R.againWaits(at)}.`;
+    return { text, extLink };
+}
+
+/**
+ * What goes back with an item, as its button says after its name (spec 089
+ * §3): "· 2 images", "· read only", "· 2 images, read only"; '' when the
+ * number is not known (or none) and it is not read on screen.
+ */
+export function waitingRetryCount(r: Pick<WaitingRetry, 'images' | 'screen'>, lang: Language): string {
+    const R = getStringsForLang(lang).live.waitingRetry;
+    const parts = [r.images ? R.images(r.images) : '', r.screen ? R.readOnly : ''].filter(Boolean);
+    return parts.length ? `· ${parts.join(', ')}` : '';
+}
+
+/** The hint in place of the button of an item back three times in 24 hours (spec 089 §6); null: it can go back. */
+export function waitingRetryLimitText(r: Pick<WaitingRetry, 'can' | 'until'>, lang: Language, now: number = Date.now()): string | null {
+    if (r.can) return null;
+    return getStringsForLang(lang).live.waitingRetry.limit(retryWhenText(r.until, now, lang));
+}
+
+/**
+ * What a place's "Retry all with the agent" takes back (spec 089 §4), of
+ * EVERY item of the place (the bridge takes the whole place, not what a
+ * filter shows): `n` the items that can go back, `images` their missing
+ * images added up, `atLeast` some of them (not read on screen) do not say how
+ * many, `readOnly` all of them are only read on screen, `later` those back
+ * three times in 24 hours and the soonest time one of them can go back again.
+ */
+export interface WaitingGroupRetry {
+    n: number;
+    images: number;
+    atLeast: boolean;
+    readOnly: boolean;
+    later: { n: number; until: string } | null;
+}
+
+export function waitingGroupRetry(items: readonly Pick<LiveWaiting, 'retry'>[]): WaitingGroupRetry {
+    const can = items.filter(w => w.retry?.can === true).map(w => w.retry!);
+    const held = items.filter(w => w.retry && w.retry.can === false).map(w => w.retry!);
+    const soonest = held.map(r => r.until ?? '').filter(t => Number.isFinite(Date.parse(t)))
+        .sort((a, b) => Date.parse(a) - Date.parse(b))[0] ?? '';
+    return {
+        n: can.length,
+        images: can.reduce((sum, r) => sum + (r.images ?? 0), 0),
+        atLeast: can.some(r => !r.screen && r.images === undefined),
+        readOnly: can.length > 0 && can.every(r => r.screen === true),
+        later: held.length ? { n: held.length, until: soonest } : null,
+    };
+}
+
+/** A place's counts as its texts take them: "2 tasks" and "5 images" / "at least 5 images" / "read only" ('' : none known). */
+export function groupRetryParts(g: WaitingGroupRetry, lang: Language): { tasks: string; images: string } {
+    const R = getStringsForLang(lang).live.waitingRetry;
+    const images = g.readOnly ? R.readOnly : g.images > 0 ? (g.atLeast ? R.atLeast(R.images(g.images)) : R.images(g.images)) : '';
+    return { tasks: R.tasks(g.n), images };
+}
+
+/** The count after a place's button: "(2 tasks, 5 images)", "(2 tasks, at least 5 images)", "(2 tasks, read only)", "(2 tasks)". */
+export function groupRetryCountText(g: WaitingGroupRetry, lang: Language): string {
+    const p = groupRetryParts(g, lang);
+    return getStringsForLang(lang).live.waitingRetry.count(p.tasks, p.images);
+}
+
+/** The question of a place's confirmation (spec 089 §4): "Return 2 tasks (5 images) to the agent? …". */
+export function groupRetryConfirmText(g: WaitingGroupRetry, lang: Language): string {
+    const p = groupRetryParts(g, lang);
+    return getStringsForLang(lang).live.waitingRetry.confirm(p.tasks, p.images);
+}
+
+/** The accessible name of a place's button: "Retry all with the agent · {place} · 2 tasks, 5 images". */
+export function groupRetryAria(name: string, g: WaitingGroupRetry, lang: Language): string {
+    const p = groupRetryParts(g, lang);
+    return getStringsForLang(lang).live.waitingRetry.groupAria(name, p.tasks, p.images);
+}
+
+/** The muted words after a place's button: "1 only tomorrow 9:12" (without the leading "·"); null: none held by the limit. */
+export function groupRetryLaterText(g: WaitingGroupRetry, lang: Language, now: number = Date.now()): string | null {
+    if (!g.later) return null;
+    return getStringsForLang(lang).live.waitingRetry.later(g.later.n, retryWhenText(g.later.until, now, lang));
+}
+
+/**
+ * The Now line a place's band says for its items (spec 089 §2, rámec 9): when
+ * two or more of its items have `retry` and all of them wait for the same
+ * reason (the same `why` and `host`, and the same line as each of them would
+ * say), that line and the ids of those items (their own Now line is left out,
+ * as a browser note said in the band is). Null otherwise.
+ */
+export function waitingGroupRetryReason<T extends Pick<LiveWaiting, 'id' | 'retry'>>(items: readonly T[], lang: Language, now: number = Date.now()):
+    (WaitingRetryReason & { ids: string[] }) | null {
+    const withRetry = items.filter(w => !!w.retry);
+    if (withRetry.length < 2) return null;
+    const first = withRetry[0].retry!;
+    if (withRetry.some(w => w.retry!.why !== first.why || (w.retry!.host ?? '') !== (first.host ?? ''))) return null;
+    const reasons = withRetry.map(w => waitingRetryReason(w, lang, now));
+    const one = reasons[0];
+    if (!one || reasons.some(r => !r || r.text !== one.text)) return null;
+    return { ...one, ids: withRetry.map(w => w.id) };
+}
+
+/**
+ * Why an item did not go back, as its row says it (spec 089 §5): it waits for
+ * something else now, it cannot go back any more, the limit (when again), the
+ * research not answering (anything else: it should not happen).
+ */
+export function waitingRetryRefusedText(r: { code: string; until?: string }, lang: Language, now: number = Date.now()): string {
+    const R = getStringsForLang(lang).live.waitingRetry;
+    if (r.code === 'changed') return R.errChanged;
+    if (r.code === 'not' || r.code === 'none') return R.errNot;
+    if (r.code === 'limit') return R.limit(retryWhenText(r.until, now, lang));
+    return R.errDown;
+}
+
+/** A place's refusal as its toast says it: "Nothing was returned: " + the reason (one sentence), lower case, without its period. */
+export function groupRetryFailText(r: { code: string; until?: string }, lang: Language, now: number = Date.now()): string {
+    const first = waitingRetryRefusedText(r, lang, now).replace(/[.!?]$/, '').trim();
+    return getStringsForLang(lang).live.waitingRetry.groupFail(first.charAt(0).toLocaleLowerCase(lang) + first.slice(1));
 }

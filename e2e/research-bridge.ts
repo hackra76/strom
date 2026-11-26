@@ -47,9 +47,12 @@ export interface FakeBridge {
     head: string;
     accepts: unknown;
     inbox: { tree: string; at: string; changes: number; sent: string }[];
-    sends: { intake: string; at: string; state: string; changes: number; tree: string; sent: string; decidedAt?: string; reason?: string; conflicts?: unknown }[];
+    /** `client`: the browser that sent it (`_STROM_CLIENT` of the send, spec 094 K2.4); absent: none said (an older app or research). */
+    sends: { intake: string; at: string; state: string; changes: number; tree: string; sent: string; decidedAt?: string; input?: string; reason?: string; conflicts?: unknown; client?: unknown }[];
     lastIntake: { id: string; at: string } | null;
     syncReply: { status: number; body: unknown };
+    /** Answers to the next sends, first first (each taken once), before `syncReply` (e.g. one refusal, then the usual). */
+    syncReplies?: { status: number; body: unknown }[];
     treeGed: string;
     down: boolean;
     links: string[];
@@ -78,6 +81,12 @@ export interface FakeBridge {
     mediaPutStatus: number;
     /** The body of a PUT turned down (default `{error: 'no'}`; L3: `{error, code, text, params}`). */
     mediaPutReply?: unknown;
+    /** Every `PUT /lists/<ref>` (spec 137 §6.6, `media.list` in `features`): the ref and the JSON body. */
+    listPuts?: { ref: string; body: Record<string, unknown> }[];
+    /** Status of a list PUT (default 200; 400 / 413 / 403: refused). */
+    listPutStatus?: number;
+    /** The next file with `X-Strom-List-Ref` answers `404 media.no-list` (the bridge lost the list), once. */
+    listLostOnce?: boolean;
     /** Files it can serve in full (`GET /media/<sha>?file=1`); others answer 410. */
     mediaFiles: Map<string, { type: string; body: Buffer }>;
     /** Busy (starting up): every request answers 503 with Retry-After. */
@@ -103,6 +112,8 @@ export interface FakeBridge {
     strom?: string;
     /** Tasks waiting for the user (`/status.waiting`). */
     waiting?: unknown[];
+    /** The research's history (`GET /log` `entries`, each its `via` when a send wrote it); unset: 404, an older bridge. */
+    log?: unknown[];
     /** What the bridge says it can do (`/status.features`, 1.12.0-rc.20). */
     features?: string[];
     /** More fields of `/status` (e.g. `channel`, `linkScheme`). */
@@ -135,6 +146,20 @@ export interface FakeBridge {
      * and said back, `replies` answer instead. A batch's close says `auto` / `sort` and its tasks only when on.
      */
     intake?: FakeIntake;
+    /**
+     * Sorting with the agent without asking (spec 102 U8, `sort.confirm` in `features`): `/status.sort` (`sort`, sent
+     * as it is; unset: not said), every `POST /settings/sort` body (`posts`). `{"confirm": "ask"}` is written;
+     * `{"confirm": "no"}` while `ask` is refused 403 `sort.raise` with the terminal's command; the same value again
+     * writes nothing; `replies` answer instead. With `sort.confirm.app` (spec 123 P2) `no` is written too, unless
+     * `raiseReason` refuses it (403 `sort.raise` with that `reason`).
+     */
+    sortConfirm?: FakeSortConfirm;
+    /**
+     * Starting the agent without confirming (spec 123 P2, `run.confirm` in `features`): `/status.work.confirm`
+     * (`confirm`; unset: not said), every `POST /settings/run` body (`posts`). `ask` and `no` are written (no commit,
+     * no `head`), unless `raiseReason` refuses `no` (403 `run.raise`); `replies` answer instead.
+     */
+    runConfirm?: FakeRunConfirm;
     /** Stuck (SIGSTOP): `/status` never answers. */
     statusHang?: boolean;
     /**
@@ -234,6 +259,32 @@ export interface FakeIntake {
     intake?: unknown;
     posts: unknown[];
     replies: { status: number; body: unknown }[];
+}
+
+/** The research's setting of sorting with the agent without asking (spec 102 U8). */
+export interface FakeSortConfirm {
+    sort?: unknown;
+    posts: unknown[];
+    replies: { status: number; body: unknown }[];
+    raiseReason?: 'device' | 'browser';
+}
+
+/** The computer's setting of starting the agent without confirming (spec 123 P2). */
+export interface FakeRunConfirm {
+    confirm?: 'ask' | 'no';
+    posts: unknown[];
+    replies: { status: number; body: unknown }[];
+    raiseReason?: 'device' | 'browser';
+}
+
+/** A computer whose app actions starting the agent ask in the research terminal first (`ask`) or not (`no`). */
+export function fakeRunConfirm(confirm: 'ask' | 'no'): FakeRunConfirm {
+    return { confirm, posts: [], replies: [] };
+}
+
+/** A research whose Sort with the agent asks for the cost each time (`ask`, the default) or not (`no`). */
+export function fakeSortConfirm(confirm: 'ask' | 'no'): FakeSortConfirm {
+    return { sort: { confirm }, posts: [], replies: [] };
 }
 
 /** A research that sorts closed batches by itself (`auto`) or not (off, the default). */
@@ -1480,6 +1531,47 @@ export interface FakePhone {
     posts: string[];
     /** Unpaired, still restorable. */
     removed: Map<string, FakePhoneEntry>;
+    /** The gateway of the devices (spec 094 P3, `devices` of `GET phone`); said only when set. */
+    devices?: FakeDevices;
+    /** Every ask of the gateway: `pair {"mode":"app",…}`, `rename <id> {"name":…}`, `delete <id>`, `restore <id> {"undo":…}`. */
+    deviceAsks?: string[];
+    /** `POST phone/pair` answers 503 phone.starting this many times first. */
+    pairStarting?: number;
+}
+
+/** A device of the home network paired with the Strom app (`devices.list[]`). */
+export interface FakeDevice {
+    id: string;
+    name: string;
+    kind?: 'phone' | 'tablet' | 'computer';
+    via: 'app';
+    pairedAt: string;
+    lastSeenAt: string | null;
+    connected: boolean;
+    stale: boolean;
+    home: boolean;
+}
+
+export interface FakeDevices {
+    app: 'ready' | 'fetching' | 'none';
+    appVersion: string;
+    name: string | null;
+    list: FakeDevice[];
+    /** Unpaired, restorable by their undo token (`undo-<id>`). */
+    removed?: Map<string, FakeDevice>;
+}
+
+/** The features of a research whose gateway of the devices is on (`devices.mode on`). */
+export const DEVICE_FEATURES = ['device.gateway', 'device.phonePage', 'device.rename', 'device.events'];
+
+/** A device row; `init` changes any of it. */
+export function fakeDevice(id: string, name: string, init: Partial<FakeDevice> = {}): FakeDevice {
+    return { id, name, via: 'app', pairedAt: '2026-11-18T09:00:00Z', lastSeenAt: null, connected: false, stale: false, home: false, ...init };
+}
+
+/** `devices` as `GET phone` says it (connected now counted from the rows). */
+function devicesOf(dv: FakeDevices): Record<string, unknown> {
+    return { app: dv.app, appVersion: dv.appVersion, name: dv.name, list: dv.list, connectedNow: dv.list.filter(x => x.connected).length };
 }
 
 /** A phone connection that is off, nothing paired, one address; `init` changes any of it. */
@@ -2170,7 +2262,7 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
         const json = (status: number, body: unknown) => route.fulfill({ status, headers: { ...cors, 'content-type': 'application/json' }, body: JSON.stringify(body) })
             .catch((err: unknown) => { if (!late) throw err; });
         if (route.request().method() === 'OPTIONS') {
-            return route.fulfill({ status: 204, headers: { ...cors, 'access-control-allow-methods': 'GET, PUT, POST', 'access-control-allow-headers': '*' } });
+            return route.fulfill({ status: 204, headers: { ...cors, 'access-control-allow-methods': 'GET, PUT, POST, DELETE', 'access-control-allow-headers': '*' } });
         }
         // A new token: the old address turns everything down (as the research does an unknown token:
         // 404 without a body, core/live.ts).
@@ -2196,6 +2288,17 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
             }
             return json(200, { known });
         }
+        const listPut = /\/lists\/([A-Za-z0-9-]{1,64})$/.exec(url.pathname);
+        if (listPut && method === 'PUT') {
+            if (!(b.features ?? []).includes('media.list')) return json(404, { error: 'Not found.', code: 'route.unknown' });
+            let body: Record<string, unknown> = {};
+            try { body = JSON.parse(route.request().postData() ?? '{}') as Record<string, unknown>; } catch { /* kept empty */ }
+            (b.listPuts ??= []).push({ ref: listPut[1], body });
+            const status = b.listPutStatus ?? 200;
+            if (status !== 200) return json(status, { error: 'refused', code: status === 413 ? 'list.large' : status === 403 ? 'app.only' : 'list.bad-body' });
+            const persons = Array.isArray(body.persons) ? body.persons as string[] : [];
+            return json(200, { list: listPut[1], persons: persons.length, unknown: [] });
+        }
         const media = /\/media\/([0-9a-f]{64})$/.exec(url.pathname);
         if (media) {
             const sha = media[1];
@@ -2208,6 +2311,10 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
             if (route.request().method() === 'PUT') {
                 const body = route.request().postDataBuffer();
                 b.mediaPuts.push({ sha, headers: route.request().headers(), bytes: body?.length ?? 0 });
+                if (b.listLostOnce && route.request().headers()['x-strom-list-ref']) {
+                    b.listLostOnce = false;
+                    return json(404, { error: 'no list', code: 'media.no-list', list: route.request().headers()['x-strom-list-ref'] });
+                }
                 if (b.mediaPutStatus !== 200) return json(b.mediaPutStatus, b.mediaPutReply ?? { error: 'no' });
                 // Content it has: said so (as the research does), nothing new.
                 const prior = b.mediaKnown.get(sha);
@@ -2439,6 +2546,44 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
             b.intake.intake = { auto: r.auto };
             return json(200, { intake: b.intake.intake, ...(was === r.auto ? { head: b.head, parent: b.head } : commitWrite(b)) });
         }
+        // Sorting with the agent without asking (spec 102 U8): only `ask` is written; `no` is the terminal's.
+        if (b.sortConfirm && method === 'POST' && /\/settings\/sort$/.test(url.pathname) && b.features?.includes('sort.confirm')) {
+            let body: unknown = null;
+            try { body = JSON.parse(route.request().postData() ?? ''); } catch { /* not JSON */ }
+            b.sortConfirm.posts.push(body);
+            const said = b.sortConfirm.replies.shift();
+            if (said) return json(said.status, said.body);
+            const r = body && typeof body === 'object' ? body as Record<string, unknown> : null;
+            if (!r || Object.keys(r).length !== 1 || (r.confirm !== 'ask' && r.confirm !== 'no')) {
+                return json(400, { error: 'Not a body /settings/sort takes.', code: 'sort.body' });
+            }
+            const was = (b.sortConfirm.sort as { confirm?: unknown } | undefined)?.confirm;
+            if (was === r.confirm) return json(200, { sort: b.sortConfirm.sort, head: b.head, parent: b.head });
+            if (r.confirm === 'no' && (!b.features?.includes('sort.confirm.app') || b.sortConfirm.raiseReason)) {
+                return json(403, { error: 'Only a person in the research terminal switches this on.', code: 'sort.raise',
+                    command: 'strom config set sort.confirm no --for-tree', ...(b.sortConfirm.raiseReason ? { reason: b.sortConfirm.raiseReason } : {}) });
+            }
+            b.sortConfirm.sort = { confirm: r.confirm };
+            return json(200, { sort: b.sortConfirm.sort, ...commitWrite(b) });
+        }
+        // Starting the agent without confirming (spec 123 P2): the computer's setting, no commit.
+        if (b.runConfirm && method === 'POST' && /\/settings\/run$/.test(url.pathname) && b.features?.includes('run.confirm')) {
+            let body: unknown = null;
+            try { body = JSON.parse(route.request().postData() ?? ''); } catch { /* not JSON */ }
+            b.runConfirm.posts.push(body);
+            const said = b.runConfirm.replies.shift();
+            if (said) return json(said.status, said.body);
+            const r = body && typeof body === 'object' ? body as Record<string, unknown> : null;
+            if (!r || Object.keys(r).length !== 1 || (r.confirm !== 'ask' && r.confirm !== 'no')) {
+                return json(400, { error: 'Not a body /settings/run takes.', code: 'run.body' });
+            }
+            if (r.confirm === 'no' && r.confirm !== b.runConfirm.confirm && b.runConfirm.raiseReason) {
+                return json(403, { error: 'Not switched on here.', code: 'run.raise', command: 'strom config set run.confirm no',
+                    reason: b.runConfirm.raiseReason });
+            }
+            b.runConfirm.confirm = r.confirm;
+            return json(200, { run: { confirm: r.confirm } });
+        }
         // A heavy part apart (research 1.26.0, `status.parts`): its rev and its fields as the full status has them.
         const partPath = /\/status\/([A-Za-z]+)$/.exec(url.pathname);
         if (partPath && method === 'GET' && b.features?.includes('status.parts')) {
@@ -2486,6 +2631,8 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
                 ...(b.hypotheses?.decide !== undefined ? { hypotheses: { decide: b.hypotheses.decide } } : {}),
                 ...(b.census ? { census: b.census.census } : {}),
                 ...(b.intake?.intake !== undefined ? { intake: b.intake.intake } : {}),
+                ...(b.sortConfirm?.sort !== undefined ? { sort: b.sortConfirm.sort } : {}),
+                ...(b.runConfirm?.confirm !== undefined ? { work: { gate: null, minutes: 60, confirm: b.runConfirm.confirm } } : {}),
                 ...(b.live ? { live: { idleMinutes: b.live.idleMinutes, idleChoices: b.live.idleChoices ?? [0, 120] } } : {}),
                 ...(b.handoffs ? { handoffs: b.handoffs } : {}),
                 ...(b.statusExtra ?? {}),
@@ -2512,27 +2659,34 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
             (b.postQueries ??= []).push(url.searchParams);
             const sent = /1 _STROM_SENT (\S+)/.exec(body)?.[1] ?? '';
             const appTree = /1 _STROM_APP_TREE (\S+)/.exec(body)?.[1] ?? UUID;
+            // The sending browser, as the research keeps it with the send (`sends[].client`, spec 094 K2.4).
+            const clientId = /\n1 _STROM_CLIENT (\S+)/.exec(body)?.[1];
+            const clientName = clientId ? /\n1 _STROM_CLIENT \S+\r?\n2 NAME ([^\r\n]+)/.exec(body)?.[1] : undefined;
+            const client = clientId ? { client: { id: clientId, ...(clientName ? { name: clientName } : {}) } } : {};
             const intake = `R${Date.now()}-${b.posts.length}`;
+            const once = b.syncReplies?.shift();
+            if (once) return json(once.status, once.body);
             const reply = b.syncReply.body as { inbox?: boolean; pending?: boolean; head?: string };
             if (b.syncReply.status === 200 && reply.inbox === false && !reply.pending && b.onWrite) {
                 // Written at once: the research has a new version, the reply names its commit.
                 const v = b.onWrite(body);
                 b.head = v.head;
                 b.treeGed = v.ged;
-                b.sends.unshift({ intake, at: new Date().toISOString(), state: 'written', changes: 6, tree: appTree, sent, decidedAt: new Date().toISOString() });
+                b.sends.unshift({ intake, at: new Date().toISOString(), state: 'written', changes: 6, tree: appTree, sent, decidedAt: new Date().toISOString(), ...client });
                 return json(200, { ...reply, head: v.head, intake, ...(b.replyExtra?.(body) ?? {}) });
             }
             if (b.syncReply.status === 202 || reply.pending) {
-                b.sends.unshift({ intake, at: new Date().toISOString(), state: 'pending', changes: 6, tree: appTree, sent });
+                b.sends.unshift({ intake, at: new Date().toISOString(), state: 'pending', changes: 6, tree: appTree, sent, ...client });
             }
             if (b.syncReply.status === 200 && reply.inbox) {
                 const at = new Date().toISOString();
                 for (const rec of b.sends) if (rec.tree === appTree && rec.state === 'pending') rec.state = 'replaced';
                 b.inbox = [{ tree: appTree, at, changes: 6, sent }];
-                b.sends.unshift({ intake, at, state: 'pending', changes: 6, tree: appTree, sent });
+                b.sends.unshift({ intake, at, state: 'pending', changes: 6, tree: appTree, sent, ...client });
             }
             return json(b.syncReply.status, b.syncReply.status < 300 ? { ...(b.syncReply.body as object), intake } : b.syncReply.body);
         }
+        if (url.pathname.endsWith('/log') && method === 'GET' && b.log) return json(200, { entries: b.log });
         if (url.pathname.endsWith('/tree.ged')) {
             b.treeGets = (b.treeGets ?? 0) + 1;
             if (b.treeDelayMs) await new Promise(r => setTimeout(r, b.treeDelayMs));
@@ -2579,8 +2733,58 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
         if (ph && phonePath) {
             const rest = phonePath[1] ?? '';
             if (method === 'GET' && rest === '') {
-                const { onReply: _r, qrExpiresAt: _q, qrAsks: _a, posts: _p, removed: _m, ...state } = ph;
-                return json(200, { ...state, pair: ph.state === 'on' ? { expiresAt: ph.qrExpiresAt ?? new Date(Date.now() + 600_000).toISOString() } : null });
+                const { onReply: _r, qrExpiresAt: _q, qrAsks: _a, posts: _p, removed: _m, devices: _d, deviceAsks: _da, pairStarting: _ps, ...state } = ph;
+                return json(200, {
+                    ...state, pair: ph.state === 'on' ? { expiresAt: ph.qrExpiresAt ?? new Date(Date.now() + 600_000).toISOString() } : null,
+                    ...(ph.devices ? { devices: devicesOf(ph.devices) } : {}),
+                });
+            }
+            const dv = ph.devices;
+            const asks = (ph.deviceAsks ??= []);
+            const body = route.request().postData() ?? '';
+            if (dv && method === 'POST' && rest === 'pair') {
+                asks.push(`pair ${body}`);
+                if (ph.state !== 'on') return json(409, { error: 'The phone connection is off.', code: 'phone.off' });
+                if (ph.pairStarting && ph.pairStarting > 0) {
+                    ph.pairStarting--;
+                    return json(503, { error: 'Starting.', code: 'phone.starting', retry: 1 });
+                }
+                const mode = (JSON.parse(body || '{}') as { mode?: string }).mode === 'page' ? 'page' : 'app';
+                const address = ph.addresses[0]?.url ?? '';
+                return json(200, {
+                    url: mode === 'app' ? `${address}/d#k=Q3mXv7TzPpL2aN8wRk4sYb6Hc1Jf9GdE` : `${address}/pair?m=page#7Kd2Xq9Lm4Rt`,
+                    qr: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 29 29"><rect width="29" height="29" fill="#fff"/><path d="M4 4h7v7H4zM18 4h7v7h-7zM4 18h7v7H4zM14 14h2v2h-2z" fill="#000"/></svg>',
+                    expiresAt: ph.qrExpiresAt ?? new Date(Date.now() + 600_000).toISOString(),
+                });
+            }
+            const devPath = dv ? /^devices\/([^/]+)(\/restore)?$/.exec(rest) : null;
+            if (dv && devPath) {
+                const id = decodeURIComponent(devPath[1]);
+                const at = dv.list.findIndex(x => x.id === id);
+                if (method === 'PUT' && !devPath[2]) {
+                    asks.push(`rename ${id} ${body}`);
+                    const name = String((JSON.parse(body || '{}') as { name?: unknown }).name ?? '').trim();
+                    if (at < 0) return json(404, { error: 'No such device.', code: 'device.unknown' });
+                    if (!name || name.length > 60) return json(400, { error: 'The body: {"name": "1–60 characters"}', code: 'device.name' });
+                    dv.list[at] = { ...dv.list[at], name };
+                    return json(200, { device: dv.list[at], devices: devicesOf(dv) });
+                }
+                if (method === 'DELETE' && !devPath[2]) {
+                    asks.push(`delete ${id}`);
+                    if (at < 0) return json(404, { error: 'No such device.', code: 'device.unknown' });
+                    (dv.removed ??= new Map()).set(id, dv.list[at]);
+                    dv.list.splice(at, 1);
+                    return json(200, { undo: `undo-${id}`, devices: devicesOf(dv) });
+                }
+                if (method === 'POST' && devPath[2]) {
+                    asks.push(`restore ${id} ${body}`);
+                    const entry = dv.removed?.get(id);
+                    const undo = (JSON.parse(body || '{}') as { undo?: unknown }).undo;
+                    if (!entry || (undo !== undefined && undo !== `undo-${id}`)) return json(410, { error: 'Gone.', code: 'device.gone' });
+                    dv.removed!.delete(id);
+                    dv.list.push(entry);
+                    return json(200, { devices: devicesOf(dv) });
+                }
             }
             if (method === 'GET' && rest === 'qr.svg') {
                 ph.qrAsks.push(url.searchParams.toString().replace(/(^|&)app=[^&]*/, ''));
@@ -2598,7 +2802,6 @@ export async function fakeBridge(page: Page, init: Partial<FakeBridge> = {}): Pr
                 });
             }
             if (method === 'POST') {
-                const body = route.request().postData() ?? '';
                 ph.posts.push(rest === 'on' ? `on ${body}` : rest);
                 if (rest === 'on') {
                     if (ph.onReply === 'no-dialog') return json(200, { state: 'off', error: { code: 'no-dialog' } });

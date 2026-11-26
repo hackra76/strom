@@ -8,13 +8,14 @@
  * never as an edit of the tree. See src/ui/module.ts for the composition pattern.
  */
 
+import { setImageSource } from '../image-src.js';
 import { DataManager } from '../data.js';
 import { TreeManager } from '../tree-manager.js';
 import { Source, SourceExcerpt, StromData, TreeId } from '../types.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { uiModule } from './module.js';
 import { runBusy } from './busy.js';
-import { onComputer } from './research-ui.js';
+import { researchReachable } from './research-ui.js';
 import { heldReasonKey } from './sources.js';
 import { setTileState } from './image-slot.js';
 import { imageLoads, IMAGES_ARRIVED_EVENT, IMAGES_STATE_EVENT, type ImagesArrivedDetail } from '../image-loads.js';
@@ -95,7 +96,7 @@ export const researchImagesMethods = uiModule({
         const link = ctx?.link;
         const base = link ? parseLiveBridge(storedResearchBridge(link.id)?.base)?.base ?? '' : '';
         const mode = heldImageMode({
-            onComputer: onComputer(),
+            onComputer: researchReachable(),
             linked: !!link,
             bridgeUp: !!link && !!base && this.researchBridgeUp(link.id),
             features: link ? this.researchStatusOf(link.id)?.features : null,
@@ -482,7 +483,7 @@ export const researchImagesMethods = uiModule({
                 const img = document.createElement('img');
                 img.className = 'source-row-thumb';
                 img.alt = '';
-                img.src = first.dataUrl;
+                setImageSource(img, first.dataUrl);
                 icon.replaceWith(img);
                 row.querySelector('.source-held-tag')?.remove();
             } else if (src && icon?.classList.contains('source-row-thumb')) {

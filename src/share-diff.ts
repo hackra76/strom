@@ -29,6 +29,7 @@ import { StromData, Person, Partnership, Source, Attachment, PlaceGeo, PersonId,
 import { STROM_DATA_VERSION } from './version.js';
 import { addSurnameGroup } from './surnames.js';
 import { shownNameOrEmpty } from './person-name.js';
+import { sameImageSync, sameWithImages } from './image-equal.js';
 
 export interface EntityChanges<T> {
     added: T[];
@@ -83,13 +84,28 @@ function stableStringify(value: unknown): string {
     return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`;
 }
 
+/**
+ * Keys a record holds for this tree alone, never a change to share: the time
+ * of a person's last change (spec 136 D4) is written by every edit here and
+ * there, each tree its own.
+ */
+const LOCAL_KEYS = new Set(['changedAt']);
+
+/** A record without its LOCAL_KEYS (the same object when it has none). */
+function withoutLocalKeys<T>(obj: T): T {
+    if (!obj || typeof obj !== 'object' || !Object.keys(obj).some(k => LOCAL_KEYS.has(k))) return obj;
+    const out = { ...obj } as Record<string, unknown>;
+    for (const k of LOCAL_KEYS) delete out[k];
+    return out as T;
+}
+
 function diffCollection<T extends { id: string }>(
     base: Record<string, T>, current: Record<string, T>
 ): EntityChanges<T> {
     const added: T[] = [], changed: T[] = [], changedBase: T[] = [], removedIds: string[] = [];
     for (const id of Object.keys(current)) {
         if (!(id in base)) added.push(current[id]);
-        else if (stableStringify(current[id]) !== stableStringify(base[id])) {
+        else if (stableStringify(withoutLocalKeys(current[id])) !== stableStringify(withoutLocalKeys(base[id]))) {
             changed.push(current[id]);
             changedBase.push(base[id]);
         }
@@ -265,7 +281,7 @@ function personLabel(p: Person): string {
 
 /** True when `after` carries a photo or attachment that `before` did not. */
 function gainedMedia(before: Person | undefined, after: Person, beforeData: StromData, afterData: StromData): boolean {
-    if (after.photo && after.photo !== before?.photo) return true;
+    if (after.photo && !sameImageSync(after.photo, before?.photo)) return true;
     return personMediaCount(afterData, after.id) > (before ? personMediaCount(beforeData, before.id) : 0);
 }
 
@@ -273,16 +289,16 @@ function gainedMedia(before: Person | undefined, after: Person, beforeData: Stro
 function diffPersonFields(before: Person, after: Person): string[] {
     const keys: string[] = [];
     for (const f of PREVIEW_FIELD_KEYS) {
-        if (stableStringify(before[f]) !== stableStringify(after[f])) keys.push(f);
+        if (!same(before[f], after[f])) keys.push(f);
     }
     // Anything else (relations, events, attachments, sources, name variants…)
     // rolls up into one honest "other details" marker.
     const strip = (p: Person) => {
-        const c = { ...p } as Record<string, unknown>;
+        const c = withoutLocalKeys({ ...p }) as Record<string, unknown>;
         for (const f of PREVIEW_FIELD_KEYS) delete c[f as string];
-        return stableStringify(c);
+        return c;
     };
-    if (strip(before) !== strip(after)) keys.push('fieldOther');
+    if (!same(strip(before), strip(after))) keys.push('fieldOther');
     return keys;
 }
 
@@ -303,7 +319,7 @@ export function summarizeChangePacket(current: StromData, packet: ChangePacket, 
         if (!before) {
             newPersons.push({ id: p.id, name: personLabel(p) });
             if (gainedMedia(undefined, p, current, after)) mediaCount++;
-        } else if (stableStringify(before) !== stableStringify(p)) {
+        } else if (!same(before, p)) {
             modifiedPersons.push({ id: p.id, name: personLabel(p), changedFieldKeys: diffPersonFields(before, p) });
             if (gainedMedia(before, p, current, after)) mediaCount++;
         }
@@ -316,7 +332,7 @@ export function summarizeChangePacket(current: StromData, packet: ChangePacket, 
     for (const x of Object.values(afterPart)) {
         const before = curPart[x.id];
         if (!before) newPartnershipCount++;
-        else if (stableStringify(before) !== stableStringify(x)) modifiedPartnershipCount++;
+        else if (!same(before, x)) modifiedPartnershipCount++;
     }
     const removedPartnershipCount = Object.keys(curPart).filter(id => !(id in afterPart)).length;
 
@@ -325,7 +341,7 @@ export function summarizeChangePacket(current: StromData, packet: ChangePacket, 
     let sourceChangeCount = 0;
     for (const x of Object.values(afterSrc)) {
         const before = curSrc[x.id];
-        if (!before || stableStringify(before) !== stableStringify(x)) sourceChangeCount++;
+        if (!before || !same(before, x)) sourceChangeCount++;
     }
     sourceChangeCount += Object.keys(curSrc).filter(id => !(id in afterSrc)).length;
 
@@ -423,8 +439,13 @@ const MAP_FIELDS = new Set(['parentRelTypes']);
 
 type Obj = Record<string, unknown>;
 
+/**
+ * Deep equality whatever the keys' order, an image the same picture in
+ * either form: the recipient's tree holds its saved images as pooled
+ * references, a packet and a baseline as data URLs — one picture, no change.
+ */
 function same(a: unknown, b: unknown): boolean {
-    return stableStringify(a) === stableStringify(b);
+    return sameWithImages(a, b, true);
 }
 
 function applyThreeWay<T extends { id: string }>(
@@ -458,6 +479,8 @@ function mergeObject<T>(cur: T, theirs: T, base: T | undefined): T {
     const b = base as unknown as Obj | undefined;
     const keys = new Set([...Object.keys(t), ...Object.keys(b ?? {})]);
     keys.delete('id');
+    // The sender's time of a last change is theirs: this tree writes its own when the changes are taken.
+    for (const k of LOCAL_KEYS) keys.delete(k);
     for (const key of keys) {
         const tv = t[key];
         if (b) {

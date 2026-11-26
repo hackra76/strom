@@ -22,15 +22,17 @@ import {
 import { canPromptInstall, promptInstall, isStandaloneDisplay } from '../pwa.js';
 import { appBrowserName, currentAppBrowser, needsTransfer } from '../research-transfer.js';
 import { isPromoAvailable } from '../research-promo.js';
-import { onComputer } from './research-ui.js';
+import { researchHere } from './research-ui.js';
 import { uiModule } from './module.js';
 import { activatedElement, runBusy } from './busy.js';
 import { imagesToAwait } from '../image-loads.js';
 import { imagesBeforeOutput } from './output-images.js';
+import { confirmMemoryForOutput } from './memory-limit-ui.js';
 import { holdLeave } from './busy-leave.js';
 import { whilePicking } from './file-pick.js';
 import { iconSvg } from '../icons.js';
 import { watchStorageNotices } from './notice-place.js';
+import { inDeviceMode } from './device-mode-ui.js';
 
 /** Last known storage state (refreshed on every check; best-effort until known). */
 let knownState: PersistenceState = 'best-effort';
@@ -212,7 +214,8 @@ export const fileCopyMethods = uiModule({
 
     renderUnsavedIndicator(): void {
         const unsaved = this.unsavedOutsideResearchKind();
-        const show = shouldShowUnsavedIndicator({
+        // A device of the home network keeps nothing of its own: the tree is the computer's research's (spec 094 §3).
+        const show = !inDeviceMode() && shouldShowUnsavedIndicator({
             state: knownState,
             unsavedCount: unsaved.trees.length,
             viewMode: DataManager.isViewMode(),
@@ -395,13 +398,15 @@ export const fileCopyMethods = uiModule({
      * browser and the toast names it. A failure stays at the button with
      * "Try again". The shortcut (no button) says only the toast.
      */
-    runQuickSave(origin: HTMLElement | null, make: () => Promise<string | null>, again: () => void): void {
+    runQuickSave(origin: HTMLElement | null, make: () => Promise<string | null>, again: () => void, allTrees = false): void {
         // The tree's photos still on their way: the copy waits for them (spec 116 §8), its button says so.
         const waits = imagesToAwait();
         void imagesBeforeOutput(strings.photos.out.backup, { el: origin }).then(async (go) => {
             if (go === 'cancelled') return;
             // The tree as stored (its photos stored once they all came) is what goes into the file.
             if (waits) await TreeManager.flush();
+            // The file with its images may need more memory than the page has (spec 135): asked first.
+            if (await confirmMemoryForOutput({ allTrees }) === 'cancel') return;
             this.runQuickSaveNow(origin, make, again);
         });
     },
@@ -452,7 +457,7 @@ export const fileCopyMethods = uiModule({
             return;
         }
         this.runQuickSave(activatedElement(), () => this.downloadAllTreesJson(null, false, 'full', ALL_CONTENT),
-            () => this.saveAllTreesCopy());
+            () => this.saveAllTreesCopy(), true);
     },
 
     saveAllTreesCopyEncrypted(): void {
@@ -602,7 +607,7 @@ export const fileCopyMethods = uiModule({
         const s = strings.fileCopy;
         const advice = currentAdvice();
         // Installing it here would settle the trees in a browser that cannot reach the research.
-        const research = needsTransfer(currentAppBrowser()) && onComputer() && advice !== 'ios-safari' && advice !== 'ios-app'
+        const research = needsTransfer(currentAppBrowser()) && researchHere() && advice !== 'ios-safari' && advice !== 'ios-app'
             && isPromoAvailable(this.researchPromoContext())
             ? ' ' + s.adviceResearch(strings.research.noConnect(appBrowserName(currentAppBrowser()))) : '';
         return this.storageAdviceBase(advice) + research;

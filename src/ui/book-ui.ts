@@ -22,7 +22,7 @@ import { TreeManager } from '../tree-manager.js';
 import { TreeRenderer } from '../renderer.js';
 import { strings, getCurrentLanguage, getStringsForLang } from '../strings.js';
 import { PrivacyMode } from '../privacy.js';
-import { PersonId, StromData } from '../types.js';
+import { PersonId, StromData, TreeId } from '../types.js';
 import { buildFamilyBook, buildFamilyBookAsync, type BookBuildEnv } from '../book.js';
 import { bookFileName, bookPreparingHtml } from '../book-window.js';
 import {
@@ -40,8 +40,10 @@ import {
     pageSetImages, pageSetPrivacyWarning, sizeVerdict,
 } from '../family-pages.js';
 import {
-    PagesCancelled, PagesFile, PagesJob, PagesZipFailed, buildPagesFile, canSharePagesFile, pagesLineIds, savePagesFile, sharePagesFile, snapshotData,
+    PagesCancelled, PagesFile, PagesJob, PagesZipFailed, buildPagesFile, canSharePagesFile, pagesImageChars, pagesLineIds, savePagesFile, sharePagesFile,
+    snapshotData,
 } from './family-pages-ui.js';
+import { confirmMemoryForOutput, outputNearLimit, type OutputCheck } from './memory-limit-ui.js';
 import { pageSetZipName } from '../family-pages-html.js';
 import { LineageIndex, Rod, RodId, ancestorCount, buildLineages, personRodRow, rodLabels, rods as allRods } from '../lineage.js';
 import { MultiPersonPicker } from '../person-picker.js';
@@ -54,6 +56,7 @@ import { readRecent } from './tree-overview.js';
 import { uiModule } from './module.js';
 import { activatedElement, BUSY_MIN_MS, BUSY_SHOW_MS, busySpinHtml, nextPaint } from './busy.js';
 import { imagesBeforeOutput } from './output-images.js';
+import { expandedData } from '../image-expand.js';
 import { showProgressToast, type ProgressToastHandle } from './toast.js';
 import type { HistoryPayload, PersonHistoryEnv } from '../history.js';
 import { imageLoads } from '../image-loads.js';
@@ -67,6 +70,9 @@ type Sub = 'sel' | 'parts' | 'detail' | 'notes' | 'privacy' | 'lang' | 'title' |
  * file being built (its progress only after ~1 s); the file ready to save.
  */
 type Phase = 'options' | 'building' | 'progress' | 'result' | 'zipFail';
+
+/** The book's memory check: it holds the open tree's images whole (image-expand.ts expandedData). */
+const BOOK_MEMORY: OutputCheck = { whole: true, what: 'book' };
 
 /** Chosen people are a selection of the pages only (1102 §4.1). */
 const KINDS: readonly Kind[] = ['tree', 'rods', 'ancestors', 'descendants', 'persons'];
@@ -1344,6 +1350,13 @@ export const bookUiMethods = uiModule({
         // The tree's photos still on their way: the file waits for them (spec 116 §8), its button says so.
         if (await imagesBeforeOutput(strings.photos.out.familyPages, { el, treeId: s.treeId }) === 'cancelled') return;
         if (st !== s || s.phase !== 'options' || (running && running !== s)) return;
+        // The file holds the images of its pages whole: near the memory limit asked first (spec 135).
+        const asked = selectionOf(s);
+        if (!selectionReady(asked)) return;
+        if (await confirmMemoryForOutput({
+            whole: true, data: s.data, treeId: s.treeId as TreeId | null, refine: () => pagesImageChars(s.data, asked, pageSetOptionsOf(s)),
+        }) === 'cancel') return;
+        if (st !== s || s.phase !== 'options' || (running && running !== s)) return;
         const sel = selectionOf(s);
         if (!selectionReady(sel)) return;
         if (s.estTimer !== null) scheduleEstimate(s, true);
@@ -1527,8 +1540,8 @@ export const bookUiMethods = uiModule({
     },
 
     /** The book's HTML for these options: for the window, or for a saved file. */
-    familyBookHtml(options: BookOptions, forSave: boolean): string {
-        return buildFamilyBook(DataManager.getData(), options, this.familyBookEnv(options, forSave));
+    familyBookHtml(options: BookOptions, forSave: boolean, data: StromData = DataManager.getData()): string {
+        return buildFamilyBook(data, options, this.familyBookEnv(options, forSave));
     },
 
     /** What the book is built with besides the data and the options (window or saved file). */
@@ -1584,7 +1597,10 @@ export const bookUiMethods = uiModule({
             if (go === 'cancelled' || win.closed) throw new BookBuildStopped();
             const k0 = doc.querySelector('.bp-k');
             if (k0) k0.textContent = '';
-            const html = await buildFamilyBookAsync(DataManager.getData(), options, this.familyBookEnv(options, false), async ({ k, n }) => {
+            // Its pooled images whole (image-expand.ts): the book's window and its print are a document of their own.
+            const bookData = await expandedData(DataManager.getData());
+            if (cancelled || win.closed) throw new BookBuildStopped();
+            const html = await buildFamilyBookAsync(bookData, options, this.familyBookEnv(options, false), async ({ k, n }) => {
                 if (cancelled || win.closed) throw new BookBuildStopped();
                 const k$ = doc.querySelector('.bp-k');
                 if (k$) k$.textContent = W.chapterK(k, n);
@@ -1633,9 +1649,15 @@ export const bookUiMethods = uiModule({
         const data = DataManager.getData();
         if (Object.keys(data.persons).length === 0) { this.showAlert(strings.book.empty, 'warning'); return; }
         const options = bookOptionsFromMemory(appBookLang(), loadBookMemory(storage(), TreeManager.getActiveTreeId()), spec);
-        const win = window.open('', '_blank');
-        if (!win) { this.showAlert(strings.export.failed, 'warning'); return; }
-        void this.fillBookWindow(win, options, true);
+        const open = (): void => {
+            const win = window.open('', '_blank');
+            if (!win) { this.showAlert(strings.export.failed, 'warning'); return; }
+            void this.fillBookWindow(win, options, true);
+        };
+        // The book holds the tree's images whole: near the memory limit asked first (spec 135),
+        // its window opened in the click of Continue; else at once (a popup opens in the click).
+        if (outputNearLimit(BOOK_MEMORY) === null) { open(); return; }
+        void confirmMemoryForOutput(BOOK_MEMORY).then(go => { if (go !== 'cancel') open(); });
     },
 
     /** "Open book": the window opens (or the one being changed is rewritten); for the pages, the file is built. */
@@ -1663,12 +1685,18 @@ export const bookUiMethods = uiModule({
         }
         const options = currentOptions(s);
         saveBookMemory(storage(), s.treeId, options, memoryExtra(s));
-        // The window first (a popup must open in the click), then the book.
-        const reused = s.win && !s.win.closed ? s.win : null;
-        const win = reused ?? window.open('', '_blank');
-        this.closeBookDialog();
-        if (!win) { this.showAlert(strings.export.failed, 'warning'); return; }
-        void this.fillBookWindow(win, options, !reused);
+        const open = (): void => {
+            // The window first (a popup must open in the click), then the book.
+            const reused = s.win && !s.win.closed ? s.win : null;
+            const win = reused ?? window.open('', '_blank');
+            this.closeBookDialog();
+            if (!win) { this.showAlert(strings.export.failed, 'warning'); return; }
+            void this.fillBookWindow(win, options, !reused);
+        };
+        // The book holds the tree's images whole: near the memory limit asked first (spec 135), the window
+        // opened in the click of Continue (the dialog stays on Cancel); else at once.
+        if (outputNearLimit(BOOK_MEMORY) === null) { open(); return; }
+        void confirmMemoryForOutput(BOOK_MEMORY).then(go => { if (go !== 'cancel' && st === s) open(); });
     },
 
     /** The book window's app actions: Change options, Save as HTML, Share; the story comparison. */
@@ -1714,9 +1742,12 @@ export const bookUiMethods = uiModule({
                 if (painted) return;
                 painted = true;
                 // The tree's photos still on their way: the file waits for them (spec 116 §8), the button stays "Saving…".
-                void imagesBeforeOutput(strings.photos.out.book, { el: null }).then((go) => {
-                    try { if (go !== 'cancelled' && !win.closed) this.saveOrShareBook(win, options, act, title()); } finally { rest(); }
-                }, rest);
+                // The file carries the pooled images whole (image-expand.ts).
+                void imagesBeforeOutput(strings.photos.out.book, { el: null })
+                    .then(async (go) => go === 'cancelled' || win.closed ? null : expandedData(DataManager.getData()))
+                    .then((data) => {
+                        try { if (data && !win.closed) this.saveOrShareBook(win, options, act, title(), data); } finally { rest(); }
+                    }, rest);
             };
             try { win.requestAnimationFrame(() => win.setTimeout(run, 0)); } catch { /* closed */ }
             setTimeout(run, 100);
@@ -1724,10 +1755,10 @@ export const bookUiMethods = uiModule({
     },
 
     /** Save as HTML / Share from the book's window: the book built for a file. */
-    saveOrShareBook(win: Window, options: BookOptions, act: string | null, bookTitle: string): void {
+    saveOrShareBook(win: Window, options: BookOptions, act: string | null, bookTitle: string, data: StromData = DataManager.getData()): void {
         const doc = win.document;
         try {
-            const html = this.familyBookHtml(options, true);
+            const html = this.familyBookHtml(options, true, data);
             const name = bookFileName(bookTitle);
             if (act === 'save') {
                 const W = win as Window & typeof globalThis;

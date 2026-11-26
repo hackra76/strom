@@ -40,6 +40,11 @@ import { wireRodTimelines } from '../rod-timeline-wire.js';
 import type { HistoryPayload, PersonHistoryEnv } from '../history.js';
 import { imageLoads, IMAGES_ARRIVED_EVENT, IMAGES_STATE_EVENT } from '../image-loads.js';
 import { pageImageWait } from './image-slot.js';
+import { hasPoolRefs } from '../image-expand.js';
+import { pageSetImageIds, withImagesWhole } from '../page-images.js';
+import { poolImagesChars } from '../memory-limit.js';
+import { forEachImagePlace } from '../image-intern.js';
+import { treeWithStandIns, withFamilyPageImages } from './family-pages-images.js';
 
 /**
  * A page of a set in the window: the set by its selection, the page by its
@@ -105,6 +110,9 @@ function cacheKey(spec: BookSelectionSpec, history: SetHistory = historyOf()): s
     return `${DataManager.getCurrentTreeId() ?? ''}|${getCurrentLanguage()}|${JSON.stringify(spec)}|${historyKey(history)}`;
 }
 
+/** The window's page drawn last (a page whose images came after another was drawn is not drawn). */
+let drawing = 0;
+
 /** Sets built while images were on their way (dropped from the cache when some come). */
 const waitingSets = new WeakSet<PageSet>();
 
@@ -139,7 +147,8 @@ export function windowPageSet(spec: BookSelectionSpec): PageSet {
     // The images still on their way are the window's too: their places wait for them (never a file: buildPagesFromDialog).
     const data = DataManager.getData();
     const shown = imageLoads.view(data);
-    const set = buildPageSet(shown, spec, {
+    // Pooled images as stand-ins: a page drawn gets the images it shows put in (family-pages-images.ts).
+    const set = buildPageSet(treeWithStandIns(shown), spec, {
         lang: getCurrentLanguage(), privacy: 'full', families: 'pages', timelines: true, history,
         ...(shown !== data ? { imageWait: pageImageWait } : {}),
     }, { treeName: treeName() });
@@ -333,6 +342,26 @@ function stepOf(page: SetPage | undefined): string {
 }
 
 /**
+ * The images' volume (data URL characters, from the catalog) a file of the
+ * set carries whole: the pooled images its pages can show (as buildPagesFile
+ * reads them), plus the images not pooled yet in the tree (counted whole).
+ */
+export function pagesImageChars(data: StromData, spec: BookSelectionSpec, opts: PageSetOptions): number {
+    const pooled = hasPoolRefs(data)
+        ? (() => {
+            const named = buildPageSet(data, spec, opts, { treeName: treeName() });
+            return poolImagesChars(pageSetImageIds(data, named.personSlug.keys(), named.familySlug.keys()));
+        })()
+        : 0;
+    let inline = 0;
+    forEachImagePlace(data, (holder, key) => {
+        const v = holder[key];
+        if (typeof v === 'string' && v.startsWith('data:')) inline += v.length;
+    });
+    return pooled + inline;
+}
+
+/**
  * Build the file a page at a time: the set, the reduced images, the pages,
  * the file (with `zip` the set of files, §6.4, written into a Blob's parts an
  * entry at a time, §7.5). `onStep(done, total, text)` reports the pages done
@@ -356,6 +385,13 @@ export async function buildPagesFile(
     onStep(0, 0, F.step.prepare);
     await idle();
     check();
+    // The file carries the pooled images whole: only the ones its pages can show (page-images.ts), read once
+    // the set (built with the references) names its people and families.
+    if (hasPoolRefs(data)) {
+        const named = buildPageSet(data, spec, opts, { treeName: treeName() });
+        data = await withImagesWhole(data, pageSetImageIds(data, named.personSlug.keys(), named.familySlug.keys()));
+        check();
+    }
     let set = buildPageSet(data, spec, opts, { treeName: treeName() });
     const want = pageSetImages(set).filter(i => (i.kind === 'clip' ? set.options.clips : set.options.photos) === 'small');
     if (want.length) {
@@ -630,8 +666,12 @@ export const familyPagesMethods = uiModule({
         this.openPersonPageSet(to.set);
     },
 
-    /** Draw a set's page in the window's body and header (the person page's window calls this for a set entry). */
-    renderFamilyPagesEntry(overlay: HTMLElement, ref: SetRef): void {
+    /**
+     * Draw a set's page in the window's body and header (the person page's
+     * window calls this for a set entry); `scrollTop`: where its body stands
+     * once drawn (the page's images may come a moment later).
+     */
+    renderFamilyPagesEntry(overlay: HTMLElement, ref: SetRef, scrollTop?: number): void {
         ensureAppCss();
         bindHistory(this);
         const scroller = overlay.querySelector('.pp-body') as HTMLElement;
@@ -672,8 +712,15 @@ export const familyPagesMethods = uiModule({
         if (!html) { slug = set.introSlug; html = renderPage(set, slug); }
         const page = set.bySlug.get(slug);
         head(page?.title ?? strings.familyPages.winTitle, page ? kickerOf(page) : '');
-        scroller.innerHTML = `<div class="sp-appset" lang="${esc(set.options.lang)}">${renderPageBar(set, slug)}`
-            + `<div class="sp-app"><div class="sp-results" aria-live="polite" hidden></div>${html}</div></div>`;
+        // The page's pooled images are read first (it takes them whole); meanwhile the window stays as it is.
+        const token = ++drawing;
+        const body = withFamilyPageImages(`<div class="sp-appset" lang="${esc(set.options.lang)}">${renderPageBar(set, slug)}`
+            + `<div class="sp-app"><div class="sp-results" aria-live="polite" hidden></div>${html}</div></div>`, () => {
+            if (token === drawing && scroller.isConnected) this.renderFamilyPagesEntry(overlay, ref, scrollTop);
+        });
+        if (body === null) return;
+        scroller.innerHTML = body;
+        if (scrollTop !== undefined) scroller.scrollTop = scrollTop;
         wireWindowBar(scroller, set);
         const root = scroller.querySelector<HTMLElement>('.sp-appset');
         if (root) { wireRodPicker(root); wireTreePages(root); wireRodTimelines(root); }

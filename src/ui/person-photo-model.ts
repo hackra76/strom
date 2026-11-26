@@ -12,6 +12,8 @@
 
 import { imageLoads, type FieldKey } from '../image-loads.js';
 import { imgStateOf, type ImgState } from './image-slot.js';
+import { onImagesInterned } from '../image-intern.js';
+import { registerMemoryImages, poolIdsOf } from '../pool-memory.js';
 
 export interface PhotoModel {
     /** The portrait the dialog holds (a data URL), or none. */
@@ -27,10 +29,30 @@ export function personPhotoKey(personId: string): FieldKey {
     return `person:${personId}:photo`;
 }
 
+/** The model of the dialog opened last (one person dialog at a time). */
+let latest: PhotoModel | null = null;
+
 /** The model of a dialog opened on `personId` (null: a new person) whose portrait is `photo` now. */
 export function openPhotoModel(personId: string | null, photo: string | undefined): PhotoModel {
-    return { value: photo || undefined, touched: false, key: personId ? personPhotoKey(personId) : null };
+    latest = { value: photo || undefined, touched: false, key: personId ? personPhotoKey(personId) : null };
+    return latest;
 }
+
+/**
+ * The tree's images stored meanwhile (spec 135, D6): an untouched portrait
+ * the dialog holds takes its pool reference as the person does, so it stays
+ * the person's own portrait (a portrait changed in the dialog stays as it is).
+ */
+export function photoInterned(model: PhotoModel, map: ReadonlyMap<string, string>): boolean {
+    const next = !model.touched && model.value !== undefined ? map.get(model.value) : undefined;
+    if (next === undefined) return false;
+    model.value = next;
+    return true;
+}
+
+onImagesInterned((_treeId, map) => { if (latest) photoInterned(latest, map); });
+// The pool's cleanup keeps the portrait the dialog holds (spec 135, D7).
+registerMemoryImages(() => poolIdsOf([latest?.value]));
 
 /** A portrait put in the dialog (from the editor), or none (Remove). */
 export function setModelPhoto(model: PhotoModel, value: string | undefined): void {

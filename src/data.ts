@@ -19,6 +19,7 @@ import {
     StromData,
     NewPersonData,
     TreeId,
+    TreeMetadata,
     
     LifeEvent,
     CoupleEvent,
@@ -37,6 +38,8 @@ import {
     PersonList,
     PersonListRule,
     PersonListSort,
+    PersonListOrigin,
+    CustomRule,
     PersonCitationField, PrimaryName, 
     EmbeddedDataEnvelope,
     FamilyWizardSpec,
@@ -50,6 +53,8 @@ import {
 import { generatePersonId, generateLifeEventId, generateSourceId, generateParticipantId, generateAttachmentId, generatePartnershipId } from './ids.js';
 import { partnershipParticipants, LAST_FOCUSED, PERSON_CITATION_FIELDS, PARTNERSHIP_CITATION_FIELDS, isGender, oppositeGender, isPrimaryName, mergedPrimaryName, isEmbeddedEnvelope } from './model-values.js';
 import { STROM_DATA_VERSION } from './version.js';
+import { sanitizeMergeRecords } from './merge/record.js';
+import { moveContactsIntoPeople, cleanEmails } from './person-contact.js';
 import { convertLegacyCensusEvents, isCoupleEventType } from './events.js';
 import { sanitizeGedcomDates } from './gedcom-date-form.js';
 import { strings, getCurrentLanguage, getStringsForLang, SUPPORTED_LANGUAGES } from './strings.js';
@@ -65,10 +70,11 @@ import { surnameForms, addSurnameGroup, removeSurnameGroup, surnameKey } from '.
 import { buildLineages, cleanLineageOverrides, LineagePatch, type LineageIndex } from './lineage.js';
 import { sanitizeQualityDismissed, sanitizeSurnameRejections, dismissalKey, surnameRejectionKey } from './quality-dismiss.js';
 import { ChangePacket, applyPacketOntoData } from './share-diff.js';
-import { createSnapshot, getSnapshotPayload, SnapshotReason, hasAutoSnapshotOnDay } from './snapshots.js';
-import { ValidationIssue, stripUnsafeMediaDataUrls, cleanPortraitSources, isSafePhotoDataUrl, translateValidationType } from './validation.js';
+import { freeCopyName } from './tree-copy-name.js';
+import { createSnapshot, getSnapshotPayload, SnapshotReason, hasAutoSnapshotOnDay, type SnapshotMeta, type SnapshotOptions } from './snapshots.js';
+import { ValidationIssue, stripUnsafeMediaDataUrls, cleanPortraitSources, dropStrayPoolRefs, isSafePhotoDataUrl, translateValidationType } from './validation.js';
 import { isPortraitSourceShape } from './photo.js';
-import { cloneTreeData } from './clone.js';
+import { cloneTreeData, cloneTreeDataAsJson } from './clone.js';
 import { sanitizeMediaRecords, moveLegacyAttachments, givePortraitsRecords, pruneMedia, findMedia, treeMedia, personMedia, mediaOf, mediaAt, placeKey as mediaPlaceKey, putMedia, dropMediaPlaces, deleteMedia, placePersonId } from './media.js';
 import { UndoManager, type UndoMark } from './undo.js';
 import { applyLivingPrivacy, applyContentOptions, resolveContentOptions, ContentOptions, PrivacyMode } from './privacy.js';
@@ -84,12 +90,15 @@ import { cleanPlaceGeoMeta, sanitizePlaceRecords, sanitizePlaceRefs } from './pl
 import { addPlaceAlias, sanitizePlaceAliases } from './place-groups.js';
 import { sanitizeTableViews } from './table-views-data.js';
 import {
-    earlierAddedAt, isListNameTaken, newPersonListId, onPersonDeleted, onPersonsMerged, personListsOf, sanitizeAddedAt,
-    sanitizePersonListRule, sanitizePersonLists, sanitizePersonListsDropped, suggestListName,
+    earlierAddedAt, isListNameTaken, listIsAuto, newPersonListId, onPersonDeleted, onPersonsMerged, personListsOf, sanitizeAddedAt,
+    sanitizeCustomRule, sanitizeListOrigin, sanitizePersonListRule, sanitizePersonLists, sanitizePersonListsDropped, stampChangedAt,
+    suggestListName,
 } from './person-lists-data.js';
+import { customLabel, customPersonIds, customToRule, ruleIssues } from './person-list-rules.js';
 import {
     listDisplayName, listPersonIds, personToastName, rulePersonIds, ruleLabel, sortListIds, withChecklist, withDoneToggled,
-    withFrozen, withManualOrder, withPersonMoved, withPersonsAdded, withPersonsRemoved, withRuleFilled, withSort, type ListEnv,
+    withCustomSnapshot, withFrozen, withKeptByRule, withManualOrder, withPersonMoved, withPersonsAdded, withPersonsRemoved, withRuleFilled, withSort,
+    type ListEnv,
 } from './person-lists.js';
 import {
     SharedEventCommon, SharedEventCommonField, SharedEventEdit, SharedEventSaveResult, SharedEventIndex, PersonSharedEvent,
@@ -103,6 +112,11 @@ import { buildPersonNameIndex, type ParticipantRef, type PersonNameIndex } from 
 import { foldName } from './godparents.js';
 import { normalizeSha256 } from './sha256.js';
 import { startupPerson } from './default-person.js';
+import { expandedData } from './image-expand.js';
+import { jsonFileWithImages } from './image-stream.js';
+import { internImages, onImagesInterned, treeImages } from './image-intern.js';
+import { registerMemoryImages } from './pool-memory.js';
+import { sameImageByCatalog } from './image-equal.js';
 
 /** Extended updates for Partnership */
 
@@ -165,6 +179,15 @@ export interface WindowEditSink {
     listsReadOnly?(): boolean;
     /** A staged dialog ended (committed or rolled back): data held back meanwhile may come in. */
     sessionEnded(): void;
+}
+
+/**
+ * Options of the lock checks (isTreeLocked, isPersonLocked, canEditMedia).
+ * `exceptFollow`: following a live research is not counted — for Link to…,
+ * offered in a followed tree as in any other (its dialog says why it waits).
+ */
+export interface LockCheck {
+    exceptFollow?: boolean;
 }
 
 /** Import action types for view mode */
@@ -361,6 +384,11 @@ export function migrateData(data: unknown): StromData {
             const at = sanitizeAddedAt(person.addedAt);
             if (at) person.addedAt = at; else delete person.addedAt;
         }
+        // spec 136 D4: the time of the person's last change, an ISO time or nothing.
+        if (person && typeof person === 'object' && 'changedAt' in person) {
+            const at = sanitizeAddedAt(person.changedAt);
+            if (at) person.changedAt = at; else delete person.changedAt;
+        }
     }
     // Preserve the source catalog if present.
     if (d.sources && typeof d.sources === 'object') {
@@ -397,6 +425,10 @@ export function migrateData(data: unknown): StromData {
     if (typeof d.version === 'number' && d.version < 25) givePortraitsRecords(result, typeof d.researchAsOf === 'string');
     // v23 (spec 107): only portrait sources whose original is still there.
     cleanPortraitSources(result);
+    // v26 (spec 134 K0.10): the e-mails kept as residences or lines of a note
+    // are the people's contact. Every load: a research version may bring
+    // such a residence back, and the move changes nothing the second time.
+    moveContactsIntoPeople(result);
 
     // Preserve place coordinates. This object is rebuilt field by field, so
     // anything not named here is dropped on EVERY load — tree switch, app
@@ -466,6 +498,9 @@ export function migrateData(data: unknown): StromData {
     // v16: the facts confirmed by hand and the research's re-verification of
     // facts (src/verify.ts); only valid entries of existing facts.
     cleanFactVerify(result);
+    // v26 (spec 134 §0.3): the merges into the tree, only well-formed records.
+    const merges = sanitizeMergeRecords(d.merges);
+    if (merges) result.merges = merges;
 
     // Preserve default person settings if present
     if (d.defaultPersonId !== undefined) {
@@ -488,8 +523,32 @@ export function migrateData(data: unknown): StromData {
     normalizeSingleParents(result);
     // The places of the files name only what is in the tree (after the people and couples are settled).
     pruneMedia(result);
+    // A pooled image's reference only where an image may be (validation.ts dropStrayPoolRefs).
+    dropStrayPoolRefs(result);
+    // The people of the automatic custom lists as the tree is read (spec 136 K1.8).
+    snapshotCustomLists(result);
 
     return result;
+}
+
+/**
+ * The people of every automatic custom list worked out as the tree is read,
+ * so an export right after carries them for an older app (spec 136 K1.8)
+ * without waiting for a save. Whatever came in their place (none, an empty
+ * array from an agent or another app, an old snapshot) is only a snapshot of
+ * the rule, so nothing is lost. A fixed or frozen list and a rule kept as it
+ * came (customUnknown) keep their people. Nothing is stored here; a save
+ * refreshes them anyway. Mutates `data`.
+ */
+function snapshotCustomLists(data: StromData): void {
+    const lists = data.personLists;
+    if (!lists?.some(l => l.custom?.auto)) return;
+    try {
+        const index = buildLineages(data);
+        data.personLists = lists.map(l => withCustomSnapshot(index, l) ?? l);
+    } catch (e) {
+        console.warn('Custom list snapshot failed', e);
+    }
 }
 
 /**
@@ -500,6 +559,16 @@ export function migrateData(data: unknown): StromData {
  * current version must be one this app reads back (N32).
  */
 export async function storedTreeForExport(treeId: TreeId): Promise<StromData | null> {
+    const stored = await TreeManager.getTreeData(treeId);
+    // Every output of a stored tree carries its pooled images whole (image-expand.ts).
+    return stored ? expandedData({ version: STROM_DATA_VERSION, ...migrateData(stored) }) : null;
+}
+
+/**
+ * storedTreeForExport with its pooled images as references: for an output
+ * that reads each image as it writes it (a GEDCOM, ged-export-images.ts).
+ */
+export async function storedTreeWithRefs(treeId: TreeId): Promise<StromData | null> {
     const stored = await TreeManager.getTreeData(treeId);
     return stored ? { version: STROM_DATA_VERSION, ...migrateData(stored) } : null;
 }
@@ -532,10 +601,18 @@ class DataManagerClass {
 
     // Undo/redo: deep copy of the data taken at the start of the current mutation.
     private pendingBefore: StromData | null = null;
+    /** A satellite's people and unions before its edit (only for Person.changedAt; it keeps no undo step). */
+    private windowBefore: StromData | null = null;
     /** The research base of `pendingBefore` (it goes on the undo step with it). */
     private pendingBase: ResearchBase | null = null;
     /** The mutation being committed changes only lists of people (an undo step allowed while following a research). */
     private pendingListsOnly = false;
+    /**
+     * The step puts back a state whole (a backup, a merge's undo or redo): the
+     * people keep the time of their last change the state has (spec 136 D4),
+     * as the Undo button keeps it.
+     */
+    private pendingKeepChangedAt = false;
     /** True while a batch (multiple mutations → one undo step) is in progress. */
     private batchActive = false;
     /** Nesting depth of beginBatch/commitBatch (a batch may run inside a batch). */
@@ -583,6 +660,7 @@ class DataManagerClass {
      * the tree index or the undo history of this window.
      */
     private windowSink: WindowEditSink | null = null;
+    private heldReadOnly: (() => boolean) | null = null;
     /** Called after every save of the open tree (and every undo/redo); see onTreeSaved(). */
     private saveListeners = new Set<() => void>();
     private embeddedEnvelope: EmbeddedDataEnvelope | null = null;
@@ -766,24 +844,38 @@ class DataManagerClass {
     // ==================== VIEW MODE ====================
 
     /**
-     * Check if a person is locked (either individually or via tree lock)
+     * Check if a person is locked (either individually or via tree lock).
+     * `exceptFollow`: as if the tree did not follow a live research (1123).
      */
-    isPersonLocked(personId: PersonId): boolean {
+    isPersonLocked(personId: PersonId, opts: LockCheck = {}): boolean {
         if (this.isLocked()) return true;
         const person = this.data.persons[personId];
         if (person?.isLocked) return true;
-        return this.isTreeLocked();
+        return this.isTreeLocked(opts);
     }
 
     /**
-     * Check if the active tree is locked
+     * Check if the active tree is locked. `exceptFollow`: following a live
+     * research is left out (1123: Link to… is offered in a followed tree, its
+     * dialog says the tree is read-only and offers End following); every other
+     * reason still counts.
      */
-    isTreeLocked(): boolean {
+    isTreeLocked(opts: LockCheck = {}): boolean {
         if (this.windowSink?.readOnly()) return true;
-        if (this.liveTreeId !== null && this.liveTreeId === this.currentTreeId) return true;
+        if (this.heldReadOnly?.()) return true;
+        if (!opts.exceptFollow && this.isLiveFollowing()) return true;
         if (this.isNewerData()) return true;
         const meta = TreeManager.getActiveTreeMetadata();
         return meta?.isLocked === true;
+    }
+
+    /**
+     * A further reason the open tree is read-only now: a device of the home
+     * network away from the computer with the research shows the tree as last
+     * known, nothing edited until it is back (spec 094 §7). Null: none.
+     */
+    setHeldReadOnly(check: (() => boolean) | null): void {
+        this.heldReadOnly = check;
     }
 
     /** Mark the tree that follows a live research (null = none). */
@@ -1036,10 +1128,12 @@ class DataManagerClass {
     /**
      * Restore an "Export all" backup: every entry becomes a NEW tree (names
      * made unique), with its audit log when the backup carries one. Switches
-     * to the last imported tree. Returns the new tree ids.
+     * to the last imported tree. Returns the new tree ids. Each is a copy of
+     * the tree it was backed up from (`treeId`, its key in the backup)
+     * without research: one research, one tree (spec 139 K5.2).
      */
     async importTreesAsNew(
-        entries: Array<{ name: string; data: StromData; isHidden?: boolean; auditLog?: import('./types.js').AuditLog; viewLinks?: unknown }>
+        entries: Array<{ name: string; data: StromData; isHidden?: boolean; auditLog?: import('./types.js').AuditLog; viewLinks?: unknown; treeId?: string }>
     ): Promise<TreeId[]> {
         if (this.viewMode) return [];
         const existingNames = new Set(TreeManager.getTrees().map(t => t.name.toLowerCase()));
@@ -1047,6 +1141,7 @@ class DataManagerClass {
         for (const entry of entries) {
             const name = this.getUniqueTreeName(entry.name || strings.treeManager.importTreeName, existingNames);
             const id = TreeManager.createTreeFromImport(migrateData(entry.data), name);
+            if (entry.treeId) TreeManager.detachAsCopy(id, { treeId: entry.treeId as TreeId, name: entry.name || name });
             if (entry.isHidden) TreeManager.setTreeVisibility(id, true);
             if (entry.auditLog) await AuditLogManager.importForTree(id, entry.auditLog);
             // The view links a backup carried (a device setting of the tree).
@@ -1090,12 +1185,12 @@ class DataManagerClass {
             }
 
             case 'update': {
-                // Update existing tree — a backup of what it held first (as any import over a tree).
+                // Update existing tree — a backup of what it held first (as any import over a tree),
+                // whatever the automatic backups setting (spec 134 K0.4).
                 if (existingTree) {
-                    if (TreeManager.isAutoBackupEnabled(existingTree.id)) {
-                        const before = await TreeManager.getTreeData(existingTree.id);
-                        if (before) await createSnapshot(existingTree.id, before, 'pre-import', Date.now());
-                    }
+                    const before = await TreeManager.getTreeData(existingTree.id);
+                    if (before) await createSnapshot(existingTree.id, before, 'pre-import', Date.now(),
+                        TreeManager.backupResearchBase(existingTree.id, TreeManager.researchBaseOf(existingTree.id)));
                     TreeManager.updateTreeFromImport(existingTree.id, data);
                     this.currentTreeId = existingTree.id;
                     TreeManager.setActiveTree(existingTree.id);
@@ -1105,7 +1200,7 @@ class DataManagerClass {
 
             case 'copy': {
                 // Create copy with new name (no sourceExportId - it's a new lineage)
-                const copyName = `${this.embeddedEnvelope.treeName} (${strings.treeManager.duplicateSuffix})`;
+                const copyName = freeCopyName(this.embeddedEnvelope.treeName, TreeManager.getTrees().map(t => t.name));
                 const treeId = TreeManager.createTreeFromImport(data, copyName);
                 this.currentTreeId = treeId;
                 // Remove empty default tree(s) after import
@@ -1167,10 +1262,10 @@ class DataManagerClass {
     /**
      * Export the newer version data as JSON (for user to import in newer app)
      */
-    exportNewerVersionData(): void {
+    async exportNewerVersionData(): Promise<void> {
         if (!this.pendingNewerVersionData) return;
 
-        const dataStr = JSON.stringify(this.pendingNewerVersionData, null, 2);
+        const dataStr = JSON.stringify(await expandedData(this.pendingNewerVersionData), null, 2);
         const blob = new Blob([dataStr], { type: 'application/json' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
@@ -1250,6 +1345,7 @@ class DataManagerClass {
                 this.currentTreeId = startupTreeId;
                 this.data = migrateData(treeData);
                 TreeManager.markDemoTree(startupTreeId, this.data);
+                TreeManager.noteTreeContents(startupTreeId, this.data);
                 return;
             }
             this.currentTreeId = startupTreeId;
@@ -1301,6 +1397,8 @@ class DataManagerClass {
             this.data = treeData ? migrateData(treeData) : this.createEmptyData();
             // An older sample tree is known by its content (never sent to a research).
             if (treeData) TreeManager.markDemoTree(treeId, this.data);
+            // The Manage trees row's import source and merges of an older tree (spec 139 §7.2).
+            if (treeData) TreeManager.noteTreeContents(treeId, this.data);
         } finally {
             if (seq === this.switchSeq) this.switchingTo = null;
         }
@@ -1414,7 +1512,7 @@ class DataManagerClass {
     /**
      * Images that came after the tree (spec 116, image-loads.ts) put into
      * the open tree `treeId` by `apply`: no undo step and no edit of the
-     * user's; not stored here (storeArrivedImages, once they all came).
+     * user's; not stored here (storeArrivedImages, a part of them at a time).
      * Null when `treeId` is not the open tree (or it cannot be changed).
      */
     applyImageArrivals<T>(treeId: TreeId, apply: (data: StromData) => T): T | null {
@@ -1450,6 +1548,45 @@ class DataManagerClass {
     }
 
     /**
+     * Images of tree `treeId` were stored (spec 135, D6; image-intern.ts):
+     * every state of the open tree this window holds takes their references
+     * — the data, the undo and redo steps, the state an open dialog or batch
+     * goes back to. The same picture as before, so no undo step, no save,
+     * no new revision; a reference of another kind (the encryption was
+     * switched) is news to the satellite windows, which get the tree again.
+     */
+    internImages(treeId: TreeId, map: ReadonlyMap<string, string>): void {
+        if (this.currentTreeId !== treeId || this.windowSink) return;
+        const n = internImages(this.data, map);
+        UndoManager.patchTree(treeId, d => { internImages(d, map); });
+        internImages(this.pendingBefore, map);
+        if (this.editSession && this.editSession.treeId === treeId) internImages(this.editSession.before, map);
+        if (n > 0 && [...map.keys()].some(k => k.charCodeAt(0) === 0)) {
+            this.revision++;
+            this.contentRevision++;
+            this.notifySaved();
+        }
+    }
+
+    /**
+     * The pooled images every state of the open tree in this window names
+     * (the data, the undo and redo steps, the state a dialog or batch goes
+     * back to): their ids, and the tree's. Null: no tree open, or a satellite
+     * (its states are the main window's) unless `anyWindow`.
+     */
+    imageIdsInMemory(anyWindow = false): { treeId: TreeId; ids: Set<string> } | null {
+        const treeId = this.currentTreeId;
+        if (!treeId || (this.windowSink && !anyWindow)) return null;
+        const ids = new Set<string>();
+        const add = (d: StromData | null | undefined): void => { if (d) for (const id of treeImages(d).refIds) ids.add(id); };
+        add(this.data);
+        UndoManager.patchTree(treeId, add);
+        add(this.pendingBefore);
+        if (this.editSession?.treeId === treeId) add(this.editSession.before);
+        return { treeId, ids };
+    }
+
+    /**
      * A load of images into the open tree `treeId` begins (spec 116, I3):
      * the images go into the history recorded from now on (`from: 'all'`:
      * into all of it — images noted with the stored tree, asked again).
@@ -1468,11 +1605,19 @@ class DataManagerClass {
     /** Images came while a staged dialog held the saves: stored when it ends (also when it is thrown away). */
     private imagesUnstored = false;
 
-    /** Store the open tree `treeId` with the images that came (one save after them all). */
-    storeArrivedImages(treeId: TreeId): void {
-        if (this.currentTreeId !== treeId) return;
-        if (this.editSession) this.imagesUnstored = true;
+    /**
+     * Store the open tree `treeId` with the images that came so far (a part
+     * of them at a time, and after the last: image-loads.ts). Resolves once
+     * that write landed — the images are then references in memory.
+     */
+    storeArrivedImages(treeId: TreeId): Promise<void> {
+        if (this.currentTreeId !== treeId) return Promise.resolve();
+        if (this.editSession) {
+            this.imagesUnstored = true;
+            return Promise.resolve();
+        }
         this.save('content');
+        return TreeManager.flush(treeId);
     }
 
     /**
@@ -1529,8 +1674,33 @@ class DataManagerClass {
         if (this.editSession) return;
 
         if (this.currentTreeId) {
+            this.refreshCustomSnapshots();
             TreeManager.saveTreeData(this.currentTreeId, this.data);
             this.notifySaved();
+        }
+    }
+
+    /**
+     * The stored people of every list kept up to date by a custom rule
+     * brought up to its people now (spec 136 D3), so an older app shows a
+     * fresh fixed list. Only the lists whose people changed are replaced; no
+     * undo step (nothing a person did). Never stops a save.
+     */
+    private refreshCustomSnapshots(): void {
+        const lists = this.data.personLists;
+        if (!lists?.some(l => l.custom?.auto)) return;
+        try {
+            const index = this.getLineageIndex();
+            let changed = false;
+            const next = lists.map(l => {
+                const n = withCustomSnapshot(index, l);
+                if (!n) return l;
+                changed = true;
+                return n;
+            });
+            if (changed) this.data.personLists = next;
+        } catch (e) {
+            console.warn('Custom list snapshot failed', e);
         }
     }
 
@@ -1580,14 +1750,17 @@ class DataManagerClass {
     }
 
     /**
-     * Satellite: take the tree as the main window sent it (a JSON string of
-     * the whole data). No storage is read or written; the undo history stays
-     * the main window's. A staged dialog is not overwritten — the caller
-     * holds the data back until it ends (isEditSessionActive()).
+     * Satellite: take the tree as the main window sent it (the whole data as
+     * the channel cloned it; an older main window's: a JSON string). No
+     * storage is read or written; the undo history stays the main window's.
+     * A staged dialog is not overwritten — the caller holds the data back
+     * until it ends (isEditSessionActive()).
      */
-    loadFromWindow(treeId: TreeId, json: string): void {
+    loadFromWindow(treeId: TreeId, data: unknown): void {
+        const raw = typeof data === 'string' ? JSON.parse(data) as StromData : data as StromData;
+        if (!raw || typeof raw !== 'object') throw new Error('no tree data');
         this.currentTreeId = treeId;
-        this.data = migrateData(JSON.parse(json) as StromData);
+        this.data = migrateData(raw);
         this.pendingBefore = null;
         this.revision++;
         this.contentRevision++;
@@ -1603,10 +1776,16 @@ class DataManagerClass {
     }
 
     /**
-     * Main window: the open tree as stored, as one JSON string (what the
-     * satellites get). A staged dialog's changes are not stored yet: its
-     * starting state is sent instead.
+     * Main window: the open tree as stored (what the satellites get), as a
+     * JSON-shaped copy sharing its strings with the data (images included):
+     * the channel clones it without one string of the whole tree. A staged
+     * dialog's changes are not stored yet: its starting state is sent instead.
      */
+    storedWindowData(): StromData {
+        return cloneTreeDataAsJson(this.editSession ? this.editSession.before : this.data);
+    }
+
+    /** The same as one JSON string. */
     storedDataJson(): string {
         return JSON.stringify(this.editSession ? this.editSession.before : this.data);
     }
@@ -1670,8 +1849,13 @@ class DataManagerClass {
         // changed here: refuse before anything changes (defense in depth —
         // the UI hides every edit entry point).
         if (this.isLocked() || this.isNewerData()) throw new DataLockedError();
-        // A satellite keeps no undo history (the main window does).
-        if (this.viewMode || this.windowSink) return;
+        if (this.viewMode) return;
+        // A satellite keeps no undo history (the main window does); its people and unions as they were, for the
+        // time of a change (spec 136 D4).
+        if (this.windowSink) {
+            if (!this.batchActive) this.windowBefore = { persons: structuredClone(this.data.persons), partnerships: structuredClone(this.data.partnerships) } as StromData;
+            return;
+        }
         // Inside a batch the pre-state was captured once by beginBatch; the inner
         // mutations must not re-snapshot (that would split the batch into steps).
         if (this.batchActive) return;
@@ -1687,6 +1871,8 @@ class DataManagerClass {
     private commitMutation(description: string, silent = false, mark?: UndoMark, toast?: MutationToast): void {
         const listsOnly = this.pendingListsOnly;
         this.pendingListsOnly = false;
+        const keepChangedAt = this.pendingKeepChangedAt;
+        this.pendingKeepChangedAt = false;
         // The files' places name only what is still in the tree (a person, couple, event or source deleted).
         pruneMedia(this.data);
         if (this.batchActive) {
@@ -1695,7 +1881,10 @@ class DataManagerClass {
             return;
         }
         if (this.windowSink) {
-            // A satellite: the main window saves the edit and keeps its undo step.
+            // A satellite: the main window saves the edit and keeps its undo step. The changed people get the
+            // time here too, so this window's copy counts them (spec 136 D4); the main window writes its own.
+            if (this.windowBefore && !keepChangedAt) stampChangedAt(this.windowBefore, this.data, new Date().toISOString());
+            this.windowBefore = null;
             this.pendingBefore = null;
             this.save();
             this.noteUserChange();
@@ -1706,6 +1895,8 @@ class DataManagerClass {
         }
         UndoManager.setActiveTree(this.currentTreeId);
         if (this.pendingBefore) {
+            // The people this step changed get the time of their last change (spec 136 D4).
+            if (!keepChangedAt) stampChangedAt(this.pendingBefore, this.data, new Date().toISOString());
             // Auto-backup the FIRST mutation of the day (state before it).
             this.maybeAutoSnapshot(this.pendingBefore, this.pendingBase);
             UndoManager.push({ data: this.pendingBefore, description, base: this.pendingBase, ...(mark ? { mark } : {}), ...(listsOnly ? { listsOnly } : {}) });
@@ -1940,17 +2131,61 @@ class DataManagerClass {
     async snapshotNow(reason: SnapshotReason): Promise<string | null> {
         if (this.viewMode || !this.currentTreeId) return null;
         // Around the research a backup is taken whatever the setting: the app never trusts the research blindly.
-        const always = reason === 'manual' || reason === 'pre-research-load' || reason === 'pre-first-send';
+        // Before a merge or an import too (spec 134 K0.4): "Before merge" and "Before import" are promised whatever the setting.
+        const always = reason === 'manual' || reason === 'pre-research-load' || reason === 'pre-first-send' || reason === 'pre-merge' || reason === 'pre-merge-undo' || reason === 'pre-import';
         if (!always && !TreeManager.isAutoBackupEnabled(this.currentTreeId)) return null;
-        if (reason === 'pre-research-load' || reason === 'pre-first-send') {
+        if (reason === 'pre-research-load' || reason === 'pre-first-send' || reason === 'pre-merge' || reason === 'pre-merge-undo' || reason === 'pre-import') {
             try {
                 return (await createSnapshot(this.currentTreeId, this.data, reason, Date.now(), this.backupBase())).id;
             } catch (err) {
-                console.warn('The backup before the research could not be written', err);
+                console.warn('The backup could not be written', reason, err);
                 return null;
             }
         }
         return (await createSnapshot(this.currentTreeId, this.data, reason, Date.now(), this.backupBase())).id;
+    }
+
+    /**
+     * The backup "Before merge" of a merge's target at the write (spec 134
+     * K0.4, K6.6): the open tree's data, or another tree's as stored, whatever
+     * the automatic backups setting, `keepFor` kept out of the rotation.
+     * Throws when the tree cannot be read or the backup written (§8 8d).
+     * The undo of a merge takes the same backup under its own name
+     * (`reason` 'pre-merge-undo', "Before undoing a merge").
+     */
+    async backupBeforeMerge(treeId: TreeId, opts: SnapshotOptions = {}, reason: 'pre-merge' | 'pre-merge-undo' = 'pre-merge'): Promise<SnapshotMeta> {
+        const open = !this.viewMode && treeId === this.currentTreeId;
+        const data = open ? this.data : await TreeManager.getTreeData(treeId);
+        if (!data) throw new Error('The tree could not be read');
+        const base = open ? this.backupBase() : TreeManager.backupResearchBase(treeId, TreeManager.researchBaseOf(treeId));
+        return createSnapshot(treeId, data, reason, Date.now(), base, opts);
+    }
+
+    /**
+     * A merge written into the open tree (spec 134 §8): its data replace the
+     * tree's as one undo step `label` (K8.5), where the work stands here (the
+     * last focus, the default person and view) staying as it is. The caller
+     * has stored the data already; this save writes the same again. False when
+     * tree `treeId` is not the open one or may not be changed now.
+     * `keepChangedAt`: the data carry the people's time of their last change
+     * already (an undo of a merge, its redo), none is written here.
+     */
+    adoptMergeResult(treeId: TreeId, data: StromData, label: string, keepChangedAt = false): boolean {
+        if (this.currentTreeId !== treeId || this.windowSink || this.isReadOnly() || this.isTreeLocked()) return false;
+        this.rollbackEditSession();   // whole-data replacement ends a staged dialog
+        const next = data;
+        for (const key of WINDOW_STATE_KEYS) {
+            if (this.data[key] === undefined) delete next[key];
+            else (next as unknown as Record<string, unknown>)[key] = this.data[key];
+        }
+        this.imagesReplaced(treeId);
+        this.beginMutation();
+        this.data = next;
+        this.pendingKeepChangedAt = keepChangedAt;
+        this.commitMutation(label, true);
+        CrossTree.invalidateCacheForTree(treeId);
+        if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('strom:data-changed'));
+        return true;
     }
 
     /** The research base a backup of the current data keeps (N61-3). */
@@ -1967,7 +2202,7 @@ class DataManagerClass {
     async restoreSnapshot(snapshotId: string, base: ResearchBase | null = null): Promise<{ missingImages: number } | null> {
         this.rollbackEditSession();   // whole-data replacement ends a staged dialog
         if (this.isReadOnly() || !this.currentTreeId) return null;
-        const payload = await getSnapshotPayload(snapshotId);
+        const payload = await getSnapshotPayload(snapshotId, { images: 'refs' });
         if (!payload) return null;
         let migrated = migrateData(JSON.parse(payload.json));
         // A backup from before data version 12 of a research tree: the sexes the
@@ -1989,6 +2224,7 @@ class DataManagerClass {
         TreeManager.restoreResearchBase(this.currentTreeId, restoredBase);
         this.imagesReplaced(this.currentTreeId);
         this.data = migrated;
+        this.pendingKeepChangedAt = true;
         this.commitMutation(strings.undo.restoreBackup, true);
         AuditLogManager.log(this.currentTreeId, 'data.load', strings.auditLog.restoredBackup);
         if (this.currentTreeId) CrossTree.invalidateCacheForTree(this.currentTreeId);
@@ -2358,7 +2594,7 @@ class DataManagerClass {
      * order: by generation for ancestors / descendants, by date added for the
      * "added" rule, manual for a fixed list of given people, else oldest first.
      */
-    createPersonList(input: { name: string; dynamic: boolean; rule?: PersonListRule; personIds?: PersonId[]; sort?: PersonListSort; checklist?: boolean }, env: ListEnv = {}): PersonList | null {
+    createPersonList(input: { name: string; dynamic: boolean; rule?: PersonListRule; personIds?: PersonId[]; sort?: PersonListSort; checklist?: boolean; origin?: PersonListOrigin }, env: ListEnv = {}): PersonList | null {
         if (this.listsReadOnly()) return null;
         const rule = input.rule ? sanitizePersonListRule(input.rule) : null;
         if (input.dynamic && !rule) return null;
@@ -2379,6 +2615,8 @@ class DataManagerClass {
             updated: new Date().toISOString(),
         };
         if (rule) list.rule = rule;
+        const origin = input.origin ? sanitizeListOrigin(input.origin) : null;
+        if (origin) list.origin = origin;
         if (!input.dynamic) {
             const ids = input.personIds ?? (rule ? sortListIds(index, list, rulePersonIds(index, rule, env), sort === 'manual' ? 'old' : sort, env) : []);
             list.personIds = [...new Set(ids)].filter(id => !!this.data.persons[id] && !this.data.persons[id].isPlaceholder);
@@ -2386,6 +2624,79 @@ class DataManagerClass {
         }
         this.storePersonList(list, strings.lists.undo.create(name), false, { text: strings.lists.toast.saved(name) }, true);
         return list;
+    }
+
+    /**
+     * A new list from a custom rule (spec 136 D3). A rule the tiles know (one
+     * plain condition, customToRule) is stored as a one-condition rule, as
+     * before; any other is stored as `custom` with `dynamic: false` and its
+     * people now in `personIds` (what an older app shows), automatic or
+     * fixed by `custom.auto`. Null when the lists cannot change or the rule
+     * has an issue (ruleIssues: incomplete, too deep, a loop…).
+     */
+    createCustomPersonList(input: { name: string; custom: CustomRule & { auto: boolean }; origin?: PersonListOrigin; sort?: PersonListSort; checklist?: boolean }, env: ListEnv = {}): PersonList | null {
+        if (this.listsReadOnly()) return null;
+        const custom = sanitizeCustomRule(input.custom);
+        if (!custom || ruleIssues(custom.root, { lists: personListsOf(this.data) }).length) return null;
+        const simple = customToRule(custom);
+        if (simple) {
+            return this.createPersonList({ name: input.name, dynamic: custom.auto, rule: simple, sort: input.sort, checklist: input.checklist, origin: input.origin }, env);
+        }
+        const index = this.getLineageIndex();
+        const name = this.suggestPersonListName(input.name.trim() || customLabel(custom, index));
+        if (!name) return null;
+        const sort: PersonListSort = input.sort && !(custom.auto && input.sort === 'manual') ? input.sort : 'old';
+        const list: PersonList = {
+            id: newPersonListId(personListsOf(this.data)), name, dynamic: false, sort, custom,
+            updated: new Date().toISOString(),
+        };
+        const origin = input.origin ? sanitizeListOrigin(input.origin) : null;
+        if (origin) list.origin = origin;
+        list.personIds = sortListIds(index, list, customPersonIds(index, custom, env, list.id), sort === 'manual' ? 'old' : sort, env);
+        if (input.checklist && !custom.auto) list.checklist = true;
+        this.storePersonList(list, strings.lists.undo.create(name), false, { text: strings.lists.toast.saved(name) }, true);
+        return list;
+    }
+
+    /**
+     * A list's rule changed in the rule dialog (spec 136 §5): a custom rule,
+     * automatic or fixed by `custom.auto`; one the tiles know is stored as a
+     * one-condition rule. An automatic list takes its people now; a fixed
+     * one keeps its people (a list that was automatic keeps the people it
+     * had: "Add from the rule" brings the rest). The origin stays. False
+     * when nothing could change (read-only, unknown list, a rule with an issue).
+     */
+    setPersonListCustomRule(id: string, input: CustomRule & { auto: boolean }, env: ListEnv = {}): boolean {
+        if (this.listsReadOnly()) return false;
+        const custom = sanitizeCustomRule(input);
+        if (!custom || ruleIssues(custom.root, { lists: personListsOf(this.data), listId: id }).length) return false;
+        const index = this.getLineageIndex();
+        return !!this.changePersonList(id, (l, now) => {
+            const was = l.custom ? l.custom.auto : !!l.dynamic;
+            const had = was ? listPersonIds(index, l, env) : (l.personIds ?? []);
+            const next: PersonList = { ...l, updated: now, name: listDisplayName(l) };
+            // The rule set here replaces one of a newer app kept as it came (K1.8).
+            delete next.customUnknown;
+            const simple = customToRule(custom);
+            if (simple) {
+                delete next.custom;
+                next.rule = simple;
+                next.dynamic = custom.auto;
+                if (custom.auto) { delete next.personIds; delete next.removed; delete next.checklist; delete next.done; }
+                else next.personIds = had.slice();
+            } else {
+                delete next.rule;
+                next.custom = custom;
+                next.dynamic = false;
+                if (custom.auto) {
+                    delete next.removed; delete next.checklist; delete next.done;
+                    next.personIds = [];
+                    next.personIds = listPersonIds(index, next, env).slice();
+                } else next.personIds = had.slice();
+            }
+            if (custom.auto && next.sort === 'manual') next.sort = 'old';
+            return next;
+        }, { silent: false, audit: true });
     }
 
     /** A new name; false when another list has it (or it is empty). */
@@ -2435,7 +2746,7 @@ class DataManagerClass {
     addPersonsToList(id: string, ids: PersonId[]): boolean {
         const list = this.getPersonList(id);
         // An automatic list takes nobody by hand (its rule fills it).
-        if (!list || list.dynamic) return false;
+        if (!list || listIsAuto(list)) return false;
         const have = new Set(list.personIds ?? []);
         const real = [...new Set(ids)].filter(pid => !!this.data.persons[pid] && !this.data.persons[pid].isPlaceholder && !have.has(pid));
         if (!real.length) return false;
@@ -2486,10 +2797,13 @@ class DataManagerClass {
         }
         return !!this.changePersonList(id, (l, now) => {
             const next: PersonList = { ...l, rule: clean, dynamic, updated: now };
+            // A one-condition rule replaces a custom one (spec 136 D3), a newer app's kept one too.
+            delete next.custom;
+            delete next.customUnknown;
             if (dynamic) {
                 delete next.personIds; delete next.removed; delete next.checklist;
                 if (next.sort === 'manual') next.sort = 'old';
-            } else if (l.dynamic) {
+            } else if (listIsAuto(l)) {
                 next.personIds = sortListIds(index, next, rulePersonIds(index, clean, env), l.sort, env);
             }
             return next;
@@ -2500,6 +2814,13 @@ class DataManagerClass {
     freezePersonList(id: string, env: ListEnv = {}): boolean {
         return !!this.changePersonList(id, (l, now) => withFrozen(this.getLineageIndex(), l, now, env), {
             silent: false, toast: () => ({ text: strings.lists.toast.frozen }), audit: true,
+        });
+    }
+
+    /** "Keep by the rule" (spec 136 §10): a fixed list with a rule automatic again (toast with Undo). */
+    keepPersonListByRule(id: string, env: ListEnv = {}): boolean {
+        return !!this.changePersonList(id, (l, now) => withKeptByRule(this.getLineageIndex(), l, now, env), {
+            silent: false, toast: () => ({ text: strings.lists.toast.keptByRule }), audit: true,
         });
     }
 
@@ -3057,6 +3378,13 @@ class DataManagerClass {
             person.refn = updates.refn || undefined;
         }
         if (updates.question !== undefined) person.question = updates.question || undefined;
+        // The contact (spec 134 K0.10): the addresses as typed, each once; none = no contact.
+        if (updates.emails !== undefined) {
+            const emails = cleanEmails(updates.emails);
+            const was = person.emails ?? [];
+            if ((emails ?? []).join('\n') !== was.join('\n')) diff(strings.labels.emails, was.join(', '), (emails ?? []).join(', '));
+            person.emails = emails;
+        }
         // Empty list means none — do not keep an empty array around.
         if (updates.nameVariants !== undefined) {
             const kept = updates.nameVariants.map(v => v.trim()).filter(Boolean);
@@ -4299,9 +4627,9 @@ class DataManagerClass {
     }
 
     /** Every person a file is with may be changed (a file of no person: the tree). */
-    private mediaEditable(att: Attachment): boolean {
-        if (this.isTreeLocked()) return false;
-        return att.places.every(p => { const pid = placePersonId(p); return !pid || !this.isPersonLocked(pid); });
+    private mediaEditable(att: Attachment, opts: LockCheck = {}): boolean {
+        if (this.isTreeLocked(opts)) return false;
+        return att.places.every(p => { const pid = placePersonId(p); return !pid || !this.isPersonLocked(pid, opts); });
     }
 
     /** Change a file's detail as one undo step. */
@@ -4338,10 +4666,14 @@ class DataManagerClass {
         });
     }
 
-    /** The file's title, kind, date and note may be changed here (not read-only, every person of it unlocked). */
-    canEditMedia(id: string): boolean {
+    /**
+     * The file's title, kind, date and note may be changed here (not read-only,
+     * every person of it unlocked). `exceptFollow`: as if the tree did not
+     * follow a live research — Link to… is offered then (1123).
+     */
+    canEditMedia(id: string, opts: LockCheck = {}): boolean {
         const att = findMedia(this.data, id);
-        return !!att && !this.isReadOnly() && this.mediaEditable(att);
+        return !!att && !this.isReadOnly() && this.mediaEditable(att, opts);
     }
 
     /**
@@ -4432,7 +4764,8 @@ class DataManagerClass {
         const sha = file.original?.sha256?.toLowerCase();
         const url = !file.originalOnly && file.dataUrl ? file.dataUrl : '';
         if (!sha && !url) return undefined;
-        return treeMedia(this.data).find(a => (sha ? a.original?.sha256?.toLowerCase() === sha : !a.originalOnly && a.dataUrl === url));
+        // The tree's copy may be a pooled image's reference by now (spec 135): the same picture by the image catalog.
+        return treeMedia(this.data).find(a => (sha ? a.original?.sha256?.toLowerCase() === sha : !a.originalOnly && sameImageByCatalog(a.dataUrl, url)));
     }
 
     /** Put a file at one more place (a person, a fact, an event, a couple, a source that is in the tree). */
@@ -5492,12 +5825,13 @@ class DataManagerClass {
      * Import data as a new tree
      * @param data The data to import
      * @param treeName Name for the new tree
+     * @param opts.fromTree Made of a selection of another tree (not a file; spec 139 §4.2)
      * @returns The new tree's ID
      */
-    async importAsNewTree(data: StromData, treeName: string): Promise<TreeId> {
+    async importAsNewTree(data: StromData, treeName: string, opts: { fromTree?: TreeMetadata['fromTree'] } = {}): Promise<TreeId> {
         this.rollbackEditSession();   // whole-data replacement ends a staged dialog
         const migratedData = migrateData(data);
-        const treeId = TreeManager.createTreeFromImport(migratedData, treeName);
+        const treeId = TreeManager.createTreeFromImport(migratedData, treeName, !opts.fromTree, opts.fromTree);
         // A copy of the sample tree (its JSON) is the sample tree too.
         TreeManager.markDemoTree(treeId, migratedData);
         this.currentTreeId = treeId;
@@ -5548,11 +5882,11 @@ class DataManagerClass {
 
     // ==================== EXPORT/IMPORT ====================
 
-    exportJSON(privacyMode: PrivacyMode = 'full', content: boolean | ContentOptions = false): void {
+    async exportJSON(privacyMode: PrivacyMode = 'full', content: boolean | ContentOptions = false): Promise<void> {
+        // The pooled images are read as the file is written (image-stream.ts), never the tree expanded.
         let out = applyLivingPrivacy(this.data, privacyMode);
         out = applyContentOptions(out, content);
-        const dataStr = JSON.stringify(out, null, 2);
-        const blob = new Blob([dataStr], { type: 'application/json' });
+        const { blob } = await jsonFileWithImages(out, { indent: 2 });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = 'family-tree.json';
@@ -5574,28 +5908,34 @@ class DataManagerClass {
      * the same as a full JSON download.
      */
     async buildAttachedFileJson(treeId: TreeId): Promise<string> {
-        return (await this.buildAttachedFile(treeId)).json;
+        const body = (await this.buildAttachedFile(treeId)).body;
+        return typeof body === 'string' ? body : body.text();
     }
 
-    /** buildAttachedFileJson with the data the file carries (its pictures count as copied). */
-    async buildAttachedFile(treeId: TreeId): Promise<{ json: string; data: StromData }> {
-        const data = await storedTreeForExport(treeId);
+    /**
+     * buildAttachedFileJson as the file's body with the data the file carries
+     * (its pictures count as copied; their pooled references kept). Without
+     * encryption a Blob whose images are read as it is written
+     * (image-stream.ts); encrypted, the text sealed whole (images expanded).
+     */
+    async buildAttachedFile(treeId: TreeId): Promise<{ body: string | Blob; data: StromData }> {
+        const data = await storedTreeWithRefs(treeId);
         if (!data) throw new Error('no tree data');
-        const json = JSON.stringify(data, null, 2);
 
         const { SettingsManager } = await import('./settings.js');
         if (SettingsManager.isEncryptionEnabled()) {
             const { CryptoSession } = await import('./crypto.js');
             if (!CryptoSession.isUnlocked()) throw new Error('locked');
-            const encrypted = await CryptoSession.encrypt(json);
-            return { json: JSON.stringify(encrypted, null, 2), data };
+            const encrypted = await CryptoSession.encrypt(JSON.stringify(await expandedData(data), null, 2));
+            return { body: JSON.stringify(encrypted, null, 2), data };
         }
-        return { json, data };
+        return { body: (await jsonFileWithImages(data, { indent: 2 })).blob, data };
     }
 
     /** Download a tree as JSON; returns the file name (null when there is no tree). */
     async exportTreeJSON(treeId: TreeId, password?: string | null, privacyMode: PrivacyMode = 'full', content: boolean | ContentOptions = false): Promise<string | null> {
-        const rawTreeData = await storedTreeForExport(treeId);
+        // The pooled images stay references until the file is written (image-stream.ts).
+        const rawTreeData = await storedTreeWithRefs(treeId);
         if (!rawTreeData) return null;
 
         const treeData = applyContentOptions(applyLivingPrivacy(rawTreeData, privacyMode), content);
@@ -5616,16 +5956,16 @@ class DataManagerClass {
         const treeName = treeMeta?.name || 'family-tree';
         const safeName = safeFileName(treeName, 'family-tree');
 
-        let dataStr: string;
+        let blob: Blob;
         if (password) {
+            // Sealed whole: the text encrypted at once, its images expanded.
             const { encrypt } = await import('./crypto.js');
-            const encrypted = await encrypt(JSON.stringify(treeData), password);
-            dataStr = JSON.stringify(encrypted, null, 2);
+            const encrypted = await encrypt(JSON.stringify(await expandedData(treeData)), password);
+            blob = new Blob([JSON.stringify(encrypted, null, 2)], { type: 'application/json' });
         } else {
-            dataStr = JSON.stringify(treeData, null, 2);
+            blob = (await jsonFileWithImages(treeData, { indent: 2 })).blob;
         }
 
-        const blob = new Blob([dataStr], { type: 'application/json' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = `${safeName || 'family-tree'}.json`;
@@ -5638,6 +5978,7 @@ class DataManagerClass {
     async exportFocusedJSON(visiblePersonIds: Set<PersonId>, password?: string | null, privacyMode: PrivacyMode = 'full', content: boolean | ContentOptions = false, fileName = 'family-tree-focus.json'): Promise<void> {
         // Self-consistent slice (glue + cleaned relations + pruned sources),
         // shared with "make a tree from this view".
+        // The pooled images stay references until the file is written (image-stream.ts).
         const sliced = extractSubtree(this.data, visiblePersonIds);
         let focusedData: StromData = applyLivingPrivacy({
             version: STROM_DATA_VERSION,
@@ -5645,16 +5986,16 @@ class DataManagerClass {
         }, privacyMode);
         focusedData = applyContentOptions(focusedData, content);
 
-        let dataStr: string;
+        let blob: Blob;
         if (password) {
+            // Sealed whole: the text encrypted at once, its images expanded.
             const { encrypt } = await import('./crypto.js');
-            const encrypted = await encrypt(JSON.stringify(focusedData), password);
-            dataStr = JSON.stringify(encrypted, null, 2);
+            const encrypted = await encrypt(JSON.stringify(await expandedData(focusedData)), password);
+            blob = new Blob([JSON.stringify(encrypted, null, 2)], { type: 'application/json' });
         } else {
-            dataStr = JSON.stringify(focusedData, null, 2);
+            blob = (await jsonFileWithImages(focusedData, { indent: 2 })).blob;
         }
 
-        const blob = new Blob([dataStr], { type: 'application/json' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = fileName;
@@ -6358,3 +6699,8 @@ class DataManagerClass {
 
 // Export singleton instance
 export const DataManager = new DataManagerClass();
+
+// The open tree's states take the references of its images once they are stored (spec 135, D6).
+onImagesInterned((treeId, map) => DataManager.internImages(treeId as TreeId, map));
+// The pool's cleanup keeps what those states name (spec 135, D7; a satellite's are asked by the main window).
+registerMemoryImages(() => DataManager.imageIdsInMemory(true)?.ids ?? []);

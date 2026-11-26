@@ -48,6 +48,10 @@ import { importProgramName } from './import-next.js';
 import { composePage, hasEntryFields } from './source-location.js';
 import { citationMainOf, citationQuality, type CitationHolder } from './citation-quality.js';
 import { citationFact, CitationRef, orderedCitations, recordPagesOf, sourceNumbers } from './citation-order.js';
+import { cleanEmails, emailOfLine } from './person-contact.js';
+import { isPoolRef, poolIdOf } from './image-ref.js';
+import { imageMetaOf } from './image-meta.js';
+import { sameImageSync } from './image-equal.js';
 
 /** What to leave out of a GEDCOM export (the export dialog's Content section). */
 export interface GedcomExportOptions {
@@ -150,6 +154,39 @@ export interface GedcomExportOptions {
      * "Back to {prog}" writes the date (spec 066 G8).
      */
     mediaDates?: boolean;
+    /**
+     * Pictures the research has already (`sync.mediaRef`, spec 133): they go
+     * by reference instead of with their data. Default: every picture with
+     * its data, as ever.
+     */
+    mediaRef?: GedcomMediaRef;
+    /**
+     * Write the people's contact (Person.emails) as `1 RESI` / `2 EMAIL`
+     * (spec 134 K0.10). Default: written, except in a file for the research
+     * (`research`): only to one that keeps it (`person.contact`); an older one
+     * would read it as a residence with no place, the app keeps it itself.
+     */
+    contacts?: boolean;
+}
+
+/**
+ * Which pictures go by reference (GedcomExportOptions.mediaRef):
+ * - `excerpt`: a source's excerpt goes without its FILE (the research cuts
+ *   it again from its original or its clip, it never reads the data);
+ * - `dataSha`: a file's data URL the research holds, by the SHA-256 of its
+ *   bytes — written as `_STROM_DATA <sha>` where `FILE data:…` would be.
+ */
+export interface GedcomMediaRef {
+    excerpt(e: { clip?: string; originalSha?: string }): boolean;
+    dataSha(dataUrl: string): string | undefined;
+}
+
+/** How many pictures an export wrote by reference and with their data (diagnostics). */
+export interface GedcomMediaCounts {
+    excerptsRef: number;
+    excerptsData: number;
+    filesRef: number;
+    filesData: number;
 }
 
 /** What an OBJE of the file says (see pushObje in exportToGedcom). */
@@ -174,6 +211,37 @@ interface ObjeWrite {
 
 /** A line that holds the place of a file until all are written (exportToGedcom's media slots). */
 const MEDIA_SLOT = '\u0000media:';
+
+/**
+ * A line that holds the place of a pooled image's FILE (spec 135): `<slot><level> <reference>`.
+ * The export itself never reads an image; ged-export-images.ts writes each one's FILE in its place,
+ * an image at a time, exactly as `pushWrapped` writes a data URL here.
+ */
+export const FILE_SLOT = '\u0000file:';
+
+/**
+ * The media type part of an image value as the export reads it: a data URL's
+ * text between `data:` and the first `;`, a pooled image's from its stored
+ * head (the catalog, image-meta.ts); '' for a pooled one the catalog does not know.
+ */
+function valueMime(value: string): string {
+    if (!isPoolRef(value)) return value.slice(5, value.indexOf(';'));
+    const head = imageMetaOf(value)?.head ?? '';
+    return head.slice(5, head.indexOf(';'));
+}
+
+/** The lines `level FILE value` (CONC-wrapped), or a pooled image's place for them (FILE_SLOT). */
+function pushFile(lines: string[], level: number, value: string): void {
+    if (poolIdOf(value)) lines.push(`${FILE_SLOT}${level} ${value}`);
+    else pushWrapped(lines, level, 'FILE', value);
+}
+
+/** The text of the lines `level FILE dataUrl` as the export writes them (one line after another, no line break at the end). */
+export function gedcomFileLines(level: number, dataUrl: string): string {
+    const out: string[] = [];
+    pushWrapped(out, level, 'FILE', dataUrl);
+    return out.join('\n');
+}
 
 /**
  * An xref another program gave that this file can use as it is: GEDCOM
@@ -351,6 +419,8 @@ export interface GedcomExportResult {
     };
     /** The xrefs this export gave persons and sources (by id): a hand-over's `ids` answer by them. */
     xrefs: { persons: ReadonlyMap<string, string>; sources: ReadonlyMap<string, string> };
+    /** The pictures written by reference and with their data (GedcomExportOptions.mediaRef). */
+    media: GedcomMediaCounts;
 }
 
 /** GEDCOM month names (uppercase) */
@@ -1091,6 +1161,7 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
     // "Back to {prog}" (spec 066 K3.2): the records from that program's files
     // keep their xref where it is safe; every other xref is made around them.
     const back = backToXrefs(data, options.backTo);
+    const writeContacts = options.contacts ?? !options.research;
     /** A person or a family of that program's files ("Back to {prog}"). */
     const isBackRecord = (holder: FactHolder): boolean =>
         (!!holder.importId && back.imports.has(holder.importId)) || (holder.originalIds ?? []).some(e => back.imports.has(e.from));
@@ -1603,9 +1674,19 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         if (m.prim) out.push(`${l} _PRIM ${m.prim}`);
         pushObjeRest(out, l, m, true);
     };
+    /** The pictures written by reference and with their data. */
+    const mediaCounts: GedcomMediaCounts = { excerptsRef: 0, excerptsData: 0, filesRef: 0, filesData: 0 };
+    /** The hash a file's data go by (GedcomExportOptions.mediaRef), else undefined: its data go. Counted either way. */
+    const fileDataRef = (file: string): string | undefined => {
+        if (!file.startsWith('data:') && !isPoolRef(file)) return undefined;
+        const sha = options.mediaRef ? normalizeSha256(options.mediaRef.dataSha(file)) : null;
+        if (sha) mediaCounts.filesRef++;
+        else mediaCounts.filesData++;
+        return sha ?? undefined;
+    };
     /** FORM of a file: its data URL's type, else the type it names. */
     const objeForm = (m: ObjeWrite): string => {
-        const mime = m.file.startsWith('data:') ? m.file.slice(5, m.file.indexOf(';')) : m.fileMime ?? '';
+        const mime = m.file.startsWith('data:') || isPoolRef(m.file) ? valueMime(m.file) : m.fileMime ?? '';
         return mime.includes('/') ? mime.split('/')[1] : 'jpeg';
     };
     /** NOTE, `_SOUR`, the original's hash, FILE (in place) and the date of an OBJE, at level `l`. */
@@ -1621,7 +1702,11 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             const o = m.original?.orientation;
             if (o && o >= 2 && o <= 8) out.push(`${l} _STROM_ORIENT ${o}`);
         }
-        if (withFile) pushWrapped(out, l, 'FILE', m.file);
+        if (withFile) {
+            const dataRef = fileDataRef(m.file);
+            if (dataRef) out.push(`${l} _STROM_DATA ${dataRef}`);
+            else pushFile(out, l, m.file);
+        }
         // The picture's date: back under its OBJE for the program it came from (spec 066 G8), and to a
         // research that keeps it (spec 108 §3).
         const day = (back.imports.size > 0 || options.mediaDates) && m.date ? mediaDateValue(m.date) : undefined;
@@ -1818,6 +1903,9 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         // Life events. OCCU carries its detail as the tag value; the rest use
         // level-2 DATE/PLAC/NOTE. 'custom'/'military' have no dedicated tag and
         // ride on the generic EVEN with a TYPE label, so nothing is dropped.
+        // The contact's addresses written under an event (see below).
+        const contact = writeContacts ? cleanEmails(person.emails) ?? [] : [];
+        const contactWritten = new Set<string>();
         for (const fileEvent of person.events ?? []) {
             // "Back to {prog}": the file's e-mail addresses go back as EMAIL,
             // out of the note while it still has their line (spec 066 K3.1).
@@ -1869,7 +1957,13 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             }
             pushDetails(lines, addressLines ? { ...event, address: undefined } : event);
             if (addressLines) lines.push(...addressLines);
-            for (const email of emails) pushWrapped(lines, 2, 'EMAIL', email);
+            // …and an address of the contact the file wrote under this event, there again (spec 134 K0.10).
+            const contactHere = backEvent ? (fileEvent.gedcomEmails ?? []).filter(e =>
+                contact.includes(e) && !emails.includes(e) && !contactWritten.has(e)) : [];
+            for (const email of [...emails, ...contactHere]) {
+                pushWrapped(lines, 2, 'EMAIL', email);
+                contactWritten.add(email);
+            }
             pushStatus(lines, event.status);
             if (event.note && !eventValueIsOnTag(event.type)) {
                 pushNote(lines, 2, event.note);
@@ -1908,6 +2002,25 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
             pushFactOrigin(person, `event:${event.id}`);
         }
 
+        // The person's contact (spec 134 K0.10): each e-mail as GEDCOM keeps
+        // it, in an address structure (`1 RESI` / `2 EMAIL`). "Back to {prog}"
+        // writes a `1 EMAIL` its file had under the person as the file did.
+        if (writeContacts) {
+            const asWritten = back.imports.size > 0 && person.gedcomExtra
+                ? person.gedcomExtra.filter(e => back.imports.has(e.from)).flatMap(e => notedStructures(e.lines))
+                    .filter(st => !!emailOfLine(st.lines[0])) : [];
+            for (const email of contact) {
+                if (contactWritten.has(email)) continue;
+                const own = asWritten.find(st => emailOfLine(st.lines[0]) === email);
+                if (own) {
+                    lines.push(...own.lines);
+                    continue;
+                }
+                lines.push('1 RESI');
+                pushWrapped(lines, 2, 'EMAIL', email);
+            }
+        }
+
         // Source citations on the person (1 SOUR @Sx@ + 2 PAGE).
         pushCitations(1, { personId });
 
@@ -1917,7 +2030,7 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         }
         for (const att of mediaByPerson.get(personId) ?? []) {
             // The portrait's own record (data v25): written once, as the portrait above.
-            if (person.photo && att.dataUrl === person.photo) continue;
+            if (person.photo && (att.dataUrl === person.photo || (isPoolRef(att.dataUrl) !== isPoolRef(person.photo) && sameImageSync(att.dataUrl, person.photo)))) continue;
             if (att.places.some(p => atOwner(p, q => 'personId' in q && q.personId === personId))) pushMediaSlot(att, 1, 'person');
         }
 
@@ -2400,7 +2513,7 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         // Crops of the entry, embedded like person media (other programs
         // cannot read data URLs — the content options can leave them out).
         for (const exc of members ? members.flatMap(m => m.excerpts ?? []) : source.excerpts ?? []) {
-            const mime = exc.dataUrl.slice(5, exc.dataUrl.indexOf(';'));
+            const mime = valueMime(exc.dataUrl);
             lines.push('1 OBJE');
             lines.push(`2 FORM ${mime.includes('/') ? mime.split('/')[1] : 'jpeg'}`);
             if (exc.caption) pushWrapped(lines, 2, 'TITL', exc.caption);
@@ -2418,7 +2531,12 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
                     lines.push(`2 _STROM_REGION ${regionHeader(regionToStored(exc.region, page.original.orientation))}`);
                 }
             }
-            pushWrapped(lines, 2, 'FILE', exc.dataUrl);
+            // The research has it (its clip, or the original it was cut from): no data.
+            if (options.mediaRef?.excerpt({ clip: exc.clip, originalSha: exc.originalSha })) mediaCounts.excerptsRef++;
+            else {
+                mediaCounts.excerptsData++;
+                pushFile(lines, 2, exc.dataUrl);
+            }
         }
         // The files of the source (spec 102): one at a person too goes there with this source as its `_SOUR`.
         for (const att of mediaBySource.get(gedcomId) ?? []) {
@@ -2477,10 +2595,19 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         for (const [id, ref] of recordOf) {
             const m = objeOf(mediaSlots[slotsOfMedia.get(id)![0]].att);
             written.push(`0 ${ref} OBJE`);
-            pushWrapped(written, 1, 'FILE', m.file);
-            written.push(`2 FORM ${objeForm(m)}`);
-            if (m.type) written.push(`3 TYPE ${m.type}`);
-            if (m.title) pushWrapped(written, 2, 'TITL', m.title);
+            const dataRef = fileDataRef(m.file);
+            if (dataRef) {
+                // By reference (spec 133): no FILE, its FORM, TYPE and TITL right under the record.
+                written.push(`1 _STROM_DATA ${dataRef}`);
+                written.push(`1 FORM ${objeForm(m)}`);
+                if (m.type) written.push(`2 TYPE ${m.type}`);
+                if (m.title) pushWrapped(written, 1, 'TITL', m.title);
+            } else {
+                pushFile(written, 1, m.file);
+                written.push(`2 FORM ${objeForm(m)}`);
+                if (m.type) written.push(`3 TYPE ${m.type}`);
+                if (m.title) pushWrapped(written, 2, 'TITL', m.title);
+            }
             if (m.name) pushWrapped(written, 1, '_STROM_NAME', m.name);
             pushObjeRest(written, 1, m);
         }
@@ -2499,5 +2626,6 @@ export function exportToGedcom(data: StromData, treeName?: string, options: Gedc
         },
         // (A page of a research's record is answered by its record: not named apart.)
         xrefs: { persons: personIdMap, sources: recordPages.size ? new Map([...sourceIdMap].filter(([id]) => !recordPages.has(id))) : sourceIdMap },
+        media: mediaCounts,
     };
 }

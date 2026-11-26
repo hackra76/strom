@@ -24,6 +24,7 @@ import { researchTrialTagHtml } from './research-tree-settings-ui.js';
 import { getSelection, selectionText } from './view-selection-ui.js';
 import { selectionOffered } from './selection-picker-ui.js';
 import { satelliteResearchMenu } from '../windows/window-research-menu.js';
+import { phoneResearchReady } from './phone-research-ui.js';
 
 /** A row / section in a menu-style bottom sheet (the "More" and "Tree" sheets). */
 interface MenuRow {
@@ -54,6 +55,8 @@ interface MenuRow {
     page?: { title: string; rows: MenuRow[]; note?: string };
     /** A stable id for the row (tests, focus). */
     id?: string;
+    /** An extra class of the row (a device's research tree: its name and second line as in the chooser). */
+    className?: string;
     /** A small sign before the label (the Table view's row actions: ⌖ ▤ ✎); '' keeps its place empty. */
     icon?: string;
     /** A drawn sign (an SVG, trusted markup) in place of `icon`'s text (the Table's pin). */
@@ -74,6 +77,8 @@ interface StorageRow { title: string; sub?: string; run: () => void; }
 interface ValueRow { label: string; value: string; run: () => void; id?: string; }
 interface MenuBlock {
     header?: string; rows: MenuRow[]; pair?: MenuRow[]; treeRow?: TreeRow; divider?: boolean; storageRow?: StorageRow; note?: string;
+    /** A quiet sentence after the rows (what is not here, and where it is). */
+    quiet?: string;
     /** A quiet label at the start of the pair's line ("View:"). */
     pairLabel?: string;
     /** A framed row across the sheet under the pair ("Family line · Whole tree ›"). */
@@ -84,6 +89,8 @@ interface MenuBlock {
     research?: ResearchSheetGroup;
     /** A quiet line with its link before the block (the research programs out of the browser's reach); hidden until it applies. */
     lead?: { id: string; text: string; link: string; run: () => void; hidden?: boolean };
+    /** What the block shows before its rows, read only (a phone's group of finds with their times). */
+    content?: HTMLElement;
 }
 
 /** Coarse pointer = touch device; used to gate touch-only behaviour. */
@@ -481,10 +488,17 @@ export const bottomSheetMethods = uiModule({
                 : () => toggleFullscreen(),
         } : null;
         const sideways = typeof matchMedia === 'function' && matchMedia(MQ_PHONE_LANDSCAPE).matches;
+        // A phone's Research screen takes Descendants' place in the bar (spec 094 §1 point 3): here instead.
+        const descendantsTile = phoneResearchReady()
+            ? [{ label: s.viewModeSwitch.descendants, id: 'sheet-descendants', run: () => this.setDisplayViewMode('descendants'), active: !this.phoneResearchActive() && mode === 'descendants' }]
+            : [];
         blocks.push({ divider: true, rows: [], pairLabel: s.menu.sectionView, pair: [
+            ...descendantsTile,
             { label: s.viewModeSwitch.fan, run: () => this.setDisplayViewMode('fan'), active: mode === 'fan' },
             { label: s.viewModeSwitch.map, run: () => this.setDisplayViewMode('map'), active: mode === 'map' },
             { label: s.viewModeSwitch.timeline, run: () => this.setDisplayViewMode('timeline'), active: mode === 'timeline' },
+            // The Statistics (spec 138 §10.1): no view mode, a window over the tree; an exported page has none.
+            ...(viewMode ? [] : [{ label: s.treeStats.menu, id: 'sheet-stats', run: () => this.showActiveTreeStats() }]),
             ...(fullscreenRow && sideways ? [fullscreenRow] : []),
         ], valueRow: selectionRow, valueInPair: sideways });
         if (fullscreenRow && !sideways) blocks.push({ rows: [fullscreenRow] });
@@ -535,6 +549,8 @@ export const bottomSheetMethods = uiModule({
         research?: boolean; more?: boolean;
         /** A quiet line under the title (the fan's sector: years and number). */
         subtitle?: string;
+        /** Quiet words after the title on its line (a person's years). */
+        titleAside?: string;
         /** Extra class of the overlay (its own scrim). */
         overlayClass?: string;
         /** Called once when the sheet closes (any way). */
@@ -555,6 +571,12 @@ export const bottomSheetMethods = uiModule({
         const title = document.createElement('div');
         title.className = 'bottom-sheet-menu-title';
         title.textContent = titleText;
+        if (opts.titleAside) {
+            const aside = document.createElement('span');
+            aside.className = 'bottom-sheet-menu-aside';
+            aside.textContent = ` · ${opts.titleAside}`;
+            title.appendChild(aside);
+        }
         sheet.appendChild(title);
         // The quiet line under the title goes with it on a second page.
         let subLine: HTMLElement | null = null;
@@ -579,6 +601,7 @@ export const bottomSheetMethods = uiModule({
                 btn.dataset.selForm = 'row';
             }
             if (row.id) btn.id = row.id;
+            if (row.className) btn.classList.add(row.className);
             if (row.icon !== undefined) {
                 const icon = document.createElement('span');
                 icon.className = 'bottom-sheet-icon';
@@ -870,6 +893,12 @@ export const bottomSheetMethods = uiModule({
                 text.className = 'research-sheet-state-text';
                 text.id = 'research-sheet-state-text';
                 text.textContent = st.title;
+                line.append(dot, text);
+                list.appendChild(line);
+            }
+            if (group.state?.action) {
+                const st = { ...group.state, action: group.state.action };
+                const line = list.querySelector<HTMLElement>('#research-sheet-state')!;
                 const act = document.createElement('button');
                 act.type = 'button';
                 act.className = st.action.asLink ? 'research-sync-link' : 'primary btn-sm research-sync-btn';
@@ -881,11 +910,17 @@ export const bottomSheetMethods = uiModule({
                     this.hideBottomSheet();
                     st.action.run();
                 });
-                line.append(dot, text, act);
-                list.appendChild(line);
+                line.appendChild(act);
             }
             for (const row of group.rows) {
-                list.appendChild(makeButton({ label: row.label, run: row.run, badge: row.count, warnBadge: true, ai: row.ai, ext: row.ext, ariaLabel: row.ariaLabel, value: row.value, id: row.id }));
+                const btn = makeButton({ label: row.label, run: row.run, badge: row.count, warnBadge: true, ai: row.ai, ext: row.ext, ariaLabel: row.ariaLabel, value: row.value, id: row.id });
+                if (row.disabled) {
+                    // Grey and still read by a screen reader (a disabled button would be skipped).
+                    btn.classList.add('is-disabled');
+                    btn.setAttribute('aria-disabled', 'true');
+                    btn.addEventListener('click', (e) => e.stopImmediatePropagation(), { capture: true });
+                }
+                list.appendChild(btn);
             }
             allRow = document.createElement('button');
             allRow.type = 'button';
@@ -937,6 +972,12 @@ export const bottomSheetMethods = uiModule({
                 note.textContent = block.note;
                 list.appendChild(note);
             }
+            if (block.quiet) {
+                const quiet = document.createElement('p');
+                quiet.className = 'bottom-sheet-quiet';
+                quiet.textContent = block.quiet;
+                list.appendChild(quiet);
+            }
             if (block.divider) {
                 const divider = document.createElement('div');
                 divider.className = 'bottom-sheet-divider';
@@ -950,6 +991,7 @@ export const bottomSheetMethods = uiModule({
                 list.appendChild(header);
             }
             if (block.research) appendResearchGroup(block.research);
+            if (block.content) list.appendChild(block.content);
             for (const row of block.rows) {
                 list.appendChild(makeButton(row));
                 if (row.after) list.appendChild(makeAfter(row.after));

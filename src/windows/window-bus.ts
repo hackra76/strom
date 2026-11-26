@@ -4,9 +4,20 @@
  * being the sending window's id; a message with `to` is meant for that
  * window only. A window never handles its own messages.
  *
- * The tree travels as one JSON string of the whole data (`json`): the
- * receiver parses it in a fraction of the time a structured clone of the
- * object takes, and it holds exactly what storage would (prototype S0).
+ * The tree goes to the satellites as the whole data object (`data`, a
+ * JSON-shaped copy the channel clones): no window builds a string of the
+ * whole tree. A big tree's images made that string hundreds of MB, twice
+ * over with any non-Latin letter, once in the main window and once more in
+ * every window it reached, at every change (out of memory with the Research
+ * overview open). A satellite's edit still travels as JSON (`json`).
+ * The tree's stored images go as the pool references the tree holds, with
+ * their catalog entries (`imageMeta`), to every satellite that takes them
+ * (`poolRefs` in its hello): it reads their bytes through the main window,
+ * found through `opener`, or else asks for them here (`images-req`, answered
+ * with the Blobs). Any other window gets them whole (window-images.ts,
+ * spec 135).
+ * A window that does not say `takesData` (3.31 and before) gets the tree as
+ * one JSON string (`json`), and while one is open, so do all.
  */
 
 import type { TreeId } from '../types.js';
@@ -74,7 +85,7 @@ export type WindowMessageBody =
      * state (K4). `agent`: the window's own following of the agent (spec 097
      * §1–§3; none without a live session), for the order of taking over (§7).
      */
-    | { type: 'hello'; windowId: string; kind: SatelliteKind; treeId: TreeId | null; state?: unknown; agent?: AgentFollow | null }
+    | { type: 'hello'; windowId: string; kind: SatelliteKind; treeId: TreeId | null; state?: unknown; agent?: AgentFollow | null; takesData?: true; poolRefs?: true }
     /** main → sat: the view's starting state from openSatellite (once, before `tree`). */
     | { type: 'init'; to: string; kind: SatelliteKind; state: unknown }
     /**
@@ -85,9 +96,16 @@ export type WindowMessageBody =
      * (`{ personId, depthUp, depthDown }`), where a window without a state of
      * its own starts.
      */
-    | { type: 'tree'; to?: string; treeId: TreeId; name: string; revision: number; json: string; replaces?: { treeId: TreeId; exists: boolean }; focus?: unknown }
-    /** main → all: the tree after a save (any: own edit, a satellite's, undo, the research). */
-    | { type: 'patch'; treeId: TreeId; revision: number; json: string }
+    | { type: 'tree'; to?: string; treeId: TreeId; name: string; revision: number; data?: unknown; json?: string; imageMeta?: Record<string, unknown>; replaces?: { treeId: TreeId; exists: boolean }; focus?: unknown }
+    /**
+     * main → all: the tree after a save (any: own edit, a satellite's, undo, the research); `data` (an older main
+     * window's: `json`). `images`: the same revision, its new images now as their pool references (spec 135).
+     */
+    | { type: 'patch'; treeId: TreeId; revision: number; data?: unknown; json?: string; imageMeta?: Record<string, unknown>; images?: true }
+    /** sat → main: the pooled images `ids` as Blobs, for a window that does not reach the main window's pool (spec 135). */
+    | { type: 'images-req'; windowId: string; reqId: string; ids: string[] }
+    /** main → sat: the answer to `images-req` (null: not in the pool, or not readable now). */
+    | { type: 'images'; to: string; reqId: string; blobs: Record<string, Blob | null> }
     /** sat → main: an edit made on the copy of revision `baseRevision`; `json` = the whole data after it. */
     | { type: 'edit'; windowId: string; editId: string; treeId: TreeId; baseRevision: number; json: string; label: string; listsOnly?: true }
     /** main → sat: the edit's result; `ok: false` = not applied (a fresh `tree` follows to that window). */
@@ -183,7 +201,7 @@ export interface ChannelLike {
 }
 
 const TYPES = new Set<string>(['hello', 'init', 'tree', 'patch', 'edit', 'edit-result', 'select', 'send-mode', 'undo', 'redo', 'status',
-    'focus-req', 'focused', 'research-action', 'research-action-result', 'research-menu-req', 'research-menu', 'research-state', 'agent-state', 'agent-state-req', 'fan-rod-colors', 'view', 'spawn', 'bye', 'main-bye', 'taking-over', 'link', 'show-on-map', 'close']);
+    'focus-req', 'focused', 'research-action', 'research-action-result', 'research-menu-req', 'research-menu', 'research-state', 'agent-state', 'agent-state-req', 'fan-rod-colors', 'view', 'spawn', 'bye', 'main-bye', 'taking-over', 'link', 'show-on-map', 'close', 'images-req', 'images']);
 
 function isWindowMessage(data: unknown): data is WindowMessage {
     if (!data || typeof data !== 'object') return false;

@@ -8,6 +8,9 @@
  * responsive (and on the main thread with pauses when a worker cannot start).
  */
 
+import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js';
+import { canWorkOffThread, runOffThread, yieldToPage } from './heavy-work.js';
+
 /** Files up to this size go through crypto.subtle.digest in one piece. */
 export const SUBTLE_MAX_BYTES = 64 * 1024 * 1024;
 /** Piece size of the streaming hash. */
@@ -184,22 +187,34 @@ function hashInWorker(blob: Blob, onProgress?: (done: number) => void): Promise<
 }
 
 /**
- * SHA-256 of bytes in memory: WebCrypto where the page has it, the
- * self-contained implementation otherwise. crypto.subtle exists only in a
- * secure context (https, localhost, a file opened from disk); on plain http
- * at a network address the app still has to hash its images.
+ * SHA-256 of bytes in memory: WebCrypto where the page has it, @noble's
+ * otherwise (a third faster than createSha256 in Safari's engine: a device of
+ * the home network hashes every photo of a research it opens). crypto.subtle
+ * exists only in a secure context (https, localhost, a file opened from disk);
+ * on plain http at a network address the app still has to hash its images.
  */
 export async function sha256Bytes(bytes: Uint8Array): Promise<ArrayBuffer> {
     if (typeof crypto !== 'undefined' && crypto.subtle) {
         return crypto.subtle.digest('SHA-256', bytes as BufferSource);
     }
-    const h = createSha256();
-    h.update(bytes);
-    const hexText = h.digestHex();
-    const out = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) out[i] = parseInt(hexText.slice(i * 2, i * 2 + 2), 16);
-    return out.buffer;
+    // Without JIT a photo takes over half a second: in a worker, or after a
+    // pause for the page (a run of them never freezes it for seconds).
+    if (bytes.length >= OFF_THREAD_MIN_BYTES) {
+        if (canWorkOffThread()) {
+            try {
+                // A view of a larger buffer goes as its own bytes (a clone would copy all of that buffer).
+                const own = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? bytes : bytes.slice();
+                const r = await runOffThread({ op: 'sha256', bytes: own });
+                if ('digest' in r) return r.digest;
+            } catch { /* done here */ }
+        }
+        await yieldToPage();
+    }
+    return nobleSha256(bytes).slice().buffer as ArrayBuffer;
 }
+
+/** Bytes from this many on are hashed off the page's thread when it has no WebCrypto (sha256Bytes). */
+export const OFF_THREAD_MIN_BYTES = 64 * 1024;
 
 /**
  * SHA-256 of a whole Blob as lowercase hex. Small files in one piece through

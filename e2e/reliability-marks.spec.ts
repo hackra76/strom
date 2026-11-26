@@ -1,7 +1,7 @@
 import { test, expect, Page, TestInfo } from '@playwright/test';
 import { readFileSync, writeFileSync } from 'fs';
-import { openApp, createFirstPerson, waitForPersist, cardAction, personModal, card } from './helpers.js';
-import { BRIDGE, HEAD, fakeBridge, openResearch, poll, researchGed } from './research-bridge.js';
+import { openApp, createFirstPerson, waitForPersist, cardAction, personModal, card, importGedcomAsNewTree } from './helpers.js';
+import { BRIDGE, HEAD, NEW_HEAD, fakeBridge, openResearch, poll, researchGed } from './research-bridge.js';
 
 /**
  * One mark of reliability per fact (spec 066 §2): after a GEDCOM from another
@@ -32,11 +32,7 @@ function writeGedcom(testInfo: TestInfo, cited = false): string {
 }
 
 async function importTree(page: Page, testInfo: TestInfo, cited = false): Promise<void> {
-    await page.locator('#gedcom-input').setInputFiles(writeGedcom(testInfo, cited));
-    await page.locator('#gedcom-result-modal #gedcom-new-tree-btn').click();
-    const importDialog = page.locator('#import-tree-modal');
-    await importDialog.locator('#import-tree-name').fill('Kvapilík');
-    await importDialog.getByRole('button', { name: 'Import' }).click();
+    await importGedcomAsNewTree(page, writeGedcom(testInfo, cited));
     const next = page.locator('#import-next-card');
     await expect(next).toBeVisible();
     await next.locator('.import-next-close').click();
@@ -422,6 +418,8 @@ interface Refusal { status: number; code: string }
 /** `/verify` and `/facts/confirm` of the research's bridge (the reply's place in the queue: `position`). */
 async function verifyRoutes(page: Page, opts: {
     position?: number; verifyRefusal?: Refusal; confirmRefusal?: Refusal; facts?: (fact: string) => unknown[];
+    /** Called before the confirm's refusal is answered (the research's state as it refuses). */
+    onConfirmRefusal?: () => void;
 } = {}): Promise<VerifyAsks> {
     const asks: VerifyAsks = { verify: [], confirm: [] };
     const cors = { 'access-control-allow-origin': '*' };
@@ -444,7 +442,10 @@ async function verifyRoutes(page: Page, opts: {
         if (route.request().method() === 'OPTIONS') return route.fulfill({ status: 204, headers: { ...cors, 'access-control-allow-headers': '*' } });
         const body = JSON.parse(route.request().postData() ?? '{}') as { fact: string; txt?: string; confirm: boolean };
         asks.confirm.push(body);
-        if (opts.confirmRefusal) return route.fulfill(refusal(opts.confirmRefusal));
+        if (opts.confirmRefusal) {
+            opts.onConfirmRefusal?.();
+            return route.fulfill(refusal(opts.confirmRefusal));
+        }
         return route.fulfill(json({ ok: true, fact: body.fact, owner: 'P0003', ...(body.confirm ? { confirmed: '2026-11-09' } : {}), head: HEAD, parent: HEAD }));
     });
     return asks;
@@ -456,9 +457,15 @@ async function openVerifyTree(page: Page, opts: {
     facts?: (fact: string) => unknown[];
 } = {}): Promise<VerifyAsks> {
     const ged = opts.ged ?? verifyGed(opts.extra);
-    await fakeBridge(page, { features: opts.features ?? ['verify', 'facts.confirm'], treeGed: ged });
+    const bridge = await fakeBridge(page, { features: opts.features ?? ['verify', 'facts.confirm'], treeGed: ged });
+    // 409 confirm.changed: the research changed the fact meanwhile, so its tree is another one under a new head.
+    const changed = opts.confirmRefusal?.code === 'confirm.changed' ? () => {
+        bridge.head = NEW_HEAD;
+        bridge.treeGed = ged.replace(`1 _STROM_HEAD ${HEAD}`, `1 _STROM_HEAD ${NEW_HEAD}`).replace('2 DATE 3 FEB 1862', '2 DATE 4 FEB 1862');
+    } : undefined;
     const asks = await verifyRoutes(page, {
         position: opts.position, verifyRefusal: opts.verifyRefusal, confirmRefusal: opts.confirmRefusal, facts: opts.facts,
+        ...(changed ? { onConfirmRefusal: changed } : {}),
     });
     await openResearch(page, { ged });
     await poll(page);
@@ -1019,11 +1026,7 @@ function namedForeignGed(testInfo: TestInfo): string {
 async function openNamedForeign(page: Page, testInfo: TestInfo): Promise<void> {
     await page.setViewportSize({ width: 1440, height: 900 });
     await openApp(page);
-    await page.locator('#gedcom-input').setInputFiles(namedForeignGed(testInfo));
-    await page.locator('#gedcom-result-modal #gedcom-new-tree-btn').click();
-    const importDialog = page.locator('#import-tree-modal');
-    await importDialog.locator('#import-tree-name').fill('Kvapilík');
-    await importDialog.getByRole('button', { name: 'Import' }).click();
+    await importGedcomAsNewTree(page, namedForeignGed(testInfo));
     const next = page.locator('#import-next-card');
     await expect(next).toBeVisible();
     await next.locator('.import-next-close').click();

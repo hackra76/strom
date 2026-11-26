@@ -23,6 +23,8 @@ import { Person, PersonId } from '../types.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { researchLinkMark } from '../research-link.js';
 import { announcedResearchScheme } from '../research-device.js';
+import { deviceBlobUrl, openBridgeFile } from '../device/device-bridge.js';
+import { parseDeviceBridge } from '../research-link.js';
 import {
     MaterialItem, cachedMaterialList, materialFileItem, materialType, materialKindLabel, materialFolder,
     materialFromKey, fileExt, fileUrl, thumbUrl, materialSystemLink, getCachedThumb, researchMakesThumb,
@@ -30,7 +32,9 @@ import {
 } from '../materials.js';
 import { iconSvg } from '../icons.js';
 import { detailsKeys, materialDetailsEdit, materialDetailsFields, materialDetailsOf } from './material-details-ui.js';
-import { attachmentResizeState, pdfBlobFromDataUrl } from '../attachments.js';
+import { attachmentResizeState } from '../attachments.js';
+import { isPoolRef } from '../image-ref.js';
+import { openPdfValue, wireImageDownload } from './image-file.js';
 import { formatBytesShort } from './originals-ui.js';
 import { openViewerList, closeImageViewer, viewerListOpen, viewerListIndex, redrawViewerList, relayoutViewer, goViewerList, ViewerSlots } from './image-viewer.js';
 import { MaterialOpenCtx, MaterialsContext, appendBreakable, materialItemSha, materialTileLetters, treeAttachmentsKey } from './materials-ui.js';
@@ -192,13 +196,9 @@ export function attachmentPdf(item: MaterialItem): { dataUrl: string; mimeType: 
     return att && !att.originalOnly && att.dataUrl && !isPendingImageUrl(att.dataUrl) && att.mimeType === 'application/pdf' ? { dataUrl: att.dataUrl, mimeType: att.mimeType } : null;
 }
 
+/** Open the tree's PDF (a data URL, or a pooled one read as a Blob) in a new tab; false: not a PDF to open. */
 export function openPdfBlob(pdf: { dataUrl: string; mimeType: string }): boolean {
-    const blob = pdfBlobFromDataUrl(pdf.dataUrl, pdf.mimeType);
-    if (!blob) return false;
-    const url = URL.createObjectURL(blob);
-    window.open(url, '_blank');
-    setTimeout(() => URL.revokeObjectURL(url), PDF_URL_LIFETIME_MS);
-    return true;
+    return openPdfValue(pdf.dataUrl, pdf.mimeType, undefined, PDF_URL_LIFETIME_MS);
 }
 
 function releaseUrls(state: ViewerState | null): void {
@@ -254,7 +254,19 @@ function viewerCard(letters: string, text: string, buttons: CardButton[], previe
         const img = h('img');
         img.alt = '';
         img.onerror = () => { tile.textContent = letters; };
-        img.src = preview;
+        if (parseDeviceBridge(preview)) {
+            // A preview of the bridge on a device (spec 094 P3): its bytes through the tunnel, never asked of
+            // the device base itself (the gateway does not serve it); the viewer lets the URL go when it closes.
+            const held = viewer;
+            void deviceBlobUrl(preview).then((url) => {
+                if (!url) { tile.textContent = letters; return; }
+                if (held && viewer === held) held.urls.push(url);
+                else setTimeout(() => URL.revokeObjectURL(url), 60_000);
+                img.src = url;
+            });
+        } else {
+            img.src = preview;
+        }
         tile.appendChild(img);
     } else {
         tile.textContent = letters;
@@ -296,7 +308,7 @@ export const materialViewerMethods = uiModule({
         const ctx = this.materialsContext();
         const sha = materialItemSha(item);
         if (!item.file || !ctx?.caps.bridgeUp || !ctx.base || !sha || !item.here) return false;
-        window.open(fileUrl(ctx.base, sha), '_blank', 'noopener');
+        openBridgeFile(fileUrl(ctx.base, sha));
         return true;
     },
 
@@ -645,7 +657,7 @@ export const materialViewerMethods = uiModule({
         }
         if (type === 'pdf') {
             if (pdf) slots.card(viewerCard('PDF', m.pdfText, [{ label: m.openPdf, run: () => openPdfBlob(pdf), primary: true }]));
-            else if (up && sha) slots.card(viewerCard('PDF', m.pdfText, [{ label: m.openPdf, run: () => { window.open(fileUrl(ctx!.base!, sha), '_blank', 'noopener'); }, primary: true }]));
+            else if (up && sha) slots.card(viewerCard('PDF', m.pdfText, [{ label: m.openPdf, run: () => openBridgeFile(fileUrl(ctx!.base!, sha)), primary: true }]));
             else slots.card(viewerCard('PDF', m.opensWhenRunning, [...start, ...openSystem]));
             return;
         }
@@ -830,31 +842,37 @@ export const materialViewerMethods = uiModule({
         };
         const download = (href: string, file: string) => {
             const a = h('a', 'mv-act', m.download);
+            a.dataset.action = 'download';
+            // The tree's own copy: a data URL as the link, a pooled one saved from its bytes on the click.
+            if (href.startsWith('data:') || isPoolRef(href)) {
+                wireImageDownload(a, href, file);
+                actions.appendChild(a);
+                return;
+            }
             a.href = href;
             a.download = file;
-            a.dataset.action = 'download';
-            if (!href.startsWith('data:')) {
-                a.target = '_blank';
-                a.rel = 'noopener';
-                // Another origin: the link alone would only open it (it stays for a middle click or a copy).
-                a.addEventListener('click', (e) => {
-                    if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
-                    e.preventDefault();
-                    if (a.getAttribute('aria-busy') === 'true') return;
-                    a.setAttribute('aria-busy', 'true');
-                    void downloadFromBridge(href, file).finally(() => a.removeAttribute('aria-busy'));
-                });
-            }
+            a.target = '_blank';
+            a.rel = 'noopener';
+            // Another origin: the link alone would only open it (it stays for a middle click or a copy).
+            a.addEventListener('click', (e) => {
+                if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+                e.preventDefault();
+                if (a.getAttribute('aria-busy') === 'true') return;
+                a.setAttribute('aria-busy', 'true');
+                void downloadFromBridge(href, file).finally(() => a.removeAttribute('aria-busy'));
+            });
             actions.appendChild(a);
         };
         // Link to… (spec 102 §4): the tree's file in the tree; material outside it needs the bridge (Q2).
         const inTree = !!item.attachment?.places?.length;
         // A family tree file (spec 117 §5): Delete permanently… is its only action.
-        const canAttach = item.tree ? false : inTree ? DataManager.canEditMedia(item.attachment!.id) : inArchive && !!ctx?.caps.assign && !item.removedId && !DataManager.isReadOnly();
+        const canAttach = item.tree ? false : inTree ? DataManager.canEditMedia(item.attachment!.id, { exceptFollow: true }) : inArchive && !!ctx?.caps.assign && !item.removedId && !DataManager.isReadOnly();
+        // Create a source from this file…: as Link to…, but not while the tree follows a research (Link to… waits in its dialog, 1123).
+        const canMakeSource = item.tree ? false : inTree ? DataManager.canEditMedia(item.attachment!.id) : canAttach;
         // The person the materials were opened for (their card, the window filtered to them) is chosen at the start (1121).
         if (canAttach) action(m.attach, () => this.openAttachDialog([item], { personId: st.ctx.personId ?? this.materialContextPerson() }), { primary: true, write: !inTree, id: 'attach' });
         // Create a source from this file… (spec 102 §5): the second action, the same conditions as Link to….
-        if (canAttach && this.canEditSources()) action(m.makeSource, () => void this.makeSourceFromMaterial(item, { personId: this.materialContextPerson() }), { write: !inTree, id: 'makeSource' });
+        if (canMakeSource && this.canEditSources()) action(m.makeSource, () => void this.makeSourceFromMaterial(item, { personId: this.materialContextPerson() }), { write: !inTree, id: 'makeSource' });
         if (inArchive && !item.tree) {
             if (item.removedId && item.hidden) {
                 // Taken out of the tree: back with its places (the tree's own write).

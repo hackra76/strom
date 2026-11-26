@@ -27,6 +27,11 @@ import { researchPersonRef, researchFamilyRef, personResearchRef, familyResearch
 import { TASKS_AUDIT_FEATURE, sanitizeWaitingAudit, type WaitingAudit } from './research-audit.js';
 import { HISTORY_KINDS, isHistoryKind, parseHistoryKindList, type HistoryKind } from './history.js';
 import { sourcePlaceKey } from './source-location.js';
+import { isImageValue, isPoolRef } from './image-ref.js';
+import { pooledImageToken } from './image-meta.js';
+import { sameImageSync, imageFinder } from './image-equal.js';
+import { graphemes } from './text-clip.js';
+import type { DeviceClient } from './device-client.js';
 
 /** `1 SOUR` value that marks a file written by Strom Research. */
 export const STROM_RESEARCH_SOURCE = 'STROM_RESEARCH';
@@ -108,6 +113,16 @@ export interface ResearchLinkMarkParams {
 
 /** The mark of an action of the research, by its link (see `ResearchActionMark`). */
 export function researchLinkMark(action: ResearchLinkAction, p: ResearchLinkMarkParams = {}): ResearchActionMark {
+    const own = computerLinkMark(action, p);
+    // A device of the home network (spec 094 §6): what it draws goes through the bridge, never a terminal — except
+    // the agent's work, which the gateway starts in the research's terminal on the computer (K3.15, `agent.start`):
+    // the same mark as on the computer.
+    if (deviceState) return own === 'agent' && deviceState.actions.includes(DEVICE_AGENT_START) ? 'agent' : 'none';
+    return own;
+}
+
+/** The mark of a link as the app on the computer with the research draws it. */
+function computerLinkMark(action: ResearchLinkAction, p: ResearchLinkMarkParams): ResearchActionMark {
     // A conversation about a task or a conflict is the agent's; an experiment switched off goes at once.
     if (action === 'task' && p.taskDo === 'chat') return 'agent';
     if (action === 'conflict' && p.conflictDo === 'agent') return 'agent';
@@ -154,6 +169,233 @@ export function researchUrlMark(url: string): ResearchActionMark | null {
     const action = m[1] as ResearchLinkAction;
     const what = new URLSearchParams(m[2] ?? '').get('do') ?? undefined;
     return researchLinkMark(action, { taskDo: what, conflictDo: what, experimentDo: what, fixDo: what });
+}
+
+/**
+ * The mark of an action asked through the bridge: its own (RESEARCH_BRIDGE_MARKS); on a device (spec 094 §6) none,
+ * unless the gateway lets it ask the bridge's actions with an agent (K3.15, `agent.bridge`): then its own too.
+ */
+export function researchBridgeMark(action: ResearchBridgeAction): ResearchBridgeMark {
+    return deviceState && !deviceState.actions.includes(DEVICE_AGENT_BRIDGE) ? 'none' : RESEARCH_BRIDGE_MARKS[action];
+}
+
+// ==================== A DEVICE OF THE HOME NETWORK (spec 094 P3) ====================
+
+/**
+ * The device action (`status.device.actions`) by which the gateway lets a device start the agent's work in the
+ * research's terminal on the computer (`POST device/agent {link}`, spec 094 K3.15): only a research where an agent
+ * works (not an archive, not one waiting for the agent).
+ */
+export const DEVICE_AGENT_START = 'agent.start';
+/** The device action by which the gateway lets a device ask the bridge's actions where an agent works without a terminal (K3.15). */
+export const DEVICE_AGENT_BRIDGE = 'agent.bridge';
+/** The feature of `/status` (only with the devices on) saying the gateway knows `device/agent` (K3.15). */
+export const DEVICE_AGENT_FEATURE = 'device.agent';
+
+/**
+ * The app opened from the research's gateway on another device and paired
+ * (spec 094 P3): where it is (`origin`), the trees the pairing opens, the
+ * computer's name to show, and the device actions its status announced
+ * (`status.device.actions`). null: not a device — the app as always.
+ */
+export interface ResearchDeviceState {
+    origin: string;
+    trees: readonly string[];
+    computer: string;
+    actions: readonly string[];
+    /** How many other devices are connected now (`status.device.others`, spec 094 §9); absent: not said. */
+    others?: number;
+}
+
+let deviceState: ResearchDeviceState | null = null;
+/** A page of the research's gateway, its device mode not yet confirmed or turned down (spec 094 P3). */
+let devicePage = false;
+
+/** The page may be a device of the gateway (true at start), or turned out not to be one (false). */
+export function setResearchDevicePage(on: boolean): void {
+    devicePage = on;
+}
+
+/** A page of the research's gateway (a device): never the research's own computer, even before it is confirmed. */
+export function researchDevicePage(): boolean {
+    return devicePage || deviceState !== null;
+}
+
+/** The device mode confirmed and paired (or left: null). */
+export function setResearchDeviceState(next: ResearchDeviceState | null): void {
+    deviceState = next ? { origin: next.origin, trees: [...next.trees], computer: next.computer, actions: [...next.actions] } : null;
+    if (!next) refusedOnDevice.clear();
+}
+
+/**
+ * The device actions a status announced (`status.device.actions`), kept with the device's state, and how many
+ * other devices it says are connected now (`status.device.others`; a status without it: not known).
+ */
+export function noteResearchDeviceActions(actions: unknown, others?: unknown): void {
+    if (!deviceState || !Array.isArray(actions)) return;
+    const n = typeof others === 'number' && Number.isFinite(others) && others >= 0 ? Math.min(999, Math.floor(others)) : null;
+    const { others: _was, ...rest } = deviceState;
+    deviceState = { ...rest, actions: actions.filter((a): a is string => typeof a === 'string'), ...(n !== null ? { others: n } : {}) };
+}
+
+/** The device's state, or null outside the device mode. */
+export function researchDeviceState(): ResearchDeviceState | null {
+    return deviceState;
+}
+
+/** The path under the device's own origin that stands for a tree's bridge (no token: the tunnel carries the key). */
+export const DEVICE_BRIDGE_PATH = '/__device/';
+
+/** The bridge of a tree reached through the gateway: `<origin>/__device/<tree>` (the origin: the device's own). */
+export function deviceBridgeBase(treeId: string, origin: string = deviceState?.origin ?? ''): string {
+    return `${origin.replace(/\/+$/, '')}${DEVICE_BRIDGE_PATH}${encodeURIComponent(treeId)}`;
+}
+
+/**
+ * A URL of a tree's bridge through the gateway: the tree and the bridge's path
+ * after it (`status`, `media/<sha>?thumb=1`). Only in the device mode and at
+ * the device's own origin; anything else is null.
+ */
+export function parseDeviceBridge(raw: unknown): { treeId: string; base: string; path: string } | null {
+    if (!deviceState || typeof raw !== 'string' || raw.length > 4096) return null;
+    let url: URL;
+    try {
+        url = new URL(raw, deviceState.origin);
+    } catch {
+        return null;
+    }
+    if (url.origin !== deviceState.origin || url.username || url.password || !url.pathname.startsWith(DEVICE_BRIDGE_PATH)) return null;
+    const rest = url.pathname.slice(DEVICE_BRIDGE_PATH.length);
+    const slash = rest.indexOf('/');
+    let treeId: string;
+    try {
+        treeId = decodeURIComponent(slash < 0 ? rest : rest.slice(0, slash));
+    } catch {
+        return null;
+    }
+    if (!treeId) return null;
+    return { treeId, base: deviceBridgeBase(treeId), path: (slash < 0 ? '' : rest.slice(slash + 1)) + url.search };
+}
+
+/**
+ * What a device may do besides the actions of the scheme and of the bridge
+ * (spec 094 §6): undo this one send, answer what waits, read a document with
+ * the agent, the devices, the research tools, the tree's settings in the
+ * research, a newer version loaded, a new direction or the agent's work on one,
+ * a conflict left to the agent.
+ */
+export type ResearchDeviceExtra = 'sync-undo-this' | 'waiting-answer' | 'read-document' | 'devices' | 'research-tools'
+    | 'tree-settings' | 'load-version' | 'direction-new' | 'direction-work' | 'conflict-agent';
+
+export type ResearchDeviceAction = ResearchLinkAction | ResearchBridgeAction | ResearchDeviceExtra;
+
+/**
+ * §6 of spec 094: true — the device does it through the bridge, without a mark;
+ * a device action of the gateway — only when the status announced it; false —
+ * only on the computer with the research (not drawn on a device).
+ */
+const DEVICE_ALLOWS: Readonly<Record<ResearchDeviceAction, boolean | string>> = {
+    // The tree's own things through the bridge: changes sent, an excerpt or an original, the tree, a book's files.
+    send: true, excerpt: true, media: true, app: true, live: true, book: true,
+    // A direction paused, ended, resumed or moved (its state through the bridge).
+    direction: true,
+    // Decided through the gateway's own paths, when it says so.
+    conflict: 'conflict.decide', hypothesis: 'hypothesis.decide', hypotheses: 'hypothesis.decide', 'sync-undo-this': 'sync.undo',
+    // Asked through the bridge without an agent.
+    'fact-confirm': true, 'verify-stop': true, 'sources-split': true, 'run-stop': true, 'waiting-answer': true,
+    // The agent's work in the research's terminal on the computer, started by the gateway (K3.15 `device/agent`): the
+    // queue, a line's run or a conversation about it, a task or a conflict left to the agent, the places and a place's
+    // history searched, a paid fix. Only their agent's links: `researchDeviceLinkAllows` refines them by `do=`.
+    work: DEVICE_AGENT_START, chat: DEVICE_AGENT_START, task: DEVICE_AGENT_START, places: DEVICE_AGENT_START,
+    history: DEVICE_AGENT_START, fixes: DEVICE_AGENT_START, 'direction-work': DEVICE_AGENT_START, 'conflict-agent': DEVICE_AGENT_START,
+    // An agent through the bridge, no terminal (K3.15): verifying, sorting files, reading a record or a source.
+    verify: DEVICE_AGENT_BRIDGE, 'verify-bulk': DEVICE_AGENT_BRIDGE, 'material-sort': DEVICE_AGENT_BRIDGE,
+    'read-document': DEVICE_AGENT_BRIDGE,
+    // The terminal for a person, the research's settings and approvals: only on the computer.
+    open: false, review: false, research: false, new: false, update: false, sessions: false,
+    story: false, 'sync-undo': false, setup: false, finish: false, archive: false, seal: false, experiment: false,
+    doctor: false, 'history-kinds': false, 'history-align': false, 'run-limit': false,
+    devices: false, 'research-tools': false, 'tree-settings': false, 'load-version': false, 'direction-new': false,
+};
+
+/** Whether `action` may be drawn on a device by what §6 allows and what the gateway announced (`actions`). */
+export function deviceAllows(action: ResearchDeviceAction, actions: readonly string[]): boolean {
+    const rule = DEVICE_ALLOWS[action];
+    return typeof rule === 'string' ? actions.includes(rule) : rule === true;
+}
+
+/** Whether an action of the research is drawn here: always outside the device mode, on a device only what §6 allows. */
+export function researchDeviceAllows(action: ResearchDeviceAction): boolean {
+    return deviceState ? deviceAllows(action, deviceState.actions) && !refusedOnDevice.has(action) : true;
+}
+
+/**
+ * Whether a link of the research is drawn here, by its action and what it asks (`do=`): always outside the device
+ * mode; on a device the agent's link (its mark on the computer `agent`) when the gateway announced `agent.start`
+ * (K3.15), any other link by what §6 allows — never a link of an `agent.start` action that only asks in the terminal
+ * (a fix that is not paid, a task not talked over).
+ */
+export function researchDeviceLinkAllows(action: ResearchLinkAction, p: ResearchLinkMarkParams = {}): boolean {
+    if (!deviceState) return true;
+    if (refusedOnDevice.has(action)) return false;
+    if (computerLinkMark(action, p) === 'agent') return deviceState.actions.includes(DEVICE_AGENT_START);
+    return DEVICE_ALLOWS[action] !== DEVICE_AGENT_START && deviceAllows(action, deviceState.actions);
+}
+
+/**
+ * Whether a ready link (`strom-research…://<action>?…`) goes from this device to the computer through the gateway
+ * (`POST device/agent`, K3.15): a device whose gateway announced `agent.start`, and a link of the agent's work
+ * (false outside the device mode: the computer opens its links itself).
+ */
+export function researchDeviceAgentLink(url: string, extra: Pick<ResearchLinkMarkParams, 'fixPaid'> = {}): boolean {
+    if (!deviceState || !deviceState.actions.includes(DEVICE_AGENT_START)) return false;
+    const m = /^strom-research(?:-[a-z0-9-]{1,32})?:\/\/([a-z-]+)(?:\?(.*))?$/.exec(url.trim());
+    if (!m || !(RESEARCH_LINK_ACTIONS as readonly string[]).includes(m[1])) return false;
+    const action = m[1] as ResearchLinkAction;
+    const what = new URLSearchParams(m[2] ?? '').get('do') ?? undefined;
+    // A fix's link does not say it is paid: the app that drew it does (`extra.fixPaid`).
+    const p: ResearchLinkMarkParams = { taskDo: what, conflictDo: what, experimentDo: what, fixDo: what, ...extra };
+    return computerLinkMark(action, p) === 'agent' && researchDeviceLinkAllows(action, p);
+}
+
+/** Said on the page when the gateway refused an action as the computer's only (its button goes; spec 094 §4). */
+export const DEVICE_COMPUTER_ONLY_EVENT = 'strom-device-computer-only';
+
+/** Actions the gateway refused on this device as the computer's only (`403 device.computer-only`), for this page. */
+const refusedOnDevice = new Set<ResearchDeviceAction>();
+
+/**
+ * The action a write of the bridge stands for on a device (what a `403 device.computer-only` of it hides), or null
+ * (a read, or a path no action is drawn for). `task`: the write carries a task (a file to what waits).
+ */
+export function deviceActionOfBridgeWrite(method: string, path: string, task = false): ResearchDeviceAction | null {
+    if (method === 'GET' || method === 'HEAD') return null;
+    const p = path.split('?')[0];
+    if (p === 'runs/stop') return 'run-stop';
+    // The gateway's own decisions (spec 094 §2.7).
+    if (p.startsWith('device/conflict/')) return 'conflict';
+    if (p.startsWith('device/hypothesis/')) return 'hypothesis';
+    if (p.startsWith('device/sync/')) return 'sync-undo-this';
+    if (p.startsWith('waiting/') || (p.startsWith('media/') && task)) return 'waiting-answer';
+    if (p.startsWith('directions/')) return 'direction';
+    // An agent through the bridge (K3.15, `agent.bridge`).
+    if (p === 'verify') return 'verify';
+    if (p === 'verify/bulk') return 'verify-bulk';
+    if (p === 'material/sort' || p.startsWith('material/sort/')) return 'material-sort';
+    if (p === 'read' || p.startsWith('read/') || p === 'sources/read' || /^sources\/[^/]+\/read\//.test(p)) return 'read-document';
+    if (p === 'sync') return 'send';
+    if (p.startsWith('media/')) return 'media';
+    return null;
+}
+
+/** The gateway refused `action` here as the computer's only: it is not drawn on this device any more (spec 094 §4). */
+export function noteResearchDeviceRefused(action: ResearchDeviceAction): void {
+    if (deviceState) refusedOnDevice.add(action);
+}
+
+/** The mark an action is drawn with here, or `hidden` (a device: only on the computer with the research). */
+export function researchDeviceMark(action: ResearchLinkAction, p: ResearchLinkMarkParams = {}): ResearchActionMark | 'hidden' {
+    return researchDeviceLinkAllows(action, p) ? researchLinkMark(action, p) : 'hidden';
 }
 
 /** A group of the research tools, in this order: look, assign work, run the agent (from free to paid). */
@@ -508,15 +750,36 @@ const CONFLICT_DOS: readonly string[] = ['decide', 'agent'];
 export type ResearchConflictTake = 'user' | 'research';
 const CONFLICT_TAKES: readonly string[] = ['user', 'research'];
 
+/** The most characters (as a person sees them) of the name a `new` link suggests — the research's own cut. */
+export const RESEARCH_NEW_NAME_MAX = 120;
+
+/**
+ * The name a `new` link suggests, cleaned as the research cleans it (1.37):
+ * NFC; control and format characters (but the joiners ZWJ/ZWNJ) and line
+ * ends become spaces, spaces merge; at most 120 whole characters as a person
+ * sees them (grapheme clusters — never half an emoji or a letter without its
+ * accent). '' when nothing is left.
+ */
+export function researchNewName(name: string | undefined): string {
+    const line = (name ?? '').normalize('NFC')
+        .replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, (c) => (c === '\u200c' || c === '\u200d' ? c : ' '))
+        .replace(/\s+/g, ' ').trim();
+    return graphemes(line).slice(0, RESEARCH_NEW_NAME_MAX).join('').trim();
+}
+
 /** "Start research with this tree": the one link without a tree (the research makes one). */
-export function researchNewUrl(token: string, browser?: string, file?: string, scheme: string = DEFAULT_RESEARCH_SCHEME): string | null {
+export function researchNewUrl(token: string, browser?: string, file?: string, scheme: string = DEFAULT_RESEARCH_SCHEME, name?: string): string | null {
     const app = researchAdoptToken(token);
     if (!app) return null;
     // The browser it came from (research-transfer.ts AppBrowser): the research opens that one again;
     // from Safari, the file the tree moves by (STROM_FROM_FILE of the line).
     const b = browser && /^[a-z]{1,16}$/.test(browser) ? `&browser=${browser}` : '';
     const f = file && /^strom-prenos-[A-Za-z0-9_-]{8}\.json$/.test(file) ? `&file=${file}` : '';
-    return `${researchLinkScheme(scheme)}://new?app=${app}${b}${f}`;
+    // The new research's suggested name (a copy's own research, spec 139 §11.4). A research that does
+    // not read it (before 1.37) asks the name as it always does, so it goes whenever there is one.
+    const clean = researchNewName(name);
+    const n = clean ? `&name=${encodeURIComponent(clean)}` : '';
+    return `${researchLinkScheme(scheme)}://new?app=${app}${b}${f}${n}`;
 }
 
 /**
@@ -876,9 +1139,10 @@ export interface LiveBridgeUrls {
 /** Endpoints of the bridge at `raw` (`http://127.0.0.1:<port>/<token>`), or null. */
 export function parseLiveBridge(raw: unknown): LiveBridgeUrls | null {
     const url = parseLoopbackUrl(raw);
-    if (!url) return null;
-    const path = url.pathname.replace(/\/+$/, '');
-    const base = `${url.origin}${path}`;
+    // A device (spec 094 P3): a tree's bridge through the gateway, at the device's own origin.
+    const device = url ? null : parseDeviceBridge(raw);
+    if (!url && !device) return null;
+    const base = device ? device.base : `${url!.origin}${url!.pathname.replace(/\/+$/, '')}`;
     return {
         base,
         status: `${base}/status`,
@@ -889,6 +1153,42 @@ export function parseLiveBridge(raw: unknown): LiveBridgeUrls | null {
 }
 
 // ==================== UPDATE OR ASK ====================
+
+/**
+ * FNV-1a of a string with the two offset bases the fingerprints use
+ * (0x811c9dc5, 0x01000193), in one pass: the same two numbers as fnv1a with
+ * each, for half the work (a phone's browser without JIT spent a second on
+ * the two passes over a large tree).
+ */
+function fnv1aPair(text: string): string {
+    let a = 0x811c9dc5, b = 0x01000193;
+    for (let i = 0; i < text.length; i++) {
+        const c = text.charCodeAt(i);
+        a = Math.imul(a ^ c, 0x01000193);
+        b = Math.imul(b ^ c, 0x01000193);
+    }
+    return `${(a >>> 0).toString(36)}-${(b >>> 0).toString(36)}`;
+}
+
+/** The last fingerprinted texts (at most this many characters) with what they gave. */
+const FINGERPRINT_MEMO_CHARS = 16 * 1024 * 1024;
+const fingerprintMemo: { text: string; out: string }[] = [];
+
+/**
+ * `<length>-<fnv1a>-<fnv1a>` of a fingerprint's text. The same text as one
+ * of the last two gives what it gave without hashing it again: a tree
+ * fingerprinted several times while it does not change (opening a research,
+ * images coming, the status) costs its JSON text and one comparison only.
+ */
+function textFingerprint(text: string): string {
+    for (const m of fingerprintMemo) if (m.text === text) return m.out;
+    const out = `${text.length.toString(36)}-${fnv1aPair(text)}`;
+    if (text.length <= FINGERPRINT_MEMO_CHARS) {
+        fingerprintMemo.unshift({ text, out });
+        if (fingerprintMemo.length > 2) fingerprintMemo.pop();
+    }
+    return out;
+}
 
 /** FNV-1a over a string with a given offset basis (32-bit). */
 function fnv1a(text: string, seed: number): number {
@@ -903,7 +1203,8 @@ function fnv1a(text: string, seed: number): number {
 /**
  * People without what the app keeps for itself and never sends in the file
  * (a hidden married surname suggestion; the research's verification of facts,
- * spec 065, which comes with its version): hiding a suggestion leaves the
+ * spec 065, which comes with its version; the time of a person's last
+ * change, spec 136, which an edit writes and the research never has): hiding a suggestion leaves the
  * tree in step with the research. A fact confirmed, or a confirmation of the
  * research taken back, here does go (`_STROM_CONFIRMED`, which the research
  * reads against `_STROM_HEAD`): only what differs from the research's own
@@ -913,9 +1214,10 @@ function fnv1a(text: string, seed: number): number {
 function withoutAppLocal(persons: StromData['persons']): StromData['persons'] {
     let out: StromData['persons'] | null = null;
     for (const [id, p] of Object.entries(persons)) {
-        if (p?.dismissedMarriedSuggestion === undefined && p?.confirmed === undefined && p?.researchVerify === undefined) continue;
+        if (p?.dismissedMarriedSuggestion === undefined && p?.confirmed === undefined && p?.researchVerify === undefined
+            && p?.changedAt === undefined) continue;
         out ??= { ...persons };
-        const { dismissedMarriedSuggestion: _local, confirmed: _confirmed, researchVerify: _verify, ...rest } = p;
+        const { dismissedMarriedSuggestion: _local, confirmed: _confirmed, researchVerify: _verify, changedAt: _changed, ...rest } = p;
         const edits = confirmationEdits(p);
         out[id as PersonId] = (Object.keys(edits).length ? { ...rest, confirmed: edits } : rest) as Person;
     }
@@ -969,6 +1271,7 @@ const FINGERPRINT_V2 = 'v2-';
  * 80 MB of images took seconds on every research update.
  */
 function imageToken(url: string): string {
+    if (isPoolRef(url)) return pooledImageToken(url);
     let h = 0x811c9dc5;
     for (let i = 0; i < url.length; i += 16) {
         h ^= url.charCodeAt(i);
@@ -989,14 +1292,14 @@ function imageToken(url: string): string {
  */
 export function contentFingerprint(data: StromData): string {
     const text = JSON.stringify(fingerprintParts(data), (_key, value) =>
-        typeof value === 'string' && value.length >= 1024 && value.startsWith('data:') ? imageToken(value) : value);
-    return `${FINGERPRINT_V2}${text.length.toString(36)}-${fnv1a(text, 0x811c9dc5).toString(36)}-${fnv1a(text, 0x01000193).toString(36)}`;
+        typeof value === 'string' && ((value.length >= 1024 && value.startsWith('data:')) || isPoolRef(value)) ? imageToken(value) : value);
+    return `${FINGERPRINT_V2}${textFingerprint(text)}`;
 }
 
 /** The fingerprint before images counted by sample (links synced by older versions). */
 function legacyFingerprint(data: StromData): string {
     const text = JSON.stringify(fingerprintParts(data));
-    return `${text.length.toString(36)}-${fnv1a(text, 0x811c9dc5).toString(36)}-${fnv1a(text, 0x01000193).toString(36)}`;
+    return textFingerprint(text);
 }
 
 /**
@@ -1095,6 +1398,24 @@ export const MEDIA_APP_FEATURE = 'media.app';
  */
 export const MATERIAL_LINKS_FEATURE = 'material.links';
 
+/**
+ * `/status.features` (Strom Research 1.37, spec 137 K2.5): material may concern a list of people —
+ * `PUT <token>/lists/<listRef>` with the list's snapshot, then each file with `X-Strom-List-Ref`.
+ */
+export const MEDIA_LIST_FEATURE = 'media.list';
+/** `/status.features` (spec 137 §6.5): `X-Strom-List-Ref` also beside `X-Strom-Source` (material of a source for a list). */
+export const MEDIA_LIST_SOURCE_FEATURE = 'media.list.source';
+
+/** Material may go to this research for a list of people (`media.list`); not known yet: no. Gated by feature, not version. */
+export function researchSendsLists(status: { features: readonly string[] | null } | null | undefined): boolean {
+    return !!status?.features?.includes(MEDIA_LIST_FEATURE);
+}
+
+/** Material of a source may also concern a list (`media.list` and `media.list.source`); not known yet: no. */
+export function researchSendsSourceLists(status: { features: readonly string[] | null } | null | undefined): boolean {
+    return researchSendsLists(status) && !!status?.features?.includes(MEDIA_LIST_SOURCE_FEATURE);
+}
+
 /** The research keeps the app's files from a write (`media.app`); not known: no. */
 export function researchKeepsAppMedia(status: { features: readonly string[] | null } | null | undefined): boolean {
     return !!status?.features?.includes(MEDIA_APP_FEATURE);
@@ -1106,15 +1427,18 @@ export interface ResearchMediaOut {
     appMedia: boolean;
     /** Each file's date (`2 _DATE`): a research that keeps what the app says of a file. */
     mediaDates: boolean;
+    /** The people's contact (Person.emails as `1 RESI` / `2 EMAIL`): a research that keeps it (CONTACT_FEATURE). */
+    contacts?: boolean;
 }
 
-/** A research that has said nothing: the files go as they always went. */
-export const NO_MEDIA_FEATURES: ResearchMediaOut = { appMedia: false, mediaDates: false };
+/** A research that has said nothing: the files go as they always went, no contact. */
+export const NO_MEDIA_FEATURES: ResearchMediaOut = { appMedia: false, mediaDates: false, contacts: false };
 
 /** How a tree's files go to this research, by its `/status.features` (not reached: as ever). */
 export function researchMediaOut(status: { features: readonly string[] | null } | null | undefined): ResearchMediaOut {
     const features = status?.features ?? [];
-    return { appMedia: features.includes(MEDIA_APP_FEATURE), mediaDates: features.includes(MATERIAL_LINKS_FEATURE) };
+    return { appMedia: features.includes(MEDIA_APP_FEATURE), mediaDates: features.includes(MATERIAL_LINKS_FEATURE),
+        contacts: features.includes(CONTACT_FEATURE) };
 }
 
 /**
@@ -1401,6 +1725,52 @@ export function keepDismissedMarriedSuggestions(next: StromData, previous: Strom
         if (!nextId || !p || p.dismissedMarriedSuggestion) continue;
         persons ??= { ...next.persons };
         persons[nextId] = { ...p, dismissedMarriedSuggestion: was.dismissedMarriedSuggestion };
+    }
+    return persons ? { ...next, persons } : next;
+}
+
+/**
+ * The research reads and writes the people's contact (Person.emails, spec 134
+ * K0.10): `1 RESI` / `2 EMAIL` both ways. Without it (an older research) the
+ * app sends no contact (it would come back as a residence with no place) and
+ * keeps the contact itself (keepContacts).
+ */
+export const CONTACT_FEATURE = 'person.contact';
+
+/**
+ * The people's contact (Person.emails) when a research version comes in. A
+ * research without `person.contact` in its `features` (not known = an older
+ * research) never had it: each person of `next` takes the previous state's
+ * contact (none included: one taken off in the app stays off), matched by
+ * REFN, else by the same id, else (no REFN yet) by matchUnlinkedPersons; a
+ * person new from the research keeps what its version gave. With the feature
+ * the research decides and `next` comes back as it is. Returns a new object
+ * when any person changed; neither input is changed.
+ */
+export function keepContacts(next: StromData, previous: StromData, features: readonly string[] | null | undefined): StromData {
+    if (features?.includes(CONTACT_FEATURE)) return next;
+    const prevToNext = new Map<string, string>();
+    const nextByRefn = uniqueRefns(next);
+    for (const [refn, prevId] of uniqueRefns(previous)) {
+        const nextId = nextByRefn.get(refn);
+        if (nextId) prevToNext.set(prevId, nextId);
+    }
+    let unlinked: Map<string, string> | null = null;
+    let persons: StromData['persons'] | null = null;
+    const taken = new Set<string>();
+    for (const [prevId, was] of Object.entries(previous.persons ?? {})) {
+        if (!was) continue;
+        const sameId = next.persons?.[prevId as PersonId] && (!was.refn?.trim() || next.persons[prevId as PersonId].refn?.trim() === was.refn.trim());
+        let nextId = prevToNext.get(prevId) ?? (sameId ? prevId : undefined);
+        if (!nextId) nextId = (unlinked ??= matchUnlinkedPersons(next, previous)).get(prevId);
+        const p = nextId ? next.persons[nextId as PersonId] : undefined;
+        if (!nextId || !p || taken.has(nextId)) continue;
+        taken.add(nextId);
+        if ((p.emails ?? []).join('\n') === (was.emails ?? []).join('\n')) continue;
+        persons ??= { ...next.persons };
+        const changed: Person = { ...p };
+        if (was.emails?.length) changed.emails = [...was.emails]; else delete changed.emails;
+        persons[nextId as PersonId] = changed;
     }
     return persons ? { ...next, persons } : next;
 }
@@ -1922,7 +2292,7 @@ export const MEDIA_BASE_MAX = 20000;
 /** One place of a file in the base (researchMediaKeys): its owner in the research, what it is there, its content. */
 function mediaPlaceKey(owner: string | null, kind: 'p' | 'c' | 'a', content: string | null | undefined): string | null {
     if (!owner || !content) return null;
-    const text = `${owner}|${kind}|${content.startsWith('data:') ? imageToken(content) : content}`;
+    const text = `${owner}|${kind}|${isImageValue(content) ? imageToken(content) : content}`;
     return `${fnv1a(text, 0x811c9dc5).toString(36)}.${fnv1a(text, 0x01000193).toString(36)}`;
 }
 
@@ -2036,7 +2406,7 @@ export function carryOverMedia(next: StromData, previous: StromData, base?: Read
         }
         unionNow.set(uid, cur.id);
         // The same photo back without its original's hash (a research that does not keep it): the original stays named.
-        if (cur.photo === old.photo && old.photoOriginal && !cur.photoOriginal) {
+        if (sameImageSync(cur.photo, old.photo) && old.photoOriginal && !cur.photoOriginal) {
             partnerships[cur.id] = { ...cur, photoOriginal: old.photoOriginal };
             unionsChanged = true;
             continue;
@@ -2062,7 +2432,7 @@ export function carryOverMedia(next: StromData, previous: StromData, base?: Read
     const sameFileIn = (have: readonly Attachment[], a: Attachment): Attachment | undefined => {
         const sha = a.original?.sha256?.toLowerCase();
         return have.find(h => h.id === a.id
-            || (!!a.dataUrl && !a.originalOnly && !h.originalOnly && h.dataUrl === a.dataUrl)
+            || (!!a.dataUrl && !a.originalOnly && !h.originalOnly && sameImageSync(h.dataUrl, a.dataUrl))
             || (!!sha && (a.originalOnly || base !== undefined) && h.original?.sha256?.toLowerCase() === sha));
     };
     const addPlaces = (rec: Attachment, places: readonly MediaPlace[]): void => {
@@ -2131,16 +2501,16 @@ export function carryOverMedia(next: StromData, previous: StromData, base?: Read
         // keeps no such link, so it comes along with the portrait it belongs
         // to while its original is still there.
         const src = old.photoSource;
-        if (src && old.photo && out.photo === old.photo && !cur.photoSource) {
+        if (src && old.photo && sameImageSync(out.photo, old.photo) && !cur.photoSource) {
             let carriedSource: PortraitSource | undefined;
             if (src.attachmentId) {
                 const att = oldFiles.find(a => a.id === src.attachmentId);
-                const now = att && personMedia(view, curId).find(a => a.id === att.id || (!a.originalOnly && a.dataUrl === att.dataUrl));
+                const now = att && personMedia(view, curId).find(a => a.id === att.id || (!a.originalOnly && !!att.dataUrl && sameImageSync(a.dataUrl, att.dataUrl)));
                 if (now) carriedSource = { ...src, attachmentId: now.id };
             } else if (src.partnershipId) {
                 const uid = unionNow.get(src.partnershipId);
                 const union = uid ? partnerships[uid] : undefined;
-                if (union && union.photo === previous.partnerships[src.partnershipId]?.photo
+                if (union && sameImageSync(union.photo, previous.partnerships[src.partnershipId]?.photo)
                     && (union.person1Id === curId || union.person2Id === curId)) carriedSource = { ...src, partnershipId: union.id };
             }
             if (carriedSource) {
@@ -2211,11 +2581,12 @@ export function carryOverMedia(next: StromData, previous: StromData, base?: Read
         }
         const have = cur.excerpts ?? [];
         const ids = new Set(have.map(e => e.id));
-        const urls = new Set(have.map(e => e.dataUrl));
+        // The same crop in either form (the tree's pooled reference, the research's data URL).
+        const sameCrop = imageFinder(have.map(e => [e.dataUrl, true] as const));
         // A research file need not mark its crops (clip): when the research
         // brings crops of its own, only those cut here from an attachment are
         // surely the app's — anything else could duplicate a newer crop.
-        const extra = own.filter(e => !ids.has(e.id) && !urls.has(e.dataUrl) && (!have.length || e.fromAttachmentId));
+        const extra = own.filter(e => !ids.has(e.id) && !sameCrop(e.dataUrl) && (!have.length || e.fromAttachmentId));
         if (extra.length) sources[id] = { ...cur, excerpts: [...have, ...extra] };
     }
 
@@ -2332,7 +2703,15 @@ export interface LiveWorker {
     hold?: WorkHold;
     /** The run waits for an archive another session uses (`archive.holds`, spec 127); `paused` says it too. */
     waits?: { archive: string; since: string; until: string };
+    /** The agent's own browser saves a book's images for the task (`working.saving`). */
+    saving?: WorkSaving;
 }
+
+/**
+ * `working[].saving`: the book (`recordset`, "B0007") whose images the agent's browser saves, `saved` of the `of`
+ * handed to the browser in this session. `of` grows (one image is handed at a time): not a known total.
+ */
+export interface WorkSaving { recordset: string; saved: number; of: number }
 
 /** The bridge says who holds a task and till when (`working[].hold`, `queue[].heldBy`; spec 127). */
 export const TASK_HOLDS_FEATURE = 'task.holds';
@@ -2380,6 +2759,8 @@ export interface QueueArchiveHeld {
 export const WORKING_PLACE_FEATURE = 'working.place';
 /** The bridge says how a row of `working` helps its line, and its branch (`working[].helps`, `branch`; spec 036 K1.8). */
 export const WORKING_HELPS_FEATURE = 'working.helps';
+/** The bridge says how many images the agent's browser saved for a row of `working` (`working[].saving`). */
+export const WORKING_SAVING_FEATURE = 'working.saving';
 
 // ==================== RUNS (spec 126 U10) ====================
 // The words of `features` for the runs of the directions, in ONE place: named as the app asked the research
@@ -2553,6 +2934,111 @@ export interface LiveWaiting {
     book?: string;
     /** What the research found wrong in how the task's waiting is recorded (spec 109; only with `tasks.audit`). */
     audit?: WaitingAudit;
+    /** What doing it gains the research (spec 105 K4.1; only with `waiting.gain`): the order "Most helpful". */
+    gain?: WaitingGain;
+    /** The task can go back to the agent from the app (spec 089; only with `waiting.retry`, only at a task). */
+    retry?: WaitingRetry;
+}
+
+/** `/status.features`: a waiting task can go back to the agent from the app (`retry` of its item, `{do: "retry"}`; spec 089). */
+export const WAITING_RETRY_FEATURE = 'waiting.retry';
+/**
+ * Why a task that can go back to the agent waits now: the agent's browser held
+ * its downloads back, the agent's session stopped midway, the archive's viewer
+ * only lets the agent read the images on screen, the agent's browser is ready
+ * now, the browser extension is not connected, the agent has no browser.
+ */
+export type WaitingRetryWhy = 'held' | 'stopped' | 'screen' | 'ready' | 'no-extension' | 'agent-without-browser';
+export const WAITING_RETRY_WHYS: readonly WaitingRetryWhy[] = ['held', 'stopped', 'screen', 'ready', 'no-extension', 'agent-without-browser'];
+/**
+ * An item's `retry` (spec 089): why it waits (an unknown `why` is told by
+ * `says`, in the research's language), whether the agent only reads it on
+ * screen, the archive's host, how many images it still misses (absent: not
+ * known), when it went back last and waits again, and whether it can go back
+ * now (false: three times in 24 hours, again from `until`). Nothing of it is
+ * worked out in the app.
+ */
+export interface WaitingRetry {
+    why: WaitingRetryWhy | string;
+    screen?: boolean;
+    host?: string;
+    images?: number;
+    says?: string;
+    again?: { at: string };
+    can: boolean;
+    until?: string;
+}
+
+/** Most missing images taken from a `retry`. */
+const MAX_RETRY_IMAGES = 100_000;
+
+/** A valid ISO-like time (Date.parse takes it), or ''. */
+function retryTime(value: unknown): string {
+    const t = cleanText(value, 40);
+    return t && Number.isFinite(Date.parse(t)) ? t : '';
+}
+
+/** An item's `retry`, or null: without a boolean `can` or a word of `why` it is not one. Invalid fields are dropped. */
+export function sanitizeWaitingRetry(value: unknown): WaitingRetry | null {
+    const r = asRecord(value);
+    if (!r || typeof r.can !== 'boolean') return null;
+    const why = typeof r.why === 'string' && /^[a-z][a-z0-9-]{0,40}$/.test(r.why.trim()) ? r.why.trim() : '';
+    if (!why) return null;
+    const host = researchArchiveHost(r.host);
+    const images = typeof r.images === 'number' && Number.isInteger(r.images) && r.images >= 0 && r.images <= MAX_RETRY_IMAGES ? r.images : null;
+    const says = cleanText(r.says, MAX_WAITING_ON);
+    const again = asRecord(r.again) ? retryTime(asRecord(r.again)!.at) : '';
+    const until = r.can ? '' : retryTime(r.until);
+    return {
+        why, ...(r.screen === true ? { screen: true } : {}), ...(host ? { host } : {}), ...(images !== null ? { images } : {}),
+        ...(says ? { says } : {}), ...(again ? { again: { at: again } } : {}), can: r.can, ...(until ? { until } : {}),
+    };
+}
+
+/** `/status.features`: the items of `waiting` say what doing them gains (`gain`; spec 105 K4.1, Strom Research 1.37). */
+export const WAITING_GAIN_FEATURE = 'waiting.gain';
+/** The order "Most helpful" is offered: the research says its items' gains (`waiting.gain`). */
+export function waitingGainOn(s: { features?: readonly string[] | null } | null | undefined): boolean {
+    return !!s?.features?.includes(WAITING_GAIN_FEATURE);
+}
+/** The parts of a gain: a new generation (whose parents are missing), the direct line, the tasks it unblocks. */
+export type WaitingGainPart =
+    | { kind: 'generation'; person?: string; name?: string; missing: 'parents' | 'father' | 'mother' }
+    | { kind: 'line' }
+    | { kind: 'unblocks'; n: number };
+/**
+ * What doing an item gains: its score (only for the order, never shown as a
+ * number), the reason as the research says it (in its language; may be
+ * empty) and the reason's parts.
+ */
+export interface WaitingGain { score: number; says: string; parts: WaitingGainPart[] }
+/** Most parts of a gain kept (the research sends three kinds, one each). */
+const MAX_GAIN_PARTS = 6;
+/** The highest score taken (the research's is at most 180). */
+const MAX_GAIN_SCORE = 1_000_000;
+const GAIN_MISSING: readonly string[] = ['parents', 'father', 'mother'];
+
+/** An item's `gain`, or null: no positive score (an item without a gain goes last, as one with none). Unknown parts are dropped. */
+export function sanitizeWaitingGain(value: unknown): WaitingGain | null {
+    const r = asRecord(value);
+    if (!r || typeof r.score !== 'number' || !Number.isFinite(r.score) || r.score <= 0) return null;
+    const parts: WaitingGainPart[] = [];
+    for (const raw of Array.isArray(r.parts) ? r.parts.slice(0, 20) : []) {
+        const p = asRecord(raw);
+        if (!p) continue;
+        if (p.kind === 'generation' && typeof p.missing === 'string' && GAIN_MISSING.includes(p.missing)) {
+            const person = researchPersonRef(p.person);
+            const name = cleanText(p.name, MAX_NAME);
+            parts.push({ kind: 'generation', ...(person ? { person } : {}), ...(name ? { name } : {}), missing: p.missing as 'parents' | 'father' | 'mother' });
+        } else if (p.kind === 'line') {
+            parts.push({ kind: 'line' });
+        } else if (p.kind === 'unblocks') {
+            const n = asCount(p.n);
+            if (n !== null && n > 0) parts.push({ kind: 'unblocks', n });
+        }
+        if (parts.length >= MAX_GAIN_PARTS) break;
+    }
+    return { score: Math.min(r.score, MAX_GAIN_SCORE), says: cleanText(r.says, 300), parts };
 }
 
 /** What a place question asks: pick a candidate, a location against another, a change of the written place. */
@@ -2779,6 +3265,11 @@ export interface LiveStatus {
     /** `notDownloaded` (with `tree.notDownloaded` in `features`): files of the tree a cloud folder has not brought down yet. */
     notDownloaded?: number;
     /**
+     * `treesRoot` (Strom Research 1.37): the folder this computer's research makes new researches in, an absolute
+     * path for display only (the folder of a copy's new research, spec 139 §11.4); absent: not said.
+     */
+    treesRoot?: string;
+    /**
      * `experiments` (with `experiments` in `features`): `history` = the research looks for events of the time for this tree;
      * with `experiments.split` also each search alone: `regions` (history of regions) and `places` (history of places).
      */
@@ -2814,6 +3305,12 @@ export interface LiveStatus {
      * research) — then no switch is offered.
      */
     intake?: LiveIntakeSetting;
+    /**
+     * `sort` (with `sort.confirm` in `features`, spec 102 U8): whether Sort with the agent asks for the cost each
+     * time (`ask`) or not (`no`, set only by a person in the research's terminal). Absent: not said (an archive, a
+     * research waiting for its agent, an older research) — then no switch is offered and the dialog asks.
+     */
+    sort?: LiveSortSetting;
     /**
      * `hypotheses.decide` (with `hypotheses.decide` in `features`, spec 060): who decides the research's
      * hypotheses; a value the app does not know reads as `person`. Absent: not said (an archive, a research
@@ -3007,6 +3504,57 @@ export function sanitizeIntakeSetting(value: unknown): LiveIntakeSetting | null 
     return r && typeof r.auto === 'boolean' ? { auto: r.auto } : null;
 }
 /**
+ * `/status.features` (spec 102 U8, Strom Research 1.37): `/status.sort.confirm` and `POST /settings/sort {confirm}`.
+ * Only `ask` may be written from the app; `no` is the person's in the research's terminal (403 `sort.raise`).
+ */
+export const SORT_CONFIRM_FEATURE = 'sort.confirm';
+
+/** Whether Sort with the agent asks for the cost each time (`ask`, the default) or not (`no`). */
+export type SortConfirm = 'ask' | 'no';
+
+/** `/status.sort`: the research's setting of sorting with the agent. */
+export interface LiveSortSetting {
+    confirm: SortConfirm;
+}
+
+/** `/status.sort` (or the `sort` of a `POST /settings/sort` reply), checked: `confirm` `ask` or `no`, else null (not said). */
+export function sanitizeSortSetting(value: unknown): LiveSortSetting | null {
+    const r = asRecord(value);
+    return r && (r.confirm === 'ask' || r.confirm === 'no') ? { confirm: r.confirm } : null;
+}
+
+/**
+ * Sort with the agent says its cost before the click (spec 102 U8): always, unless the research says `no`
+ * (read only with `sort.confirm`). The click itself stays the person's either way.
+ */
+export function sortAsksCost(status: Pick<LiveStatus, 'sort'> | null | undefined): boolean {
+    return status?.sort?.confirm !== 'no';
+}
+/**
+ * `/status.features` (spec 123 P2, Strom Research 1.37): `POST /settings/sort {"confirm": "no"}` goes from the app's
+ * page on the research's computer too (without it `no` is refused 403 `sort.raise`: only the research's terminal).
+ */
+export const SORT_CONFIRM_APP_FEATURE = 'sort.confirm.app';
+/**
+ * `/status.features` (spec 123 P2, Strom Research 1.37): `POST /settings/run {"confirm": …}` — whether the app's
+ * actions that start the agent ask in the research's terminal first (`ask`) or start at once (`no`), a setting of
+ * the computer for all its researches; its value is `/status.work.confirm`.
+ */
+export const RUN_CONFIRM_FEATURE = 'run.confirm';
+
+/** `/status.work.confirm` of a research with `run.confirm` (null: the switch is not offered). */
+export function runConfirmOf(status: Pick<LiveStatus, 'work' | 'features'> | null | undefined): SortConfirm | null {
+    return status?.features?.includes(RUN_CONFIRM_FEATURE) ? status.work?.confirm ?? null : null;
+}
+
+/**
+ * Whether a "without asking" switch (`sort.confirm`, `run.confirm`; spec 123 K2.4) is inactive: on a device of the
+ * research's gateway (spec 094) switching on is never offered (the gateway refuses it); switching off goes anywhere.
+ */
+export function confirmSwitchLocked(on: boolean, device: boolean): boolean {
+    return device && !on;
+}
+/**
  * `/status.features` (spec 060): `/status.hypotheses.decide`, `POST /hypotheses {decide}` and who decided a
  * hypothesis in the research's file (`_BY`, `DECI`, `_AT`).
  */
@@ -3082,6 +3630,8 @@ export function sanitizeBatches(value: unknown): LiveBatch[] | null {
 export interface ResearchSendRecord {
     /** The mark the `/sync` reply gave it. */
     intake: string;
+    /** The research's input written from it (`I0412`, what `strom sync undo` takes); absent = not said. */
+    input?: string;
     at: string;
     state: 'pending' | 'written' | 'discarded' | 'replaced' | 'nothing' | 'undone' | 'failed';
     changes: number | null;
@@ -3119,6 +3669,8 @@ export interface ResearchSendRecord {
     mediaCount?: number;
     /** The sources deleted in the app a written send retracted (`retracted`, spec 117 §4); absent = none said. */
     retracted?: string[];
+    /** The browser that sent it (`client`, spec 094 K2.4); absent = the send carried none (an older app or research). */
+    client?: DeviceClient;
 }
 
 const SEND_STATES = new Set(['pending', 'written', 'discarded', 'replaced', 'nothing', 'undone', 'failed']);
@@ -3138,6 +3690,7 @@ export function sanitizeSends(value: unknown, codes = false): ResearchSendRecord
             const t = cleanText(v, 40);
             return Number.isFinite(Date.parse(t)) ? t : '';
         };
+        const client = sanitizeResearchClient(r.client);
         out.push({
             intake,
             at: iso(r.at),
@@ -3152,10 +3705,12 @@ export function sanitizeSends(value: unknown, codes = false): ResearchSendRecord
             conflictPersons: conflictPersons(r.conflicts),
             ...(conflictIds(r.conflicts).length ? { conflictIds: conflictIds(r.conflicts) } : {}),
             // Written again since: `resent: true` (1.12.0-rc.21), or `again` (the mark of that send).
+            ...(typeof r.input === 'string' && /^I\d+$/.test(r.input) ? { input: r.input } : {}),
             ...(r.resent === true || r.again === true ? { again: 'yes' } : headerToken(r.again) ? { again: headerToken(r.again)! } : {}),
             ...(codes && (r.state === 'written' || r.state === 'nothing') ? sendNotWritten(r) : {}),
             ...(r.state === 'written' ? sendMedia(r) : {}),
             ...(r.state === 'written' && retractedSources(r.retracted).length ? { retracted: retractedSources(r.retracted) } : {}),
+            ...(client ? { client } : {}),
         });
     }
     return out;
@@ -3866,8 +4421,25 @@ const asRecord = (v: unknown): Record<string, unknown> | null =>
 const asCount = (v: unknown): number | null =>
     typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : null;
 
-/** The `working` list (status field or `working` event). Untrusted input. */
-export function sanitizeWorking(value: unknown, helpsSaid = false, holds: HoldsSaid = NO_HOLDS): LiveWorker[] {
+/** The most images of a `working[].saving` taken from the bridge. */
+const MAX_SAVING = 1_000_000;
+const asImageCount = (v: unknown): number | null =>
+    typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= MAX_SAVING ? v : null;
+
+/** `working[].saving`, or null: a book's id and two whole counts, `saved` not above `of`. Untrusted input. */
+export function sanitizeSaving(value: unknown): WorkSaving | null {
+    const r = asRecord(value);
+    const recordset = r ? researchBookRef(r.recordset) : null;
+    const saved = r ? asImageCount(r.saved) : null;
+    const of = r ? asImageCount(r.of) : null;
+    return recordset && saved !== null && of !== null && saved <= of ? { recordset, saved, of } : null;
+}
+
+/**
+ * The `working` list (status field or `working` event). Untrusted input. `helps`, the holds and `saving`
+ * only from a research whose features say them.
+ */
+export function sanitizeWorking(value: unknown, helpsSaid = false, holds: HoldsSaid = NO_HOLDS, savingSaid = false): LiveWorker[] {
     if (!Array.isArray(value)) return [];
     const out: LiveWorker[] = [];
     for (const item of value.slice(0, MAX_ITEMS)) {
@@ -3892,10 +4464,13 @@ export function sanitizeWorking(value: unknown, helpsSaid = false, holds: HoldsS
         const waits = holds.archive ? sanitizeWaits(r.waits) : null;
         // The row's run (spec 126 U10): read whenever sent — an older research sends none, and the app reads it only with `/status.runs`.
         const run = researchRunRef(r.run);
+        // The images the agent's browser saves: only from a research that says it.
+        const saving = savingSaid ? sanitizeSaving(r.saving) : null;
         out.push({
             who, since: cleanText(r.since, 40), task: cleanText(r.task), ...(person ? { person } : {}), ...(family ? { family } : {}), ...(paused ? { paused } : {}),
             ...(research ? { research } : {}), ...(session ? { session } : {}), ...(place ? { place } : {}),
             ...(helps ? { helps } : {}), ...(branch ? { branch } : {}), ...(hold ? { hold } : {}), ...(waits ? { waits } : {}), ...(run ? { run } : {}),
+            ...(saving ? { saving } : {}),
         });
     }
     return out;
@@ -4243,7 +4818,7 @@ export function waitingPlaceFields(r: Record<string, unknown>): Partial<LiveWait
  * announces `waiting.groups` (kind, section, group, phase … are read only then).
  * A place question (kind 'place') is read with or without them.
  */
-export function sanitizeWaiting(value: unknown, groups = false, branches = false, audit = false): LiveWaiting[] {
+export function sanitizeWaiting(value: unknown, groups = false, branches = false, audit = false, gain = false, retry = false): LiveWaiting[] {
     if (!Array.isArray(value)) return [];
     const out: LiveWaiting[] = [];
     for (const item of value.slice(0, MAX_WAITING)) {
@@ -4280,9 +4855,24 @@ export function sanitizeWaiting(value: unknown, groups = false, branches = false
             ...(groups ? waitingGroupFields(r, kind) : {}),
             ...(researchBookRef(r.book) ? { book: researchBookRef(r.book)! } : {}),
             ...(audit ? waitingAuditField(r) : {}),
+            ...(gain ? waitingGainField(r) : {}),
+            ...(retry ? waitingRetryField(r) : {}),
         });
     }
     return out;
+}
+
+/** An item's gain (`waiting.gain`, spec 105 K4.1): only a well-formed one with a positive score. */
+function waitingGainField(r: Record<string, unknown>): Partial<LiveWaiting> {
+    const gain = sanitizeWaitingGain(r.gain);
+    return gain ? { gain } : {};
+}
+
+/** Whether a task can go back to the agent (`waiting.retry`, spec 089): only at a task ("T…"), only a well-formed one. */
+function waitingRetryField(r: Record<string, unknown>): Partial<LiveWaiting> {
+    if (!researchTaskRef(r.id)) return {};
+    const retry = sanitizeWaitingRetry(r.retry);
+    return retry ? { retry } : {};
 }
 
 /** A task's finding (`tasks.audit`, spec 109): only at a task ("T…"), only a well-formed one. */
@@ -4711,6 +5301,20 @@ function statusBooks(value: unknown, features: readonly string[] | null): LiveBo
     return features?.includes(BOOKS_FEATURE) ? sanitizeBooks(value, features.includes(INBOX_ASIDE_FEATURE)) : null;
 }
 
+/**
+ * `/status.treesRoot`: an absolute path (`/…`, `~/…`, `C:\…`, `\\server\…`) of one line, at most
+ * 1024 characters, its trailing separator dropped; anything else is not said (null). Shown, never used as a path.
+ */
+export function sanitizeTreesRoot(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const path = value.trim();
+    // eslint-disable-next-line no-control-regex
+    if (!path || path.length > 1024 || /[\u0000-\u001f\u007f\u2028\u2029]/.test(path)) return null;
+    if (!/^(\/|~(\/|$)|[A-Za-z]:[\\\/]|\\\\)/.test(path)) return null;
+    const trimmed = path.replace(/[\\\/]+$/, '');
+    return trimmed && !/^[A-Za-z]:$/.test(trimmed) ? trimmed : path;
+}
+
 export function sanitizeLiveStatus(value: unknown): LiveStatus | null {
     const r = asRecord(value);
     if (!r) return null;
@@ -4726,10 +5330,10 @@ export function sanitizeLiveStatus(value: unknown): LiveStatus | null {
         headAt: Number.isFinite(Date.parse(cleanText(r.headAt, 40))) ? cleanText(r.headAt, 40) : '',
         persons: asCount(r.persons),
         families: asCount(r.families),
-        working: sanitizeWorking(r.working, !!features?.includes(WORKING_HELPS_FEATURE), holdsSaid(features)),
+        working: sanitizeWorking(r.working, !!features?.includes(WORKING_HELPS_FEATURE), holdsSaid(features), !!features?.includes(WORKING_SAVING_FEATURE)),
         waiting: [
             ...sanitizeWaiting(r.waiting, !!features?.includes(WAITING_GROUPS_FEATURE), !!features?.includes(OFF_LINE_BRANCHES_FEATURE),
-                !!features?.includes(TASKS_AUDIT_FEATURE)),
+                !!features?.includes(TASKS_AUDIT_FEATURE), !!features?.includes(WAITING_GAIN_FEATURE), !!features?.includes(WAITING_RETRY_FEATURE)),
             // The files of the books' inbox set aside (`inbox.aside`): decisions under their book.
             ...asideWaiting(statusBooks(r.books, features)),
         ],
@@ -4757,6 +5361,7 @@ export function sanitizeLiveStatus(value: unknown): LiveStatus | null {
         ...(features?.includes(SEAL_FOREIGN_FEATURE) && (r.seal === 'here' || r.seal === 'elsewhere') ? { seal: r.seal } : {}),
         ...(features?.includes(HANDOFFS_FEATURE) ? { handoffs: sanitizeHandoffs(r.handoffs) } : {}),
         ...(features?.includes(NOT_DOWNLOADED_FEATURE) && asCount(r.notDownloaded) !== null ? { notDownloaded: asCount(r.notDownloaded)! } : {}),
+        ...(sanitizeTreesRoot(r.treesRoot) ? { treesRoot: sanitizeTreesRoot(r.treesRoot)! } : {}),
         ...experimentsSaid(r, features),
         ...hypothesesSaid(r, features),
         ...(readAgainSaid(r.readAgain, features) ? { readAgain: readAgainSaid(r.readAgain, features)! } : {}),
@@ -4765,12 +5370,15 @@ export function sanitizeLiveStatus(value: unknown): LiveStatus | null {
         ...directionsRevSaid(r, features),
         ...verifyStatusSaid(r, features),
         ...(features?.includes(STATUS_BUSY_FEATURE) && sanitizeBusy(r.busy) ? { busy: sanitizeBusy(r.busy)! } : {}),
-        ...(features?.includes(WORK_LINK_FEATURE) && sanitizeLiveWork(r.work) ? { work: sanitizeLiveWork(r.work)! } : {}),
+        // `run.confirm` (spec 123 P2) reads `work.confirm` even from a research that would not say `work.link`.
+        ...((features?.includes(WORK_LINK_FEATURE) || features?.includes(RUN_CONFIRM_FEATURE)) && sanitizeLiveWork(r.work)
+            ? { work: sanitizeLiveWork(r.work)! } : {}),
         ...(sanitizeResearchCaps(r.caps) ? { caps: sanitizeResearchCaps(r.caps)! } : {}),
         ...(features?.includes(OFF_LINE_BRANCHES_FEATURE) && sanitizeOffLine(r.offLine) ? { offLine: sanitizeOffLine(r.offLine)! } : {}),
         ...(statusBooks(r.books, features) ? { books: statusBooks(r.books, features)! } : {}),
         ...(features?.includes(CENSUS_FEATURE) ? { census: sanitizeCensus(r.census) } : {}),
         ...(features?.includes(INTAKE_AUTO_FEATURE) && sanitizeIntakeSetting(r.intake) ? { intake: sanitizeIntakeSetting(r.intake)! } : {}),
+        ...(features?.includes(SORT_CONFIRM_FEATURE) && sanitizeSortSetting(r.sort) ? { sort: sanitizeSortSetting(r.sort)! } : {}),
         ...(features?.includes(QUEUE_PAGE_FEATURE) && sanitizeQueueCounts(r.queueCounts) ? { queueCounts: sanitizeQueueCounts(r.queueCounts)! } : {}),
         ...runsSaid(r, features),
         ...agentSaid(r.agent),
@@ -4960,6 +5568,8 @@ export interface LiveLogEntry {
      * (and from an older research).
      */
     sources?: string[][];
+    /** The browser whose send wrote it (`via`, spec 094 K2.4); absent = not a send, or a send without one. */
+    via?: DeviceClient;
 }
 
 /** Most sources one history line names. */
@@ -4998,6 +5608,7 @@ export function sanitizeLiveLog(value: unknown): LiveLogEntry[] | null {
         const lines = rawText ? rawText.map((t, i) => ({ t: cleanText(t), k: rawKinds?.[i], s: lineSources(rawSources?.[i]) })).filter(l => l.t) : null;
         const research = researchDirectionRef(e.research);
         const run = researchRunRef(e.run);
+        const via = sanitizeResearchClient(e.via);
         out.push({
             head: cleanText(e.head, 80), at, what, task: cleanText(e.task),
             ...(lines ? { text: lines.map(l => l.t) } : {}),
@@ -5005,6 +5616,7 @@ export function sanitizeLiveLog(value: unknown): LiveLogEntry[] | null {
             ...(research ? { research } : {}),
             ...(run ? { run } : {}),
             ...(lines && lines.some(l => l.s.length > 0) ? { sources: lines.map(l => l.s) } : {}),
+            ...(via ? { via } : {}),
         });
     }
     return out;
@@ -5268,6 +5880,11 @@ export interface ResearchHeaderInfo {
     /** The fingerprint of the tree as sent (`_STROM_SENT`): only on a send to the bridge. */
     sent?: string;
     /**
+     * The browser that sends (`_STROM_CLIENT <id>` / `2 NAME <name>`, spec 094 K2.4): only on a send to
+     * the bridge, never in an exported file. A research that does not know it skips it.
+     */
+    client?: DeviceClient;
+    /**
      * The send whose copy this one builds on (`_STROM_SINCE R…`): written there,
      * its version not loaded here — this copy is that copy plus the edits since.
      * Only to a bridge that says `sync.since`.
@@ -5289,6 +5906,36 @@ function headerToken(value: unknown): string | null {
     return typeof value === 'string' && /^[A-Za-z0-9._:-]{1,64}$/.test(value) ? value : null;
 }
 
+/** Longest device name kept (graphemes; the research cuts at the same length). */
+const MAX_DEVICE_NAME = 60;
+
+/**
+ * A device as the research names it (`sends[].client`, `entries[].via`,
+ * `conflicts[].sent.*.client`): `{ id, name? }`, checked. Untrusted: an id
+ * not of the research's shape drops the whole device; the name is plain text
+ * (control and direction characters out, at most 60 graphemes), left out when
+ * empty or not text. Null: none said.
+ */
+export function sanitizeResearchClient(value: unknown): DeviceClient | null {
+    const r = asRecord(value);
+    const id = r ? headerToken(r.id) : null;
+    if (!r || !id) return null;
+    const name = deviceNameText(r.name);
+    return name ? { id, name } : { id };
+}
+
+/** A device's name as plain text ('' = none): NFC, no control or bidi characters, one line, at most 60 graphemes. */
+function deviceNameText(value: unknown): string {
+    if (typeof value !== 'string') return '';
+    // eslint-disable-next-line no-control-regex
+    const flat = value.normalize('NFC').replace(/[\u0000-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩]+/g, ' ')
+        .replace(/\s+/g, ' ').trim();
+    // A broken name (a replacement character, half of a surrogate pair): none, as the research takes it.
+    if (!flat || flat.includes('�') || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(flat)) return '';
+    const g = graphemes(flat);
+    return g.length <= MAX_DEVICE_NAME ? flat : g.slice(0, MAX_DEVICE_NAME).join('').trim();
+}
+
 /** The header lines that tie an exported GEDCOM to its research. */
 export function researchHeaderLines(link: ResearchHeaderInfo | null | undefined): string[] {
     const id = normalizeResearchId(link?.id);
@@ -5296,6 +5943,8 @@ export function researchHeaderLines(link: ResearchHeaderInfo | null | undefined)
     const head = isResearchHead(link?.head);
     const appTree = headerToken(link?.appTree);
     const sent = headerToken(link?.sent);
+    // The sending browser: only on a send to the bridge (the caller gives it then), never in a file.
+    const client = link?.client ? sanitizeResearchClient(link.client) : null;
     const since = headerToken(link?.since);
     const deleted = [...new Set((link?.deletedSources ?? []).filter(s => typeof s === 'string' && /^S\d{1,9}$/.test(s)))].slice(0, SOURCE_DELETED_MOST);
     return [
@@ -5305,6 +5954,7 @@ export function researchHeaderLines(link: ResearchHeaderInfo | null | undefined)
         ...(appTree ? [`1 _STROM_APP_TREE ${appTree}`] : []),
         ...(link?.transcripts === 'evidence' || link?.transcripts === 'lead' ? [`1 _STROM_TRANSCRIPTS ${link.transcripts}`] : []),
         ...(sent ? [`1 _STROM_SENT ${sent}`] : []),
+        ...(client ? [`1 _STROM_CLIENT ${client.id}`, ...(client.name ? [`2 NAME ${client.name}`] : [])] : []),
         ...(since ? [`1 _STROM_SINCE ${since}`] : []),
         // `1 _STROM_SEX_U Y` follows in every file the app writes (src/ged-exporter.ts STROM_SEX_U_LINE).
     ];
@@ -5374,6 +6024,50 @@ export interface SyncReply {
     mediaCount: number;
     /** The sources deleted in the app it retracted with this write (`retracted`, spec 117 §4; S ids); [] = none said. */
     retracted: string[];
+    /**
+     * The two sends a conflict is between (`conflicts[].sent`, spec 094 K2.4): an edit from one device
+     * against an edit from another. [] = none said (an older research, or only conflicts with the research's own value).
+     */
+    conflictSent: SyncConflictSent[];
+}
+
+/**
+ * A conflict between two sends (`conflicts[].sent`): `earlier` the send whose value stands in the
+ * research (`sent.research`, its input I… when said), `later` this send (`sent.user`). A side's
+ * `client` is absent when that send carried none (an older app): then it is "an earlier / the later send".
+ */
+export interface SyncConflictSent {
+    /** The research's conflict ("X0007"). */
+    id: string;
+    earlier: { client?: DeviceClient; input?: string };
+    later: { client?: DeviceClient };
+}
+
+/** Most conflicts with their two sends taken from one answer. */
+const MAX_CONFLICT_SENT = 20;
+
+/** The `sent` of a list of conflicts (at most 20, each conflict once); a conflict without `sent` is left out. Untrusted. */
+export function conflictSentOf(value: unknown): SyncConflictSent[] {
+    if (!Array.isArray(value)) return [];
+    const out: SyncConflictSent[] = [];
+    for (const item of value.slice(0, MAX_ITEMS)) {
+        if (out.length >= MAX_CONFLICT_SENT) break;
+        const r = asRecord(item);
+        const id = r ? researchConflictRef(r.id ?? r.conflict) : null;
+        const sent = r ? asRecord(r.sent) : null;
+        const later = sent ? asRecord(sent.user) : null;
+        const earlier = sent ? asRecord(sent.research) : null;
+        if (!id || !sent || (!later && !earlier) || out.some(c => c.id === id)) continue;
+        const earlierClient = earlier ? sanitizeResearchClient(earlier.client) : null;
+        const laterClient = later ? sanitizeResearchClient(later.client) : null;
+        const input = earlier && typeof earlier.input === 'string' && /^I\d{1,9}$/.test(earlier.input) ? earlier.input : '';
+        out.push({
+            id,
+            earlier: { ...(earlierClient ? { client: earlierClient } : {}), ...(input ? { input } : {}) },
+            later: laterClient ? { client: laterClient } : {},
+        });
+    }
+    return out;
 }
 
 /** The kinds of a change of the tree's own files a write names (`media[].kind`, spec 108). */
@@ -5599,7 +6293,7 @@ export function sanitizeSkipped(value: unknown, codes: boolean): SyncReply['skip
 export function sanitizeSyncReply(value: unknown, features?: readonly string[] | null): SyncReply {
     const codes = !!features?.includes(SYNC_NW_CODES_FEATURE);
     const r = asRecord(value);
-    if (!r) return { ok: false, changes: null, error: '', inbox: null, intake: '', head: '', applied: null, pending: false, conflicts: null, conflictPersons: [], conflictIds: [], conflictTakeIds: [], kept: null, reason: '', skipped: [], code: '', undoneSince: [], takenBack: null, notWritten: [], personConflicts: [], ids: null, readings: [], media: [], mediaCount: 0, retracted: [] };
+    if (!r) return { ok: false, changes: null, error: '', inbox: null, intake: '', head: '', applied: null, pending: false, conflicts: null, conflictPersons: [], conflictIds: [], conflictTakeIds: [], kept: null, reason: '', skipped: [], code: '', undoneSince: [], takenBack: null, notWritten: [], personConflicts: [], ids: null, readings: [], media: [], mediaCount: 0, retracted: [], conflictSent: [] };
     const idsRec = asRecord(r.ids);
     const idPersons = adoptIdMap(idsRec?.persons, /^P\d{1,9}$/);
     const idSources = adoptIdMap(idsRec?.sources, /^S\d{1,9}$/);
@@ -5631,6 +6325,7 @@ export function sanitizeSyncReply(value: unknown, features?: readonly string[] |
         media,
         mediaCount: mediaCountOf(r.mediaCount, r.media, media.length),
         retracted: retractedSources(r.retracted),
+        conflictSent: conflictSentOf(r.conflicts),
     };
 }
 
@@ -5794,6 +6489,44 @@ export function applyAdoptIds(data: StromData, xrefs: ExportXrefs, ids: AdoptIds
         }
     }
     return { data: { ...data, persons, ...(sources ? { sources } : {}) }, persons: np, sources: ns };
+}
+
+/**
+ * The tree as a new research takes it (strom-research://new, POST /adopt):
+ * without the numbers another research gave its people and sources (a copy
+ * of a research tree, a tree taken off its research, spec 139 K5.4). A
+ * research reads `REFN P0012` (no TYPE, or TYPE strom-research) and
+ * `REFN S0004` as its own: the new research would number such a person as
+ * one of the file's under that number, and its answer (`ids`, by the file's
+ * xrefs) would not name them — the copy would keep the old research's
+ * numbers and send them as the new one's. Without them every person and
+ * source goes as the file's own and gets the new research's number back.
+ * Other numbers (an archive's, another program's) stay. Returns `data` when
+ * nothing is left out, else a new object.
+ */
+export function withoutResearchNumbers(data: StromData): StromData {
+    const personNumber = (p: { refn?: string; refnType?: string }): boolean =>
+        !!p.refn && /^P\d{4,}$/.test(p.refn.trim()) && (!p.refnType || p.refnType === RESEARCH_REFN_TYPE);
+    const sourceNumber = (s: { refn?: string }): boolean => !!s.refn && /^S\d{4,}$/.test(s.refn.trim());
+    const persons = Object.values(data.persons).some(p => p && personNumber(p));
+    const sources = Object.values(data.sources ?? {}).some(s => s && sourceNumber(s));
+    if (!persons && !sources) return data;
+    const out: StromData = { ...data };
+    if (persons) {
+        out.persons = Object.fromEntries(Object.entries(data.persons).map(([id, p]) => {
+            if (!p || !personNumber(p)) return [id, p];
+            const { refn: _refn, refnType: _type, ...rest } = p;
+            return [id, rest];
+        })) as StromData['persons'];
+    }
+    if (sources && data.sources) {
+        out.sources = Object.fromEntries(Object.entries(data.sources).map(([id, src]) => {
+            if (!src || !sourceNumber(src)) return [id, src];
+            const { refn: _refn, ...rest } = src;
+            return [id, rest];
+        })) as StromData['sources'];
+    }
+    return out;
 }
 
 /**

@@ -1,0 +1,567 @@
+import { test, expect, type Locator, type Page } from '@playwright/test';
+import { openApp, importJsonAsNewTree, mergeCompare, mergeCurrentStep, mergeWriteAndSwitch, openTreeActions, runStructure, reloadApp } from './helpers.js';
+
+/**
+ * The ways into the import guide and its first moment (spec 134 §2): a
+ * dropped GEDCOM file, Import → GEDCOM, Merge into another tree (Swap), Merge
+ * this view into; each opens step 1 with the import filled in and writes
+ * nothing. A research's own file still loads as the research. A tree that
+ * cannot take the import (locked, followed live) says why and what can be
+ * done; a file that is no GEDCOM says so; a dialog open says it needs
+ * finishing first; a merge left open is offered again after a reload, with
+ * the line about its tree changed since. The families Modřín (the tree) and
+ * Jilm (the file) are invented.
+ */
+
+const GED = 'e2e/fixtures/rodokmen-jilmovi.ged';
+
+/** The app with the tree Modřínovi open (3 people). */
+async function openModrinovi(page: Page): Promise<void> {
+    await openApp(page);
+    await importJsonAsNewTree(page, 'e2e/fixtures/modrinovi.json', 'Modřínovi');
+}
+
+/** A second tree Jilmovi (not switched to); its id. */
+async function seedJilmovi(page: Page): Promise<string> {
+    return page.evaluate(() => {
+        const TM = window.Strom.TreeManager;
+        const id = TM.createTree('Jilmovi');
+        TM.saveTreeData(id, {
+            persons: { j1: { id: 'j1', firstName: 'Amos', lastName: 'Jilm', gender: 'male', isPlaceholder: false, partnerships: [], parentIds: [], childIds: [] } },
+            partnerships: {},
+        });
+        return id;
+    });
+}
+
+/** Every tree's stored data, the open tree and the backups: what "nothing written" compares. */
+async function stored(page: Page): Promise<string> {
+    return page.evaluate(async () => {
+        const TM = window.Strom.TreeManager;
+        const trees = TM.getTrees();
+        const data: Record<string, unknown> = {};
+        for (const t of trees) data[t.name] = await TM.getTreeData(t.id);
+        return JSON.stringify({ open: window.Strom.DataManager.getCurrentTreeId(), names: trees.map((t: { name: string }) => t.name).sort(), data });
+    });
+}
+
+/** A file dropped on the page as the browser does it (dragenter, dragover, drop). */
+async function dropFile(page: Page, name: string, text: string, stopAt?: 'dragover', type = 'text/plain'): Promise<void> {
+    await page.evaluate(({ name, text, stopAt, type }) => {
+        const dt = new DataTransfer();
+        dt.items.add(new File([text], name, { type }));
+        const fire = (type: string) => document.body.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt }));
+        fire('dragenter');
+        fire('dragover');
+        if (stopAt === 'dragover') return;
+        fire('drop');
+    }, { name, text, stopAt, type });
+}
+
+const gedText = async (): Promise<string> => (await import('node:fs')).readFileSync(GED, 'utf-8');
+/** A Strom tree as a .json file (Jan, Marta and Lucie Merge, invented). */
+const jsonText = async (): Promise<string> => (await import('node:fs')).readFileSync('e2e/fixtures/merge-b.json', 'utf-8');
+
+const target = (wizard: Locator, name: string): Locator =>
+    wizard.locator('.merge-s1-target').filter({ has: wizard.page().locator('.merge-s1-tname', { hasText: new RegExp(`^${name}$`) }) });
+
+test('a dropped GEDCOM file: the overlay says the guide opens, step 1 holds the file, nothing is written', async ({ page }) => {
+    await openModrinovi(page);
+    const before = await stored(page);
+    const text = await gedText();
+
+    // While dragging: the overlay says what happens to the file.
+    await dropFile(page, 'rodokmen-jilmovi.ged', text, 'dragover');
+    const overlay = page.locator('#drop-overlay');
+    await expect(overlay).toHaveClass(/active/);
+    await expect(overlay).toContainText('The import guide opens: first choose what to do with it. Nothing is written until the last step is confirmed.');
+    await page.evaluate(() => document.body.dispatchEvent(new DragEvent('dragleave', { bubbles: true, dataTransfer: new DataTransfer() })));
+
+    await dropFile(page, 'rodokmen-jilmovi.ged', text);
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await expect(mergeCurrentStep(wizard)).toHaveAttribute('data-step', '1');
+    await expect(wizard.locator('#merge-route')).toHaveText('rodokmen-jilmovi.ged → Modřínovi');
+    expect(await stored(page)).toBe(before);
+
+    // Closed before the comparison: still nothing written.
+    await page.keyboard.press('Escape');
+    await expect(wizard).toBeHidden();
+    expect(await stored(page)).toBe(before);
+});
+
+test('Import → GEDCOM opens step 1 with the file and writes nothing', async ({ page }) => {
+    await openModrinovi(page);
+    const before = await stored(page);
+    await page.locator('#gedcom-input').setInputFiles(GED);
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await expect(mergeCurrentStep(wizard)).toHaveAttribute('data-step', '1');
+    await expect(wizard.locator('#merge-route')).toHaveText('rodokmen-jilmovi.ged → Modřínovi');
+    expect(await stored(page)).toBe(before);
+});
+
+test('Merge into another tree from Manage trees: the open tree is the target, Swap turns the way round, nothing is switched or written', async ({ page }) => {
+    await openModrinovi(page);
+    await seedJilmovi(page);
+    const before = await stored(page);
+
+    await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
+    const manager = page.locator('#tree-manager-modal');
+    const row = manager.locator('.tree-manager-item').filter({ has: page.locator('.tree-manager-item-name', { hasText: /^Jilmovi$/ }) });
+    await runStructure(page, 'mergeInto', row.locator('.tree-manager-item-actions'));
+
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await expect(manager).toBeHidden();
+    await expect(mergeCurrentStep(wizard)).toHaveAttribute('data-step', '1');
+    await expect(target(wizard, 'Modřínovi').locator('input')).toBeChecked();
+    await expect(wizard.locator('.merge-s1-targets')).not.toContainText('Jilmovi');
+    await expect(wizard.locator('#merge-route')).toHaveText('Jilmovi → Modřínovi');
+
+    await wizard.locator('.merge-s1-swap').click();
+    await expect(wizard.locator('#merge-route')).toHaveText('Modřínovi → Jilmovi');
+    expect(await stored(page)).toBe(before);
+});
+
+test('Merge this view into: the open tree is not offered, the other one is the target', async ({ page }) => {
+    await openModrinovi(page);
+    await seedJilmovi(page);
+    const before = await stored(page);
+    await runStructure(page, 'mergeView', await openTreeActions(page));
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await expect(wizard.locator('.merge-s1-target')).toHaveCount(1);
+    await expect(target(wizard, 'Jilmovi').locator('input')).toBeChecked();
+    expect(await stored(page)).toBe(before);
+});
+
+test('a research\'s own file still loads as the research, not through the guide', async ({ page }) => {
+    await openModrinovi(page);
+    const text = [
+        '0 HEAD', '1 SOUR STROM_RESEARCH', '1 DATE 27 SEP 2026', '1 _STROM_TREE 3c9e1f20-7a4b-4d6e-9f12-5b8a0c7d2e41', '1 _STROM_HEAD 9d2c4e6f8a1b',
+        '1 CHAR UTF-8', '1 NOTE Jilmovi z Mechové',
+        '0 @P0001@ INDI', '1 NAME Amos /Jilm/', '1 SEX M', '1 REFN P0001',
+        '0 TRLR', '',
+    ].join('\n');
+    await dropFile(page, 'jilmovi.ged', text);
+    // The research's tree is there (loaded, or asked about first), the guide never opens.
+    await expect.poll(async () => await page.evaluate(() => window.Strom.TreeManager.getTrees().some((t: { name: string }) => t.name === 'Jilmovi z Mechové'))
+        || await page.locator('#confirmation-modal.active').isVisible()).toBe(true);
+    await expect(page.locator('#merge-modal')).toBeHidden();
+});
+
+test('a locked tree: step 1 says why, Add to a tree offers Manage trees', async ({ page }) => {
+    await openModrinovi(page);
+    await page.evaluate(() => window.Strom.TreeManager.toggleTreeLock(window.Strom.DataManager.getCurrentTreeId()));
+    const before = await stored(page);
+    await page.locator('#gedcom-input').setInputFiles(GED);
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    // The only tree cannot take it: New tree is preset, the tree said why.
+    await expect(wizard.locator('.merge-s1-modes [data-mode="new"]')).toHaveAttribute('aria-checked', 'true');
+    await wizard.locator('.merge-s1-modes [data-mode="add"]').click();
+    const tile = target(wizard, 'Modřínovi');
+    await expect(tile).toHaveAttribute('data-block', 'locked');
+    await expect(tile.locator('.merge-s1-tline')).toContainText('The tree Modřínovi is locked: it cannot be written to.');
+    // The reason is read whole (wrapped), never cut with "…".
+    expect(await tile.locator('.merge-s1-tline').evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+    // Every tree blocked: a dialog says why, with Manage trees and Choose another tree.
+    const dialog = page.locator('#confirmation-modal');
+    await expect(dialog).toHaveClass(/active/);
+    await expect(dialog).toContainText('The tree Modřínovi is locked: it cannot be written to.');
+    await expect(dialog.getByRole('button', { name: 'Choose another tree' })).toBeVisible();
+    await dialog.getByRole('button', { name: 'Choose another tree' }).click();
+    await expect(wizard).toBeVisible();
+    // No tree to name: the route is the file alone, the primary compares without a tree's name and waits.
+    await expect(wizard.locator('#merge-route')).not.toContainText('→');
+    await expect(wizard.locator('#merge-next')).toHaveText(/^Compare \d+ people$/);
+    await expect(wizard.locator('#merge-next')).toBeDisabled();
+    await expect(wizard.locator('#merge-counts')).not.toContainText('New tree');
+    expect(await stored(page)).toBe(before);
+});
+
+test('a tree followed live: step 1 says so, End following frees it', async ({ page }) => {
+    await openModrinovi(page);
+    // Following stood in for: the research is not running in this test.
+    await page.evaluate(() => {
+        const UI = window.Strom.UI as unknown as { isLiveFollowActive: () => boolean; setLiveFollow: (on: boolean) => void };
+        let on = true;
+        UI.isLiveFollowActive = () => on;
+        UI.setLiveFollow = (v: boolean) => { on = v; };
+    });
+    await page.locator('#gedcom-input').setInputFiles(GED);
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await wizard.locator('.merge-s1-modes [data-mode="add"]').click();
+    // The dialog for every tree blocked: End following.
+    const dialog = page.locator('#confirmation-modal');
+    await expect(dialog).toHaveClass(/active/);
+    await expect(dialog).toContainText('The tree is followed live from the research now (◎ Follow the agent in the tree), so it is read-only.');
+    await dialog.getByRole('button', { name: 'Choose another tree' }).click();
+    // The line in step 1 says the way on (backup, sending paused) with its own action.
+    const line = wizard.locator('#merge-s1-live');
+    await expect(line).toContainText('The tree is followed live from the research now (◎ Follow the agent in the tree), so it is read-only.');
+    await expect(line).toContainText('a backup is saved before writing, sending to the research is paused');
+    // The followed tree's tile is no dead end: pressed, the dialog offers the same; Choose another tree keeps it blocked.
+    // aria-disabled (the radio cannot be chosen), yet a press on it is answered.
+    await target(wizard, 'Modřínovi').click({ force: true });
+    await expect(dialog).toHaveClass(/active/);
+    await expect(dialog.getByRole('button', { name: 'Turn off following and merge here' })).toBeVisible();
+    await dialog.getByRole('button', { name: 'Choose another tree' }).click();
+    await expect(line).toBeVisible();
+    await expect(line.locator('[data-s1="end-follow"]')).toHaveText('Turn off following and merge here');
+    await line.locator('[data-s1="end-follow"]').click();
+    await expect(line).toHaveCount(0);
+    await expect(target(wizard, 'Modřínovi').locator('input')).toBeChecked();
+    await expect(wizard.locator('#merge-route')).toHaveText('rodokmen-jilmovi.ged → Modřínovi');
+});
+
+test('a copy of a research tree with ◎ on: the import merges into it, it is not followed', async ({ page }) => {
+    await openModrinovi(page);
+    // An older copy of a research tree (made when Duplicate kept the link, marked a copy) open, ◎ left on from the research tree:
+    // no live session of this tree, so following does not apply and the tree can take the import.
+    await page.evaluate(() => {
+        window.Strom.TreeManager.setResearchLink(window.Strom.DataManager.getCurrentTreeId()!,
+            { id: '5b0e1c2a-7d4f-4e8a-9c3b-2f6a1d0e9b47', fingerprint: '', syncedAt: new Date().toISOString(), copy: true } as never);
+        window.Strom.UI.setLiveFollow(true);
+    });
+    expect(await page.evaluate(() => window.Strom.UI.isLiveFollowOn())).toBe(true);
+    await page.locator('#gedcom-input').setInputFiles(GED);
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await wizard.locator('.merge-s1-modes [data-mode="add"]').click();
+    await expect(page.locator('#confirmation-modal')).not.toHaveClass(/active/);
+    await expect(wizard.locator('#merge-s1-live')).toHaveCount(0);
+    await expect(target(wizard, 'Modřínovi').locator('input')).toBeChecked();
+    await expect(wizard.locator('#merge-route')).toHaveText('rodokmen-jilmovi.ged → Modřínovi');
+});
+
+test('a research-linked tree with ◎ stored on but no live session: the import merges into it, nothing says it is followed', async ({ page }) => {
+    await openModrinovi(page);
+    await page.evaluate(() => {
+        window.Strom.TreeManager.setResearchLink(window.Strom.DataManager.getCurrentTreeId()!,
+            { id: '5b0e1c2a-7d4f-4e8a-9c3b-2f6a1d0e9b47', fingerprint: '', syncedAt: new Date().toISOString() } as never);
+        window.Strom.UI.setLiveFollow(true);
+    });
+    await page.locator('#gedcom-input').setInputFiles(GED);
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await wizard.locator('.merge-s1-modes [data-mode="add"]').click();
+    await expect(page.locator('#confirmation-modal')).not.toHaveClass(/active/);
+    await expect(wizard.locator('#merge-s1-live')).toHaveCount(0);
+    await expect(target(wizard, 'Modřínovi').locator('input')).toBeChecked();
+});
+
+test('a dropped file that is no GEDCOM says so and changes nothing', async ({ page }) => {
+    await openModrinovi(page);
+    const before = await stored(page);
+    await dropFile(page, 'poznamky-jilm.ged', 'Kniha Jilmů z Mechové\nnení to rodokmen\n');
+    const dialog = page.locator('#confirmation-modal');
+    await expect(dialog).toHaveClass(/active/);
+    await expect(dialog).toContainText('poznamky-jilm.ged is not a readable GEDCOM file. Nothing changed.');
+    await expect(page.locator('#merge-modal')).toBeHidden();
+    expect(await stored(page)).toBe(before);
+});
+
+test('a dropped Strom tree (.json): the guide as for a GEDCOM file, step 1 with the file and its modes, nothing written (K10.2)', async ({ page }) => {
+    await openModrinovi(page);
+    const before = await stored(page);
+    const text = await jsonText();
+
+    // While dragging: the overlay says the guide opens.
+    await dropFile(page, 'strom-merge.json', text, 'dragover', 'application/json');
+    const overlay = page.locator('#drop-overlay');
+    await expect(overlay).toHaveClass(/active/);
+    await expect(overlay).toContainText('Drop a .ged or .json file to open it');
+    await expect(overlay).toContainText('The import guide opens: first choose what to do with it.');
+    await page.evaluate(() => document.body.dispatchEvent(new DragEvent('dragleave', { bubbles: true, dataTransfer: new DataTransfer() })));
+
+    await dropFile(page, 'strom-merge.json', text, undefined, 'application/json');
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await expect(mergeCurrentStep(wizard)).toHaveAttribute('data-step', '1');
+    await expect(wizard.locator('#merge-route')).toHaveText('strom-merge.json → Modřínovi');
+    // New tree · Add to a tree · Only compare, as for a GEDCOM file (no Save as JSON for a JSON).
+    await expect(wizard.locator('.merge-s1-modes [data-mode]')).toHaveCount(3);
+    for (const m of ['new', 'add', 'compare']) await expect(wizard.locator(`.merge-s1-modes [data-mode="${m}"]`)).toBeVisible();
+    await mergeCompare(wizard);
+    await expect(wizard.locator('#merge-counts .merge-stat .merge-stat-value')).toHaveCount(4);
+    expect(await stored(page)).toBe(before);
+});
+
+test('a dropped .json that is no tree of the app says so and changes nothing (K10.2)', async ({ page }) => {
+    await openModrinovi(page);
+    const before = await stored(page);
+    await dropFile(page, 'poznamky-jilm.json', '{"notes": "Kniha Jilmů z Mechové"}', undefined, 'application/json');
+    const dialog = page.locator('#confirmation-modal');
+    await expect(dialog).toHaveClass(/active/);
+    await expect(dialog).toContainText('poznamky-jilm.json is not a readable family tree file (.json). Nothing changed.');
+    await expect(page.locator('#merge-modal')).toBeHidden();
+    expect(await stored(page)).toBe(before);
+});
+
+test('a Strom tree (.json) dropped over another dialog: the toast, Open now opens the guide (K10.2)', async ({ page }) => {
+    await openModrinovi(page);
+    await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
+    await expect(page.locator('#tree-manager-modal')).toBeVisible();
+    await dropFile(page, 'strom-merge.json', await jsonText(), undefined, 'application/json');
+    const toast = page.locator('.toast').last();
+    await expect(toast).toContainText('needs finishing first; then the file opens in the guide.');
+    await expect(page.locator('#merge-modal')).toBeHidden();
+    await toast.getByRole('button', { name: 'Open now' }).click();
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await expect(wizard.locator('#merge-route')).toHaveText('strom-merge.json → Modřínovi');
+});
+
+test('a GEDCOM file dropped over another dialog: the toast says it needs finishing first, Open now opens the guide', async ({ page }) => {
+    await openModrinovi(page);
+    await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
+    await expect(page.locator('#tree-manager-modal')).toBeVisible();
+    await dropFile(page, 'rodokmen-jilmovi.ged', await gedText());
+    const toast = page.locator('.toast').last();
+    await expect(toast).toContainText('needs finishing first; then the file opens in the guide.');
+    await expect(page.locator('#merge-modal')).toBeHidden();
+    await toast.getByRole('button', { name: 'Open now' }).click();
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await expect(page.locator('#tree-manager-modal')).toBeHidden();
+    await expect(wizard.locator('#merge-route')).toHaveText('rodokmen-jilmovi.ged → Modřínovi');
+});
+
+/** Manage trees open, the row of tree `name`. */
+async function managerRow(page: Page, name: string): Promise<Locator> {
+    await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
+    const manager = page.locator('#tree-manager-modal');
+    await expect(manager).toBeVisible();
+    return manager.locator('.tree-manager-item').filter({ has: page.locator('.tree-manager-item-name', { hasText: new RegExp(`^${name}$`) }) });
+}
+
+/** A file dropped on a row of Manage trees as the browser does it (dragenter, dragover, drop on the row). */
+async function dropFileOnRow(row: Locator, name: string, text: string, stopAt?: 'dragover', type = 'text/plain'): Promise<void> {
+    await row.evaluate((node, { name, text, stopAt, type }) => {
+        const dt = new DataTransfer();
+        dt.items.add(new File([text], name, { type }));
+        const fire = (t: string) => node.dispatchEvent(new DragEvent(t, { bubbles: true, cancelable: true, dataTransfer: dt }));
+        fire('dragenter');
+        fire('dragover');
+        if (stopAt === 'dragover') return;
+        fire('drop');
+    }, { name, text, stopAt, type });
+}
+
+/** The row `from` dragged with the mouse onto the row `to` (dragstart, dragenter, dragover, drop, dragend). */
+async function dragRowOnRow(from: Locator, to: Locator, stopAt?: 'dragover'): Promise<void> {
+    const target = await to.elementHandle();
+    await from.evaluate((source, { target, stopAt }) => {
+        const dt = new DataTransfer();
+        const fire = (node: Element, t: string) => node.dispatchEvent(new DragEvent(t, { bubbles: true, cancelable: true, dataTransfer: dt }));
+        fire(source, 'dragstart');
+        fire(target as Element, 'dragenter');
+        fire(target as Element, 'dragover');
+        if (stopAt === 'dragover') return;
+        fire(target as Element, 'drop');
+        fire(source, 'dragend');
+    }, { target, stopAt });
+}
+
+test('a GEDCOM file or a Strom tree dropped on a tree\'s row in Manage trees: step 1 with that tree as the target, closing returns to Manage trees (K10.3)', async ({ page }) => {
+    await openModrinovi(page);
+    await seedJilmovi(page);
+    const before = await stored(page);
+    const manager = page.locator('#tree-manager-modal');
+    const wizard = page.locator('#merge-modal');
+
+    await dropFileOnRow(await managerRow(page, 'Jilmovi'), 'rodokmen-jilmovi.ged', await gedText());
+    await expect(wizard).toBeVisible();
+    await expect(manager).toBeHidden();
+    await expect(mergeCurrentStep(wizard)).toHaveAttribute('data-step', '1');
+    await expect(wizard.locator('.merge-s1-modes [data-mode="add"]')).toHaveAttribute('aria-checked', 'true');
+    await expect(target(wizard, 'Jilmovi').locator('input')).toBeChecked();
+    await expect(wizard.locator('#merge-route')).toHaveText('rodokmen-jilmovi.ged → Jilmovi');
+    // The open tree stays open: Jilmovi is read for the comparison only.
+    expect(await stored(page)).toBe(before);
+
+    await page.keyboard.press('Escape');
+    await expect(wizard).toBeHidden();
+    await expect(manager).toBeVisible();
+
+    // A Strom tree (.json) the same way.
+    const row = manager.locator('.tree-manager-item').filter({ has: page.locator('.tree-manager-item-name', { hasText: /^Jilmovi$/ }) });
+    await dropFileOnRow(row, 'strom-merge.json', await jsonText(), undefined, 'application/json');
+    await expect(wizard).toBeVisible();
+    await expect(target(wizard, 'Jilmovi').locator('input')).toBeChecked();
+    await expect(wizard.locator('#merge-route')).toHaveText('strom-merge.json → Jilmovi');
+    // The window's own drop left it: no toast about a dialog to finish.
+    await expect(page.locator('.toast', { hasText: 'needs finishing first' })).toHaveCount(0);
+    expect(await stored(page)).toBe(before);
+});
+
+test('a tree\'s row dragged onto another row: step 1 with the dragged tree as the import and the other as the target; onto itself nothing (K10.3)', async ({ page }) => {
+    await openModrinovi(page);
+    await seedJilmovi(page);
+    const before = await stored(page);
+    const from = await managerRow(page, 'Modřínovi');
+    const to = page.locator('#tree-manager-modal .tree-manager-item').filter({ has: page.locator('.tree-manager-item-name', { hasText: /^Jilmovi$/ }) });
+    await expect(from).toHaveAttribute('draggable', 'true');
+
+    // Onto itself: nothing happens.
+    await dragRowOnRow(from, from);
+    await expect(page.locator('#merge-modal')).toBeHidden();
+    await expect(from).not.toHaveClass(/is-drop-target/);
+
+    await dragRowOnRow(from, to);
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await expect(mergeCurrentStep(wizard)).toHaveAttribute('data-step', '1');
+    await expect(wizard.locator('#merge-route')).toHaveText('Modřínovi → Jilmovi');
+    await expect(target(wizard, 'Jilmovi').locator('input')).toBeChecked();
+    expect(await stored(page)).toBe(before);
+});
+
+test('while dragging over a tree\'s row: the row is dashed and says what the drop does (K10.3)', async ({ page }) => {
+    await openModrinovi(page);
+    await seedJilmovi(page);
+    const row = await managerRow(page, 'Jilmovi');
+
+    await dropFileOnRow(row, 'rodokmen-jilmovi.ged', await gedText(), 'dragover');
+    await expect(row).toHaveClass(/is-drop-target/);
+    const hint = row.locator('.tree-manager-drop-hint');
+    await expect(hint).toHaveText('Drop: add rodokmen-jilmovi.ged to the tree Jilmovi');
+    expect(await row.evaluate(el => getComputedStyle(el).outlineStyle)).toBe('dashed');
+    // The window's overlay stays away over Manage trees.
+    await expect(page.locator('#drop-overlay.active')).toHaveCount(0);
+    await row.evaluate(el => el.dispatchEvent(new DragEvent('dragleave', { bubbles: true, dataTransfer: new DataTransfer() })));
+    await expect(row).not.toHaveClass(/is-drop-target/);
+    await expect(hint).toHaveCount(0);
+
+    const from = page.locator('#tree-manager-modal .tree-manager-item').filter({ has: page.locator('.tree-manager-item-name', { hasText: /^Modřínovi$/ }) });
+    await dragRowOnRow(from, row, 'dragover');
+    await expect(row).toHaveClass(/is-drop-target/);
+    await expect(row.locator('.tree-manager-drop-hint')).toHaveText('Drop: add Modřínovi to the tree Jilmovi');
+    await expect(from).toHaveClass(/is-drag-source/);
+});
+
+test('a reload in an unfinished guide: the merge is offered again, the tree unchanged; its tree changed since: the line says so', async ({ page }) => {
+    await openModrinovi(page);
+    await page.locator('#gedcom-input').setInputFiles(GED);
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await mergeCompare(wizard);
+    await expect.poll(() => page.evaluate(async () => !!(await window.Strom.MergerUI.getPendingMergeInfo()).current), { timeout: 10_000 }).toBe(true);
+    const before = await stored(page);
+
+    await reloadApp(page);
+    const pending = page.locator('#pending-merge-modal');
+    await expect(pending).toHaveClass(/active/);
+    // A merge that did not finish (13g): its tree and the file are unchanged.
+    await expect(pending.locator('.pending-merge-message')).toHaveText('Last time the merge did not finish. The tree Modřínovi and the file are unchanged.');
+    const item = pending.locator('.pending-merge-item');
+    await expect(item).toHaveCount(1);
+    await expect(item.locator('.pending-merge-meta')).toContainText('Step 2 of 6 · Who is who');
+    await expect(item.locator('.pending-merge-changed')).toHaveCount(0);
+    expect(await stored(page)).toBe(before);
+
+    // The tree changes meanwhile (one person's birth place): the offer says so.
+    await page.evaluate(() => window.Strom.UI.closePendingMergeDialog());
+    await page.evaluate(async () => {
+        const TM = window.Strom.TreeManager;
+        const id = window.Strom.DataManager.getCurrentTreeId();
+        const data = await TM.getTreeData(id);
+        const first = Object.values(data.persons)[0] as { birthPlace?: string };
+        first.birthPlace = 'Křemenná u Mechové';
+        TM.saveTreeData(id, data);
+    });
+    await reloadApp(page);
+    await expect(pending).toHaveClass(/active/);
+    await expect(item.locator('.pending-merge-changed')).toHaveText('The tree Modřínovi has changed since (1 edit): suggestions are recalculated, decisions stay.');
+});
+
+/** The backups "Before merge" of the tree `treeId`, as its backups dialog lists them (the dialog closed again). */
+async function preMergeBackups(page: Page, treeId: string): Promise<string[]> {
+    await page.evaluate((id) => window.Strom.UI.showSnapshotsDialog(id), treeId);
+    const rows = page.locator('#snapshots-modal .snapshot-row');
+    await expect(page.locator('#snapshots-modal')).toBeVisible();
+    const texts = (await rows.allTextContents()).filter(t => t.includes('Before merge'));
+    await page.evaluate(() => window.Strom.UI.closeSnapshotsDialog());
+    return texts;
+}
+
+/** Automatic backups off for the tree: the backup "Before merge" is taken all the same (K0.4). */
+async function autoBackupsOff(page: Page, treeId: string): Promise<void> {
+    await page.evaluate((id) => window.Strom.TreeManager.setAutoBackups(id, false), treeId);
+}
+
+const openTreeId = (page: Page): Promise<string> => page.evaluate(() => window.Strom.DataManager.getCurrentTreeId()!);
+
+for (const way of ['GEDCOM file', 'view', 'share'] as const) {
+    test(`the backup Before merge from a ${way}: none while comparing, one of the target at the write, with automatic backups off`, async ({ page }) => {
+        await openModrinovi(page);
+        const jilmovi = await seedJilmovi(page);
+        const modrinovi = await openTreeId(page);
+        const target = way === 'view' ? jilmovi : modrinovi;
+        await autoBackupsOff(page, target);
+
+        if (way === 'GEDCOM file') {
+            await page.locator('#gedcom-input').setInputFiles(GED);
+        } else if (way === 'view') {
+            await runStructure(page, 'mergeView', await openTreeActions(page));
+        } else {
+            // A relative's reply to a shared file, as Review and merge takes it.
+            await page.evaluate(async (id) => {
+                const UI = window.Strom.UI as unknown as { pendingReplyEnvelope: unknown; shareReplyMerge(): Promise<void> };
+                UI.pendingReplyEnvelope = {
+                    senderName: 'Amos',
+                    data: {
+                        version: 26, partnerships: {},
+                        persons: { r1: { id: 'r1', firstName: 'Amos', lastName: 'Jilm', gender: 'male', birthDate: '1925', isPlaceholder: false, partnerships: [], parentIds: [], childIds: [] } },
+                    },
+                };
+                document.getElementById('share-reply-modal')!.dataset.targetTreeId = id;
+                await UI.shareReplyMerge();
+            }, modrinovi);
+        }
+        const wizard = page.locator('#merge-modal');
+        await expect(wizard).toBeVisible();
+        await mergeCompare(wizard);
+        expect(await preMergeBackups(page, target)).toEqual([]);
+
+        await mergeWriteAndSwitch(page, wizard);
+        const backups = await preMergeBackups(page, target);
+        expect(backups).toHaveLength(1);
+        expect(backups[0]).toContain(way === 'view' ? '1 person' : '3 people');
+    });
+}
+
+test('a saved merge whose tree changed, gone on with as saved: the backup Before merge holds the tree as it is at the write', async ({ page }) => {
+    await openModrinovi(page);
+    const modrinovi = await openTreeId(page);
+    await autoBackupsOff(page, modrinovi);
+    await page.locator('#gedcom-input').setInputFiles(GED);
+    const wizard = page.locator('#merge-modal');
+    await expect(wizard).toBeVisible();
+    await mergeCompare(wizard);
+    await wizard.locator('#merge-save-later').click();
+    await expect(wizard).toBeHidden();
+    await expect.poll(() => page.evaluate(async () => (await window.Strom.MergerUI.getPendingMergeInfo()).saved.length)).toBe(1);
+
+    // The tree gets a fourth person meanwhile.
+    await page.evaluate(() => {
+        window.Strom.DataManager.createPerson({ firstName: 'Hostivít', lastName: 'Modřín', gender: 'male', birthDate: '1950' });
+    });
+
+    await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
+    await page.locator('#tree-manager-modal .tree-manager-item-pending .pending-merge-resume').click();
+    const ask = page.locator('#confirmation-modal');
+    await expect(page.locator('#confirm-title')).toHaveText('The tree has changed');
+    await ask.getByRole('button', { name: 'Go on as saved' }).click();
+    await expect(wizard).toBeVisible();
+    await expect(mergeCurrentStep(wizard)).toHaveAttribute('data-step', '2');
+    expect(await preMergeBackups(page, modrinovi)).toEqual([]);
+
+    await mergeWriteAndSwitch(page, wizard);
+    const backups = await preMergeBackups(page, modrinovi);
+    expect(backups).toHaveLength(1);
+    expect(backups[0]).toContain('4 people');
+});

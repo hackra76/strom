@@ -31,6 +31,11 @@ import { PERSISTENCE_EVENT } from './persistence.js';
 import { FILE_COPY_EVENT, RESEARCH_BASE_EVENT, UPDATE_BACKUP_FAILED_EVENT } from './tree-manager.js';
 import { SNAPSHOTS_TRIMMED_EVENT, SNAPSHOT_CREATED_EVENT, SnapshotTrim } from './snapshots.js';
 import { collectPoolGarbage } from './media-pool.js';
+import { backfillImageMeta } from './image-meta-backfill.js';
+import { imageCacheStats, setImageCacheLimits, releaseImageUrls } from './image-src.js';
+import { expandedData } from './image-expand.js';
+import { satellitesHolding } from './windows/window-images.js';
+import { MemoryLimit, initMemoryLimitNotice } from './ui/memory-limit-ui.js';
 import { keepLifelineChipsFor } from './lifeline-view.js';
 import { parseDeepLink, stripDeepLinkParams } from './deep-link.js';
 import { shouldRegisterServiceWorker, registerServiceWorker, linkManifest, isBetaBuild, appModeFor, captureInstallPrompt, INSTALL_AVAILABILITY_EVENT, isSafariOnComputer, safariAppName } from './pwa.js';
@@ -56,6 +61,8 @@ import { followSatelliteView, openAnotherWindow } from './windows/sat-views.js';
 import { currentSystem, isDesktopSystem, setWindowControlsRefresher } from './windows/window-open.js';
 import type { SatelliteClient } from './windows/satellite.js';
 import type { WindowRegistry } from './windows/window-registry.js';
+import { deviceModeCandidate } from './device/device-mode.js';
+import { setResearchDevicePage } from './research-link.js';
 
 // Make modules available globally for HTML event handlers
 declare global {
@@ -71,6 +78,17 @@ declare global {
             SettingsManager: typeof SettingsManager;
             TreePreview: typeof TreePreview;
             TreeCompare: typeof TreeCompare;
+            Images: {
+                imageCacheStats: typeof imageCacheStats;
+                setImageCacheLimits: typeof setImageCacheLimits;
+                releaseImageUrls: typeof releaseImageUrls;
+                /** Tree data (or any part) with every pooled image whole: what tests compare with the images they put in. */
+                expandedData: typeof expandedData;
+                /** The satellites that tell the main window which pooled images they hold (spec 135). */
+                satellitesHolding: typeof satellitesHolding;
+            };
+            /** The memory limit's estimate and a stand-in limit (spec 135). */
+            MemoryLimit: typeof MemoryLimit;
             /** The main window's registry of its satellite windows (spec 079; absent in other windows). */
             Windows?: WindowRegistry;
         };
@@ -645,7 +663,10 @@ function initShell(): DebugOptions {
         MergerUI,
         SettingsManager,
         TreePreview,
-        TreeCompare
+        TreeCompare,
+        // The pooled images' object URLs (image-src.ts): their count and bounds.
+        Images: { imageCacheStats, setImageCacheLimits, releaseImageUrls, expandedData, satellitesHolding },
+        MemoryLimit,
     };
 
     // Parse debug options from URL
@@ -862,6 +883,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     // password prompt, so a locked start never saves silently (V3).
     registerAppListeners();
 
+    // A device of the home network (spec 094 P3): only a page at the research's
+    // gateway (its port, a code in its address, a pairing of this origin) asks
+    // the gateway anything; the app on the web makes no new request.
+    if (deviceModeCandidate()) {
+        // The start screen, the pairing by the address's code, the tree chosen and followed through the gateway (spec 094 §2).
+        void UI.startDeviceApp(APP_VERSION).catch(err => {
+            setResearchDevicePage(false);
+            UI.closeDeviceBoot();
+            console.warn('Device mode did not start', err);
+        });
+    }
+
     // PWA: offline indicator always; register the service worker only on the
     // hosted PWA (never in embedded/file:// exports or dev).
     UI.initOnlineIndicator();
@@ -942,8 +975,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         UI.initMaterials();
         // A tree downloaded in Safari to move to another browser for the research: its banner.
         UI.initResearchTransferBanner();
+        // A copy the one-time repair took off a shared research: said once, at its opening.
+        UI.initResearchDetachedNotice();
         // A private window: its trees go when it closes (said once).
         void UI.initPrivateWindowNotice();
+        // A tree near the memory one page may use: said once (spec 135).
+        initMemoryLimitNotice();
 
         // Handle URL import parameter (from offline version redirect)
         handleUrlImportParam();
@@ -1082,15 +1119,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Cancelling leaves an "Unlock" banner (V3). A plain embedded file is
     // shown right away — the local password is asked for only when the
     // file is saved into local storage (ensureLocalUnlocked).
-    // Pooled images no stored tree or backup names any more (an image removed
-    // from a tree stays in the pool until a cleanup). Off the startup path.
-    setTimeout(() => { void collectPoolGarbage(); }, 30_000);
+    // Pooled images nothing names any more (no stored tree, backup or state in
+    // memory): marked, and removed by a cleanup a week later. Off the startup path.
+    // Then the image catalog for trees stored before it (one image at a time;
+    // encrypted ones once unlocked — again a while after unlocking).
+    setTimeout(() => {
+        void collectPoolGarbage()
+            .then(() => backfillImageMeta(TreeManager.getTrees().map(t => t.id)))
+            .catch(err => console.warn('Image catalog backfill failed', err));
+    }, 30_000);
 
     const showingEmbedded = DataManager.isViewMode() || DataManager.hasNewerVersionData();
     if (!showingEmbedded && SettingsManager.isEncryptionEnabled() && !CryptoSession.isUnlocked()
         && await TreeManager.hasEncryptedTrees()) {
         void UI.showLocalUnlockPrompt(async () => {
             await UI.onLocalDataUnlocked?.();
+            setTimeout(() => {
+                void backfillImageMeta(TreeManager.getTrees().map(t => t.id)).catch(err => console.warn('Image catalog backfill failed', err));
+            }, 30_000);
         });
         console.log(`Strom v${APP_VERSION} initialized (locked)`);
         return;

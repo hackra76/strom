@@ -17,6 +17,12 @@
  *   heartbeat may be slowed down by the browser).
  */
 
+import { findPoolSource, type PoolSource } from './window-images.js';
+import { noteOwnImages, noteImageMeta } from '../image-meta.js';
+import { treeImages } from '../image-intern.js';
+import type { StromData } from '../types.js';
+import { setPoolBlobSource, releaseImageUrls } from '../image-src.js';
+import { memoryImageIds } from '../pool-memory.js';
 import { DataManager, type WindowEditSink } from '../data.js';
 import type { TreeId } from '../types.js';
 import { WindowBus, answerWhenFocused, FOCUS_WAIT_MS, type MessageOf, type WindowStatus, type EditRefusal, type WindowBounds } from './window-bus.js';
@@ -27,7 +33,8 @@ import type { AgentFollow } from './agent-follow-state.js';
 /** Where the satellite's copy of the tree lives (DataManager; a test may pass its own). */
 export interface SatelliteDataTarget {
     setWindowSink(sink: WindowEditSink | null): void;
-    loadFromWindow(treeId: TreeId, json: string): void;
+    /** `data`: the tree as the channel cloned it (an older main window's: a JSON string). */
+    loadFromWindow(treeId: TreeId, data: unknown): void;
     windowDataJson(): string;
     isEditSessionActive(): boolean;
 }
@@ -107,6 +114,9 @@ export function followSelectionKey(windowId: string): string {
 /** A hello the main window has not answered may be on its way this long (no second one meanwhile). */
 export const HELLO_RETRY_MS = 1000;
 
+/** How long images asked of the main window over the channel are waited for (then: not shown). */
+export const IMAGES_WAIT_MS = 15_000;
+
 /** How long without the main window's status before the satellite checks whether it is gone (§3.3). */
 export const MAIN_SILENCE_MS = 3000;
 /** What stands in for a locked tree's copy. */
@@ -125,6 +135,8 @@ export interface SatelliteClientOptions {
     hasFocus?: () => boolean;
     /** Where the window stands (sent with bye; K4). */
     bounds?: () => WindowBounds | undefined;
+    /** The main window's image pool (window-images.ts findPoolSource; tests pass their own). */
+    poolSource?: () => PoolSource | null;
 }
 
 interface QueuedEdit {
@@ -146,6 +158,9 @@ export class SatelliteClient {
     private readonly closeSelf: () => void;
     private readonly hasFocus: () => boolean;
     private readonly bounds: () => WindowBounds | undefined;
+    private readonly poolSource: () => PoolSource | null;
+    /** Images asked of the main window over the channel (no opener), by request id. */
+    private readonly imageWaiters = new Map<string, (blobs: Record<string, Blob | null>) => void>();
     private readonly listeners = new Map<keyof SatelliteEvents, Set<(p: unknown) => void>>();
     private readonly unsubscribe: (() => void)[] = [];
 
@@ -195,6 +210,7 @@ export class SatelliteClient {
         this.closeSelf = opts.closeSelf ?? (() => { if (typeof window !== 'undefined') window.close(); });
         this.hasFocus = opts.hasFocus ?? (() => typeof document !== 'undefined' && document.hasFocus());
         this.bounds = opts.bounds ?? defaultBounds;
+        this.poolSource = opts.poolSource ?? (() => findPoolSource());
         this.sentMode = this.sendMode;
     }
 
@@ -341,6 +357,7 @@ export class SatelliteClient {
             b.on('tree', m => this.onTree(m)),
             b.on('patch', m => this.onPatch(m)),
             b.on('edit-result', m => this.onEditResult(m)),
+            b.on('images', m => this.imageWaiters.get(m.reqId)?.(m.blobs && typeof m.blobs === 'object' ? m.blobs : {})),
             b.on('select', m => this.onSelect(m)),
             b.on('main-bye', m => { if (m.from === this.mainId) this.mainId = null; }),
             b.on('focus-req', m => this.onFocusRequest(m.from)),
@@ -356,7 +373,10 @@ export class SatelliteClient {
             b.on('taking-over', m => this.emit('taking-over', { windowId: m.windowId || m.from })),
         );
         if (typeof window !== 'undefined') {
-            const bye = () => this.bus.post({ type: 'bye', windowId: this.windowId, bounds: this.bounds() });
+            const bye = () => {
+                this.bus.post({ type: 'bye', windowId: this.windowId, bounds: this.bounds() });
+                try { this.poolSource()?.hold?.(this.windowId, null); } catch { /* the main window went */ }
+            };
             window.addEventListener('pagehide', bye);
             this.unsubscribe.push(() => window.removeEventListener('pagehide', bye));
         }
@@ -518,7 +538,8 @@ export class SatelliteClient {
 
     private hello(): void {
         this.helloAt = Date.now();
-        this.bus.post({ type: 'hello', windowId: this.windowId, kind: this._kind, treeId: this._treeId ?? this.requestedTreeId, agent: this._agent });
+        // The tree's pooled images are read through the main window (its pool, or asked over the channel): references as they are.
+        this.bus.post({ type: 'hello', windowId: this.windowId, kind: this._kind, treeId: this._treeId ?? this.requestedTreeId, agent: this._agent, takesData: true, poolRefs: true });
     }
 
     private setConnection(c: SatelliteConnection): void {
@@ -568,6 +589,8 @@ export class SatelliteClient {
         this.heldPatch = null;
         this._revision = -1;
         this.data.loadFromWindow(treeId, EMPTY_TREE_JSON);
+        // No image of the locked tree stays readable here either.
+        releaseImageUrls();
         this.emit('data', { treeId, revision: -1, source: 'tree' });
     }
 
@@ -595,7 +618,46 @@ export class SatelliteClient {
         this.emit('tree-gone', { treeId: this._treeId });
     }
 
+    /**
+     * The tree holds its stored images as pool references (spec 135): they
+     * are the main window's own (it sent them), so the load sanitizer here
+     * keeps them, with the catalog entries the message carries. Their bytes
+     * are read by the main window (it holds the storage and the key of an
+     * encrypted pool): through `opener`, or asked over the channel when this
+     * window does not reach it (a second tab turned into a window). This
+     * window reads and stores nothing itself.
+     */
+    private adoptPoolRefs(m: { data?: unknown; imageMeta?: Record<string, unknown> }): void {
+        if (!m.data || typeof m.data !== 'object') return;
+        const ids = treeImages(m.data as StromData).refIds;
+        if (ids.size === 0) return;
+        noteOwnImages(Object.fromEntries([...ids].map(id => [id, 0])));
+        noteImageMeta(m.imageMeta);
+        setPoolBlobSource(wanted => this.readPooled(wanted));
+        // The main window's pool cleanup keeps what this window holds (spec 135, D7); again after its reload.
+        this.poolSource()?.hold?.(this.windowId, () => [...memoryImageIds()]);
+    }
+
+    /** Pooled images' Blobs: through the main window's pool, else asked of the main window over the channel. */
+    private readPooled(ids: readonly string[]): Promise<Map<string, Blob | null>> {
+        const source = this.poolSource();
+        if (source) return source.blobs(ids);
+        const none = () => new Map(ids.map(id => [id, null] as [string, Blob | null]));
+        if (!this.started || ids.length === 0) return Promise.resolve(none());
+        const reqId = newWindowId();
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => { this.imageWaiters.delete(reqId); resolve(none()); }, IMAGES_WAIT_MS);
+            this.imageWaiters.set(reqId, (blobs) => {
+                clearTimeout(timer);
+                this.imageWaiters.delete(reqId);
+                resolve(new Map(ids.map(id => [id, blobs[id] instanceof Blob ? blobs[id] : null] as [string, Blob | null])));
+            });
+            this.bus.post({ type: 'images-req', windowId: this.windowId, reqId, ids: [...ids] });
+        });
+    }
+
     private onTree(m: MessageOf<'tree'>): void {
+        this.adoptPoolRefs(m);
         if (this.data.isEditSessionActive()) {
             this.heldTree = m;
             return;
@@ -617,7 +679,7 @@ export class SatelliteClient {
         this.queue.length = 0;
         this.inFlight = null;
         this._mainFocus = m.focus ?? null;
-        this.data.loadFromWindow(m.treeId, m.json);
+        this.data.loadFromWindow(m.treeId, m.data ?? m.json);
         this._treeId = m.treeId;
         this._treeName = m.name;
         this._revision = m.revision;
@@ -628,9 +690,13 @@ export class SatelliteClient {
     }
 
     private onPatch(m: MessageOf<'patch'>): void {
-        if (m.treeId !== this._treeId || m.revision <= this._revision || this.gone) return;
+        if (m.treeId !== this._treeId || this.gone) return;
+        // The same revision with its new images as pool references (spec 135): taken only while nothing here waits.
+        const sameWithImages = m.images === true && m.revision === this._revision;
+        if (m.revision <= this._revision && !sameWithImages) return;
+        this.adoptPoolRefs(m);
         if (this.inFlight || this.queue.length > 0 || this.data.isEditSessionActive()) {
-            this.heldPatch = m;
+            if (!sameWithImages) this.heldPatch = m;
             return;
         }
         this.applyPatch(m);
@@ -638,7 +704,7 @@ export class SatelliteClient {
 
     private applyPatch(m: MessageOf<'patch'>): void {
         this.heldPatch = null;
-        this.data.loadFromWindow(m.treeId, m.json);
+        this.data.loadFromWindow(m.treeId, m.data ?? m.json);
         this._revision = m.revision;
         this.emit('data', { treeId: m.treeId, revision: m.revision, source: 'patch' });
     }

@@ -17,10 +17,10 @@ import { yearOf } from '../dates.js';
 import {
     RESEARCH_LINK_ACTIONS, RESEARCH_TOOL_ACTIONS, RESEARCH_TOOL_GROUPS, ResearchLinkAction, ResearchReviewScope, ResearchStoryDo,
     ResearchToolAction, researchPersonRef, researchLinkMark, type ResearchActionMark,
-    RESEARCH_BRIDGE_MARKS,
+    researchBridgeMark, researchDeviceAllows, researchDeviceState, type ResearchDeviceAction,
 } from '../research-link.js';
 import { uiModule } from './module.js';
-import { onComputer, updateBusyText } from './research-ui.js';
+import { updateBusyText, researchHere, researchReachable, researchDevice } from './research-ui.js';
 import { PersonMenuAction } from './context-menu.js';
 import { personSubtitle } from './person-sources-ui.js';
 import { normalizeModal } from './modal-skeleton.js';
@@ -32,6 +32,9 @@ import { waitingTodoCount } from '../research-waiting.js';
 import { researchOpenMark, researchActionLabel, researchActionMark, researchMarkFlags } from './research-open-mark.js';
 import { researchOpenSvg } from '../history-symbols.js';
 import { overviewInWindow } from '../windows/overview-window.js';
+import { inDeviceMode, thisDeviceId } from './device-mode-ui.js';
+import { deviceUndoableSend } from './device-progress-ui.js';
+import { deviceDownNow } from './device-offline-ui.js';
 
 export { researchOpenMark } from './research-open-mark.js';
 
@@ -93,7 +96,7 @@ interface SubmenuItem {
     /** A quiet second line ("sent 11:20"). */
     sub?: string;
     /** A state pill at the end ("on · 2", "connection problem"). */
-    pill?: { text: string; tone: 'on' | 'error' };
+    pill?: { text: string; tone: 'on' | 'error' | 'off' };
     /** Not possible now (`aria-disabled`, grey): its second line says why. */
     disabled?: boolean;
     /** A separate item right under it ("Open research" beside an inactive item, with its link's mark). */
@@ -130,6 +133,8 @@ interface ResearchMenuModel {
     waiting: number;
     /** The research tools it announced ("Research tools ›", §8); empty: no item. */
     tools: ResearchToolAction[];
+    /** A device of the home network (spec 094 §6): one quiet sentence at the end, what stays on the computer. */
+    onlyComputer?: string;
 }
 
 /** A row of the More sheet's research group. */
@@ -143,12 +148,14 @@ export interface ResearchSheetRow {
     /** A quiet value at the end ("1 284"). */
     value?: string;
     id?: string;
+    /** Grey, not run (a device without its computer, spec 094 §7). */
+    disabled?: boolean;
 }
 
 /** The More sheet's research group (a narrow window with a mouse): the state in one line and the frequent actions. */
 export interface ResearchSheetGroup {
     /** The state, when its block offers something: its title and first action. */
-    state?: { tone: string; title: string; action: { label: string; asLink: boolean; research?: boolean; ai?: boolean; run: () => void } };
+    state?: { tone: string; title: string; action?: { label: string; asLink: boolean; research?: boolean; ai?: boolean; run: () => void } };
     rows: ResearchSheetRow[];
 }
 
@@ -163,6 +170,28 @@ const BLOCK_SENDS = ['send', 'startAndSend', 'showChangesFirst'];
 
 /** At most this many actions before "Other actions ⌄" (promoted ones count; "Open research" gives way first). */
 const FIRST_LEVEL_MAX = 6;
+
+/**
+ * The research's action behind each item of the menu (spec 094 §6): on a device of the home network an item
+ * is drawn only when `researchDeviceAllows` its action; items of the app alone (materials, the view's links,
+ * the state before loading) have none.
+ */
+const MENU_ITEM_ACTIONS: Readonly<Record<string, ResearchDeviceAction>> = {
+    'research-item-live': 'live', 'research-item-waiting': 'waiting-answer', 'research-item-send': 'send',
+    'research-item-changes': 'send', 'research-item-images': 'excerpt',
+    'research-item-chat': 'chat', 'research-item-queue-work': 'work', 'research-item-open': 'open',
+    'research-item-start': 'open', 'research-item-install': 'setup', 'research-item-about': 'setup',
+    'research-item-read': 'read-document', 'research-item-history': 'history', 'research-item-version': 'load-version',
+    'research-item-update': 'update', 'research-item-phone': 'devices', 'research-item-fixes': 'fixes',
+    'research-item-verify': 'verify-bulk', 'research-item-tools': 'research-tools', 'research-item-undo': 'sync-undo',
+    'research-item-tree-settings': 'tree-settings', 'research-item-setup': 'setup', 'research-item-undo-this': 'sync-undo-this',
+};
+
+/** An item of the menu drawn here (always outside the device mode). */
+function itemAllowed(item: SubmenuItem): boolean {
+    const action = MENU_ITEM_ACTIONS[item.id];
+    return !action || researchDeviceAllows(action);
+}
 
 /** An item that opens a link of the research: its mark by the link's group (`RESEARCH_LINK_MARKS`). */
 function opens(mark: ResearchActionMark): Pick<SubmenuItem, 'ext' | 'ai'> {
@@ -306,7 +335,7 @@ export const researchActionsMethods = uiModule({
 
     /** The Research button and menu: a research tree on a computer, its data not locked. */
     researchMenuShown(): boolean {
-        return onComputer() && !DataManager.isLocked() && this.activeResearchId() !== null;
+        return researchReachable() && !DataManager.isLocked() && this.activeResearchId() !== null;
     },
 
     /** The research on this computer announced at least one link (and it is not switched off). */
@@ -316,7 +345,8 @@ export const researchActionsMethods = uiModule({
 
     /** Tasks waiting for the user, as the menu counts them (0 when the menu is not shown). */
     researchWaitingCount(): number {
-        if (!this.researchMenuShown() || !this.researchAnyAnnounced()) return 0;
+        // A device of the home network (spec 094 P3) gets no links, its bridge answers what waits.
+        if (!this.researchMenuShown() || (!this.researchAnyAnnounced() && !researchDevice())) return 0;
         // Its bridge not known here: what it once said is waiting is not shown as now.
         if (!this.activeResearchModeKnown()) return 0;
         // What was sent and waits for a reply asks nothing of the user now.
@@ -333,6 +363,7 @@ export const researchActionsMethods = uiModule({
         // The block offers the send ("Send", "Start and send", "What will be sent"): no "Send changes" row beside it.
         const blockSends = !!block && block.actions.some(a => BLOCK_SENDS.includes(a.action));
         const researchId = this.activeResearchId();
+        const device = researchDevice();
         const capable = !!researchId && this.researchSyncCapable(researchId);
         const bridgeUp = capable && !!researchId && this.researchBridgeFresh(researchId);
         const ctx = this.researchSyncLink();
@@ -380,7 +411,7 @@ export const researchActionsMethods = uiModule({
             ? [{ id: 'research-item-view-links', label: strings.viewLinks.menuItem(this.viewLinksShownCount()), method: 'researchActionViewLinks' }] : [];
         // Verify facts in the tree (spec 065 §10l): through the bridge, the AI badge alone; not in an archive.
         const verifyRow: SubmenuItem[] = !noAgent && this.verifyBulkAvailable()
-            ? [{ id: 'research-item-verify', label: strings.verify.bulkRow, method: 'showVerifyBulkDialog', ai: RESEARCH_BRIDGE_MARKS['verify-bulk'] === 'bridgeAgent' }] : [];
+            ? [{ id: 'research-item-verify', label: strings.verify.bulkRow, method: 'showVerifyBulkDialog', ai: researchBridgeMark('verify-bulk') === 'bridgeAgent' }] : [];
         let first: SubmenuItem[];
         let more: SubmenuItem[];
         // Read a document (spec 013): now and then, the first item of "Other actions" (its link and badge as they are).
@@ -398,8 +429,20 @@ export const researchActionsMethods = uiModule({
             ...(overviewInWindow() ? { title: strings.win.overviewInWindow } : {}),
         }];
         if (followingHere) overviewRows.push({ id: 'research-item-stop', label: r.stop, method: 'researchActionStop' });
-        else if (!noAgent && this.researchLinkAvailable('live')) overviewRows.push({ id: 'research-item-live', label: r.followLive, method: 'researchActionLive' });
-        if (!this.researchAnyAnnounced()) {
+        else if (!noAgent && (this.researchLinkAvailable('live') || device)) overviewRows.push({ id: 'research-item-live', label: r.followLive, method: 'researchActionLive' });
+        if (device) {
+            // A device of the home network (spec 094 §8, 8.1): the overview, following live, what waits, the send;
+            // under "Other actions" the materials — nothing of the terminal, the agent or the research's settings.
+            first = [...overviewRows];
+            if (waiting > 0) first.push({ id: 'research-item-waiting', label: r.waiting, method: 'researchActionWaiting', count: waiting });
+            first.push(...sendRow.map(i => ({ ...i, ext: false, ai: false })));
+            const materialsFirst = [...materials].sort((a, b) => Number(b.id === 'research-item-materials') - Number(a.id === 'research-item-materials'));
+            // Undo this device's newest send (4.2, 6.1), when the gateway allows it and there is one.
+            const undoThis: SubmenuItem[] = this.activeResearchId() && deviceUndoableSend(this.researchStatusOf(this.activeResearchId()!)?.sends, thisDeviceId())
+                ? [{ id: 'research-item-undo-this', label: strings.sync.undoThisMenu, method: 'researchActionUndoThisSend' }] : [];
+            more = [...changesRow, ...materialsFirst, ...undoThis, ...viewLinks];
+            moreQuiet = [];
+        } else if (!this.researchAnyAnnounced()) {
             // No strom-research:// links here (an older research, none announced, or
             // switched off): the way back, and what it is. A research that says what
             // it takes still gets its version loaded and its settings for this tree.
@@ -507,7 +550,7 @@ export const researchActionsMethods = uiModule({
             else more = [row, ...more];
         }
         // "History of places" (spec 1028 §1.1): right after reading documents, its summary under it.
-        const historySub = this.historyManageAvailable() ? this.historyManageMenuSub() : null;
+        const historySub = this.historyManageAvailable() && !device ? this.historyManageMenuSub() : null;
         const historyRow: SubmenuItem[] = historySub === null ? []
             : [{ id: 'research-item-history', label: strings.history.manage, method: 'openHistoryManageFrom', args: ['menu'], ...(historySub ? { sub: historySub } : {}) }];
         more = [...readRow, ...historyRow, ...more];
@@ -519,7 +562,16 @@ export const researchActionsMethods = uiModule({
             : '';
         // An older research (it never said what it takes): a state block of its own, "How to update…".
         const blocks = (syncBlock || followingBlock) + this.researchOlderBlockHtml();
-        return { foot: !!ctx, blocks, first, more, moreQuiet, moreAttention, note, waiting, tools };
+        // On a device (spec 094 §6) only what it does through the bridge; one quiet sentence says where the rest is.
+        const onlyComputer = device ? strings.device.onlyComputerAll(researchDeviceState()?.computer ?? '') : undefined;
+        // A device without its computer (spec 094 §7, 7.3): all grey but "Add materials…" (its photos wait here).
+        const away = (list: SubmenuItem[]): SubmenuItem[] => device && deviceDownNow()
+            ? list.map(i => i.id === 'research-item-batch' ? i : { ...i, disabled: true })
+            : list;
+        return {
+            foot: !!ctx, blocks, first: away(first.filter(itemAllowed)), more: away(more.filter(itemAllowed)), moreQuiet: away(moreQuiet.filter(itemAllowed)),
+            moreAttention: device ? '' : moreAttention, note, waiting, tools: device ? [] : tools, ...(onlyComputer ? { onlyComputer } : {}),
+        };
     },
 
     /** The research menu's HTML; on the More sheet's page a title with "‹" back comes first. */
@@ -553,7 +605,8 @@ export const researchActionsMethods = uiModule({
             ? `<div class="research-menu-foot" id="research-menu-foot" role="none"${anyExt ? ` title="${esc(desc)}"` : ''}>${researchTrialTagHtml(true)}`
                 + (anyExt ? `<span class="research-menu-foot-text">${researchOpenSvgMark(12)}${esc(r.footer)}</span>` : '') + '</div>'
             : '';
-        return heading + model.blocks + first + more + foot;
+        const only = model.onlyComputer ? `<div class="research-menu-only-computer" id="research-menu-only-computer" role="none">${esc(model.onlyComputer)}</div>` : '';
+        return heading + model.blocks + first + more + only + foot;
     },
 
     /** "Other actions ⌄" opened or closed in place; focus on its first item (`first`) or back on the row. */
@@ -755,13 +808,15 @@ export const researchActionsMethods = uiModule({
         const reading = !!this.readRunningNow();
         btn.classList.toggle('is-reading', reading && signal === '' && !DataManager.isLiveFollowing());
         // The phone connection on: a small dot in the corner, said in the name (beside any count).
-        const phoneOn = this.phoneSummaryNow()?.state === 'on';
+        // (Not on a device of the home network: the dot belongs to the computer whose connection is on, spec 094 §8.)
+        const phoneOn = !researchDevice() && this.phoneSummaryNow()?.state === 'on';
         const phoneDot = btn.querySelector<HTMLElement>('.research-menu-phone');
         if (phoneDot) phoneDot.hidden = !phoneOn;
         const base = waiting > 0 ? r.menuButtonAriaWaiting(waiting) : unsent.label ? r.menuButtonAriaUnsent : r.menuTitle;
         const name = reading ? `${base}, ${strings.read.stripRunning}` : base;
-        btn.setAttribute('aria-label', phoneOn ? `${name}, ${strings.phone.btnOn}` : name);
-        if (phoneOn) btn.title = `${r.menuTitle} · ${strings.phone.btnOn}`;
+        const btnOn = phoneOn ? this.phoneT().btnOn : '';
+        btn.setAttribute('aria-label', phoneOn ? `${name}, ${btnOn}` : name);
+        if (phoneOn) btn.title = `${r.menuTitle} · ${btnOn}`;
         else btn.removeAttribute('title');
         return signal;
     },
@@ -782,6 +837,8 @@ export const researchActionsMethods = uiModule({
      */
     openResearchMenu(opts: { opener?: HTMLElement | null; focus?: 'first' | 'last' } = {}): void {
         if (!this.researchMenuShown()) return;
+        // The gateway of the devices: "on · N connected" counts the devices connected now (a quiet look, at most every 15 s).
+        void this.phonePeekDevices();
         const btn = document.getElementById('research-menu-btn');
         const menu = document.getElementById('research-menu');
         if (!btn || !menu || btn.getClientRects().length === 0) {
@@ -868,12 +925,28 @@ export const researchActionsMethods = uiModule({
         if (!this.researchMenuShown()) return null;
         const model = this.researchMenuModel();
         // "Open research", "Read a document" and the rest: on the second level, "All research actions ›".
-        const frequent = new Set(['research-item-overview', 'research-item-waiting', 'research-item-chat', 'research-item-images', 'research-item-materials']);
+        // A device of the home network (spec 094 §4, 4.1): the overview, what waits (always, its count when any),
+        // the materials and "Add materials…", in this order.
+        const device = researchDevice();
+        const frequent = device
+            ? ['research-item-overview', 'research-item-waiting', 'research-item-materials', 'research-item-batch']
+            : ['research-item-overview', 'research-item-waiting', 'research-item-chat', 'research-item-images', 'research-item-materials'];
         const ui = this as unknown as Record<string, (...args: string[]) => void>;
-        const rows: ResearchSheetRow[] = [...model.first, ...model.more].filter(i => frequent.has(i.id) && !i.disabled).map(i => ({
+        const items = [...model.first, ...model.more];
+        if (device && !items.some(i => i.id === 'research-item-waiting')) {
+            items.push({ id: 'research-item-waiting', label: strings.research.waiting, method: 'researchActionWaiting' });
+        }
+        const order = (i: SubmenuItem): number => device ? frequent.indexOf(i.id) : 0;
+        const away = device && deviceDownNow() !== null;
+        const rows: ResearchSheetRow[] = items.filter(i => frequent.includes(i.id) && (!i.disabled || away)).sort((a, b) => order(a) - order(b)).map(i => ({
             label: i.label, count: i.count, ai: i.ai, ext: i.ext, ariaLabel: itemAria(i), value: i.val, id: `sheet-${i.id}`,
+            ...(away && i.id !== 'research-item-batch' ? { disabled: true } : {}),
             run: () => ui[i.method](...(i.args ?? [])),
         }));
+        // A batch going on (its sheet closed): its row first, back to its list.
+        const sending = this.batchSheetRow();
+        if (sending) rows.unshift({ ...sending, ariaLabel: `${sending.label} · ${sending.value}`, id: 'sheet-batch-sending' });
+        if (away) return { rows, state: { tone: 'warn', title: this.deviceDownStateLine() } };
         const block = this.researchSyncBlockData();
         const first = block?.actions[0];
         return {
@@ -888,7 +961,8 @@ export const researchActionsMethods = uiModule({
 
     /** The last export of all trees for the reminder (null: never), or undefined when it is not shown now. */
     exportReminderLast(): string | null | undefined {
-        if (!this.researchSyncLink() || DataManager.isReadOnly()) return undefined;
+        // A device of the home network backs nothing up: the research's computer keeps the tree (spec 094 §3).
+        if (!this.researchSyncLink() || DataManager.isReadOnly() || inDeviceMode()) return undefined;
         return exportReminderDue() || reminderThisOpening ? lastExportAll() : undefined;
     },
 
@@ -1022,7 +1096,7 @@ export const researchActionsMethods = uiModule({
 
     /** The research's id of a person in the active research tree, when its actions can be offered. */
     personResearchRef(personId: PersonId): string | null {
-        if (!onComputer() || this.activeResearchId() === null) return null;
+        if (!researchHere() || this.activeResearchId() === null) return null;
         return researchPersonRef(DataManager.getPerson(personId)?.refn);
     },
 

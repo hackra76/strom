@@ -3,7 +3,7 @@ import { nPl, numPl, plPl, joinAndPl, relationPl } from './helpers.js';
 
 export const plPart5: Pick<StringsType, 'danger' | 'emptyStates' | 'relationships' | 'card' | 'buttons' | 'dialog'
     | 'gender' | 'partnershipStatus' | 'parentRelType' | 'export' | 'depth' | 'rodView' | 'scope' | 'selection' | 'focus'
-    | 'generationLabels' | 'treeOverview' | 'branchTabs' | 'search' | 'deepLink' | 'searchFilters' | 'personPicker'
+    | 'generationLabels' | 'treeOverview' | 'branchTabs' | 'search' | 'searchScope' | 'deepLink' | 'searchFilters' | 'personPicker'
     | 'errors' | 'storageSafety' | 'addChild' | 'uiTips' | 'about' | 'gedcom' | 'gedcomNotes' | 'saveCurrent'
     | 'validation'> = {
     danger: {
@@ -700,6 +700,29 @@ export const plPart5: Pick<StringsType, 'danger' | 'emptyStates' | 'relationship
         resultCount: (n: number) => nPl(n, 'osoba', 'osoby', 'osób'),
     },
 
+    // Search scope (spec 137 K1): the whole tree, a person's direct line, the people in view.
+    searchScope: {
+        group: 'Zakres wyszukiwania',
+        tree: 'Całe drzewo',
+        line: 'Linia prosta',
+        view: 'W widoku',
+        treeTitle: 'Szukaj w całym drzewie',
+        lineTitle: (p: string) => `Tylko ${p} wraz z przodkami i potomkami`,
+        viewTitle: (n: number) => `Tylko osoby widoczne teraz w widoku (${n})`,
+        lineRef: (p: string) => `Linia prosta: ${p} · z przodkami i potomkami`,
+        lineRefMain: (p: string) => `Linia prosta: ${p}, główna osoba drzewa · z przodkami i potomkami`,
+        viewRef: (v: string, n: number) => `W widoku: ${v} · ${nPl(n, 'osoba', 'osoby', 'osób')}`,
+        tableView: 'Tabela po filtrze',
+        altKeys: '(Alt+←/→)',
+        emptyLine: (n: number) => `W linii prostej nikogo. W całym drzewie ${nPl(n, 'wynik', 'wyniki', 'wyników')}.`,
+        emptyView: (n: number) => `W widoku nikogo. W całym drzewie ${nPl(n, 'wynik', 'wyniki', 'wyników')}.`,
+        searchWhole: 'Szukaj w całym drzewie',
+        footLine: 'tylko linia prosta',
+        footView: 'tylko w widoku',
+        sheetLine: (p: string) => `Wyszukiwanie tylko w linii prostej: ${p}.`,
+        sheetView: (v: string) => `Wyszukiwanie tylko w widoku: ${v}.`,
+    },
+
     // Links into the app from outside (macOS widget): ?person= / ?show=waiting
     deepLink: {
         personNotFound: 'Wskazanej osoby nie ma w tym drzewie.',
@@ -937,7 +960,6 @@ export const plPart5: Pick<StringsType, 'danger' | 'emptyStates' | 'relationship
         remarriageNoDate: (married: string) => `Rozwód, ponowny ślub ${married}`,
         association: (name: string, label: string) => `Relacja: ${name} (${label})`,
         assoRoles: { CHIL: 'dziecko', FATH: 'ojciec', FRIEND: 'przyjaciel', HUSB: 'mąż', MOTH: 'matka', MULTIPLE: 'kilka ról', NGHBR: 'sąsiad', PARENT: 'rodzic', SPOU: 'małżonek', WIFE: 'żona' } as Record<string, string>,
-        email: (value: string) => `E-mail: ${value}`,
         adoptedChild: 'dziecko adoptowane',
         fosterChild: 'dziecko w rodzinie zastępczej',
         child: 'dziecko',

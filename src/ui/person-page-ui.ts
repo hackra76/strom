@@ -25,7 +25,7 @@ import { isDesktop, isTablet, isMobile, MQ_PHONE_BAR } from '../breakpoints.js';
 import { appFontFaceCss, POSTER_SERIF_FACES, POSTER_LINE_FACES } from '../poster-fonts.js';
 import {
     PERSON_PAGE_ALL_GROUPS, PersonPageGroups, PersonPageOptions, PersonPageContext, PersonPageData,
-    preparePersonPageData, protectPersonPageTree, buildPersonPageBody, buildPersonPageDocument, personPageTocItems,
+    preparePersonPageData, protectPersonPageTree, buildPersonPageBody, buildPersonPageDocument, personPageTocItems, pdfPageCount,
     personPageFileName, estimatePersonPageSize, personPageSizeMb, personPageLivingNames, personPageTocCurrent,
     PERSON_PAGE_DEFAULT_PRIVACY, PERSON_PAGE_PRIVACY_MODES, personPageExportPrivacy, personPageChartInput, personPageFileToggles,
     personPageFanModel, personPageFanSvg,
@@ -45,6 +45,35 @@ import { HISTORY_CHANGED_EVENT } from './history-ui.js';
 import { activatedElement } from './busy.js';
 import { imagesToAwait } from '../image-loads.js';
 import { imagesBeforeOutput, imagesReadyForPrint } from './output-images.js';
+import { personPageImageIds, withImagesWhole } from '../page-images.js';
+import { ensureImageMeta } from '../media-pool.js';
+import { imageMetaOf } from '../image-meta.js';
+import { imageBlob, startImageHydrator } from '../image-src.js';
+import { POOL_REF, POOL_REF_ATTR } from '../image-ref.js';
+import { forgetFamilyPageImages } from './family-pages-images.js';
+
+/** The page's pooled images whose catalog entries (type, size) were asked for: once each while the page is open. */
+const metaAsked = new Set<string>();
+/** The pages of the pooled PDF files shown, by reference (null: not readable); the ones being read. */
+const pdfPageCounts = new Map<string, number | null>();
+const pdfReading = new Set<string>();
+
+/** The pages of a pooled PDF (person-page.ts PersonPageOptions.pdfPages): read once, `redraw` when known. */
+function pooledPdfPages(ref: string, redraw: () => void): number | null {
+    if (pdfPageCounts.has(ref)) return pdfPageCounts.get(ref) ?? null;
+    if (!pdfReading.has(ref)) {
+        pdfReading.add(ref);
+        void imageBlob(ref)
+            .then(async (blob) => (blob ? pdfPageCount(new Uint8Array(await blob.arrayBuffer())) : null))
+            .catch(() => null)
+            .then((n) => {
+                if (!pdfReading.delete(ref)) return;
+                pdfPageCounts.set(ref, n);
+                if (n !== null) redraw();
+            });
+    }
+    return null;
+}
 
 export const PERSON_PAGE_ID = 'person-page-modal';
 export const PERSON_PAGE_EXPORT_ID = 'person-page-export-modal';
@@ -354,6 +383,10 @@ export const personPageMethods = uiModule({
         if (imagesHandler) window.removeEventListener(IMAGES_STATE_EVENT, imagesHandler);
         imagesHandler = null;
         imagesFailedShown = -1;
+        metaAsked.clear();
+        pdfPageCounts.clear();
+        pdfReading.clear();
+        forgetFamilyPageImages();
         if (resizeHandler) window.removeEventListener('resize', resizeHandler);
         resizeHandler = null;
         this.dialogStack = this.dialogStack.filter(d => d !== PERSON_PAGE_ID);
@@ -396,11 +429,23 @@ export const personPageMethods = uiModule({
             pagePlaces = [];
             syncShareButton();
             this.closePersonPageMenu(false);
-            this.renderFamilyPagesEntry(overlay, entry.set);
-            (overlay.querySelector('.pp-body') as HTMLElement).scrollTop = entry.scrollTop;
+            this.renderFamilyPagesEntry(overlay, entry.set, entry.scrollTop);
             return;
         }
         if (!DataManager.getPerson(entry.personId)) { this.closePersonPage(); return; }
+        // The page shows the person's pooled images by reference (the hydrator puts them in when on screen);
+        // their catalog entries (type, size) are made first where missing; meanwhile the page stays as it is.
+        const redraw = (): void => {
+            if (!overlayEl() || state?.current !== entry) return;
+            this.snapshotPersonPage();
+            this.renderPersonPage();
+        };
+        const noMeta = [...personPageImageIds(DataManager.getData(), entry.personId)].filter(id => !imageMetaOf(id) && !metaAsked.has(id));
+        if (noMeta.length) {
+            for (const id of noMeta) metaAsked.add(id);
+            void ensureImageMeta(noMeta).catch(() => undefined).then(redraw);
+            return;
+        }
         const h2 = overlay.querySelector('#pp-title') as HTMLElement;
         h2.textContent = P.title;
         h2.removeAttribute('title');
@@ -414,6 +459,7 @@ export const personPageMethods = uiModule({
             ...(chartWidth ? { chartWidth } : {}),
             ...(familyPages.size ? { familyPages } : {}),
             imageWait: pageImageWait,
+            pdfPages: (ref: string) => pooledPdfPages(ref, redraw),
             // Photos at a person without a portrait: the initials and "Portrait from a photo…" open the picker (spec 107 §2).
             portraitPick: this.personPagePortraitPick(entry.personId),
         });
@@ -442,6 +488,8 @@ export const personPageMethods = uiModule({
 
         const scroller = overlay.querySelector('.pp-body') as HTMLElement;
         scroller.innerHTML = `<div class="pp-layout">${toc}${body}</div>`;
+        // The pooled images of the page (data-pool-ref) are put in while on screen.
+        if (body.includes(POOL_REF_ATTR)) startImageHydrator(document);
         scroller.scrollTop = entry.scrollTop;
         this.watchPersonPageToc();
         this.watchPersonPageChart(personPageChartInput(page, opts.now), lang);
@@ -791,10 +839,13 @@ export const personPageMethods = uiModule({
         }
         const zoom = target.closest<HTMLElement>('[data-pp-zoom]');
         if (zoom) {
-            const src = (zoom.querySelector('img') ?? zoom.closest('.pp-fig')?.querySelector('img'))?.getAttribute('src');
+            const img = zoom.querySelector('img') ?? zoom.closest('.pp-fig')?.querySelector('img');
+            // A pooled image by its address (its reference, turned or not), not the placeholder it may show.
+            const key = img?.getAttribute(POOL_REF_ATTR);
+            const src = key ? POOL_REF + key : img?.getAttribute('src');
             // A portrait cut from a photo of the tree: Portrait | Whole photo (spec 107 §2).
             const person = zoom.classList.contains('pp-portrait') && state ? DataManager.getPerson(state.current.personId) : null;
-            const whole = person && src === person.photo ? portraitWholePhoto(person) : null;
+            const whole = person?.photo && src === person.photo ? portraitWholePhoto(person) : null;
             if (src) openImageViewer(src, () => zoom.focus({ preventScroll: true }), undefined, whole);
             return;
         }
@@ -1144,18 +1195,21 @@ export const personPageMethods = uiModule({
     /** "Save as HTML" / "Share…" once the tree's photos came (spec 116 §8): the file is built with them. */
     async personPageExportAfterImages(share: boolean): Promise<void> {
         if (await imagesBeforeOutput(strings.photos.out.personPage) === 'cancelled' || !state) return;
-        this.showPersonPageExport(share);
+        // The file carries the pooled images whole: only the ones its page can show (page-images.ts).
+        const tree = DataManager.getData();
+        const data = await withImagesWhole(tree, personPageImageIds(tree, state.current.personId));
+        if (!state) return;
+        this.showPersonPageExport(share, data);
     },
 
     // ── "Save as HTML" (§5.1, §5.5, §6.1) ──
 
-    showPersonPageExport(share: boolean): void {
+    showPersonPageExport(share: boolean, data: StromData = DataManager.getData()): void {
         if (!state) return;
         this.closePersonPageExport();
         const personId = state.current.personId;
         const P = strings.personPage;
         const X = P.export;
-        const data = DataManager.getData();
         // Attachment images over 1600 px go into the file reduced (§3.5); the tree keeps the originals.
         let shrunk = new Map<string, string>();
         const fileData = (): StromData => withShrunkAttachments(data, personId, shrunk);
@@ -1325,7 +1379,7 @@ export const personPageMethods = uiModule({
                 setTimeout(() => URL.revokeObjectURL(url), 1000);
                 this.showToast(X.saved(out.name), 4000, { kind: 'person-page' });
             } catch {
-                this.showToast(X.error, 8000, { kind: 'person-page', action: { label: X.retry, run: () => this.showPersonPageExport(false) } });
+                this.showToast(X.error, 8000, { kind: 'person-page', action: { label: X.retry, run: () => this.showPersonPageExport(false, data) } });
             }
         };
         const shareFile = async (): Promise<void> => {
@@ -1339,7 +1393,7 @@ export const personPageMethods = uiModule({
                 await navigator.share({ files: [file], title: out.title });
             } catch (err) {
                 if ((err as { name?: string } | null)?.name === 'AbortError') return;
-                this.showToast(X.error, 8000, { kind: 'person-page', action: { label: X.retry, run: () => this.showPersonPageExport(true) } });
+                this.showToast(X.error, 8000, { kind: 'person-page', action: { label: X.retry, run: () => this.showPersonPageExport(true, data) } });
             }
         };
 

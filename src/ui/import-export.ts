@@ -13,7 +13,10 @@ import type { FollowSwitchFrom } from './research-follow-ui.js';
 import { allMedia } from '../media.js';
 import type { PrivacyMode, ContentOptions } from '../privacy.js';
 import { noteExportAll } from '../research-device.js';
-import { DataManager, auditPersonName, storedTreeForExport } from '../data.js';
+import { DataManager, auditPersonName, storedTreeForExport, storedTreeWithRefs } from '../data.js';
+import { confirmMemoryForImport } from './memory-limit-ui.js';
+import { jsonDropKind } from '../drop-route.js';
+import type { DropInto } from '../tree-drop.js';
 import { TreeManager } from '../tree-manager.js';
 import { sanitizeResearchField } from '../research-link.js';
 import { TreeRenderer } from '../renderer.js';
@@ -61,6 +64,8 @@ export interface AfterImportOptions {
     importId?: string;
     added?: number;
     updated?: number;
+    /** The "What next" card without its data check row (the merge guide's last step has it, spec 134 §9). */
+    noCheck?: boolean;
 }
 import {
     validateJsonImport,
@@ -87,8 +92,15 @@ import { viewLinksPayload } from '../view-links.js';
 import type { PersonList } from '../types.js';
 import { listDisplayName, listKind } from '../person-lists.js';
 import { listKindIcon } from './list-kind-icon.js';
+import { expandedData } from '../image-expand.js';
+import { jsonFileWithImages } from '../image-stream.js';
 
 /** A list the export dialog's list scope offers (spec 084 §12): one with people. */
+/** A Strom file to add to the open tree through the merge guide (spec 139 §6.2): the tree and the file's name. */
+interface JsonImportInto { treeId: TreeId; fileName: string;
+    /** Dropped on this tree's row in Manage trees (K10.3): any tree, not only the open one; the guide returns there. */
+    dropped?: true }
+
 interface ExportableList { list: PersonList; count: number }
 
 /** The active tree's lists with people, by name. */
@@ -374,9 +386,10 @@ export const importExportMethods = uiModule({
         // mode to pick the living-privacy level and what content (photos,
         // attachments — embedded as base64) goes into the file.
         this.showExportPasswordDialog(async () => {
-            const { exportToGedcom } = await import('../ged-exporter.js');
+            const { exportGedcomWithImages } = await import('../ged-export-images.js');
             const { applyLivingPrivacy } = await import('../privacy.js');
-            const stored = await storedTreeForExport(treeId);
+            // The images stay in the pool: each is read as the file is written (no expanded copy of the tree).
+            const stored = await storedTreeWithRefs(treeId);
             const metadata = TreeManager.getTreeMetadata(treeId);
             if (!stored) return;
             const data: StromData = scoped ? { version: stored.version, ...extractSubtree(stored, new Set(scoped.ids)) } : stored;
@@ -395,12 +408,12 @@ export const importExportMethods = uiModule({
             const backTo = this.exportGedcomBackTo(data);
             // A research tree's citations in the research's order when it orders them (spec 095); a main citation always marked.
             const { citationFileOrder } = await import('../citation-gates.js');
-            const result = exportToGedcom(filtered, metadata?.name, {
+            const result = await exportGedcomWithImages(filtered, metadata?.name, {
                 content, research, origins: true, confirmations: true, researchNote, backTo, citationFileOrder: citationFileOrder(treeId),
             });
 
             // Download file
-            const blob = new Blob([result.content], { type: 'text/plain;charset=utf-8' });
+            const blob = new Blob(result.parts, { type: 'text/plain;charset=utf-8' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -549,6 +562,7 @@ export const importExportMethods = uiModule({
         input.value = '';
 
         void (async () => {
+            if (!(await confirmMemoryForImport(file.size, file.name))) return;
             const got = await readPickedFile(origin, file, async ctl => {
                 // Raw bytes, not readAsText: the file's own HEAD > CHAR (or, for
                 // ANSI, its bytes) decides the encoding; the summary offers another.
@@ -574,8 +588,32 @@ export const importExportMethods = uiModule({
             this.importFromTreeManager = fromManager;
             this.importToCurrentTree = toCurrent;
             this.leavePickDialog();
-            this.showGedcomResultDialog();
+            // Into an empty tree: today's summary with "Insert into tree";
+            // otherwise the import guide, its step 1 holding the summary (spec 134 §3).
+            if (toCurrent) this.showGedcomResultDialog();
+            else this.openGedcomGuide(fromManager);
         })();
+    },
+
+    /** The GEDCOM file just read, into the import guide: what it holds is step 1's left column. */
+    openGedcomGuide(fromManager: boolean, target?: TreeId): void {
+        const result = this.gedcomResult;
+        if (!result) return;
+        this.renderGedcomSummary();
+        const file = this.gedcomFileInfo;
+        // The guide returns to Manage trees itself when it started there.
+        this.importFromTreeManager = false;
+        MergerUI.startMerge(this.gedcomDataForImport(), file?.name || undefined, fromManager,
+            { gedcom: true, ...(result.importId ? { importId: result.importId } : {}) },
+            { kind: 'ged', ...(file?.sha ? { fingerprint: file.sha } : {}) },
+            // Dropped on a tree's row (K10.3): Add to that tree; otherwise from Manage trees, New tree.
+            { gedcomLive: true, ...(target ? { target } : fromManager ? { mode: 'new' as const } : {}) });
+    },
+
+    /** The import guide let the GEDCOM file go (written, saved as JSON or closed). */
+    endGedcomGuide(): void {
+        this.gedcomResult = null;
+        this.gedcomRawBuffer = null;
     },
 
     /**
@@ -600,8 +638,18 @@ export const importExportMethods = uiModule({
         openFilePicker(document.getElementById(inputId) as HTMLInputElement | null);
     },
 
+    /**
+     * Today's GEDCOM summary drawn again (after another encoding, media
+     * attached or downloaded): in the import guide's step 1, the guide takes
+     * the changed data; otherwise the dialog of "Insert into tree".
+     */
     showGedcomResultDialog(): void {
         if (!this.gedcomResult) return;
+        if (MergerUI.hasGedcomGuide()) {
+            this.renderGedcomSummary();
+            MergerUI.replaceIncoming(this.gedcomDataForImport());
+            return;
+        }
 
         const modal = document.getElementById('gedcom-result-modal');
         if (!modal) return;
@@ -614,6 +662,19 @@ export const importExportMethods = uiModule({
         if (!alreadyOnStack && (this.importFromTreeManager || this.importToCurrentTree)) {
             this.pushDialog('gedcom-result-modal');
         }
+        this.renderGedcomSummary();
+        // The dialog is only "Insert into tree" now: the other ways are the import guide's.
+        const insertBtn = document.getElementById('gedcom-insert-btn');
+        if (insertBtn) insertBtn.style.display = '';
+        modal.classList.add('active');
+    },
+
+    /**
+     * What the GEDCOM file holds (`#gedcom-summary`): the tiles, the lines
+     * about what was not carried over, the encoding, images and external media.
+     */
+    renderGedcomSummary(): void {
+        if (!this.gedcomResult) return;
 
         // Update stats
         const personsEl = document.getElementById('gedcom-stat-persons');
@@ -621,7 +682,10 @@ export const importExportMethods = uiModule({
         const placeholdersEl = document.getElementById('gedcom-stat-placeholders');
         const unsupportedEl = document.getElementById('gedcom-stat-unsupported');
 
-        if (personsEl) personsEl.textContent = String(this.gedcomResult.stats.totalPersons);
+        // The people without the "?" stand-ins, counted as the import guide counts them
+        // (its sentence and its plan): the stand-ins have their own tile.
+        const people = Object.values(this.gedcomResult.data.persons).filter(p => !p.isPlaceholder).length;
+        if (personsEl) personsEl.textContent = String(people);
         if (partnershipsEl) partnershipsEl.textContent = String(this.gedcomResult.stats.totalPartnerships);
         if (placeholdersEl) placeholdersEl.textContent = String(this.gedcomResult.stats.placeholderPersons);
         if (unsupportedEl) unsupportedEl.textContent = String(this.gedcomResult.stats.unsupportedTags);
@@ -718,35 +782,6 @@ export const importExportMethods = uiModule({
         const downloadBtn = document.getElementById('gedcom-media-download');
         const urlRefs = this.gedcomResult.externalMedia.filter(r => r.isUrl).length;
         if (downloadBtn) downloadBtn.style.display = urlRefs > 0 ? '' : 'none';
-
-        // Show/hide buttons based on context
-        const newTreeBtn = document.getElementById('gedcom-new-tree-btn');
-        const mergeBtn = document.getElementById('gedcom-merge-btn');
-        const saveJsonBtn = document.getElementById('gedcom-save-json-btn');
-        const insertBtn = document.getElementById('gedcom-insert-btn');
-
-        if (this.importToCurrentTree) {
-            // Importing to current tree (from empty state) - show only "Insert into tree"
-            if (newTreeBtn) newTreeBtn.style.display = 'none';
-            if (mergeBtn) mergeBtn.style.display = 'none';
-            if (saveJsonBtn) saveJsonBtn.style.display = 'none';
-            if (insertBtn) insertBtn.style.display = '';
-        } else if (this.importFromTreeManager) {
-            // From tree manager "New Tree" - only "Import as New Tree" and "Save as JSON"
-            // Merge is available via tree manager's "Merge into..." action
-            if (newTreeBtn) newTreeBtn.style.display = '';
-            if (mergeBtn) mergeBtn.style.display = 'none';
-            if (saveJsonBtn) saveJsonBtn.style.display = '';
-            if (insertBtn) insertBtn.style.display = 'none';
-        } else {
-            // Normal import - show standard options
-            if (newTreeBtn) newTreeBtn.style.display = '';
-            if (mergeBtn) mergeBtn.style.display = '';
-            if (saveJsonBtn) saveJsonBtn.style.display = '';
-            if (insertBtn) insertBtn.style.display = 'none';
-        }
-
-        modal.classList.add('active');
     },
 
     /**
@@ -968,6 +1003,7 @@ export const importExportMethods = uiModule({
     setGedcomImportImages(checked: boolean): void {
         this.gedcomImportImages = checked;
         this.applyGedcomImagesChoice();
+        if (MergerUI.hasGedcomGuide() && this.gedcomResult) MergerUI.replaceIncoming(this.gedcomDataForImport());
     },
 
     /**
@@ -995,10 +1031,11 @@ export const importExportMethods = uiModule({
         return this.gedcomImportImages === false ? stripMedia(data) : data;
     },
 
-    downloadGedcomAsJson(): void {
+    async downloadGedcomAsJson(): Promise<void> {
         if (!this.gedcomResult) return;
 
-        const dataStr = JSON.stringify(this.gedcomDataForImport(), null, 2);
+        // The file carries any pooled image whole (image-expand.ts).
+        const dataStr = JSON.stringify(await expandedData(this.gedcomDataForImport()), null, 2);
         const blob = new Blob([dataStr], { type: 'application/json' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
@@ -1033,35 +1070,6 @@ export const importExportMethods = uiModule({
             if (treeId) void this.afterImport(treeId, { gedcom: true, path: 'insert', ...(importId ? { importId } : {}) });
             return;
         }
-
-        // Save flag before close (which resets it)
-        const fromManager = this.importFromTreeManager;
-
-        // Close gedcom result but don't return to parent yet
-        document.getElementById('gedcom-result-modal')?.classList.remove('active');
-        this.dialogStack.pop(); // Remove gedcom-result-modal
-
-        // Show import tree dialog with parent preserved
-        this.showImportTreeDialog(this.gedcomDataForImport(), strings.treeManager.importTreeName, fromManager);
-        this.pendingGedcomImport = importId ? { importId } : {};
-        this.gedcomResult = null;
-    },
-
-    /**
-     * Merge GEDCOM data with existing tree
-     */
-    async mergeGedcomWithExisting(): Promise<void> {
-        const result = this.gedcomResult;
-        if (!result) return;
-        const incoming = this.gedcomDataForImport();
-        // §8: the matching runs under the working state of the choice, its words at once for large trees.
-        await runHeavy(activatedElement(), () => {
-            if (this.gedcomResult !== result) return;
-            MergerUI.startMerge(incoming, undefined, false,
-                { gedcom: true, ...(result.importId ? { importId: result.importId } : {}) });
-            this.gedcomResult = null;
-            this.closeGedcomResultDialog();
-        }, { label: strings.merge.analyzing, atOnce: mergeAnalysisLong(DataManager.getData(), incoming) });
     },
 
     // ---- JSON IMPORT WITH VALIDATION ----
@@ -1075,7 +1083,11 @@ export const importExportMethods = uiModule({
         if (!file) return;
         // Reset input
         input.value = '';
-        void this.readJsonImportFile(file, origin, () => { openFilePicker(input, origin); });
+        // Snapshot the intent now (Add from a file to this tree): it never leaks into a later import.
+        const into = this.importIntoTreeId;
+        this.importIntoTreeId = null;
+        void this.readJsonImportFile(file, origin, () => { this.importIntoTreeId = into; openFilePicker(input, origin); },
+            into ? { treeId: into, fileName: file.name } : undefined);
     },
 
     /**
@@ -1083,17 +1095,51 @@ export const importExportMethods = uiModule({
      * is not JSON is said there with "Choose another file", the rest goes on
      * as an import of its text.
      */
-    async readJsonImportFile(file: File, origin: HTMLElement | null, again: () => void): Promise<void> {
+    async readJsonImportFile(file: File, origin: HTMLElement | null, again: () => void, into?: JsonImportInto): Promise<void> {
         // A stale handle from an earlier (failed/cancelled) "open from
         // file" must never get attached to THIS unrelated import — Ctrl+S
         // would then silently overwrite the wrong file on disk.
         await this.readJsonImportText(file.name, () => file.text(), file.size, origin, again,
-            () => { this.pendingOpenFileHandle = null; });
+            () => { this.pendingOpenFileHandle = null; }, into);
+    },
+
+    /**
+     * A .json dropped onto the window (spec 134 K10.2), read: a tree goes to
+     * the import guide with the open tree as its target (as Add from a file
+     * to this tree; an encrypted one asks its password first); a backup of
+     * all trees or a change packet goes the JSON import's way. Anything else
+     * is material for a research that takes batches (`batch`), otherwise
+     * said unreadable; nothing changes.
+     */
+    async importDroppedJson(file: File, opts: { batch: boolean; into?: DropInto }): Promise<void> {
+        if (!(await confirmMemoryForImport(file.size, file.name))) return;
+        let text = '';
+        let parsed: unknown;
+        try {
+            text = await file.text();
+            parsed = JSON.parse(text);
+        } catch {
+            parsed = undefined;
+        }
+        if (jsonDropKind(parsed) === 'other') {
+            if (opts.batch) this.showBatchDialog({ files: [{ file, path: file.name }] });
+            else await this.showAlert(strings.mergeWizard.unreadableJson(file.name), 'error');
+            return;
+        }
+        // Dropped on a tree's row (K10.3): that tree; otherwise the open one.
+        const treeId = opts.into?.target ?? DataManager.getCurrentTreeId();
+        // A file handle from an earlier "open from file" never belongs to this import.
+        this.pendingOpenFileHandle = null;
+        this.jsonImportFileName = file.name;
+        await this.importJsonString(text, parsed, treeId
+            ? { treeId, fileName: file.name, ...(opts.into ? { dropped: true as const } : {}) } : undefined);
     },
 
     /** See readJsonImportFile; `before` runs once the text is read, before the import. */
     async readJsonImportText(name: string, read: () => Promise<string>, size: number, origin: HTMLElement | null,
-        again: () => void, before?: () => void): Promise<void> {
+        again: () => void, before?: () => void, into?: JsonImportInto): Promise<void> {
+        if (!(await confirmMemoryForImport(size, name))) return;
+        this.jsonImportFileName = name;
         const got = await readPickedFile(origin, { name }, async ctl => {
             const text = await read();
             await paintBeforeParse(size);
@@ -1111,7 +1157,7 @@ export const importExportMethods = uiModule({
         if (!got) return;
         before?.();
         this.leavePickDialog();
-        await this.importJsonString(got.text, got.parsed);
+        await this.importJsonString(got.text, got.parsed, into);
     },
 
     /**
@@ -1119,7 +1165,7 @@ export const importExportMethods = uiModule({
      * (encrypted → password prompt, invalid → dialog, warnings → confirm). Shared
      * by the file-input upload and the File System Access "open from file" flow.
      */
-    async importJsonString(content: string, parsedAlready?: unknown): Promise<void> {
+    async importJsonString(content: string, parsedAlready?: unknown, into?: JsonImportInto): Promise<void> {
         let parsed: unknown = parsedAlready;
         if (parsedAlready === undefined) {
             try {
@@ -1140,7 +1186,7 @@ export const importExportMethods = uiModule({
 
         const { isEncrypted } = await import('../crypto.js');
         if (isEncrypted(parsed)) {
-            this.handleEncryptedJsonImport(parsed);
+            this.handleEncryptedJsonImport(parsed, into);
             return;
         }
 
@@ -1161,7 +1207,7 @@ export const importExportMethods = uiModule({
         }
         const data = result.data!;
         const images = countImages(data);
-        const withImages = (include: boolean) => this.processJsonImport(include ? data : stripMedia(data));
+        const withImages = (include: boolean) => this.processJsonImport(include ? data : stripMedia(data), into);
         if (result.warnings.length > 0) {
             // The dialog is shown anyway: it carries the images checkbox too.
             this.showValidationDialog(result, withImages,
@@ -1171,7 +1217,17 @@ export const importExportMethods = uiModule({
         }
     },
 
-    processJsonImport(data: StromData): void {
+    processJsonImport(data: StromData, into?: JsonImportInto): void {
+        // Add from a file to this tree (spec 139 §6.2, K1.4): the merge guide with the open tree as its
+        // target, never a new tree; the file's research tie does not carry over.
+        // Dropped on a tree's row in Manage trees (K10.3): that tree the target, open or not; closing returns there.
+        if (into && (into.dropped || into.treeId === DataManager.getCurrentTreeId()) && !DataManager.isViewMode()) {
+            this.pendingImportResearch = null;
+            this.closeImportDialog();
+            if (into.dropped) this.closeTreeManagerDialog();
+            MergerUI.startMerge(data, into.fileName, !!into.dropped, undefined, { kind: 'json' }, into.dropped ? { target: into.treeId } : {});
+            return;
+        }
         // Check if importing directly to current tree (from empty state)
         if (this.importToCurrentTree) {
             this.importToCurrentTree = false;
@@ -1193,22 +1249,26 @@ export const importExportMethods = uiModule({
 
         // Always import as new tree
         const fromManager = this.importFromTreeManager;
+        const fileName = this.jsonImportFileName;
+        this.jsonImportFileName = null;
         this.closeImportDialog();
         this.showImportTreeDialog(data, strings.treeManager.importTreeName, fromManager);
+        // The new tree's row names the file (spec 139 §7.2).
+        this.importTreeFileName = fileName;
     },
 
     /**
      * Handle encrypted JSON import - show password prompt with retry
      */
-    handleEncryptedJsonImport(encryptedData: EncryptedData): void {
+    handleEncryptedJsonImport(encryptedData: EncryptedData, into?: JsonImportInto): void {
         this.pendingEncryptedImport = encryptedData;
-        this.showEncryptedImportPrompt();
+        this.showEncryptedImportPrompt(into);
     },
 
     /**
      * Show password prompt for encrypted import
      */
-    showEncryptedImportPrompt(): void {
+    showEncryptedImportPrompt(into?: JsonImportInto): void {
         const modal = document.getElementById('password-prompt-modal');
         const input = document.getElementById('password-prompt-input') as HTMLInputElement;
         const error = document.getElementById('password-prompt-error');
@@ -1222,7 +1282,7 @@ export const importExportMethods = uiModule({
 
         // Set callback for this specific import - callback manages dialog
         this.passwordPromptCallback = async (password: string) => {
-            await this.tryDecryptImport(password);
+            await this.tryDecryptImport(password, into);
         };
         this.passwordPromptCallbackManagesDialog = true;
 
@@ -1233,7 +1293,7 @@ export const importExportMethods = uiModule({
     /**
      * Try to decrypt and import with given password
      */
-    async tryDecryptImport(password: string): Promise<void> {
+    async tryDecryptImport(password: string, into?: JsonImportInto): Promise<void> {
         if (!this.pendingEncryptedImport) return;
 
         const error = document.getElementById('password-prompt-error');
@@ -1264,7 +1324,7 @@ export const importExportMethods = uiModule({
         this.pendingEncryptedImport = null;
 
         // Same routing as a plain file (single tree or "Export all" backup)
-        await this.importJsonString(decrypted);
+        await this.importJsonString(decrypted, undefined, into);
     },
 
     // ---- SAVE CURRENT DATA DIALOG ----
@@ -1316,6 +1376,7 @@ export const importExportMethods = uiModule({
      */
     importJsonToCurrentTree(): void {
         this.importToCurrentTree = true;
+        this.importIntoTreeId = null;
         // The dialog stays while the file is chosen and read (9a); it goes once the file is read.
         this.pickImportFile('file-input');
     },
@@ -1334,6 +1395,7 @@ export const importExportMethods = uiModule({
      */
     startJsonImportFromManager(): void {
         this.importFromTreeManager = true;
+        this.importIntoTreeId = null;
         // The New tree menu stays while the file is chosen and read (9a); leavePickDialog
         // then closes it and keeps the tree manager in the stack.
         this.pickImportFile('file-input');
@@ -1348,7 +1410,20 @@ export const importExportMethods = uiModule({
     startGedcomImportPlain(): void {
         this.importFromTreeManager = false;
         this.importToCurrentTree = false;
+        this.importIntoTreeId = null;
         this.pickImportFile('gedcom-input');
+    },
+
+    /**
+     * Change structure… › Add from a file to this tree › Strom file (spec 139
+     * §6.2): the file read goes to the merge guide with this (open) tree as
+     * its target, never to a new tree.
+     */
+    startJsonImportIntoTree(treeId: TreeId): void {
+        this.importFromTreeManager = false;
+        this.importToCurrentTree = false;
+        this.importIntoTreeId = treeId;
+        this.pickImportFile('file-input');
     },
 
     startGedcomImportFromManager(): void {
@@ -1364,6 +1439,7 @@ export const importExportMethods = uiModule({
      * as always).
      */
     handleImportFileCancel(): void {
+        this.importIntoTreeId = null;
         if (!this.importFromTreeManager) return;
         // The menu stays open while the file is chosen (9a): nothing to come back to.
         if (document.getElementById('new-tree-menu-modal')?.classList.contains('active')) return;
@@ -1398,6 +1474,7 @@ export const importExportMethods = uiModule({
         input.value = '';
 
         void (async () => {
+            if (!(await confirmMemoryForImport(file.size, file.name))) return;
             const got = await readPickedFile(origin, file, async () => {
                 const htmlContent = await file.text();
                 const envelope = this.extractEnvelopeFromHtml(htmlContent);
@@ -1518,12 +1595,12 @@ export const importExportMethods = uiModule({
      * confirm, then import all of them as NEW trees (review V5).
      */
     async importMultiTreeBackup(trees: BackupTrees): Promise<void> {
-        const valid: Array<{ name: string; data: StromData; isHidden?: boolean; auditLog?: AuditLog; viewLinks?: unknown }> = [];
+        const valid: Array<{ name: string; data: StromData; isHidden?: boolean; auditLog?: AuditLog; viewLinks?: unknown; treeId?: string }> = [];
         let skipped = 0;
-        for (const entry of Object.values(trees)) {
+        for (const [treeId, entry] of Object.entries(trees)) {
             const result = validateJsonImport(JSON.stringify(entry.data));
             if (result.valid && result.data) {
-                valid.push({ name: entry.name, data: result.data, isHidden: entry.isHidden, auditLog: entry.auditLog, viewLinks: entry.viewLinks });
+                valid.push({ name: entry.name, data: result.data, isHidden: entry.isHidden, auditLog: entry.auditLog, viewLinks: entry.viewLinks, treeId });
             } else {
                 skipped++;
             }
@@ -1579,8 +1656,9 @@ export const importExportMethods = uiModule({
 
         this.importTreeData = data;
         this.importFromTreeManager = fromTreeManager;
-        // Set again by a GEDCOM import right after this.
+        // Set again by a GEDCOM import (or a JSON file's name) right after this.
         this.pendingGedcomImport = null;
+        this.importTreeFileName = null;
 
         // Handle dialog stack - if from tree manager, it's already in stack
         if (fromTreeManager) {
@@ -1605,13 +1683,18 @@ export const importExportMethods = uiModule({
     /**
      * Tie the tree made from a JSON file to the research the file names: it
      * receives the research's updates when no other tree does, else it is a
-     * copy (still offered when sending changes back).
+     * copy of that tree without research (spec 139 K5.1, K5.2).
      */
     restoreImportResearch(treeId: TreeId): void {
         const research = this.pendingImportResearch;
         this.pendingImportResearch = null;
         if (!research) return;
         const holder = TreeManager.findTreeByResearchId(research.id);
+        // Another tree takes the research's updates: this one is its copy, without research (spec 139 K5.1, K5.2).
+        if (holder && holder.id !== treeId) {
+            TreeManager.detachAsCopy(treeId, { treeId: holder.id, name: holder.name });
+            return;
+        }
         TreeManager.setResearchLink(treeId, {
             id: research.id,
             // Unknown since the research sent it (the file may hold edits made
@@ -1619,7 +1702,6 @@ export const importExportMethods = uiModule({
             fingerprint: '',
             syncedAt: new Date().toISOString(),
             ...(research.head ? { head: research.head } : {}),
-            ...(holder && holder.id !== treeId ? { copy: true } : {}),
         }, { agentless: this.researchAgentlessFor(research.id) });
     },
 
@@ -1628,6 +1710,7 @@ export const importExportMethods = uiModule({
         this.importTreeData = null;
         this.pendingImportResearch = null;
         this.pendingGedcomImport = null;
+        this.importTreeFileName = null;
         if (this.importFromTreeManager) {
             this.returnToParentDialog();
             this.importFromTreeManager = false;
@@ -1651,21 +1734,51 @@ export const importExportMethods = uiModule({
             () => ({ ok: false, kind: 'error', text: strings.busy.failed, retry: () => { void this.confirmImportTree(); } }));
         if (!newTreeId) return;
         this.restoreImportResearch(newTreeId);
+        // A JSON file carries no import record: its name goes with the tree (a GEDCOM's is in data.imports).
+        if (!gedcomImport && this.importTreeFileName) TreeManager.setImportedFrom(newTreeId, this.importTreeFileName);
 
         this.closeImportTreeDialog();
-        this.updateTreeSwitcher();
-        this.updateTreeManagerList();
-        TreeRenderer.render();
-        TreeRenderer.resetFocusHistory();
-        this.refreshSearch();
-        // Update URL to reflect new tree
-        this.updateUrlTreeParam(newTreeId);
+        await this.showImportedTree(newTreeId);
         // If this import came from "open from file", attach that handle now.
         void this.attachPendingFileHandle(newTreeId);
         // M6: post-import health check — offer to review any data issues.
         void this.afterImport(newTreeId, gedcomImport
             ? { gedcom: true, path: 'new', ...(gedcomImport.importId ? { importId: gedcomImport.importId } : {}) }
             : {});
+    },
+
+    /**
+     * A tree just imported as a new one, shown as a switch to it shows it
+     * (switchToTreeNow): the switcher, Manage trees, the focus the tree opens
+     * on (its own start person, never the focus of the tree left), the canvas
+     * centred on it, search and the address.
+     */
+    async showImportedTree(newTreeId: TreeId): Promise<void> {
+        this.updateTreeSwitcher();
+        this.updateTreeManagerList();
+        TreeRenderer.restoreFromSession();
+        await TreeRenderer.renderAsync();
+        this.refreshSearch();
+        ZoomPan.centerOnFocusWithContext();
+        // Update URL to reflect new tree
+        this.updateUrlTreeParam(newTreeId);
+    },
+
+    /**
+     * The import guide's New tree of a whole GEDCOM file (spec 134 §3): today's
+     * import of a new tree under the file's name, no name asked. `closed`
+     * runs once the tree is written (the guide closes), then the tree is shown
+     * with the "What next" card. False when nothing was written.
+     */
+    async importGuideNewTree(data: StromData, name: string, importId: string | undefined, closed: () => void): Promise<boolean> {
+        const btn = document.getElementById('merge-next');
+        const newTreeId = await busyLocal(btn, strings.busy.importing, () => DataManager.importAsNewTree(data, name),
+            () => ({ ok: false, kind: 'error', text: strings.busy.failed }));
+        if (!newTreeId) return false;
+        closed();
+        await this.showImportedTree(newTreeId);
+        void this.afterImport(newTreeId, { gedcom: true, path: 'new', ...(importId ? { importId } : {}) });
+        return true;
     },
 
     /**
@@ -1812,7 +1925,8 @@ export const importExportMethods = uiModule({
         const allData: Record<string, BackupTreeEntry> = {};
 
         for (const tree of trees) {
-            const data = await storedTreeForExport(tree.id);
+            // The pooled images stay references until the file is written (image-stream.ts).
+            const data = await storedTreeWithRefs(tree.id);
             if (data) {
                 let treeExport = applyLivingPrivacy(data, privacyMode);
                 treeExport = applyContentOptions(treeExport, content);
@@ -1831,17 +1945,17 @@ export const importExportMethods = uiModule({
             }
         }
 
-        let dataStr: string;
+        let blob: Blob;
         if (password) {
+            // Sealed whole: the text encrypted at once, its images expanded.
             const { encrypt } = await import('../crypto.js');
-            const encrypted = await encrypt(JSON.stringify(allData), password);
-            dataStr = JSON.stringify(encrypted, null, 2);
+            const encrypted = await encrypt(JSON.stringify(await expandedData(allData)), password);
+            blob = new Blob([JSON.stringify(encrypted, null, 2)], { type: 'application/json' });
         } else {
-            dataStr = JSON.stringify(allData, null, 2);
+            blob = (await jsonFileWithImages(allData, { indent: 2 })).blob;
         }
 
         const fileName = 'strom-all-trees.json';
-        const blob = new Blob([dataStr], { type: 'application/json' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = fileName;

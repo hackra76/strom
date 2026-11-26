@@ -19,7 +19,7 @@ import {
     SourceChangeKind, CoupleChangeKind, PlaceChange, VariantChange, SentOtherRow, sentOtherRows, sanitizeSentOtherRow, withRetractedRows,
     sourceAppOnly, coupleAppOnly, placesAppOnly, variantsAppOnly, lineageAppOnly, pairNotWritten, RESEARCH_UNREAD_KINDS,
     NotWrittenItem, PairedNotWritten, withWrittenMedia, MEDIA_APP_READ_KINDS, gateMediaChanges, docSentRows, type MediaWrites,
-    splitPersonAppOnly, personAppOnly,
+    splitPersonAppOnly, personAppOnly, sendCounts, type SendCounts,
 } from '../research-changes.js';
 import { lifeEventLabel } from '../person-sources.js';
 import { researchKeepsAppMedia, MATERIAL_LINKS_FEATURE, type SyncMediaWritten } from '../research-link.js';
@@ -371,6 +371,17 @@ function nwSourceRef(n: NotWrittenItem): string {
  * (the bridge not running, or a research without the gate).
  */
 type RestoreOffer = 'now' | 'later' | '';
+
+/**
+ * "What will be sent" right after a merge (spec 134 11a): its lead and note, the two buttons' words.
+ * The lead says the numbers of the list below it (null: the exact list cannot be told).
+ */
+export interface MergeSendWords {
+    lead: (counts: SendCounts | null) => string;
+    note: string;
+    keep: string;
+    go: string;
+}
 
 function restoreTail(ref: string, title: string, restore: RestoreOffer): string {
     return restore === 'now' && ref
@@ -827,7 +838,7 @@ export const researchChangesMethods = uiModule({
     // ==================== THE PANEL ====================
 
     /** Open "What will be sent" / "What was written" under the toolbar's button (or the ⋯ button). */
-    showResearchChanges(mode: 'send' | 'written', opts: { confirm?: boolean; inexact?: boolean } = {}, waited = false): void {
+    showResearchChanges(mode: 'send' | 'written', opts: { confirm?: boolean; inexact?: boolean; merge?: MergeSendWords } = {}, waited = false): void {
         this.closeActionsMenu();
         this.closeResearchChanges();
         const ctx = this.researchSyncLink();
@@ -1015,10 +1026,19 @@ export const researchChangesMethods = uiModule({
                 ? `<button type="button" class="secondary btn-sm" data-act="close">${esc(strings.buttons.close)}</button>`
                 : auto && !opts.confirm
                 ? `<button type="button" class="research-sync-link" data-act="send">${esc(s.sendNow)}</button>`
+                : opts.merge
+                // After a merge (spec 134 11a): keep it in the app for now, or send it.
+                ? `<button type="button" class="secondary btn-sm" data-act="close">${esc(opts.merge.keep)}</button>`
+                    + `<button type="button" class="primary btn-sm" data-act="send">${esc(opts.merge.go)}</button>`
                 : (opts.confirm && !ctx.link.previewDue
                     ? `<label class="research-changes-skip"><input type="checkbox" id="research-changes-skip"> ${esc(c.skipPreview)}</label>` : '')
                     + `<button type="button" class="secondary btn-sm" data-act="close">${esc(strings.buttons.close)}</button>`
                     + `<button type="button" class="primary btn-sm" data-act="send">${esc(s.barSend)}</button>`;
+            if (opts.merge && !nothing) {
+                footPair = true;
+                // The same numbers as the sections' heads (134 V-N5).
+                sub = opts.merge.lead(inexact ? null : sendCounts(list, other));
+            }
         }
         // About to send to a research without `media.app`: a person with only files is tagged "app only" (as a source is).
         const writes = mode === 'send' ? this.researchMediaWritesOf(ctx.treeId) : null;
@@ -1089,10 +1109,11 @@ export const researchChangesMethods = uiModule({
                     + `<span class="research-changes-kinds">${esc(kind)}</span></span></li>`;
             });
             const others = sourceRows.length + coupleRows.length + placesRow.length + variantsRow.length + lineageRows.length;
+            const counts = sendCounts(list, other);
             bodyHtml = (inexact ? `<p class="research-changes-inexact">${esc(c.inexact)}</p>` : '')
-                + section('persons', others ? c.sectionPersons(list.length) : '', list.map(ch => () => personRow(ch)))
-                + section('sources', c.sectionSources(sourceRows.length), sourceRows)
-                + section('couples', c.sectionCouples(coupleRows.length), coupleRows)
+                + section('persons', others ? c.sectionPersons(counts.persons) : '', list.map(ch => () => personRow(ch)))
+                + section('sources', c.sectionSources(counts.sources), sourceRows)
+                + section('couples', c.sectionCouples(counts.couples), coupleRows)
                 + section('places', places ? c.sectionPlaces(places.count) : '', placesRow)
                 + section('variants', variants ? c.sectionVariants(variants.count) : '', variantsRow)
                 + section('lineage', lineageRows.length ? c.sectionLineage(lineageRows.length) : '', lineageRows)
@@ -1118,6 +1139,7 @@ export const researchChangesMethods = uiModule({
             <div class="research-changes-head">
                 <div class="research-changes-title">${esc(title)}</div>
                 <div class="research-changes-sub">${esc(sub)}</div>
+                ${mode === 'send' && opts.merge ? `<div class="research-changes-sub research-changes-merge-note">${esc(opts.merge.note)}</div>` : ''}
             </div>
             <div class="research-changes-body">${bodyHtml}</div>
             ${foot ? `<div class="research-changes-foot${footPair ? ' is-pair' : ''}">${foot}</div>` : ''}`;

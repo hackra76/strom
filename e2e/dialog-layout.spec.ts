@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { openApp, createFirstPerson, addRelation, card } from './helpers.js';
+import { openApp, createFirstPerson, addRelation, card, importJsonAsNewTree, mergeCompare, mergeCurrentStep } from './helpers.js';
 
 /**
  * Dialogs whose header is a bare <h2> — the confirm box, the event editor,
@@ -134,6 +134,43 @@ test('every dialog follows its kind: ×, one Close|Cancel before the primary', a
     }
 });
 
+// Change structure… draws each step's footer; the dialog closed (the static
+// audit above), every step keeps the rules: options Close (info), the steps
+// that lead on Back · Cancel · primary (as the merge guide), the file Cancel.
+test('Change structure: every step follows its kind, closed and open', async ({ page }) => {
+    await openApp(page);
+    await createFirstPerson(page, 'Jan', 'Novak');
+    await addRelation(page, 'Jan', 'child', 'Petr', 'Novak');
+    await page.evaluate(() => window.Strom.TreeManager.createTree('Rodina Kalinovských'));
+    expect(await dialogRuleProblems(page)).toEqual([]);
+    await page.evaluate(() => window.Strom.UI.showStructureDialog(window.Strom.TreeManager.getActiveTreeId()!));
+    const dialog = page.locator('#structure-modal');
+    const step = async (key: string) => {
+        await expect(dialog).toHaveAttribute('data-step', key);
+        expect(await dialogRuleProblems(page), key).toEqual([]);
+    };
+    await step('options');
+    await dialog.locator('.menu-option[data-action="select"]').click();
+    await step('who');
+    await dialog.locator('#structure-footer [data-action="continue"]').click();
+    await step('summary');
+    await dialog.locator('#structure-back').click();
+    await dialog.locator('#structure-back').click();
+    await dialog.locator('.menu-option[data-action="into"]').click();
+    await step('join-what');
+    await dialog.locator('#structure-back').click();
+    await dialog.locator('.menu-option[data-action="from"]').click();
+    await step('from');
+    await dialog.locator('#structure-back').click();
+    await dialog.locator('.menu-option[data-action="file"]').click();
+    await step('file');
+    // Cancel of a step that leads on closes the whole dialog.
+    await dialog.locator('#structure-back').click();
+    await dialog.locator('.menu-option[data-action="select"]').click();
+    await dialog.locator('#structure-footer [data-dismiss]').click();
+    await expect(dialog).toBeHidden();
+});
+
 test('info dialogs close on the backdrop and on Close; forms ignore the backdrop', async ({ page }) => {
     await openApp(page);
     await createFirstPerson(page, 'Jan', 'Novak');
@@ -256,14 +293,17 @@ test('the confirm dialog is the small width and its title keeps the 20px/24px in
     expect(i.titleTop, 'nor against the top edge').toBeGreaterThan(8);
 });
 
-test('tree manager: New tree is the only primary, rows offer "Open at startup"', async ({ page }) => {
+test('tree manager: no primary in the footer (the row under the pointer has it), Close last; rows offer "Open at startup"', async ({ page }) => {
     await openApp(page);
     await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
     const manager = page.locator('#tree-manager-modal');
     await expect(manager).toBeVisible();
     const footer = manager.locator('.tree-manager-footer');
-    await expect(footer.locator('button.primary')).toHaveCount(1);
-    await expect(footer.locator('button').last()).toHaveClass(/primary/);
+    // spec 139 §7.1: New tree is secondary.
+    await expect(footer.locator('button.primary')).toHaveCount(0);
+    await expect(footer.locator('button')).toHaveCount(3);
+    await expect(footer.locator('button').nth(1)).toHaveClass(/tree-manager-new-btn/);
+    await expect(footer.locator('button').last()).toHaveAttribute('data-dismiss', '');
     await expect(footer.locator('[data-dismiss]')).toHaveText('Close');
     await expect(footer).not.toContainText('Default tree');
 
@@ -546,3 +586,74 @@ for (const width of [1440, 1024, 390]) {
         expect(counted, 'the sheet counts showed in some format').toBeGreaterThan(0);
     });
 }
+
+/**
+ * The import guide's step 3 builds its dialogs per open (spec 134 §5): the
+ * question when a person others link through is unticked (5a, a decision:
+ * no ×, Cancel before the primary) and the choice of a person for
+ * "Ancestors of…" (5c, a picker), both the small width. A file with Kvido
+ * (joined with the tree), his father and grandfather; invented people.
+ */
+test('import guide step 3: the untick question (5a) and the person picker (5c) follow their kinds', async ({ page }) => {
+    await openApp(page);
+    await importJsonAsNewTree(page, 'e2e/fixtures/modrinovi.json', 'Modřínovi');
+    const file = ['0 HEAD', '1 GEDC', '2 VERS 5.5.1', '1 CHAR UTF-8',
+        '0 @I1@ INDI', '1 NAME Kvido /Modřín/', '1 SEX M', '1 BIRT', '2 DATE 1921', '2 PLAC Křemenná', '1 FAMC @F1@',
+        '0 @I2@ INDI', '1 NAME Budivoj /Modřín/', '1 SEX M', '1 BIRT', '2 DATE 1890', '1 FAMS @F1@', '1 FAMC @F2@',
+        '0 @I3@ INDI', '1 NAME Bonifác /Modřín/', '1 SEX M', '1 BIRT', '2 DATE 1860', '1 FAMS @F2@',
+        '0 @F1@ FAM', '1 HUSB @I2@', '1 CHIL @I1@', '0 @F2@ FAM', '1 HUSB @I3@', '1 CHIL @I2@', '0 TRLR'].join('\n');
+    await page.locator('#gedcom-input').setInputFiles({ name: 'rodokmen.ged', mimeType: 'text/plain', buffer: Buffer.from(file, 'utf-8') });
+    const wizard = page.locator('#merge-modal');
+    await mergeCompare(wizard);
+    await wizard.locator('#merge-next').click();
+    await expect(mergeCurrentStep(wizard)).toHaveAttribute('data-step', '3');
+
+    await wizard.locator('.merge-s3-row').filter({ has: page.locator('.merge-s3-name', { hasText: 'Budivoj' }) }).locator('input[type="checkbox"]').click();
+    for (const [id, close] of [['merge-s3-unlink', '[data-dismiss]'], ['merge-s3-pick', '.buttons [data-dismiss]']] as const) {
+        if (id === 'merge-s3-pick') await wizard.locator('.merge-s3-variants [data-v="ancestors"]').click();
+        const dialog = page.locator(`#${id}`);
+        await expect(dialog, id).toBeVisible();
+        await expect(dialog.locator(':scope > .modal'), id).toHaveClass(/\bmodal--sm\b/);
+        expect(await dialogRuleProblems(page), id).toEqual([]);
+        // Focus is inside the dialog, and Tab keeps it there.
+        for (let i = 0; i < 12; i++) {
+            await page.keyboard.press('Tab');
+            expect(await dialog.evaluate(el => el.contains(document.activeElement)), id).toBe(true);
+        }
+        await dialog.locator(close).click();
+        await expect(dialog, id).toHaveCount(0);
+    }
+});
+
+/**
+ * The import guide's "Link to a person…" (spec 134 §6, 6b) is a picker of
+ * the middle width: × in its header, Cancel before the primary, the focus
+ * kept inside. A file with Kvido (joined with the tree) and a father and son
+ * with no way to the tree; invented people.
+ */
+test('import guide: the dialog Link to a person… (6b) follows its kind', async ({ page }) => {
+    await openApp(page);
+    await importJsonAsNewTree(page, 'e2e/fixtures/modrinovi.json', 'Modřínovi');
+    const file = ['0 HEAD', '1 GEDC', '2 VERS 5.5.1', '1 CHAR UTF-8',
+        '0 @I1@ INDI', '1 NAME Kvido /Modřín/', '1 SEX M', '1 BIRT', '2 DATE 1921', '2 PLAC Křemenná',
+        '0 @I2@ INDI', '1 NAME Radhost /Jilm/', '1 SEX M', '1 BIRT', '2 DATE 1860', '1 FAMS @F1@',
+        '0 @I3@ INDI', '1 NAME Božetěch /Jilm/', '1 SEX M', '1 BIRT', '2 DATE 1890', '1 FAMC @F1@',
+        '0 @F1@ FAM', '1 HUSB @I2@', '1 CHIL @I3@', '0 TRLR'].join('\n');
+    await page.locator('#gedcom-input').setInputFiles({ name: 'rodokmen.ged', mimeType: 'text/plain', buffer: Buffer.from(file, 'utf-8') });
+    const wizard = page.locator('#merge-modal');
+    await mergeCompare(wizard);
+    await wizard.locator('#merge-next').click();
+    await expect(mergeCurrentStep(wizard)).toHaveAttribute('data-step', '3');
+    await wizard.locator('#merge-s3-tab-groups').click();
+    await wizard.locator('#merge-s3-groups [data-decide="connect"]').first().click();
+    const dialog = page.locator('#merge-connect-modal');
+    await expect(dialog).toBeVisible();
+    await expect(dialog.locator(':scope > .modal')).toHaveClass(/\bmodal--md\b/);
+    expect(await dialogRuleProblems(page)).toEqual([]);
+    for (let i = 0; i < 12; i++) {
+        await page.keyboard.press('Tab');
+        expect(await dialog.evaluate(el => el.contains(document.activeElement))).toBe(true);
+    }
+    await dialog.locator('.buttons [data-dismiss]').click();
+    await expect(dialog).toHaveCount(0);
+});

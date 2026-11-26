@@ -12,6 +12,7 @@
  * See src/ui/module.ts for the composition pattern.
  */
 
+import { setImageSource } from '../image-src.js';
 import { isPendingImageUrl } from '../research-image-refs.js';
 import { DataManager, LIVE_FOLLOW_EVENT } from '../data.js';
 import { Attachment, MediaPlace, PartnershipId, Person, PersonId, Source } from '../types.js';
@@ -30,6 +31,7 @@ import { formatBytes } from './attachments-ui.js';
 import { type MaterialsContext, materialItemSha } from './materials-ui.js';
 import { uiModule } from './module.js';
 import { isBusy } from './busy.js';
+import { materialScopeSource } from './search-scope-ui.js';
 
 type Target = 'person' | 'event' | 'couple' | 'source';
 const TARGETS: Target[] = ['person', 'event', 'couple', 'source'];
@@ -163,7 +165,7 @@ export const materialAttachMethods = uiModule({
             if (att?.dataUrl && att.mimeType.startsWith('image/') && !att.originalOnly && !isPendingImageUrl(att.dataUrl)) {
                 const img = h('img', 'mdlg-attach-thumb');
                 img.alt = '';
-                img.src = att.dataUrl;
+                setImageSource(img, att.dataUrl);
                 dialog.box.querySelector('.mdlg-head')!.prepend(img);
                 dialog.box.querySelector('.mdlg-head')!.classList.add('has-thumb');
             }
@@ -284,6 +286,8 @@ export const materialAttachMethods = uiModule({
                 placeholder: m.attachPersonPh,
                 showBirthYear: true,
                 persons: DataManager.getAllPersons().filter(p => !p.isPlaceholder),
+                // The Materials window covers the view: Whole tree / Direct line only (spec 137 §1.5).
+                scope: materialScopeSource(fromPerson?.id),
                 onSelect: (id) => { anchorPerson = id; show(target); },
             });
             single.focusInput();
@@ -329,6 +333,7 @@ export const materialAttachMethods = uiModule({
                     maxLabel: m.assignMax,
                     fixedLabel: m.attachAlready,
                     initial: preselect,
+                    scope: materialScopeSource(fromPerson?.id),
                 });
                 chosenPeople = [...preselect];
                 multi.focusInput();

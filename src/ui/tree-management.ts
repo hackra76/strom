@@ -6,10 +6,10 @@
 import { researchOpenMark, researchOpenSrHtml } from './research-open-mark.js';
 import { DataManager, auditPersonName } from '../data.js';
 import { runTreeSwitch, type TreeSwitchPlace, type TreeSwitchResult } from './tree-switch-busy.js';
-import { activatedElement, busyLocal } from './busy.js';
+import { activatedElement } from './busy.js';
 import type { FollowSwitchFrom } from './research-follow-ui.js';
-import { countFamilies } from '../ged-exporter.js';
 import { TreeManager } from '../tree-manager.js';
+import { sharedImageTrees, treeImageIds } from '../snapshots.js';
 import { TreeRenderer } from '../renderer.js';
 import { ZoomPan } from '../zoom.js';
 import { TreePreview, TreeCompare } from '../tree-preview.js';
@@ -27,7 +27,9 @@ import {
 } from '../types.js';
 import { LAST_FOCUSED } from '../model-values.js';
 import { strings, getCurrentLanguage } from '../strings.js';
-import { formatFileSize, formatRelativeDateTime } from '../format.js';
+import { formatRelativeDateTime, formatTreeSize } from '../format.js';
+import { pendingMergeHasTarget, pendingMergeSourceName, pendingMergeTreeId } from '../tree-row.js';
+import { treeOrigin } from './tree-origin.js';
 import { parseGedcom, convertToStrom, GedcomConversionResult } from '../ged-parser.js';
 import {
     validateJsonImport,
@@ -46,18 +48,23 @@ import { dropLifelineChips } from '../lifeline-view.js';
 import { HISTORY_PLACE_FEATURE } from '../research-link.js';
 import { historyKindLocked, historyKindsShown, HISTORY_SCOPE_KINDS, type HistoryKinds } from '../history.js';
 import { ThemeMode, LanguageSetting, AppMode, AuditLog } from '../types.js';
+import type { TreeMetadata } from '../types.js';
 import { CryptoSession, isEncrypted, encrypt, decrypt, EncryptedData } from '../crypto.js';
 import { validateTreeData, ValidationResult as TreeValidationResult, ValidationIssue } from '../validation.js';
 import * as CrossTree from '../cross-tree.js';
 import { fitFlyout } from './flyout.js';
 import { uiModule } from './module.js';
-import { treeActionsAsSheet, collapsedToggle, TreeActionRow, TREE_STRUCTURE_GROUP_SUFFIX } from './tree-actions.js';
+import { treeActionsAsSheet, TreeActionRow } from './tree-actions.js';
 import { isPhoneToolbar } from './search.js';
 
 import { iconSvg } from '../icons.js';
+import { shortName, treeRowDrop, treeRowFileRoute, TREE_DRAG_TYPE, type TreeDrag } from '../tree-drop.js';
+import { TreeEditLock } from './tree-edit-lock.js';
 import { shownNameOrEmpty } from '../person-name.js';
 import { forgetTreeMaterials } from './materials-ui.js';
 import { updateDefaultFocusButtons } from './default-focus.js';
+import { inDeviceMode, deviceTreesNotHere } from './device-mode-ui.js';
+import { deviceTreeTextHtml } from './device-start-ui.js';
 
 /** Room (px) a row menu needs beside ⋯ to show a useful part of its rows. */
 const TREE_MENU_MIN_ROOM = 240;
@@ -68,14 +75,6 @@ const ACTIONS_SUBMENUS: readonly ActionsSubmenu[] = ['family', 'tree'];
 
 /** The tree's flyout never starts higher than this (px from the window's top: under the toolbar). */
 const TREE_FLYOUT_TOP = 62;
-
-/** "Change structure ⌄" in the ⋯ flyout is open (until the menu closes). */
-let actionsStructureOpen = false;
-
-/** The first row "Change structure ⌄" reveals in the ⋯ flyout. */
-function firstStructureItem(): HTMLElement | null {
-    return document.querySelector<HTMLElement>('#actions-tree-structure [role^="menuitem"]');
-}
 
 /**
  * Focus the first item of a ⋯-menu flyout opened from the keyboard. The tree's
@@ -197,6 +196,8 @@ export const treeManagementMethods = uiModule({
         // Keep the action-menu anniversaries signal in sync: this method is
         // already called wherever the count can change (tree switch, edits, ...).
         this.refreshActionMenuBadges();
+        // The device mode's second line under the name (spec 094 §3; nothing outside it).
+        this.refreshDeviceModeUi();
 
         const nameEl = document.getElementById('current-tree-name');
         const dropdown = document.getElementById('tree-switcher-dropdown');
@@ -255,7 +256,17 @@ export const treeManagementMethods = uiModule({
         // Normal mode: show storage trees
         const activeTree = TreeManager.getActiveTreeMetadata();
         if (nameEl) {
-            nameEl.textContent = activeTree?.name || '…';
+            // A phone's Research screen names its own tree (the tree under it may be another, or none yet).
+            nameEl.textContent = this.phoneResearchTreeName() || activeTree?.name || '…';
+        }
+        // A merge not sent to the tree's research yet, quietly beside the switcher (spec 134 11b).
+        this.listenForMergeHold();
+        const holdEl = document.getElementById('tree-switcher-hold');
+        if (holdEl) {
+            holdEl.textContent = this.treeHoldText(activeTree);
+            // Shortened with an ellipsis when the toolbar is tight: the whole text on hover.
+            holdEl.title = holdEl.textContent;
+            holdEl.hidden = !holdEl.textContent;
         }
 
         if (!dropdown) return;
@@ -264,18 +275,34 @@ export const treeManagementMethods = uiModule({
         const trees = TreeManager.getVisibleTrees();
         const activeId = TreeManager.getActiveTreeId();
 
-        let html = '';
+        // A device of the home network: the connection's state and "Connection…" on top (spec 094 3.11).
+        let html = this.deviceConnTopHtml();
 
+        // A device of the home network: the research's trees (spec 094 3.7), the open one marked, each as in the
+        // chooser; a tree not opened here yet is loaded through the gateway when chosen.
+        const deviceTrees = inDeviceMode() ? this.deviceTreeChoicesNow() : null;
+        if (deviceTrees) {
+            html += `<div class="tree-switcher-head" id="tree-switcher-device-head">${this.escapeHtml(strings.device.treesTitle)}</div>`;
+            deviceTrees.forEach((c, i) => {
+                html += `
+                <div class="tree-switcher-item sel-opt device-tree-item ${c.current ? 'active' : ''}" data-sel-form="row" role="menuitem" tabindex="0"
+                     data-device-tree="${i}"${c.current ? ' aria-current="true"' : ''}>
+                    <span class="tree-item-check">${c.current ? iconSvg('check') : ''}</span>
+                    ${deviceTreeTextHtml(c)}
+                </div>`;
+            });
+        }
         // Tree list (only visible trees): ✓ in its own column, the name, the research marks (spec 011).
-        for (const tree of trees) {
+        for (const tree of deviceTrees ? [] : trees) {
             const isActive = tree.id === activeId;
             const title = this.treeSwitcherTitle(tree);
             html += `
                 <div class="tree-switcher-item sel-opt ${isActive ? 'active' : ''}" data-sel-form="row" role="menuitem" tabindex="0" data-tree-id="${tree.id}"
                      ${title ? `title="${this.escapeHtml(title)}"` : ''} onclick="window.Strom.UI.switchToTree('${tree.id}')">
                     <span class="tree-item-check">${isActive ? iconSvg('check') : ''}</span>
-                    <span class="tree-item-name">${this.escapeHtml(tree.name)}</span>
+                    <span class="tree-item-name" title="${this.escapeHtml(title ? `${tree.name}\n${title}` : tree.name)}">${this.escapeHtml(tree.name)}</span>
                     ${this.treeSwitcherKindHtml(tree)}
+                    ${this.treeHoldText(tree) ? `<span class="tree-item-hold">${this.escapeHtml(this.treeHoldText(tree))}</span>` : ''}
                     ${this.treeSwitcherMarksHtml(tree)}
                 </div>
             `;
@@ -287,7 +314,14 @@ export const treeManagementMethods = uiModule({
         // The switcher is trees only: view/tree actions live in the ⋯ actions
         // menu (desktop) and the mobile "More" sheet (≤1024px). Import… makes a
         // new tree, so it belongs here, not with the open tree's actions.
-        html += `
+        // On a device of the home network the trees belong to the computer's
+        // research: one quiet line says where new trees and import are (spec 094 §3).
+        if (inDeviceMode()) html += `
+            <div class="tree-switcher-divider"></div>
+            ${this.phoneResearchActive() ? `<div class="tree-switcher-quiet" id="tree-switcher-no-load">${this.escapeHtml(strings.deviceResearch.switchNoLoad)}</div>` : ''}
+            <div class="tree-switcher-quiet" id="tree-switcher-not-here">${this.escapeHtml(deviceTreesNotHere())}</div>
+        `;
+        else html += `
             <div class="tree-switcher-divider"></div>
             <div class="tree-switcher-action edit-only" id="tree-switcher-import" role="menuitem" tabindex="0" onclick="window.Strom.UI.treeSwitcherImport()">
                 ${strings.treeSwitcher.import}
@@ -298,6 +332,16 @@ export const treeManagementMethods = uiModule({
         `;
 
         dropdown.innerHTML = html;
+        dropdown.classList.toggle('device-trees-on', !!deviceTrees);
+        if (deviceTrees) {
+            dropdown.querySelectorAll<HTMLElement>('[data-device-tree]').forEach(item => {
+                const c = deviceTrees[Number(item.dataset.deviceTree)];
+                item.addEventListener('click', () => {
+                    dropdown.classList.remove('active');
+                    if (c) void this.pickDeviceTree(c);
+                });
+            });
+        }
         this.refreshTreeSwitcherDot();
     },
 
@@ -318,16 +362,27 @@ export const treeManagementMethods = uiModule({
         if (dot) dot.style.display = annDot ? 'block' : 'none';
         // The "More" tab carries both: there the research group sits in its sheet (a narrow window with a mouse).
         // Changes waiting for a research that is not running: their number on the tab, in place of the dot (audit 017 a-D6).
-        const resting = this.researchRestingWaitingCount();
+        // A device of the home network (spec 094 §4, 4.11): the tab says what the Research button says on a computer —
+        // what waits for action counted first, else the dot of edits not sent, else the dot of news.
+        const waitingHere = inDeviceMode() && researchSignal === 'count' ? this.researchWaitingCount() : 0;
+        const resting = waitingHere > 0 ? 0 : this.researchRestingWaitingCount();
+        const shownCount = waitingHere || resting;
         const moreCount = document.getElementById('bottom-bar-more-count');
         if (moreCount) {
-            moreCount.hidden = resting === 0;
-            moreCount.textContent = resting > 99 ? '99+' : resting > 0 ? String(resting) : '';
-            if (resting > 0) moreCount.title = `${strings.sync.stateBridgeDown} · ${strings.sync.waitingN(resting)}`;
+            moreCount.hidden = shownCount === 0;
+            moreCount.classList.toggle('research-count-badge', waitingHere > 0);
+            moreCount.textContent = shownCount > 99 ? '99+' : shownCount > 0 ? String(shownCount) : '';
+            if (waitingHere > 0) moreCount.title = `${strings.research.waiting}: ${waitingHere}`;
+            else if (resting > 0) moreCount.title = `${strings.sync.stateBridgeDown} · ${strings.sync.waitingN(resting)}`;
             else moreCount.removeAttribute('title');
         }
         const moreDot = document.getElementById('bottom-bar-more-dot');
-        if (moreDot) moreDot.style.display = resting === 0 && (annDot || researchSignal !== '') ? 'block' : 'none';
+        if (moreDot) {
+            moreDot.style.display = shownCount === 0 && (annDot || researchSignal !== '') ? 'block' : 'none';
+            // Edits not sent (or a state asking for action) in the research's colour; news in the accent.
+            if (inDeviceMode() && (researchSignal === 'unsent' || researchSignal === 'attention')) moreDot.dataset.signal = researchSignal;
+            else delete moreDot.dataset.signal;
+        }
         this.renderActionsExportReminder();
         // Count badge on the Anniversaries row; its tooltip and the row's
         // spoken name say what the number counts (the next days, T33).
@@ -448,7 +503,6 @@ export const treeManagementMethods = uiModule({
      */
     closeActionsMenu(): void {
         this.closeActionsSubmenu();
-        actionsStructureOpen = false;
         this.closeResearchTrialNote();
         const dropdown = document.getElementById('actions-menu-dropdown');
         if (dropdown?.classList.contains('active')) this.exportReminderClosed();
@@ -480,8 +534,7 @@ export const treeManagementMethods = uiModule({
      * The "Tree: {name} ›" flyout is the one list of tree actions
      * (treeActionGroups, menu 1020 §3), the same as the tree manager's ⋯ and
      * the More sheet, so they never drift apart. The previous rows stay until
-     * the new ones are ready (no empty flash). "Change structure ⌄" opens its
-     * rows in place; it starts closed with every opening of the menu.
+     * the new ones are ready (no empty flash).
      */
     async renderActionsTreeRows(treeId: TreeId): Promise<void> {
         const host = document.getElementById('actions-tree-submenu');
@@ -553,42 +606,7 @@ export const treeManagementMethods = uiModule({
                 divider.setAttribute('role', 'separator');
                 nodes.push(divider);
             }
-            if (!group.collapsedLabel) {
-                nodes.push(...group.rows.map(rowItem));
-                return;
-            }
-            const groupId = 'actions-tree-structure';
-            const toggle = collapsedToggle(group.collapsedLabel, groupId,
-                'tree-switcher-action actions-tree-action tree-actions-structure-toggle'
-                + (group.rows.every(r => r.editOnly) ? ' edit-only' : ''), 'actions-tree-action-label', 'div');
-            toggle.id = 'actions-tree-structure-toggle';
-            toggle.tabIndex = 0;
-            toggle.setAttribute('aria-expanded', String(actionsStructureOpen));
-            toggle.addEventListener('click', () => this.toggleActionsTreeStructure('row'));
-            toggle.addEventListener('keydown', (e) => {
-                if (e.altKey || e.ctrlKey || e.metaKey) return;
-                if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    this.toggleActionsTreeStructure(actionsStructureOpen ? 'row' : 'first');
-                } else if (e.key === 'ArrowRight') {
-                    e.preventDefault();
-                    if (actionsStructureOpen) firstStructureItem()?.focus();
-                    else this.toggleActionsTreeStructure('first');
-                }
-            });
-            const box = document.createElement('div');
-            box.id = groupId;
-            box.className = 'actions-tree-structure';
-            box.setAttribute('role', 'group');
-            box.setAttribute('aria-label', group.collapsedLabel);
-            box.hidden = !actionsStructureOpen;
-            box.append(...group.rows.map(rowItem));
-            box.addEventListener('keydown', (e) => {
-                if (e.key !== 'ArrowLeft' || e.altKey || e.ctrlKey || e.metaKey) return;
-                e.preventDefault();
-                this.toggleActionsTreeStructure('row');
-            });
-            nodes.push(toggle, box);
+            nodes.push(...group.rows.map(rowItem));
         });
         // A row focused from the keyboard meanwhile (→ on "Tree:") keeps the focus on its new copy.
         const focused = document.activeElement instanceof HTMLElement && host.contains(document.activeElement)
@@ -598,18 +616,6 @@ export const treeManagementMethods = uiModule({
         if (document.getElementById('actions-tree-wrap')?.classList.contains('submenu-open')) {
             this.positionActionsSubmenu('actions-tree-submenu');
         }
-    },
-
-    /** "Change structure ⌄" in the ⋯ flyout opened or closed in place; focus on its first row (`first`) or the row. */
-    toggleActionsTreeStructure(focus: 'first' | 'row'): void {
-        actionsStructureOpen = !actionsStructureOpen;
-        const toggle = document.getElementById('actions-tree-structure-toggle');
-        const box = document.getElementById('actions-tree-structure');
-        toggle?.setAttribute('aria-expanded', String(actionsStructureOpen));
-        if (box) box.hidden = !actionsStructureOpen;
-        this.positionActionsSubmenu('actions-tree-submenu');
-        if (focus === 'first' && actionsStructureOpen) firstStructureItem()?.focus();
-        else toggle?.focus();
     },
 
     /**
@@ -756,14 +762,19 @@ export const treeManagementMethods = uiModule({
             dropdown.classList.toggle('active');
             if (dropdown.classList.contains('active')) {
                 this.updateTreeSwitcher();
-                // The other trees' research state: asked now unless fresh.
-                this.kickOtherResearch();
+                // The other trees' research state: asked now unless fresh (on a device: each research tree's status).
+                if (inDeviceMode()) this.kickDeviceTreeRows();
+                else this.kickOtherResearch();
             }
         }
     },
 
     /** The phone's tree list: the visible trees (the open one marked), then Manage trees ›. */
     showTreeSwitcherSheet(): void {
+        if (inDeviceMode()) {
+            this.showDeviceTreesSheet();
+            return;
+        }
         const activeId = TreeManager.getActiveTreeId();
         const trees = TreeManager.getVisibleTrees();
         this.noteBottomSheetTrigger();
@@ -776,10 +787,10 @@ export const treeManagementMethods = uiModule({
         this.presentMenuSheet(strings.treeManager.switcherTitle, [
             { rows: trees.map(tree => {
                 const marks = this.treeSheetMarks(tree);
-                const kind = this.treeKindLabel(tree);
+                const sub = [this.treeKindLabel(tree), this.treeHoldText(tree)].filter(Boolean).join(' \u00b7 ');
                 return {
                     label: tree.name,
-                    ...(kind ? { sub: kind } : {}),
+                    ...(sub ? { sub } : {}),
                     active: tree.id === activeId,
                     treeId: tree.id,
                     extra: marks?.extra,
@@ -793,6 +804,29 @@ export const treeManagementMethods = uiModule({
         ]);
         // The other trees' research state: asked now unless fresh.
         this.kickOtherResearch();
+    },
+
+    /**
+     * A device's Trees sheet (spec 094 3.7): "Research trees" — every tree of the research, each as in the
+     * chooser (its name in the serif, its persons, what its research does, the archive's label), the open one
+     * marked; then one quiet line where import and managing trees would be (they are the computer's).
+     */
+    showDeviceTreesSheet(): void {
+        this.noteBottomSheetTrigger();
+        this.hideBottomSheet();
+        const rows = this.deviceTreeChoicesNow().map((c, i) => {
+            const text = document.createElement('span');
+            text.className = 'device-tree-sheet-text';
+            text.innerHTML = deviceTreeTextHtml(c);
+            return { label: '', id: `device-tree-sheet-${i}`, className: 'device-tree-item', active: c.current, extra: text, run: () => { void this.pickDeviceTree(c); } };
+        });
+        this.presentMenuSheet(strings.device.treesTitle, [
+            { rows },
+            // On a phone's Research screen a switch changes only the screen's data (spec 094 §1 point 8).
+            ...(this.phoneResearchActive() ? [{ divider: true, rows: [], quiet: strings.deviceResearch.switchNoLoad }] : []),
+            { divider: !this.phoneResearchActive(), rows: [], quiet: deviceTreesNotHere() },
+        ]);
+        this.kickDeviceTreeRows();
     },
 
     /**
@@ -944,70 +978,80 @@ export const treeManagementMethods = uiModule({
         const filter = (searchable ? (searchInput?.value ?? '') : '').trim().toLowerCase();
         const visibleTrees = filter ? trees.filter(t => t.name.toLowerCase().includes(filter)) : trees;
 
+        const lang = getCurrentLanguage();
+        const s = strings.treeManager;
+        const st = strings.structure;
+        const esc = (text: string) => this.escapeHtml(text);
+        // Unfinished merges stand under the tree they merge into (spec 139 §9.1); those whose tree is gone, in a section of their own.
+        const pendingMerges = await listMergeSessionsInfo();
+        const underTree = new Map<string, typeof pendingMerges>();
+        const orphans: typeof pendingMerges = [];
+        for (const session of pendingMerges) {
+            const target = pendingMergeTreeId(session, trees);
+            if (target) underTree.set(target, [...(underTree.get(target) ?? []), session]);
+            else orphans.push(session);
+        }
+        const mergeName = (session: (typeof pendingMerges)[number]) => pendingMergeSourceName(session, strings.merge.pendingMergeLabel);
+        const mergeFacts = (session: (typeof pendingMerges)[number]) => [
+            // The guide's step 2 "to decide" (134 S-P2), then how far it got.
+            ...((session.stats.pending ?? 0) > 0 ? [strings.mergeWizard.subPending(session.stats.pending ?? 0)] : []),
+            strings.merge.reviewedCount(session.stats.reviewed, session.stats.total),
+            ...(session.stats.conflicts > 0 ? [strings.merge.pendingMergeConflicts(session.stats.conflicts)] : []),
+            st.savedAt(formatRelativeDateTime(new Date(session.savedAt).getTime(), lang)),
+        ];
+        const mergeLinks = (session: (typeof pendingMerges)[number], resume: boolean) => `
+            <span class="tree-manager-pending-actions">
+                ${resume ? `<button type="button" class="link-button edit-only pending-merge-resume" data-session-id="${esc(session.id)}">${esc(strings.merge.resume)}</button>` : ''}
+                ${resume ? `<button type="button" class="link-button edit-only pending-merge-rename" data-session-id="${esc(session.id)}" data-merge-name="${esc(mergeName(session))}">${esc(s.rename)}</button>` : ''}
+                <button type="button" class="link-button danger edit-only pending-merge-discard" data-session-id="${esc(session.id)}" data-merge-name="${esc(mergeName(session))}">${esc(strings.merge.discard)}</button>
+            </span>`;
+
         let html = '';
-        const defaultTree = TreeManager.getDefaultTree();
         for (const tree of visibleTrees) {
             const isActive = tree.id === activeId;
-
-            // Get tree data for additional stats
-            const treeData = await TreeManager.getTreeData(tree.id);
-            // As the research and GEDCOM count them: a single parent's family too.
-            const familyCount = treeData ? countFamilies(treeData) : 0;
-
-            // Get tree size from metadata
-            const treeSize = tree.sizeBytes;
-            // Only sizes worth noticing (1 MB and up), rounded: "1,4 MB".
-            const treeSizeFormatted = formatFileSize(treeSize, getCurrentLanguage());
-
-            // Get default person setting
-            const defaultPersonSetting = treeData?.defaultPersonId;
-            let defaultPersonDisplay = '';
-
-            if (defaultPersonSetting === LAST_FOCUSED) {
-                defaultPersonDisplay = strings.treeManager.defaultPersonLastFocused;
-            } else if (defaultPersonSetting && treeData?.persons[defaultPersonSetting]) {
-                const person = treeData.persons[defaultPersonSetting];
-                const birthYear = person.birthDate ? person.birthDate.split('-')[0] : '';
-                const name = shownNameOrEmpty(person);
-                defaultPersonDisplay = birthYear ? `${name} (*${birthYear})` : name;
-            }
-            // If undefined, don't show anything (first person is implicit default)
-            // A tree opening in its last used view says so (1101).
-            if (treeData?.defaultView === 'last') {
-                defaultPersonDisplay = defaultPersonDisplay
-                    ? `${defaultPersonDisplay} \u00b7 ${strings.treeManager.defaultViewLastSummary}`
-                    : strings.treeManager.defaultViewLastSummary;
-            }
-
-            const s = strings.treeManager;
-
-            // Status as explicit text chips — a leading glyph was easy to miss
-            // and its meaning unclear. Active reads green, hidden/locked gray.
+            // Change structure… where the tree can be written (the dialog itself says what a followed tree cannot do).
+            const canStructure = !tree.isLocked && !TreeManager.isTreeNewer(tree.id);
+            // Status as text chips; the open tree's row also has the selection's fill and line (Linka).
             const badges =
-                (isActive ? `<span class="tree-badge active-badge">${s.activeBadge}</span>` : '') +
-                (tree.isLocked ? `<span class="tree-badge">${s.lockedBadge}</span>` : '') +
-                (tree.isHidden ? `<span class="tree-badge">${s.hiddenBadge}</span>` : '');
+                (isActive ? `<span class="tree-badge active-badge">${esc(s.opened)}</span>` : '') +
+                (tree.isLocked ? `<span class="tree-badge">${esc(s.lockedBadge)}</span>` : '') +
+                (tree.isHidden ? `<span class="tree-badge">${esc(s.hiddenBadge)}</span>` : '');
+            // Every tree the same facts, all from the tree index (spec 139 §7.2): no tree's data is read here.
+            const edited = Date.parse(tree.lastModifiedAt);
+            const stats = [
+                esc(s.persons(tree.personCount)),
+                esc(st.couples(tree.partnershipCount)),
+                `<span class="tree-manager-item-size">${esc(formatTreeSize(tree.sizeBytes, lang))}</span>`,
+                ...(Number.isFinite(edited) ? [esc(strings.treeActions.edited(formatRelativeDateTime(edited, lang)))] : []),
+            ].join(' · ');
+            const pending = (underTree.get(tree.id) ?? []).map(session => `
+                <div class="tree-manager-item-pending" data-session-id="${esc(session.id)}">
+                    <span class="tree-manager-item-indicator pending" aria-hidden="true"></span>
+                    <span class="tree-manager-pending-text">${esc([st.pendingRow(mergeName(session), tree.name), ...mergeFacts(session)].join(' · '))}</span>
+                    ${mergeLinks(session, true)}
+                </div>`).join('');
 
             html += `
                 <div class="tree-manager-item sel-opt ${isActive ? 'active' : ''} ${tree.isHidden ? 'hidden-tree' : ''}" data-sel-form="row" data-tree-id="${tree.id}">
-                    <div class="tree-manager-item-header">
-                        <span class="tree-manager-item-name clickable" onclick="window.Strom.UI.openTreeFromManager('${tree.id}')">${this.escapeHtml(tree.name)}</span>
-                        ${badges}
-                        ${treeSizeFormatted ? `<span class="tree-manager-item-size">${treeSizeFormatted}</span>` : ''}
+                    <div class="tree-manager-item-info">
+                        <div class="tree-manager-item-header">
+                            <span class="tree-manager-item-name clickable" title="${esc(tree.name)}" onclick="window.Strom.UI.openTreeFromManager('${tree.id}')">${esc(tree.name)}</span>
+                            ${badges}
+                        </div>
+                        <div class="tree-manager-item-stats-row">${stats}</div>
+                        ${this.treeManagerOriginHtml(tree)}
+                        ${this.treeManagerHoldHtml(tree)}
                     </div>
-                    <div class="tree-manager-item-stats-row">
-                        ${s.persons(tree.personCount)} • ${s.families(familyCount)}
-                        ${defaultPersonDisplay ? ` • ${this.escapeHtml(defaultPersonDisplay)}` : ''}
-                    </div>
-                    ${tree.research?.id && !tree.research.copy ? this.researchLiveSlotHtml(tree.id) : ''}
                     <div class="tree-manager-item-actions">
-                        <button class="tree-open-btn" data-tree-id="${tree.id}" onclick="window.Strom.UI.openTreeFromManager('${tree.id}')">${s.open}</button>
-                        ${isActive ? `<span class="tree-opened-label">${s.opened}</span>` : ''}
+                        ${isActive ? '' : `<button type="button" class="tree-open-btn" data-tree-id="${tree.id}" onclick="window.Strom.UI.openTreeFromManager('${tree.id}')">${esc(s.open)}</button>`}
+                        ${canStructure ? `<button type="button" class="tree-row-action edit-only" data-row-action="structure" data-action="structure" data-tree-id="${tree.id}">${esc(st.menuItem)}</button>` : ''}
+                        <button type="button" class="tree-row-action" data-row-action="export" data-action="export" data-tree-id="${tree.id}">${esc(s.export)}</button>
                         <div class="tree-row-menu-wrap">
-                            <button class="tree-row-menu-btn" data-tree-id="${tree.id}" data-tip="${s.moreActions}" aria-label="${s.moreActions}" aria-haspopup="menu">⋯</button>
+                            <button type="button" class="tree-row-menu-btn" data-tree-id="${tree.id}" data-tip="${esc(s.moreActions)}" aria-label="${esc(s.moreActions)}" aria-haspopup="menu">⋯</button>
                             <div class="tree-row-menu" role="menu"></div>
                         </div>
                     </div>
+                    ${pending}
                 </div>
             `;
         }
@@ -1016,44 +1060,21 @@ export const treeManagementMethods = uiModule({
             html += `<p class="tree-manager-empty">${strings.merge.noItems}</p>`;
         }
 
-        // Pending merge sessions get their own labelled section — mixed into
-        // the tree list they read as "some broken tree".
-        const pendingMerges = await listMergeSessionsInfo();
-        if (pendingMerges.length > 0) {
-            html += `<div class="tree-manager-section">${strings.treeManager.pendingSection}</div>`;
+        // Merges whose target tree is gone (or never named): their own section, Discard only when there is nothing to continue into.
+        if (orphans.length > 0) {
+            html += `<div class="tree-manager-section">${esc(st.pendingOrphans)}</div>`;
         }
-        for (const session of pendingMerges) {
-            const date = formatRelativeDateTime(new Date(session.savedAt).getTime(), getCurrentLanguage());
-
-            // Display name - use incomingFileName or generate from tree names
-            const displayName = session.incomingFileName
-                || (session.sourceTreeName && session.targetTreeName
-                    ? `${session.targetTreeName} + ${session.sourceTreeName}`
-                    : strings.merge.pendingMergeLabel);
-
-            // Stats info showing source/target trees
-            const mergeInfo = session.sourceTreeName && session.targetTreeName
-                ? strings.merge.pendingMergeInto(session.sourceTreeName, session.targetTreeName)
-                : '';
-            const conflictsInfo = session.stats.conflicts > 0
-                ? ` • ${strings.merge.pendingMergeConflicts(session.stats.conflicts)}`
-                : '';
-            const progressInfo = strings.merge.reviewedCount(session.stats.reviewed, session.stats.total);
-            const statsText = mergeInfo ? `${mergeInfo}${conflictsInfo} • ${progressInfo}` : `${progressInfo}${conflictsInfo}`;
-
+        for (const session of orphans) {
+            const gone = pendingMergeHasTarget(session);
+            const facts = [...(gone ? [st.targetGone] : []), ...mergeFacts(session)].join(' · ');
             html += `
-                <div class="tree-manager-item pending-merge">
+                <div class="tree-manager-item pending-merge" data-session-id="${esc(session.id)}">
                     <div class="tree-manager-item-header">
-                        <span class="tree-manager-item-indicator pending"></span>
-                        <span class="tree-manager-item-name">${this.escapeHtml(displayName)}</span>
-                        <span class="tree-manager-item-stats">${this.escapeHtml(statsText)}</span>
-                        <span class="tree-manager-item-size">${date}</span>
+                        <span class="tree-manager-item-indicator pending" aria-hidden="true"></span>
+                        <span class="tree-manager-item-name">${esc(mergeName(session))}</span>
                     </div>
-                    <div class="tree-manager-item-actions">
-                        <button class="tree-open-btn edit-only" onclick="window.Strom.UI.resumePendingMergeFromManager('${session.id}')">${strings.merge.resume}</button>
-                        <button class="edit-only tree-text-action pending-merge-rename" data-session-id="${this.escapeHtml(session.id)}" data-merge-name="${this.escapeHtml(displayName)}">${strings.treeManager.rename}</button>
-                        <button class="danger edit-only tree-text-action pending-merge-discard" data-session-id="${this.escapeHtml(session.id)}" data-merge-name="${this.escapeHtml(displayName)}">${strings.merge.discard}</button>
-                    </div>
+                    <div class="tree-manager-item-stats">${esc(facts)}</div>
+                    ${mergeLinks(session, !gone)}
                 </div>
             `;
         }
@@ -1064,6 +1085,9 @@ export const treeManagementMethods = uiModule({
         this.kickOtherResearch();
         // Merge names come from file/tree names: no inline JS (a quote in the
         // name would break out of the handler string).
+        list.querySelectorAll<HTMLElement>('.pending-merge-resume').forEach(btn => {
+            btn.addEventListener('click', () => { this.resumePendingMergeFromManager(btn.dataset.sessionId ?? ''); });
+        });
         list.querySelectorAll<HTMLElement>('.pending-merge-rename').forEach(btn => {
             btn.addEventListener('click', () => { void this.renamePendingMergeFromManager(btn.dataset.sessionId ?? '', btn.dataset.mergeName ?? ''); });
         });
@@ -1071,9 +1095,161 @@ export const treeManagementMethods = uiModule({
             btn.addEventListener('click', () => { void this.discardPendingMergeFromManager(btn.dataset.sessionId ?? '', btn.dataset.mergeName ?? ''); });
         });
         this.wireTreeRowMenus(list);
+        this.wireTreeRowDrops(list);
+        void this.markSharedImageTrees(list, trees.map(t => t.id));
+    },
+
+    /**
+     * A tree row's third line (spec 139 §7.2, §11.2): its origin and research,
+     * never empty ("no research" at least), then the research's switch (its
+     * owner, on a computer with the bridge: fillResearchLiveSlot) or a copy's
+     * switch, off (where the research runs here: it opens the dialog of the
+     * copy's own research), and the link to its merge history. The open tree
+     * followed live says so instead, with End following (K5.7). Read from the
+     * tree index only.
+     */
+    treeManagerOriginHtml(tree: TreeMetadata): string {
+        const esc = (text: string) => this.escapeHtml(text);
+        const st = strings.structure;
+        const origin = treeOrigin(tree);
+        const followed = origin.kind === 'research' && DataManager.isLiveFollowing() && DataManager.getCurrentTreeId() === tree.id;
+        const title = origin.researchId ? ` title="${esc(st.research(origin.researchId))}"` : '';
+        const merges = tree.mergeCount ?? 0;
+        let research = '';
+        if (followed) {
+            research = `<button type="button" class="link-button tree-manager-stop-follow" data-row-action="stopFollowing" data-tree-id="${tree.id}">${esc(strings.research.stop)}</button>`;
+        } else if (origin.kind === 'research') {
+            research = this.researchLiveSlotHtml(tree.id);
+        } else if (origin.kind === 'copy' && this.copyResearchAvailable(tree)) {
+            // Off, and a click does not turn it: the copy gets a research of its own only through the dialog (§11.4).
+            research = `<div class="research-live research-live--manager"><div class="research-live-row">`
+                + `<button type="button" class="view-link-switch research-live-switch tree-manager-copy-research" role="switch" aria-checked="false" data-row-action="copyResearch" data-tree-id="${tree.id}">`
+                + `<span class="view-link-switch__label">${esc(strings.researchLive.switchLabel)}</span><span class="view-link-switch__track" aria-hidden="true"></span></button></div></div>`;
+        }
+        const text = followed
+            ? `<span class="tree-manager-item-followed">${esc(st.followed)}</span><span class="tree-manager-item-origin-text"${title}>${esc(`${origin.text} · ${st.writeStopped}`)}</span>`
+            : `<span class="tree-manager-item-origin-text"${title}>${esc(origin.text)}</span>`;
+        return `
+            <div class="tree-manager-item-origin" data-origin="${origin.kind}"${followed ? ' data-followed="1"' : ''}>
+                ${text}
+                ${research}
+                ${merges > 0 ? `<button type="button" class="link-button tree-manager-merge-history" data-row-action="mergeHistory" data-tree-id="${tree.id}">${esc(st.mergeHistory(merges))}</button>` : ''}
+            </div>`;
+    },
+
+    /**
+     * Trees sharing images with another (a copy, 134 S-P1): "images shared"
+     * after their size. Read after the list is drawn, so the list never waits
+     * for the trees' stored records.
+     */
+    async markSharedImageTrees(list: HTMLElement, ids: readonly TreeId[]): Promise<void> {
+        const sharing = sharedImageTrees(new Map(await Promise.all(ids.map(async id => [id, await treeImageIds(id).catch(() => [])] as const))));
+        const s = strings.treeManager;
+        for (const id of sharing) {
+            const size = list.querySelector<HTMLElement>(`.tree-manager-item[data-tree-id="${CSS.escape(id)}"] .tree-manager-item-size`);
+            if (!size || size.dataset.shared) continue;
+            size.dataset.shared = '1';
+            size.title = s.imagesSharedTip;
+            size.append(` · ${s.imagesShared}`);
+        }
     },
 
     /** Per-row "⋯" menus: one open at a time, outside click closes. Wired once. */
+    /**
+     * Drops on a tree's row (spec 134 K10.3): a file (.ged or a Strom tree
+     * .json) opens the import guide with that tree as the target; another
+     * tree's row, dragged with a mouse, opens it with the dragged tree as
+     * the import (as ⋯ → Merge into another tree…, the target chosen). The
+     * row under the drag is dashed and says what the drop does. Touch drags
+     * nothing (the ⋯ menu stays the way). The drop is taken here: the
+     * window's own drop sees it prevented and leaves it.
+     */
+    wireTreeRowDrops(list: HTMLElement): void {
+        const fine = typeof matchMedia === 'function' && matchMedia('(hover: hover) and (pointer: fine)').matches;
+        const canEdit = (): boolean => !DataManager.isViewMode();
+        if (fine && canEdit()) {
+            list.querySelectorAll<HTMLElement>('.tree-manager-item[data-tree-id]').forEach(row => { row.draggable = true; });
+        }
+        if (list.dataset.dropWired) return;
+        list.dataset.dropWired = '1';
+        // The tree whose row is being dragged (its id is not readable before the drop).
+        let dragged: string | null = null;
+        let over: HTMLElement | null = null;
+        const clear = (): void => {
+            over?.classList.remove('is-drop-target');
+            over?.querySelector('.tree-manager-drop-hint')?.remove();
+            over = null;
+        };
+        const rowOf = (e: Event): HTMLElement | null =>
+            (e.target as Element | null)?.closest?.<HTMLElement>('.tree-manager-item[data-tree-id]') ?? null;
+        const dragOf = (e: DragEvent): TreeDrag => {
+            const types = Array.from(e.dataTransfer?.types ?? []);
+            if (dragged && types.includes(TREE_DRAG_TYPE)) return { kind: 'tree', treeId: dragged };
+            return types.includes('Files') ? { kind: 'files' } : null;
+        };
+        const nameOf = (id: string): string => shortName(TreeManager.getTreeMetadata(id as TreeId)?.name ?? '');
+        list.addEventListener('dragstart', e => {
+            const row = rowOf(e);
+            if (!row?.draggable || !e.dataTransfer || e.target !== row) return;
+            dragged = row.dataset.treeId ?? null;
+            e.dataTransfer.setData(TREE_DRAG_TYPE, dragged ?? '');
+            e.dataTransfer.effectAllowed = 'copy';
+            row.classList.add('is-drag-source');
+        });
+        list.addEventListener('dragend', () => {
+            dragged = null;
+            clear();
+            list.querySelectorAll('.is-drag-source').forEach(r => r.classList.remove('is-drag-source'));
+        });
+        const hover = (e: DragEvent): void => {
+            const row = rowOf(e);
+            const drop = treeRowDrop(dragOf(e), row?.dataset.treeId, { canEdit: canEdit() });
+            if (drop.kind === 'none' || !row) {
+                if (over && over !== row) clear();
+                return;
+            }
+            // Taken: the row is where the drop goes.
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+            if (over === row) return;
+            clear();
+            over = row;
+            row.classList.add('is-drop-target');
+            // The browser names a dragged file only at the drop: until then "the file".
+            const file = drop.kind === 'file' ? e.dataTransfer?.files?.[0]?.name || null : nameOf(drop.source);
+            const hint = document.createElement('span');
+            hint.className = 'tree-manager-drop-hint';
+            const text = hint.appendChild(document.createElement('span'));
+            text.textContent = strings.mergeWizard.dropOnTree(file ? shortName(file) : null, nameOf(drop.target));
+            (row.querySelector('.tree-manager-item-actions') ?? row).appendChild(hint);
+        };
+        list.addEventListener('dragenter', hover);
+        list.addEventListener('dragover', hover);
+        list.addEventListener('dragleave', e => {
+            if (over && !over.contains(e.relatedTarget as Node | null)) clear();
+        });
+        list.addEventListener('drop', e => {
+            const drop = treeRowDrop(dragOf(e), rowOf(e)?.dataset.treeId, { canEdit: canEdit() });
+            clear();
+            if (drop.kind === 'none') return;
+            // Not stopped: the window's drop resets its drag count and, seeing it prevented, does nothing more.
+            e.preventDefault();
+            if (drop.kind === 'tree') {
+                void this.showMergeTreesDialog(drop.source, 'tree-manager-modal', drop.target as TreeId);
+                return;
+            }
+            // The tree is being replaced: a file dropped now is refused, as on the window.
+            if (TreeEditLock.refuse()) return;
+            const files = Array.from(e.dataTransfer?.files ?? []);
+            const into = { target: drop.target as TreeId };
+            const route = treeRowFileRoute(files.map(f => f.name));
+            if (route === 'none') return;
+            if (route === 'json') void this.openJsonFile(files[0], { batch: false, into });
+            // A GEDCOM file, or one the window would refuse: openGedcomFile says it opens only GEDCOM.
+            else void this.openGedcomFile(files[0], into);
+        });
+    },
+
     wireTreeRowMenus(list: HTMLElement): void {
         const closeAll = () =>
             list.querySelectorAll('.tree-row-menu.open').forEach(m => m.classList.remove('open'));
@@ -1082,6 +1258,22 @@ export const treeManagementMethods = uiModule({
             list.dataset.menuWired = '1';
             list.addEventListener('click', (e) => {
                 const target = e.target as HTMLElement;
+                // The row's own buttons and links (spec 139 §8.1, §9.2): Change structure…, Export…, Merge history (n).
+                const act = target.closest<HTMLElement>('[data-row-action]');
+                if (act?.dataset.treeId) {
+                    const id = act.dataset.treeId as TreeId;
+                    closeAll();
+                    if (act.dataset.rowAction === 'structure') void this.showStructureDialog(id, { source: 'manager', parent: 'tree-manager-modal' });
+                    else if (act.dataset.rowAction === 'export') this.showExportDialogFromManager(id);
+                    else if (act.dataset.rowAction === 'mergeHistory') void this.showMergeHistory(id, 'tree-manager-modal');
+                    else if (act.dataset.rowAction === 'copyResearch') this.showCopyResearchDialog(id);
+                    else if (act.dataset.rowAction === 'stopFollowing') {
+                        this.stopLiveFollow();
+                        void this.updateTreeManagerList();
+                    }
+                    e.stopPropagation();
+                    return;
+                }
                 const btn = target.closest('.tree-row-menu-btn') as HTMLElement | null;
                 if (btn) {
                     const menu = btn.parentElement?.querySelector('.tree-row-menu') as HTMLElement | null;
@@ -1111,7 +1303,11 @@ export const treeManagementMethods = uiModule({
 
     /** Fill a row's ⋯ menu from the shared tree-action list, then show it by its button. */
     async openTreeRowMenu(btn: HTMLElement, menu: HTMLElement, treeId: TreeId): Promise<void> {
-        const groups = await this.treeActionGroups(treeId, 'manager');
+        // Change structure… and Export… are left out where the row shows them as buttons (spec 139 §8.2);
+        // a narrow window that hides those buttons keeps them in the menu.
+        const row = btn.closest('.tree-manager-item');
+        const inRow = !!row?.querySelector<HTMLElement>('[data-row-action="export"]')?.offsetParent;
+        const groups = await this.treeActionGroups(treeId, 'manager', { inRow });
         menu.replaceChildren();
         const rowItem = (row: TreeActionRow): HTMLButtonElement => {
             const item = document.createElement('button');
@@ -1170,48 +1366,7 @@ export const treeManagementMethods = uiModule({
                 if (editOnly) divider.classList.add('edit-only');
                 menu.appendChild(divider);
             }
-            if (!group.collapsedLabel) {
-                for (const row of group.rows) menu.appendChild(rowItem(row));
-                return;
-            }
-            // "Change structure ⌄": its rows open in place (closed again with the menu).
-            const groupId = `tree-row-menu-${treeId}-${TREE_STRUCTURE_GROUP_SUFFIX}`;
-            const toggle = collapsedToggle(group.collapsedLabel, groupId,
-                'tree-row-menu-item tree-actions-structure-toggle' + (editOnly ? ' edit-only' : ''), 'tree-row-menu-label');
-            const box = document.createElement('div');
-            box.id = groupId;
-            box.className = 'tree-row-menu-structure';
-            box.setAttribute('role', 'group');
-            box.setAttribute('aria-label', group.collapsedLabel);
-            box.hidden = true;
-            for (const row of group.rows) box.appendChild(rowItem(row));
-            const setOpen = (open: boolean, focus: 'first' | 'row') => {
-                box.hidden = !open;
-                toggle.setAttribute('aria-expanded', String(open));
-                this.updateTreeRowMenuHint(menu);
-                if (focus === 'first' && open) box.querySelector<HTMLElement>('.tree-row-menu-item')?.focus();
-                else toggle.focus();
-            };
-            toggle.addEventListener('click', (e) => {
-                e.stopPropagation();
-                setOpen(box.hidden, 'row');
-            });
-            toggle.addEventListener('keydown', (e) => {
-                if (e.altKey || e.ctrlKey || e.metaKey) return;
-                if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    setOpen(box.hidden, 'first');
-                } else if (e.key === 'ArrowRight') {
-                    e.preventDefault();
-                    setOpen(true, 'first');
-                }
-            });
-            box.addEventListener('keydown', (e) => {
-                if (e.key !== 'ArrowLeft' || e.altKey || e.ctrlKey || e.metaKey) return;
-                e.preventDefault();
-                setOpen(false, 'row');
-            });
-            menu.append(toggle, box);
+            for (const row of group.rows) menu.appendChild(rowItem(row));
         });
         // A tree that is not open: say where the missing actions are.
         if (treeId !== TreeManager.getActiveTreeId()) {
@@ -1586,80 +1741,11 @@ export const treeManagementMethods = uiModule({
 
     // ---- DUPLICATE TREE ----
     /**
-     * Show duplicate tree dialog
+     * Copy of a whole tree: Change structure… on the copy's summary with its
+     * name (the old naming dialog is gone, spec 139 §4).
      */
     duplicateTree(treeId: string, parentDialogId?: string): void {
-        const tree = TreeManager.getTreeMetadata(treeId as TreeId);
-        if (!tree) return;
-
-        this.duplicateTreeId = treeId as TreeId;
-        const defaultName = tree.name + ' ' + strings.treeManager.duplicateSuffix;
-
-        const modal = document.getElementById('duplicate-tree-modal');
-        const input = document.getElementById('duplicate-tree-name') as HTMLInputElement;
-
-        // Dialog stack: Escape returns to the parent (the tree manager) when there is one.
-        this.clearDialogStack();
-        if (parentDialogId) {
-            this.pushDialog(parentDialogId);
-            this.closeDialogById(parentDialogId);
-        }
-        this.pushDialog('duplicate-tree-modal');
-
-        if (input) {
-            input.value = defaultName;
-        }
-
-        modal?.classList.add('active');
-        input?.focus();
-        input?.select();
-
-        // Handle Enter key
-        if (input) {
-            input.onkeydown = (e: KeyboardEvent) => {
-                if (e.key === 'Enter') {
-                    e.preventDefault();
-                    this.confirmDuplicateTree();
-                }
-            };
-        }
-    },
-
-    /**
-     * Close duplicate tree dialog
-     */
-    closeDuplicateTreeDialog(): void {
-        const modal = document.getElementById('duplicate-tree-modal');
-        modal?.classList.remove('active');
-        this.returnToParentDialog();
-        this.duplicateTreeId = null;
-    },
-
-    /**
-     * Confirm duplicate tree
-     */
-    async confirmDuplicateTree(): Promise<void> {
-        if (!this.duplicateTreeId) return;
-
-        const input = document.getElementById('duplicate-tree-name') as HTMLInputElement;
-        const newName = input?.value.trim();
-
-        if (!newName) {
-            input?.focus();
-            return;
-        }
-
-        // The dialog's button carries the copying (§1: the tree read and written anew); Enter in the name has it too.
-        const btn = activatedElement() ?? document.querySelector<HTMLElement>('#duplicate-tree-modal .buttons .primary');
-        const sourceId = this.duplicateTreeId;
-        const copied = await busyLocal(btn, strings.busy.saving, async () => {
-            await TreeManager.duplicateTree(sourceId, newName);
-            return true;
-        }, () => ({ ok: false, kind: 'error', text: strings.busy.failed, retry: () => { void this.confirmDuplicateTree(); } }));
-        if (!copied) return;
-        this.closeDuplicateTreeDialog();
-        this.updateTreeManagerList();
-        this.updateTreeSwitcher();
+        void this.showStructureDialog(treeId as TreeId, { parent: parentDialogId, step: 'copy' });
     },
 
     // ---- TREE VISIBILITY ----

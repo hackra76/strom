@@ -17,6 +17,7 @@
  * See src/ui/module.ts for the composition pattern.
  */
 
+import { imgSrcAttr } from '../image-src.js';
 import { MENU_LOAD_LIMIT_MS, startMenuLoad, type MenuLoad } from './menu-load.js';
 import { allMedia, treeMedia, mediaPersonIds } from '../media.js';
 import { materialPersonLabel, mediaUsesIndex } from '../media-uses.js';
@@ -53,13 +54,14 @@ import {
 } from './materials-ui.js';
 import { uiModule } from './module.js';
 import type { SortStripView } from './material-sort-ui.js';
-import type { SortStripState } from '../material-sort.js';
+import { sortLacksPerson, type SortStripState } from '../material-sort.js';
 import { isPhoneBar } from '../breakpoints.js';
 import { researchBridgeActionLabel } from './research-open-mark.js';
 import { barHtml } from './prog-bar.js';
 import { selectionDeletable, treeFileSource, withoutTreeFiles } from '../material-delete.js';
 import { formatBytesShort } from './originals-ui.js';
 import { closeHeadMenu, openHeadMenu, SEP, type MenuEntry } from './table-view/table-headmenu.js';
+import { materialScopeSource } from './search-scope-ui.js';
 
 const MODAL_ID = 'materials-modal';
 const VIEW_KEY = 'strom.materials.view';
@@ -687,7 +689,7 @@ export const materialsWindowMethods = uiModule({
             delete i.agentLeft;
             delete i.copyOf;
             // The file of a source is assigned (spec 102 §7): no "Not assigned by the agent", no copy tag.
-            if (!marks || !i.file || i.hidden || i.sourceOf?.length || (i.titled && (i.persons.length || i.viaBatch.length))) continue;
+            if (!marks || !i.file || i.hidden || i.sourceOf?.length || (i.titled && !sortLacksPerson(i))) continue;
             const left = marks.left.get(i.file.id);
             if (left) i.agentLeft = { ...left };
             const copy = marks.copyOf.get(i.file.id);
@@ -1118,7 +1120,7 @@ export const materialsWindowMethods = uiModule({
         const waits = waitingTileHtml(materialImageWait(item), { tag: 'span', cls, px, content: letters, extra: marks });
         if (waits) return waits;
         if (att && !att.originalOnly && att.mimeType.startsWith('image/') && att.dataUrl) {
-            return `<span class="${cls} has-thumb"><img src="${esc(att.dataUrl)}" alt="" loading="lazy">${marks}</span>`;
+            return `<span class="${cls} has-thumb"><img ${imgSrcAttr(att.dataUrl)} alt="" loading="lazy">${marks}</span>`;
         }
         const sha = materialItemSha(item);
         const lazy = !!sha && item.origin !== 'tree' && ['image', 'pdf'].includes(materialType(item.mime, item.name));
@@ -1827,7 +1829,7 @@ export const materialsWindowMethods = uiModule({
         }
         // Sort with the agent over the batch's files without a title or a person (spec 102 §1: the batch's strip went).
         const gate = this.materialSortGate();
-        if (!folder && (gate === 'on' || gate === 'offRun') && (group.pending || group.items.some(i => !!i.file && !i.hidden && (!i.titled || (!i.persons.length && !i.viaBatch.length))))) {
+        if (!folder && (gate === 'on' || gate === 'offRun') && (group.pending || group.items.some(i => !!i.file && !i.hidden && (!i.titled || sortLacksPerson(i))))) {
             rows.push({ id: 'sort', label: m.agentSort.sort, divider: rows.length > 0 });
         }
         if (ctx.caps.openLinks !== false) rows.push({ id: 'research', label: strings.batch.openInResearch, divider: rows.length > 0 });
@@ -2204,6 +2206,8 @@ export const materialsWindowMethods = uiModule({
             w.picker = new PersonPicker({
                 containerId: 'mw-person-picker',
                 filter: p => w.model === 'app' || !!researchPersonRef(p.refn),
+                // The window covers the view: Whole tree / Direct line of the tree's main person (spec 137 §1.5).
+                scope: materialScopeSource(null),
                 onSelect: (id) => {
                     const key = w.model === 'app' ? (DataManager.getPerson(id) ? id : null) : researchPersonRef(DataManager.getPerson(id)?.refn);
                     if (!key) return;

@@ -6,6 +6,7 @@
 import { DataManager } from './data.js';
 import { IMAGES_ARRIVED_EVENT, IMAGES_STATE_EVENT, imageLoads, personsByNearness } from './image-loads.js';
 import { cardAvatarHtml, cardImageRowHtml, cardImageView, cardTooltipPhotoHtml, imgPhaseDelay, imgStateOf, setImgState, withImgAria, type CardImageView } from './ui/image-slot.js';
+import { sameImgSource, showsImage } from './image-src.js';
 import { getUI } from './ui-ref.js';
 import { cardStatusAria, cardStatusWords, statusMarkHtml } from './ui/fact-status.js';
 import { ZoomPan } from './zoom.js';
@@ -101,7 +102,7 @@ import { BulkFamily, bulkAddedKeys, bulkBroughtInByParent, bulkKeysShown, bulkNe
 import { partnerIdsShownInPlace, selectSubgraph } from './layout/pipeline/1-select-subgraph.js';
 import { measureUnionOrderPills, applyUnionOrderGlyphLift, measureTabRows, rowKey, unionOrderPillKey, unionOrderPillPartsHtml, pillFontsPending, branchTabRestHtml, tabsForm, tabsFormClass, bubblePlacement, bubbleBox, touchBubbleBox, touchBubbleBounds, touchBubbleSide, bubbleOpensBelow, BUBBLE_WINDOW_MARGIN, BUBBLE_LOW_WINDOW_NAMES, BUBBLE_LOW_WINDOW_HEIGHT, bubbleNameCounts, bubbleNamesToFit } from './union-order-measure.js';
 import { prepareBubble, showBubble, hideBubble, closeOpenBubble, openBubble, openBubbleOwner } from './bubble-layer.js';
-import { LiveDiff, diffLive, liveChangeCount } from './live-diff.js';
+import { LiveDiff, diffLive, liveChangeCount, realPeople } from './live-diff.js';
 import { playLiveScene } from './live-scene.js';
 import { LIVE, edgeNotchSpot, EdgeSide, liveMotionOn, cardTrailOpacity } from './live-transition.js';
 import { getLiveMotion } from './live-follow-prefs.js';
@@ -1227,7 +1228,8 @@ class TreeRendererClass {
             }
         }
         if (live.quiet) return;
-        this.showLiveEdges(diff.added, colorOf);
+        // A notch for a person come, not for a "?" stand-in given a new id (134 V-N6).
+        this.showLiveEdges(realPeople(diff.added, data), colorOf);
         announceLive(diff, live.previous, data);
     }
 
@@ -6196,7 +6198,7 @@ class TreeRendererClass {
         }
         const oldImg = old.querySelector<HTMLImageElement>('.card-avatar img');
         const newImg = card.querySelector<HTMLImageElement>('.card-avatar img');
-        if (oldImg && newImg && oldImg.getAttribute('src') === newImg.getAttribute('src')) newImg.replaceWith(oldImg);
+        if (oldImg && newImg && sameImgSource(oldImg, newImg)) newImg.replaceWith(oldImg);
         markChangedRows(old, card);
         old.replaceWith(card);
         live.redrawn.add(id);
@@ -6916,7 +6918,7 @@ class TreeRendererClass {
         const col = tooltip.querySelector<HTMLElement>(':scope > .tt-photo');
         const want = view.ttPhoto === 'img' && !photo ? null : view.ttPhoto;
         const same = want === null ? !col
-            : want === 'img' ? col?.tagName === 'IMG' && col.getAttribute('src') === photo
+            : want === 'img' ? col?.tagName === 'IMG' && !!photo && showsImage(col, photo)
                 : col?.tagName === 'SPAN';
         if (!same) {
             col?.remove();

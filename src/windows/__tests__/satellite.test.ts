@@ -8,6 +8,7 @@
  * window that went quiet and let its lock go counts as closed.
  */
 
+import { imageMetaOf } from '../../image-meta.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { DataManager } from '../../data.js';
 import { TreeManager } from '../../tree-manager.js';
@@ -18,6 +19,7 @@ import type { StromData, TreeId, Person, PersonId } from '../../types.js';
 import { WindowBus, createMemoryHub, FOCUS_WAIT_MS, type WindowMessage, type WindowStatus } from '../window-bus.js';
 import { SatelliteClient, followSelectionKey, MAIN_SILENCE_MS } from '../satellite.js';
 import { sendModeKey } from '../follow-mode.js';
+import { imageBlob, setPoolBlobSource } from '../../image-src.js';
 import type { LocksLike } from '../window-role.js';
 
 const TREE = 'sat-tree' as TreeId;
@@ -242,6 +244,26 @@ describe('edits', () => {
 });
 
 describe('patches', () => {
+    it('the tree and a patch as an object (data) are taken as well as an older main window\'s JSON string', async () => {
+        const parse = vi.spyOn(JSON, 'parse');
+        sat.start();
+        await settle();
+        main.post({ type: 'status', ...status({ revision: 100 }) });
+        main.post({ type: 'tree', to: SAT, treeId: TREE, name: 'Hrachovcovi', revision: 100, data: JSON.parse(treeJson(['p1', 'Bořivoj'])) });
+        main.post({ type: 'patch', treeId: TREE, revision: 101, data: JSON.parse(treeJson(['p1', 'Bořivoj'], ['p2', 'Ctibor'])) });
+        parse.mockClear();
+        await settle();
+        expect(DataManager.getPerson('p2' as PersonId)!.firstName).toBe('Ctibor');
+        expect(sat.revision).toBe(101);
+        // No string of the whole tree is parsed for it.
+        expect(parse.mock.calls.filter(c => typeof c[0] === 'string' && c[0].includes('Ctibor'))).toEqual([]);
+        parse.mockRestore();
+        main.post({ type: 'patch', treeId: TREE, revision: 102, json: treeJson(['p1', 'Bořivoj'], ['p2', 'Ctibor Hrachovec']) });
+        await settle();
+        expect(DataManager.getPerson('p2' as PersonId)!.firstName).toBe('Ctibor Hrachovec');
+        expectNoStorage();
+    });
+
     it('a newer patch replaces the copy; an older one or another tree\'s is ignored', async () => {
         await connect();
         main.post({ type: 'patch', treeId: TREE, revision: 105, json: treeJson(['p1', 'Bořivoj Ctibor']) });
@@ -630,5 +652,121 @@ describe('bring to front', () => {
         await settle(FOCUS_WAIT_MS + 50);
         expect(of('focused')).toHaveLength(1);
         expect(attention).not.toHaveBeenCalled();
+    });
+});
+
+describe('pooled images in a satellite (spec 135, D8)', () => {
+    const id = 'p:' + 'cd'.repeat(20);
+    const ref = '\u0000sm:' + id;
+    const photo = 'data:image/jpeg;base64,' + 'Q'.repeat(4000);
+    const meta = { len: 9000, head: 'data:image/png;base64,', bytes: 6700, w: 120, h: 160, token: 'img:tok', mtok: 'mt' };
+
+    function client(pool: { blobs: (ids: readonly string[]) => Promise<Map<string, Blob | null>>; hold?: (w: string, h: (() => Iterable<string>) | null) => void } | null): void {
+        sat.stop();
+        sat = new SatelliteClient({ kind: 'overview', treeId: TREE, windowId: SAT, newId: false }, {
+            bus: new WindowBus(SAT, hub.channel()),
+            storage: { getItem: k => session.get(k) ?? null, setItem: (k, v) => { session.set(k, v); } },
+            locks: noLocks(), closeSelf: () => {}, hasFocus: () => true, bounds: () => undefined,
+            poolSource: () => pool,
+        });
+    }
+
+    function withRef(...names: [string, string][]): StromData {
+        const data = JSON.parse(treeJson(...names)) as StromData;
+        (data.persons as Record<string, Person>)['p1'].photo = ref;
+        return data;
+    }
+
+    afterEach(() => { setPoolBlobSource(null); });
+
+    it('takes the tree\'s references as they are, with their catalog entries; reads them through the main window, which learns what it holds; an edit sends them back as they are and a new image whole', async () => {
+        const asked: string[][] = [];
+        const holds = new Map<string, () => Iterable<string>>();
+        client({
+            blobs: async (ids) => { asked.push([...ids]); return new Map(ids.map(i => [i, new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' })])); },
+            hold: (w, held) => { if (held) holds.set(w, held); else holds.delete(w); },
+        });
+        sat.start();
+        await settle();
+        expect(of('hello')[0]).toMatchObject({ takesData: true, poolRefs: true });
+        main.post({ type: 'status', ...status({ revision: 100 }) });
+        main.post({ type: 'tree', to: SAT, treeId: TREE, name: 'Hrachovcovi', revision: 100, data: withRef(['p1', 'Bořivoj']), imageMeta: { [id]: meta } });
+        await settle();
+        // The load sanitizer kept it (an own image of the main window), and its catalog entry is known here.
+        expect(DataManager.getPerson('p1' as PersonId)!.photo).toBe(ref);
+        expect(imageMetaOf(ref)).toMatchObject({ bytes: 6700, w: 120 });
+        expect([...holds.get(SAT)!()]).toContain(id);
+        expect((await imageBlob(ref))?.size).toBe(3);
+        expect(asked).toEqual([[id]]);
+        main.post({ type: 'patch', treeId: TREE, revision: 101, data: withRef(['p1', 'Bořivoj'], ['p2', 'Ctibor']), imageMeta: { [id]: meta } });
+        await settle();
+        expect(DataManager.getPerson('p2' as PersonId)!.firstName).toBe('Ctibor');
+        expect(DataManager.getPerson('p1' as PersonId)!.photo).toBe(ref);
+        DataManager.updatePerson('p2' as PersonId, { photo });
+        await settle();
+        const sent = JSON.parse(of('edit')[0].json) as StromData;
+        expect(sent.persons['p1' as PersonId].photo).toBe(ref);
+        expect(sent.persons['p2' as PersonId].photo).toBe(photo);
+    });
+
+    it('a window that does not reach the main window\'s pool asks the main window for the images over the channel; it reads nothing itself', async () => {
+        client(null);
+        const getMany = vi.spyOn(StorageManager, 'getMany');
+        sat.start();
+        await settle();
+        expect(of('hello')[0]).toMatchObject({ takesData: true, poolRefs: true });
+        main.post({ type: 'status', ...status({ revision: 100 }) });
+        main.post({ type: 'tree', to: SAT, treeId: TREE, name: 'Hrachovcovi', revision: 100, data: withRef(['p1', 'Bořivoj']) });
+        await settle();
+        expect(DataManager.getPerson('p1' as PersonId)!.photo).toBe(ref);
+        const blob = imageBlob(ref);
+        await settle();
+        const req = of('images-req')[0];
+        expect(req).toMatchObject({ windowId: SAT, ids: [id] });
+        main.post({ type: 'images', to: SAT, reqId: req.reqId, blobs: { [id]: new Blob([new Uint8Array([9, 9])], { type: 'image/jpeg' }) } });
+        await settle();
+        expect((await blob)?.size).toBe(2);
+        expect(getMany).not.toHaveBeenCalled();
+    });
+
+    it('the same revision again with its new images as references: taken, but not while an edit of its own is on its way', async () => {
+        client(null);
+        sat.start();
+        await settle();
+        main.post({ type: 'status', ...status({ revision: 100 }) });
+        const whole = JSON.parse(treeJson(['p1', 'Bořivoj'])) as StromData;
+        (whole.persons as Record<string, Person>)['p1'].photo = photo;
+        main.post({ type: 'tree', to: SAT, treeId: TREE, name: 'Hrachovcovi', revision: 100, data: whole });
+        await settle();
+        expect(DataManager.getPerson('p1' as PersonId)!.photo).toBe(photo);
+        // A plain patch of the same revision is nothing new.
+        main.post({ type: 'patch', treeId: TREE, revision: 100, data: withRef(['p1', 'Bořivoj']) });
+        await settle();
+        expect(DataManager.getPerson('p1' as PersonId)!.photo).toBe(photo);
+        main.post({ type: 'patch', treeId: TREE, revision: 100, data: withRef(['p1', 'Bořivoj']), images: true });
+        await settle();
+        expect(DataManager.getPerson('p1' as PersonId)!.photo).toBe(ref);
+        expect(sat.revision).toBe(100);
+        // An edit on its way: the main window's answer brings the next revision; the images patch is not kept.
+        DataManager.updatePerson('p1' as PersonId, { firstName: 'Bořek' });
+        await settle();
+        const whole2 = JSON.parse(treeJson(['p1', 'Bořek'])) as StromData;
+        (whole2.persons as Record<string, Person>)['p1'].photo = photo;
+        main.post({ type: 'patch', treeId: TREE, revision: 100, data: whole2, images: true });
+        await settle();
+        expect(DataManager.getPerson('p1' as PersonId)!.photo).toBe(ref);
+        expect(DataManager.getPerson('p1' as PersonId)!.firstName).toBe('Bořek');
+    });
+
+    it('the images whole (an older main window) are taken as they are', async () => {
+        client(null);
+        sat.start();
+        await settle();
+        main.post({ type: 'status', ...status({ revision: 100 }) });
+        const data = JSON.parse(treeJson(['p1', 'Bořivoj'])) as StromData;
+        (data.persons as Record<string, Person>)['p1'].photo = photo;
+        main.post({ type: 'tree', to: SAT, treeId: TREE, name: 'Hrachovcovi', revision: 100, json: JSON.stringify(data) });
+        await settle();
+        expect(DataManager.getPerson('p1' as PersonId)!.photo).toBe(photo);
     });
 });

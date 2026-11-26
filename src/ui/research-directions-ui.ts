@@ -9,16 +9,17 @@
  * already has such a direction. Bridge text is set as text, never HTML.
  */
 
-import { setResearchActionLabel } from './research-open-mark.js';
+import { deviceComputerName, inDeviceMode } from './device-mode-ui.js';
+import { researchMarkFlags, setResearchActionLabel } from './research-open-mark.js';
 import { workingWhyText } from './research-offline-ui.js';
 import { DataManager } from '../data.js';
 import { strings, getCurrentLanguage } from '../strings.js';
 import { formatLiveClock } from '../live-time.js';
 import { Person, PersonId } from '../types.js';
-import { LiveDirection, LiveDirectionKind, LiveWorker, ResearchDirectionDo, researchLinkMark } from '../research-link.js';
+import { LiveDirection, LiveDirectionKind, LiveWorker, ResearchDirectionDo, researchDeviceAllows, researchLinkMark } from '../research-link.js';
 import { uiModule } from './module.js';
 import { MQ_PHONE_BAR } from '../breakpoints.js';
-import { LiveFold, LiveSession, el, liveSection, researchSession, pausedText, workingHoldEl, timeEl, workingNumberBadge, lightsGroup } from './research-ui.js';
+import { LiveFold, LiveSession, el, liveSection, researchSession, pausedText, workingHoldEl, workingSavingEl, timeEl, workingNumberBadge, lightsGroup } from './research-ui.js';
 import type { OverviewLinesState } from '../windows/overview-window.js';
 import { shownName, fitNameHtml } from '../person-name.js';
 import {
@@ -545,6 +546,17 @@ export type LineRunOffer =
     | { kind: 'offer'; n: number }
     | { kind: 'held'; why: string; limit: boolean; n: number };
 
+/**
+ * The arc beside a worked direction's name: spinning while its agent works; still, in the warning colour, while the
+ * direction's own run waits (an archive, the limit), as its state line says.
+ */
+function workingArc(s: LiveSession, d: LiveDirection): HTMLElement {
+    const waits = runLinesOn(s.features) && lineRunOf(liveRuns(s), d.id)?.state === 'waiting';
+    const arc = el('span', waits ? 'agent-mark is-wait' : 'agent-mark agent-mark--spin');
+    arc.setAttribute('aria-hidden', 'true');
+    return arc;
+}
+
 /** The sentence of a held direction's run (null: the action is not drawn). */
 function lineRunWhy(block: LineRunBlock, runs: readonly LiveRun[]): string | null {
     const L = strings.live;
@@ -646,10 +658,12 @@ export const researchDirectionsMethods = uiModule({
         for (const w of g.workers) {
             // Two or more runs while following: each run's session number in its colour (as in the fan).
             const num = this.liveWorkingNumber(working.indexOf(w));
-            if (w.task || num !== null) {
+            const saving = workingSavingEl(w, !!w.task);
+            if (w.task || num !== null || saving) {
                 const task = main.appendChild(el('span', 'live-line__task'));
                 if (num !== null) task.appendChild(workingNumberBadge(num));
                 if (w.task) task.append(w.task);
+                if (saving) task.appendChild(saving);
             }
             const meta = el('span', 'live-line__meta');
             const person = personByRefn(w.person);
@@ -786,7 +800,9 @@ export const researchDirectionsMethods = uiModule({
         const { active: listed, inactive: ended } = orderDirections(s.researches, true);
         const rows = pendingOrder ? withPendingOrder(listed, pendingOrder.order) : listed;
         let aside: HTMLElement | undefined;
-        if (!viewOnly) {
+        // A new line is the computer's (spec 094 §6): not offered on a device.
+        const canNew = !viewOnly && researchDeviceAllows('direction-new');
+        if (canNew) {
             const add = el('button', 'link-button research-directions__new', L.dirNew);
             add.type = 'button';
             add.dataset.do = 'new';
@@ -805,7 +821,7 @@ export const researchDirectionsMethods = uiModule({
         if (orderMode && rows.length >= 2 && view.ordered) {
             host.appendChild(el('p', 'research-directions__note', orderMode === 'strict' ? L.dirOrderStrict : L.dirOrderWeight));
         }
-        if (rows.length === 0 && !viewOnly) {
+        if (rows.length === 0 && canNew) {
             const empty = el('div', 'research-directions__empty');
             empty.appendChild(el('p', 'research-directions__empty-text', L.dirEmptyNew));
             const add = el('button', 'secondary research-directions__empty-new', L.dirNew);
@@ -888,11 +904,7 @@ export const researchDirectionsMethods = uiModule({
         const head = el('button', 'research-direction__head');
         head.type = 'button';
         head.appendChild(el('span', 'research-direction__name', d.name));
-        if (d.working) {
-            const arc = el('span', 'agent-mark agent-mark--spin');
-            arc.setAttribute('aria-hidden', 'true');
-            head.appendChild(arc);
-        }
+        if (d.working) head.appendChild(workingArc(s, d));
         if (paused) head.appendChild(el('span', 'research-direction__chip', L.dirPausedChip(d.since ? shortDate(d.since) : '')));
         if (view.phoneOnly) {
             head.onclick = () => this.showDirectionInTree(d, mode);
@@ -919,7 +931,9 @@ export const researchDirectionsMethods = uiModule({
         if (orderSaving && pendingOrder?.moved === d.id) {
             side.appendChild(busyStatusEl(strings.busy.savingRow));
         }
-        if (view.ordered && !view.phoneOnly) {
+        // A device's phone (spec 094 §4, 4.6): the order and the state through the ⋯'s sheet, no arrows.
+        const device = sheet && inDeviceMode();
+        if (view.ordered && !view.phoneOnly && !device) {
             const order = shownOrder(s);
             const at = order.indexOf(d.id);
             const moves = el('div', 'research-direction__moves');
@@ -936,13 +950,13 @@ export const researchDirectionsMethods = uiModule({
             }
             side.appendChild(moves);
         }
-        if (!view.readOnly && !sheet) side.appendChild(this.directionMoreButton(s, d, view));
+        if (!view.readOnly && (!sheet || (device && researchDeviceAllows('direction')))) side.appendChild(this.directionMoreButton(s, d, view, device));
         row.appendChild(side);
         return row;
     },
 
-    /** The ⋯ of a managed row (held while the bridge does not answer). */
-    directionMoreButton(s: LiveSession, d: LiveDirection, view: DirectionsView): HTMLElement {
+    /** The ⋯ of a managed row (held while the bridge does not answer); `device`: a device's phone, its sheet of actions. */
+    directionMoreButton(s: LiveSession, d: LiveDirection, view: DirectionsView, device = false): HTMLElement {
         const L = strings.live;
         const more = el('button', 'live-queue-more research-direction__more', '⋯');
         more.type = 'button';
@@ -954,7 +968,8 @@ export const researchDirectionsMethods = uiModule({
         else if (!drawRowMoreBusy(more, rowsBusy.view(d.id))) {
             more.onclick = (e) => {
                 e.stopPropagation();
-                this.openManagedDirectionMenu(more, s, d);
+                if (device) this.openDeviceDirectionSheet(more, s, d);
+                else this.openManagedDirectionMenu(more, s, d);
             };
         }
         return more;
@@ -1067,6 +1082,8 @@ export const researchDirectionsMethods = uiModule({
         const runBox = this.lineRunControl(s, d, mode, view);
         if (runBox) detail.appendChild(runBox);
 
+        // A device's phone (spec 094 §4, 4.7): its actions are the ⋯'s sheet's, the detail only tells.
+        if (mode === 'sheet' && inDeviceMode()) return detail;
         const actions = el('div', 'research-direction__actions');
         if (!view.readOnly && d.state !== 'done') {
             const what: DirectionStateDo = d.state === 'paused' ? 'resume' : 'pause';
@@ -1326,6 +1343,39 @@ export const researchDirectionsMethods = uiModule({
             });
         }
         this.showDirectionMenu(anchor, d, items);
+    },
+
+    /**
+     * "Line actions · {name}" of a device's phone (spec 094 §4, 4.7): a sheet
+     * from below with the moves the order allows, Pause / Restart, End… and
+     * Show in tree, each through the bridge without a mark. Working on the line
+     * with its agent: on a device that starts the agent (K3.15) the row as on
+     * the computer (AI + the terminal), else one quiet sentence says where.
+     */
+    openDeviceDirectionSheet(anchor: HTMLElement, s: LiveSession, d: LiveDirection): void {
+        const L = strings.live;
+        const rows: { id: string; label: string; sub?: string; run: () => void }[] = [];
+        if (this.directionsView(s).canOrder) {
+            const order = shownOrder(s);
+            const at = order.indexOf(d.id);
+            if (at > 0) rows.push({ id: 'device-dir-up', label: L.dirMoveUp, run: () => this.moveDirection(d.id, 'up') });
+            if (at >= 0 && at < order.length - 1) rows.push({ id: 'device-dir-down', label: L.dirMoveDown, run: () => this.moveDirection(d.id, 'down') });
+            if (at > 1) rows.push({ id: 'device-dir-top', label: L.dirMoveTop, run: () => this.moveDirection(d.id, 'top') });
+        }
+        if (d.state === 'active') rows.push({ id: 'device-dir-pause', label: L.dirPause, sub: L.dirPauseHint, run: () => void this.changeDirectionState(d, 'pause') });
+        else rows.push({ id: 'device-dir-resume', label: L.dirResume, sub: L.dirResumeHint, run: () => void this.changeDirectionState(d, 'resume') });
+        if (d.state !== 'done') rows.push({ id: 'device-dir-end', label: L.dirEndMenu, sub: L.dirEndHint, run: () => this.openDirectionEnd(anchor, d) });
+        if (directionPersonIds(d)) rows.push({ id: 'device-dir-show', label: L.dirShow, run: () => this.showDirectionInTree(d, 'sheet') });
+        const pc = deviceComputerName();
+        // A device that starts the agent (K3.15 `agent.start`): the conversation as on the computer, through the gateway.
+        const work = d.state === 'active' && !this.activeResearchNoAgent() ? this.activeResearchLink('chat', { research: d.id }) : null;
+        const flags = researchMarkFlags(researchLinkMark('chat'));
+        const workRows = work ? [{ id: 'device-dir-work', label: L.dirWork, sub: L.dirWorkHint, ai: flags.ai, ext: flags.research, run: () => this.launchResearchLink(work, 'agent') }] : [];
+        // The quiet sentence after the rows (a block's own comes before its rows).
+        this.presentMenuSheet(L.dirActions(d.name), [
+            ...(workRows.length ? [{ rows: workRows }, { rows, divider: true }] : [{ rows }]),
+            ...(d.state === 'active' && pc && !work ? [{ rows: [], quiet: strings.device.dirWorkOnComputer(pc) }] : []),
+        ], { overlayClass: 'research-direction-sheet' });
     },
 
     /**
@@ -1705,11 +1755,7 @@ export const researchDirectionsMethods = uiModule({
         head.type = 'button';
         const name = el('span', 'research-direction__name', d.name);
         head.appendChild(name);
-        if (d.working && d.state === 'active') {
-            const arc = el('span', 'agent-mark agent-mark--spin');
-            arc.setAttribute('aria-hidden', 'true');
-            head.appendChild(arc);
-        }
+        if (d.working && d.state === 'active') head.appendChild(workingArc(s, d));
         if (d.state !== 'active') head.appendChild(el('span', 'research-direction__chip', d.state === 'paused' ? L.dirPaused : L.dirDone));
         if (phone) {
             // Phone: a tap shows the direction's people in the tree.
@@ -1737,7 +1783,7 @@ export const researchDirectionsMethods = uiModule({
                 meta.appendChild(link);
             }
             if (isEmpty(d)) {
-                meta.appendChild(el('span', 'research-direction__empty', phone ? L.dirEmptyPhone : L.dirEmpty));
+                meta.appendChild(el('span', 'research-direction__empty', phone && !inDeviceMode() ? L.dirEmptyPhone : L.dirEmpty));
             } else {
                 if (d.tasks) meta.appendChild(el('span', undefined, L.dirTasks(d.tasks)));
                 if (d.waiting) meta.appendChild(el('span', 'research-direction__waiting', L.dirWaiting(d.waiting)));

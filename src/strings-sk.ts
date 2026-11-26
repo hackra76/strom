@@ -3682,7 +3682,6 @@ export function buildSlovakStrings(cz: StringsType): StringsType {
         ...sk.merge,
         sharedOnce: 'Raz – je u oboch.',
         sharedAttach: (n: number) => `Pripojiť k spoločnej udalosti (${nSk(n, 'osoba', 'osoby', 'osôb')}) – vlastná kópia sa zhoduje`,
-        sharedJoined: (n: number) => `Zdieľané udalosti: ${n} spojených`,
     };
 
     sk.personMerge = {

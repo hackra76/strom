@@ -170,8 +170,32 @@
  *   writes such a record at its person once, as the portrait. The version
  *   marks a tree moved over, so a record taken out later is not made again;
  *   an older app (v24) warns first, as for every bump.
+ * v26 (2026-11, spec 134): a person's contact (Person.emails). A GEDCOM RESI
+ *   that carries only a contact (`2 EMAIL`, MyHeritage) is the person's
+ *   e-mail, not a residence, and `1 EMAIL` under the person is too; a tree
+ *   of v25 and older has its e-mails moved over at every load (the lines an
+ *   import wrote of them into a residence's or the person's note; a residence
+ *   left with nothing goes, src/person-contact.ts moveContactsIntoPeople).
+ *   An older app (v25) would drop the contact on a re-save, so the bump makes
+ *   it warn first. Also the history of merges into the tree
+ *   (StromData.merges, spec 134 §0.3): what each merge brought and what was
+ *   undone of it, for the Merge history and the undo. Additive: a tree of
+ *   v25 has none (absent = none), nothing is made when it is read.
+ *   Custom list rules and a list's origin (PersonList.custom / .origin,
+ *   spec 136) and the time of a person's last change (Person.changedAt) are
+ *   additive fields of v26 too, out in the same release: a list with a
+ *   custom rule is stored with `dynamic: false` and its last worked-out
+ *   people in `personIds`, so an older app keeps showing it as a fixed list
+ *   with that set (the app refreshes the set at every save while the rule
+ *   keeps the list up to date). A custom rule the app cannot read whole (a
+ *   later rule version or condition) is kept as it came in
+ *   `PersonList.customUnknown` while the list stays fixed, and read back as
+ *   `custom` by an app that can read it: a later rule version needs no bump
+ *   of its own. Only the betas 3.32.0-beta.1 to beta.3 read
+ *   v26 without knowing them and drop them on a re-save. Were they released
+ *   later than v26, they would need a bump of their own.
  */
-export const STROM_DATA_VERSION = 25;
+export const STROM_DATA_VERSION = 26;
 
 /**
  * Current app version, shown in the About dialog and stamped into exports.
@@ -180,4 +204,4 @@ export const STROM_DATA_VERSION = 25;
  * should be kept in sync with package.json.
  */
 declare const __APP_VERSION__: string | undefined;
-export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '3.31.0';
+export const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '3.32.0';

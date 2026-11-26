@@ -1,7 +1,7 @@
 import { test, expect, Page, Locator } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'url';
-import { openApp, createFirstPerson, card, addRelation, fillPerson, waitForPersist, focusViaSearch, openTreeActions, openTreeStructure } from './helpers.js';
+import { openApp, seedTree, createFirstPerson, card, addRelation, fillPerson, waitForPersist, focusViaSearch, openTreeActions, runStructure, type StructureRun } from './helpers.js';
 
 /**
  * Tree manager flows beyond create / rename / delete: duplicating a tree (an
@@ -24,20 +24,39 @@ function row(page: Page, treeName: string): Locator {
 async function rowAction(page: Page, treeName: string, item: string): Promise<void> {
     if (!await manager(page).isVisible()) await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
     const r = row(page, treeName);
+    // Structure actions run through Change structure…, a button in the row (spec 139 §8.1).
+    if (STRUCTURE_ITEMS[item]) {
+        await runStructure(page, STRUCTURE_ITEMS[item], r.locator('.tree-manager-item-actions'));
+        return;
+    }
     await r.locator('.tree-row-menu-btn').click();
     const menu = r.locator('.tree-row-menu.open');
-    const entry = menu.locator('.tree-row-menu-item', { hasText: item }).first();
-    // Structure actions sit under "Change structure ⌄".
-    if (!await entry.isVisible()) await openTreeStructure(page, menu);
-    await entry.click();
+    await menu.locator('.tree-row-menu-item', { hasText: item }).first().click();
 }
 
-/** ⋯ → Tree: → item (a structure action: under Change structure ⌄). */
+/** The items of the old Change structure ⌄ group, now options of its dialog. */
+const STRUCTURE_ITEMS: Record<string, StructureRun> = { Duplicate: 'duplicate', 'Merge into another tree': 'mergeInto' };
+
+/** ⋯ → Tree: → item (a structure action: through Change structure…). */
+/** The value "Default person and view" shows in a row's ⋯ (the row itself no longer names it, spec 139 §7.2). */
+async function defaultPersonValue(page: Page, treeName: string): Promise<string> {
+    const r = row(page, treeName);
+    await r.locator('.tree-row-menu-btn').click();
+    const value = r.locator('.tree-row-menu.open .tree-row-menu-item[data-action="defaultPerson"] .tree-row-menu-value');
+    await expect(value).toBeVisible();
+    const text = (await value.textContent()) ?? '';
+    await r.locator('.tree-row-menu-btn').click();
+    await expect(r.locator('.tree-row-menu.open')).toHaveCount(0);
+    return text;
+}
+
 async function treeSubmenu(page: Page, item: string): Promise<void> {
     const sub = await openTreeActions(page);
-    const row = sub.locator('.tree-switcher-action', { hasText: item }).first();
-    if (!await row.isVisible()) await openTreeStructure(page, sub);
-    await row.click();
+    if (STRUCTURE_ITEMS[item]) {
+        await runStructure(page, STRUCTURE_ITEMS[item], sub);
+        return;
+    }
+    await sub.locator('.tree-switcher-action', { hasText: item }).first().click();
 }
 
 /** In the open tree overview: expand Data quality and press one of its buttons. */
@@ -91,13 +110,17 @@ test('Duplicate in a tree row makes an independent copy: editing it leaves the o
     await family(page);
     const original = await activeTreeName(page);
 
+    // Change structure… › Copy of the whole tree: its summary with the name (spec 139 §4).
     await rowAction(page, original, 'Duplicate');
-    const dialog = page.locator('#duplicate-tree-modal');
-    await expect(dialog).toBeVisible();
+    const dialog = page.locator('#structure-modal');
+    await expect(dialog).toHaveAttribute('data-step', 'summary');
     await expect(manager(page)).toBeHidden();
-    await expect(dialog.locator('#duplicate-tree-name')).toHaveValue(`${original} (copy)`);
-    await dialog.locator('#duplicate-tree-name').fill('Novak copy');
-    await dialog.getByRole('button', { name: 'Duplicate' }).click();
+    await expect(dialog.locator('.structure-lead')).toHaveText(`The copy gets the whole tree ${original}:`);
+    await expect(dialog.locator('.structure-stat b')).toHaveText(['3', '1', '0', '0']);
+    await expect(dialog.locator('.structure-stat span')).toHaveText(['people', 'couple', 'sources', 'images']);
+    await expect(dialog.locator('#structure-name')).toHaveValue(`${original} (copy)`);
+    await dialog.locator('#structure-name').fill('Novak copy');
+    await dialog.getByRole('button', { name: 'Create copy' }).click();
     await expect(dialog).toBeHidden();
 
     // Back in the manager with both trees; the original is still the active one.
@@ -126,31 +149,113 @@ test('Duplicate in a tree row makes an independent copy: editing it leaves the o
     });
 });
 
-test('duplicate dialog: Cancel and an empty name create nothing; Escape returns to the manager', async ({ page }) => {
+test('copy summary: Back and an empty name create nothing; Escape goes a step back, then to the manager', async ({ page }) => {
     await openApp(page);
     await createFirstPerson(page, 'Jan', 'Novak');
     const original = await activeTreeName(page);
     const treeCount = () => page.evaluate(() => window.Strom.TreeManager.getTrees().length);
-    const dialog = page.locator('#duplicate-tree-modal');
+    const dialog = page.locator('#structure-modal');
 
     await rowAction(page, original, 'Duplicate');
-    await dialog.getByRole('button', { name: 'Cancel' }).click();
-    await expect(dialog).toBeHidden();
-    await expect(manager(page)).toBeVisible();
-    expect(await treeCount()).toBe(1);
-
-    // An empty name is refused: the dialog stays, the field keeps the focus.
-    await rowAction(page, original, 'Duplicate');
-    await dialog.locator('#duplicate-tree-name').fill('   ');
-    await dialog.getByRole('button', { name: 'Duplicate' }).click();
-    await expect(dialog).toBeVisible();
-    await expect(dialog.locator('#duplicate-tree-name')).toBeFocused();
-    expect(await treeCount()).toBe(1);
-
+    await expect(dialog).toHaveAttribute('data-step', 'summary');
+    await dialog.locator('#structure-footer').getByRole('button', { name: 'Back' }).click();
+    // Back on the options of Change structure…; its Escape returns to the manager.
+    await expect(dialog).toHaveAttribute('data-step', 'options');
     await page.keyboard.press('Escape');
     await expect(dialog).toBeHidden();
     await expect(manager(page)).toBeVisible();
     expect(await treeCount()).toBe(1);
+
+    // An empty name is refused: the step stays, the field keeps the focus.
+    await rowAction(page, original, 'Duplicate');
+    await dialog.locator('#structure-name').fill('   ');
+    await dialog.getByRole('button', { name: 'Create copy' }).click();
+    await expect(dialog).toHaveAttribute('data-step', 'summary');
+    await expect(dialog.locator('#structure-name')).toBeFocused();
+    expect(await treeCount()).toBe(1);
+
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveAttribute('data-step', 'options');
+    await page.keyboard.press('Escape');
+    await expect(manager(page)).toBeVisible();
+    expect(await treeCount()).toBe(1);
+
+    // Duplicate as a call (the old naming dialog is gone): the dialog opens on the copy's summary over its options.
+    await page.evaluate((name) => {
+        const tree = window.Strom.TreeManager.getTrees().find((t: { name: string }) => t.name === name)!;
+        window.Strom.UI.duplicateTree(tree.id, 'tree-manager-modal');
+    }, original);
+    await expect(dialog).toHaveAttribute('data-step', 'summary');
+    await expect(manager(page)).toBeHidden();
+    await expect(page.locator('#duplicate-tree-modal')).toHaveCount(0);
+    await expect(dialog.locator('#structure-name')).toHaveValue(`${original} (copy)`);
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveAttribute('data-step', 'options');
+    await page.keyboard.press('Escape');
+    await expect(manager(page)).toBeVisible();
+    expect(await treeCount()).toBe(1);
+});
+
+test('a second Duplicate offers a free name "(copy 2)"; a name another tree has is said under the field (134 S-N4)', async ({ page }) => {
+    await openApp(page);
+    await createFirstPerson(page, 'Jan', 'Novak');
+    await waitForPersist(page, 'Jan');
+    const original = await activeTreeName(page);
+    const dialog = page.locator('#structure-modal');
+    const name = dialog.locator('#structure-name');
+    const taken = dialog.locator('#structure-name-taken');
+
+    await rowAction(page, original, 'Duplicate');
+    await expect(name).toHaveValue(`${original} (copy)`);
+    await expect(taken).toBeHidden();
+    await dialog.getByRole('button', { name: 'Create copy' }).click();
+    await expect(row(page, `${original} (copy)`)).toHaveCount(1);
+
+    await rowAction(page, original, 'Duplicate');
+    await expect(name).toHaveValue(`${original} (copy 2)`);
+    await expect(taken).toBeHidden();
+    // Typed by hand: the name of the first copy is told inline, not refused.
+    await name.fill(`${original} (copy)`);
+    await expect(taken).toHaveText('A tree with this name already exists.');
+    await expect(name).toHaveAttribute('aria-describedby', 'structure-name-taken');
+    await name.fill(`${original} (copy 2)`);
+    await expect(taken).toBeHidden();
+    await name.press('Enter');
+    await expect(dialog).toBeHidden();
+    await expect(row(page, `${original} (copy 2)`)).toHaveCount(1);
+});
+
+test('a copy whose images the original shares: both sizes say "images shared", a tree of its own images not (134 S-P1)', async ({ page }) => {
+    await openApp(page);
+    // A noisy drawn picture over 1 MB, so the size is shown.
+    const photo = await page.evaluate(() => {
+        const c = document.createElement('canvas');
+        c.width = 800; c.height = 600;
+        const x = c.getContext('2d')!;
+        const img = x.createImageData(c.width, c.height);
+        for (let i = 0; i < img.data.length; i += 65536) crypto.getRandomValues(img.data.subarray(i, i + 65536));
+        for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;
+        x.putImageData(img, 0, 0);
+        return c.toDataURL('image/png');
+    });
+    expect(photo.length).toBeGreaterThan(1_100_000);
+    await seedTree(page, { jan: { firstName: 'Jan', lastName: 'Novak', photo } }, 'Novak', 'jan');
+    await createTree(page, 'Dvorak');
+    await createFirstPerson(page, 'Karel', 'Dvorak');
+    await waitForPersist(page, 'Karel');
+    await page.evaluate(async () => {
+        const T = window.Strom.TreeManager;
+        await T.flush();
+        const novak = T.getTrees().find((t: { name: string }) => t.name === 'Novak')!;
+        await T.duplicateTree(novak.id, 'Novak (copy)');
+        await T.flush();
+    });
+    await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
+    const size = (name: string) => row(page, name).locator('.tree-manager-item-size');
+    await expect(size('Novak')).toContainText('MB · images shared');
+    await expect(size('Novak (copy)')).toContainText('MB · images shared');
+    await expect(size('Novak')).toHaveAttribute('title', /shared with another tree/);
+    await expect(row(page, 'Dvorak')).not.toContainText('images shared');
 });
 
 // ---------------------------------------------------------------- Tree: submenu
@@ -165,9 +270,11 @@ test('⋯ → Tree: Duplicate / Rename / Tree overview / Merge into / Hide act o
 
     // Duplicate: prefilled with the ACTIVE tree's name; Enter confirms.
     await treeSubmenu(page, 'Duplicate');
-    const dup = page.locator('#duplicate-tree-modal');
-    await expect(dup.locator('#duplicate-tree-name')).toHaveValue('Second (copy)');
-    await dup.locator('#duplicate-tree-name').press('Enter');
+    const dup = page.locator('#structure-modal');
+    await expect(dup).toHaveAttribute('data-step', 'summary');
+    await expect(dup.locator('#structure-name')).toHaveValue('Second (copy)');
+    await expect(dup.getByRole('button', { name: 'Create copy' })).toBeEnabled();
+    await dup.locator('#structure-name').press('Enter');
     await expect(dup).toBeHidden();
     await expect(row(page, 'Second (copy)')).toHaveCount(1);
     expect((await storedTrees(page))['Second (copy)']).toEqual(['Karel']);
@@ -189,12 +296,12 @@ test('⋯ → Tree: Duplicate / Rename / Tree overview / Merge into / Hide act o
     await expect(overview.locator('.tov-title')).toHaveText('Tree overview: Dvorak');
     await page.evaluate(() => window.Strom.UI.closeTreeOverview());
 
-    // Merge into another tree: the active tree is the source, the others are targets.
+    // Merge into another tree: the import guide with the active tree as the import, the others as targets.
     await treeSubmenu(page, 'Merge into another tree');
-    const mergeDialog = page.locator('#merge-trees-modal');
+    const mergeDialog = page.locator('#merge-modal');
     await expect(mergeDialog).toBeVisible();
-    await expect(mergeDialog.locator('#merge-trees-options')).toContainText('Second (copy)');
-    await expect(mergeDialog.locator('#merge-trees-options')).not.toContainText('Dvorak');
+    await expect(mergeDialog.locator('.merge-s1-targets')).toContainText('Second (copy)');
+    await expect(mergeDialog.locator('.merge-s1-targets')).not.toContainText('Dvorak');
     await page.keyboard.press('Escape');
     await expect(mergeDialog).toBeHidden();
 
@@ -245,7 +352,7 @@ test('a specific default person is the focus at the next start; "First person" g
     await expect(dialog).toBeHidden();
     // Back in the manager; the row names the start person.
     await expect(manager(page)).toBeVisible();
-    await expect(row(page, tree).locator('.tree-manager-item-stats-row')).toContainText('Marie Novak');
+    expect(await defaultPersonValue(page, tree)).toContain('Marie Novak');
     await page.evaluate(() => window.Strom.UI.closeTreeManagerDialog());
 
     // Focus someone else, start again (a reload would keep Petr, 1101): Marie is the focus.
@@ -262,7 +369,7 @@ test('a specific default person is the focus at the next start; "First person" g
     await expect(dialog.locator('#default-person-picker-container')).toBeHidden();
     await dialog.getByRole('button', { name: 'Save' }).click();
     await expect(dialog).toBeHidden();
-    await expect(row(page, tree).locator('.tree-manager-item-stats-row')).not.toContainText('Marie');
+    expect(await defaultPersonValue(page, tree)).not.toContain('Marie');
     await page.evaluate(() => window.Strom.UI.closeTreeManagerDialog());
     await waitForPersistGone(page, '"defaultPersonId"');
     await page.goto(page.url());
@@ -280,7 +387,7 @@ test('"Last focused" as the default person restores the last focused person at t
     await expect(dialog.locator('#default-person-picker-container')).toBeHidden();
     await dialog.getByRole('button', { name: 'Save' }).click();
     await expect(dialog).toBeHidden();
-    await expect(row(page, tree).locator('.tree-manager-item-stats-row')).toContainText('Last focused');
+    expect(await defaultPersonValue(page, tree)).toContain('Last focused');
     await page.evaluate(() => window.Strom.UI.closeTreeManagerDialog());
 
     await focusViaSearch(page, 'Petr');
@@ -334,7 +441,7 @@ test('New tree → "From current view" makes a tree of exactly the persons on sc
     const original = await activeTreeName(page);
 
     await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
-    await manager(page).locator('.tree-manager-footer .primary').click();
+    await manager(page).locator('.tree-manager-footer .tree-manager-new-btn').click();
     const menu = page.locator('#new-tree-menu-modal');
     await expect(menu).toBeVisible();
     await menu.locator('.menu-option', { hasText: 'From current view' }).click();
@@ -355,7 +462,7 @@ test('New tree → "From current view" makes a tree of exactly the persons on sc
 test('"From current view" on an empty tree warns and creates nothing', async ({ page }) => {
     await openApp(page);
     await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
-    await manager(page).locator('.tree-manager-footer .primary').click();
+    await manager(page).locator('.tree-manager-footer .tree-manager-new-btn').click();
     await page.locator('#new-tree-menu-modal .menu-option', { hasText: 'From current view' }).click();
     await expect(page.locator('#confirmation-modal')).toBeVisible();
     await expect(page.locator('#confirm-message')).toHaveText('No focused data to create tree from');
@@ -549,4 +656,91 @@ test('turning automatic backups off with "Keep backups" keeps the existing backu
     await toggle.check();
     await expect(page.locator('#confirmation-modal')).toBeHidden();
     expect(await page.evaluate((i) => window.Strom.TreeManager.isAutoBackupEnabled(i), id)).toBe(true);
+});
+
+test.describe('the row of Manage trees (spec 139 §7, §8)', () => {
+    test.use({ viewport: { width: 1440, height: 900 } });
+
+    async function twoTrees(page: Page): Promise<void> {
+        await openApp(page);
+        await createFirstPerson(page, 'Vojtěch', 'Jesenský');
+        // A tree that is not open, about 240 kB: its size shows all the same.
+        await page.evaluate(async () => {
+            const dm = window.Strom.DataManager;
+            const first = window.Strom.TreeManager.getActiveTreeId()!;
+            await dm.importAsNewTree({
+                persons: { k1: { id: 'k1', firstName: 'Bořivoj', lastName: 'Kalinovský', gender: 'male', notes: 'x'.repeat(240 * 1024), partnerships: [], parentIds: [], childIds: [] } },
+                partnerships: {},
+            } as never, 'Rodina Kalinovských');
+            await dm.switchTree(first);
+        });
+        await expect(card(page, 'Vojtěch')).toBeVisible();
+    }
+
+    test('every tree shows its facts from the index alone: size, couples, no research; no tree data read', async ({ page }) => {
+        await twoTrees(page);
+        // Drawing the list reads no tree's data (§7.1).
+        await page.evaluate(() => {
+            const tm = window.Strom.TreeManager as unknown as { getTreeData: (...a: unknown[]) => unknown; __reads?: number };
+            const orig = tm.getTreeData.bind(tm);
+            tm.__reads = 0;
+            tm.getTreeData = (...a: unknown[]) => { tm.__reads!++; return orig(...a); };
+        });
+        await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
+        const r = row(page, 'Rodina Kalinovských');
+        await expect(r).toBeVisible();
+        const bytes = await page.evaluate(() => window.Strom.TreeManager.getTrees().find(t => t.name === 'Rodina Kalinovských')!.sizeBytes);
+        expect(bytes).toBeGreaterThan(240 * 1024);
+        expect(bytes).toBeLessThan(1024 * 1024);
+        await expect(r.locator('.tree-manager-item-size')).toHaveText(`${Math.round(bytes / 1024)} kB`);
+        await expect(r.locator('.tree-manager-item-stats-row')).toContainText('1 person · 0 couples · ');
+        await expect(r.locator('.tree-manager-item-origin')).toHaveAttribute('data-origin', 'none');
+        await expect(r.locator('.tree-manager-item-origin-text')).toHaveText('no research');
+        // The open tree: the chip at its name, its size too.
+        const open = manager(page).locator('.tree-manager-item.active');
+        await expect(open.locator('.tree-manager-item-header .active-badge')).toBeVisible();
+        await expect(open.locator('.tree-manager-item-size')).toHaveText(/^\d+ kB$/);
+        expect(await page.evaluate(() => (window.Strom.TreeManager as unknown as { __reads: number }).__reads)).toBe(0);
+        // The dialog is 880 px wide on a computer.
+        expect(Math.round((await manager(page).locator('.modal').boundingBox())!.width)).toBe(880);
+    });
+
+    test('one primary button at most: Open is quiet at rest, primary in the row under the pointer; Delete apart, last, asks first', async ({ page }) => {
+        await twoTrees(page);
+        await page.evaluate(() => window.Strom.UI.showTreeManagerDialog());
+        const primary = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--primary').trim());
+        const filled = (): Promise<number> => manager(page).locator('.tree-manager-item button').evaluateAll((els, p) => {
+            const probe = document.createElement('div');
+            probe.style.color = p;
+            document.body.appendChild(probe);
+            const want = getComputedStyle(probe).color;
+            probe.remove();
+            return els.filter(el => getComputedStyle(el).backgroundColor === want).length;
+        }, primary);
+        // At rest (the pointer away from every row): nothing filled.
+        await page.mouse.move(2, 2);
+        await expect.poll(filled).toBe(0);
+        const r = row(page, 'Rodina Kalinovských');
+        await expect(r.locator('.tree-manager-item-actions > button:visible')).toHaveText(['Open', 'Change structure…', 'Export…']);
+        await r.locator('.tree-manager-item-info').hover();
+        await expect.poll(filled).toBe(1);
+        await expect(r.locator('.tree-open-btn')).toHaveCSS('background-color', await r.locator('.tree-open-btn').evaluate((_, p) => {
+            const probe = document.createElement('div'); probe.style.color = p; document.body.appendChild(probe);
+            const c = getComputedStyle(probe).color; probe.remove(); return c;
+        }, primary));
+
+        // ⋯: no Export or structure (they are the row's buttons), Delete last behind a line.
+        await r.locator('.tree-row-menu-btn').click();
+        const menu = r.locator('.tree-row-menu.open');
+        await expect(menu.locator('.tree-row-menu-item[data-action="delete"]')).toBeVisible();
+        const keys = await menu.locator('.tree-row-menu-item').evaluateAll(els => els.map(el => (el as HTMLElement).dataset.action));
+        expect(keys).not.toContain('export');
+        expect(keys).not.toContain('structure');
+        expect(keys[keys.length - 1]).toBe('delete');
+        const del = menu.locator('.tree-row-menu-item[data-action="delete"]');
+        expect(await del.evaluate(el => el.previousElementSibling?.classList.contains('tree-row-menu-divider'))).toBe(true);
+        await del.click();
+        await expect(page.locator('#confirmation-modal')).toHaveClass(/active/);
+        await expect(page.locator('#confirmation-modal')).toHaveClass(/dialog-danger/);
+    });
 });

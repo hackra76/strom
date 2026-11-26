@@ -17,7 +17,7 @@ import { noteQueueStartStatus, QUEUE_SCOPE, QUEUE_START_MS, type QueueStartView 
 import { NOW_LIMIT_NOTE, runsSideBySide } from './queue-work-dialog.js';
 import { RUN_ENDED_MS, linesWithRun, liveRuns, orderRuns, runCount, runLinesOn, runStopOn, runsShown, type LiveRun } from '../research-runs.js';
 import { postRunStop } from '../research-runs-write.js';
-import { runEndedText, runName, runWaitText } from '../research-runs-text.js';
+import { runEndedText, runName, runWaitText, runsWaitingText } from '../research-runs-text.js';
 import { busySpinHtml, busyStatusEl } from './busy.js';
 import { canvasBusy } from './canvas-busy.js';
 import type { RowRefusal } from './waiting-row-notes.js';
@@ -29,34 +29,31 @@ import { strings, getCurrentLanguage } from '../strings.js';
 import { Person, PersonId, ResearchHypothesis } from '../types.js';
 import { acceptBatch, acceptBatchRowResult } from '../research-hypothesis-waiting.js';
 import { computeEvidenceGaps } from '../stats.js';
-import { LiveBook, type LiveDirection, LiveChangeKind, LiveWaiting, LiveWorker, ResearchActionMark, WAITING_SECTIONS, type QueueTaskKind, booksOn, researchConflictRef, researchPersonRef, researchTaskRef, recentAddsCount, researchLinkMark } from '../research-link.js';
+import { LiveBook, type LiveDirection, LiveChangeKind, LiveWaiting, LiveWorker, ResearchActionMark, WAITING_SECTIONS, type QueueTaskKind, booksOn, waitingGainOn, researchConflictRef, researchPersonRef, researchTaskRef, recentAddsCount, researchDeviceAllows, researchLinkMark } from '../research-link.js';
 import { bookById, bookHeadTitle, bookImagesText, bookMetaParts, bookOfferText, bookTitle, bookWebUrl, urgentBooks, urgentBooksShown } from '../research-books.js';
 import { waitingGroupSendable, waitingGroupHasNote, waitingSendable, waitingUnsendable, waitingFileWritable } from '../research-waiting-write.js';
 import {
-    FLAT_GROUP, PLACES_GROUP, WaitingFilter, WaitingGroupOpts, WaitingGroupRows, WaitingOrder, WaitingPhase, isTimeOrder, listedBook, sortWaitingByTime, waitingOrdersFor, effectiveWaitingFilter, waitingActionDo, waitingChatLeads, waitingChips, waitingDaysAgo, waitingGroupChatTask,
+    FLAT_GROUP, PLACES_GROUP, WaitingFilter, WaitingGroupOpts, WaitingGroupRows, WaitingOrder, WaitingPhase, isSortedOrder, isTimeOrder, listedBook, sortWaiting, waitingOrdersFor, effectiveWaitingFilter, waitingActionDo, waitingChatLeads, waitingChips, waitingDaysAgo, waitingGroupChatTask,
     waitingGroupOpenByDefault, waitingPhase, waitingPhases, waitingSection, waitingTaskActions, waitingTodoCount,
     WaitActionView, imagesState, splitWaitingActions, waitingActions, waitingForImages, waitingGroupBandLines, waitingGroupMissing, waitingPhaseLines, textWithLinks,
+    waitingRetryCount, waitingRetryLimitText, waitingRetryMain, waitingRetryReason,
+    WaitingGroupRetry, groupRetryAria, groupRetryConfirmText, groupRetryCountText, groupRetryLaterText, waitingGroupRetry, waitingGroupRetryReason,
 } from '../research-waiting.js';
 import { WaitingAnswerForm, waitingAnswerChangedNote } from './waiting-answer-form.js';
 import { appendImagesDetail, bindImagesDrop, clearImagesSeen, forgetImagesArrived, imagesShortEl, itemKey, noteImagesArrived } from './waiting-images-ui.js';
 import { clearOverviewImages, foldOverviewImages, overviewImagesResult, auditFixedRowDrawn, waitingAuditMarkEl, waitingAuditShown } from './waiting-task-ui.js';
 import { formatLiveClock } from '../live-time.js';
 import { waitsText } from '../research-holds.js';
-import { MQ_PHONE_BAR, isPhoneBar } from '../breakpoints.js';
+import { MQ_PHONE_BAR, isMobile, isPhoneBar } from '../breakpoints.js';
 import { openHeadMenu } from './table-view/table-headmenu.js';
 import {
     ORDER_ICON, WaitingGroups, noteWaitingNew, setWaitingDrawn, shownWaitingGroups, storeWaitingGroupMode, storeWaitingGroups, storeWaitingOrder,
     storedWaitingGroupMode, storedWaitingGroups, storedWaitingOrder, waitingDrawn, waitingGroupModesFor, waitingGroupsLabel,
-    groupTitleMoreEl, waitingOnMoreEl, waitingGroupTagEl, waitingOrderLabel, waitingSideEl, waitingSinceEl, watchWaitingOrderStorage,
+    groupTitleMoreEl, waitingOnMoreEl, waitingGainEl, waitingGroupTagEl, waitingOrderLabel, waitingSideEl, waitingSinceEl, watchWaitingOrderStorage,
 } from './waiting-order-ui.js';
 import { browserGroupNote, browserNote } from '../research-browser.js';
 import { uiModule } from './module.js';
-import {
-    LiveChangeItem, LiveFold, LiveSession, appendChangeText, el, ensureLiveTicker, liveDuration, liveSection,
-    liveSession, nowHelpTopic, timeEl, appendAllHidden, noteWaitingShown, waitingChip, waitingNewChip,
-    liveState, pausedText, appendWorkingHold, workingHoldEl, waitsOnUser, appendLinkedText, newWaitingView, waitingKindLabel, appendFollowNote, holdFollowNoteIn,
-    markWaitingFocus, waitingWhyEl, overviewViewing, OverviewViewing, onComputer, lightsGroup, markOverviewLit, researchSession,
-} from './research-ui.js';
+import { LiveChangeItem, LiveFold, LiveSession, appendChangeText, el, ensureLiveTicker, liveDuration, liveSection, liveSession, nowHelpTopic, timeEl, appendAllHidden, noteWaitingShown, waitingChip, waitingNewChip, liveState, pausedText, appendWorkingHold, workingHoldEl, workingSavingEl, waitsOnUser, appendLinkedText, newWaitingView, waitingKindLabel, appendFollowNote, holdFollowNoteIn, markWaitingFocus, waitingWhyEl, overviewViewing, OverviewViewing, lightsGroup, markOverviewLit, researchSession, researchTableLive, researchHere } from './research-ui.js';
 import { storyWaitingPeople } from './story-compare-ui.js';
 import {
     WorkingLine, directionDragActive, directionGlyph, directionPersonIds, directionRedrawHeld, keepLineFocus, setQueueDirectionFilter, taskDirectionName, workingLineCount, workingLineGroups,
@@ -68,6 +65,9 @@ import { focusQueueMoved, setQueueBranchFilter, waitBranchText, workingWhyText }
 import { setQueueKindFilter } from './queue-kind-ui.js';
 import { beginQueueSlots, endQueueSlots } from '../research-queue-pages.js';
 import { KnowsKind, knowsKindChoice, knowsKindShows } from '../knows-kind.js';
+import { knowsGroupOptions, knowsGroupShown, knowsGroupedRows, knowsGroups, type KnowsGroup, type KnowsGroupLine, type KnowsGroupOf } from '../knows-group.js';
+import { personLineIds, researchLinesOf } from './table-view/table-research.js';
+import { SettingsManager } from '../settings.js';
 import { activeQueueSearch, clearQueueSearch } from './queue-search-ui.js';
 import { overviewSearches, focusFirstSectionRow, type SectionSearch } from './section-search.js';
 import { appendSearchOutcome, keepSheetOverKeyboard, mountSectionSearch, paintSearchChip, searchHitTag, searchSummaryEl } from './section-search-view.js';
@@ -75,7 +75,9 @@ import { fieldVisible, foldSearch2, idNumber, tokenize, type SearchDoc, type Sea
 import { chipCount, searchIndex, searchSection, sectionPartOpen, toggleSectionPart, type SearchIndex } from '../section-search-filter.js';
 import type { HypothesisListSearch } from './hypothesis-waiting-ui.js';
 import { knowsSearchIndex, type KnowsIndex, type KnowsSearchRow } from '../knows-search.js';
-import { PREF_KEYS, PrefKey, SectionPref, prefKeyOfOverview, sectionOrder, sectionPrefs, setSectionPref, topPrefs, topTileShown } from './live-section-prefs.js';
+import { inDeviceMode, deviceComputerName } from './device-mode-ui.js';
+import { deviceProgressSeenAt, deviceProgressSends, noteDeviceProgressSeen, resetDeviceProgressSeen } from './device-progress-ui.js';
+import { PREF_KEYS, PrefKey, SectionPref, prefKeyOfOverview, overviewKeyOf, sectionOrder, sectionPrefs, setSectionPref, topPrefs, topTileShown } from './live-section-prefs.js';
 import { OverviewSourceKind, afterTurnOnKeys, skeletonLines } from '../research-overview-source.js';
 import { sectionTitle } from './live-section-edit.js';
 import { keepSectionControlFocus } from './live-section-edit-ui.js';
@@ -117,6 +119,19 @@ const MAX_STEPS = 20;
 /** Items whose browser note their group's heading says (spec 048 §11.2): their details leave it out. */
 const browserNotedInHead = new Set<string>();
 
+/**
+ * A place's "Retry all with the agent" asked to confirm in its band (spec 089
+ * §4): the place's key, and whether its write runs. One place at a time;
+ * gone when the overview closes or the place no longer offers it.
+ */
+let retryConfirm: { key: string; saving: boolean } | null = null;
+
+/** The element with this focus key in the overview, focused after a redraw. */
+function focusOverviewKey(key: string): void {
+    const t = document.querySelector<HTMLElement>(`#research-overview [data-focus-key="${CSS.escape(key)}"]`);
+    if (t && !(t as HTMLButtonElement).disabled) t.focus({ preventScroll: true });
+}
+
 type Filter = 'all' | Exclude<LiveChangeKind, 'other'>;
 type Mode = 'docked' | 'overlay' | 'sheet' | 'window';
 
@@ -125,6 +140,8 @@ let filter: Filter = 'all';
 let relighting = false;
 /** The kind shown in "What the research knows" while the overview is open (All again once it closes). */
 let knowsKind: KnowsKind = 'all';
+/** The groups of "What the research knows" folded or unfolded by hand (`${group}:${key}`), while the overview is open (spec 140). */
+const knowsGroupsOpen = new Map<string, boolean>();
 /** When the overview was opened (changes after it are marked new for a moment). */
 let openedAt = 0;
 /** Older change groups the user unfolded (by group key). */
@@ -209,6 +226,41 @@ export function overviewSectionState(key: string): SectionPref {
     return p ?? (FOLDED_BY_DEFAULT.has(key) ? 'collapsed' : 'expanded');
 }
 
+/**
+ * The overview's first section with something in it, in the sections' order (spec 094 §4, 4.3: on a device's
+ * phone only that one opens by itself). Now always has its line; without the bridge only what the tree holds.
+ */
+function firstSectionWithContent(s: LiveSession, fromTree: boolean): string | null {
+    for (const k of sectionOrder()) {
+        if (sectionPref(overviewKeyOf(k)) === 'hidden') continue;
+        const has = k === 'working' ? !fromTree && s.working.length > 0
+            : k === 'waiting' ? s.waiting.length > 0
+                : k === 'directions' ? s.researches.length > 0
+                    : k === 'changes' ? !fromTree && (s.changes.length > 0 || s.adds.length > 0)
+                        : k === 'queue' ? !fromTree && !s.ended && s.queue.length > 0
+                            : true;
+        if (has) return overviewKeyOf(k);
+    }
+    return null;
+}
+
+/**
+ * Now on a device while nothing is worked on (spec 094 §4, 4.10): "Nothing is being worked on now" and, when the
+ * research said its last run, when it ended and on which line.
+ */
+function idleNowRow(s: LiveSession): HTMLElement {
+    const L = strings.live;
+    const li = el('li', 'live-empty research-overview__idle');
+    li.appendChild(el('span', 'research-overview__idle-title', L.nothingAtWork));
+    const last = [...(s.runsEnded ?? [])].sort((a, b) => Date.parse(b.ended) - Date.parse(a.ended))[0];
+    if (last) {
+        const line = last.research ? s.researches.find(d => d.id === last.research)?.name ?? '' : '';
+        const when = formatLiveClock(Date.parse(last.ended), Date.now(), getCurrentLanguage());
+        li.appendChild(el('span', 'research-overview__idle-last', L.lastWorked(when, line)));
+    }
+    return li;
+}
+
 function personByRefn(refn: string | undefined): Person | null {
     if (!refn) return null;
     return Object.values(DataManager.getData().persons).find(p => p.refn === refn) ?? null;
@@ -245,6 +297,10 @@ interface ItemAction {
     run?: () => void;
     /** Written through the bridge (one click only). */
     write?: boolean;
+    /** What goes with it, after its name and never wrapped apart ("· 2 images", spec 089 §3). */
+    count?: string;
+    /** Its write runs ("saving" in its row): no second click. */
+    disabled?: boolean;
 }
 
 /** Answer forms by tree and item: the open one (one at a time) and those kept over a redraw. */
@@ -325,9 +381,14 @@ function waitingActionEl(a: ItemAction, weight: 'primary' | 'secondary' | 'link'
     const btn = el('button', `${cls} research-overview__waiting-action`);
     if (a.mark) setResearchActionLabel(btn, a.label, a.mark);
     else btn.textContent = a.label;
+    if (a.count) {
+        btn.classList.add('has-count');
+        btn.append(' ', el('span', 'waiting-retry-count', a.count));
+    }
     btn.type = 'button';
     btn.dataset.action = a.key;
     if (a.write) btn.dataset.write = 'bridge';
+    if (a.disabled) btn.disabled = true;
     btn.onclick = (e) => {
         e.stopPropagation();
         if (a.write) {
@@ -479,6 +540,7 @@ export const researchOverviewMethods = uiModule({
             return;
         }
         openedAt = Date.now();
+        resetDeviceProgressSeen();
         if (overviewMode() !== 'sheet') {
             try { localStorage.setItem(OPEN_KEY, '1'); } catch { /* not kept */ }
         }
@@ -652,6 +714,8 @@ export const researchOverviewMethods = uiModule({
         // The sections' searches and the kind shown in "What the research knows" last while the overview is open.
         overviewSearches.reset();
         knowsKind = 'all';
+        knowsGroupsOpen.clear();
+        retryConfirm = null;
         if (s !== liveSession()) this.closeOverviewViewing();
         closeAnswerForm();
         clearImagesSeen();
@@ -723,6 +787,8 @@ export const researchOverviewMethods = uiModule({
                 overviewSearches.reset();
                 resetOverviewColumns();
                 knowsKind = 'all';
+                knowsGroupsOpen.clear();
+                retryConfirm = null;
             }
             keepSheetOverKeyboard(null);
             this.setResearchOverviewDocked(false);
@@ -785,7 +851,8 @@ export const researchOverviewMethods = uiModule({
             const closedStrip = ownWindow?.strip?.() ?? null;
             if (closedStrip) root.appendChild(closedStrip);
             // Without following, the bridge answering: what "Follow live" does, under the head (6b).
-            if (source === 'bridge' && !this.activeResearchAgentless() && frozenAt === null) {
+            // A device of the home network (spec 094 §4, 9): its tree is the research's already; following is an option of the menu.
+            if (source === 'bridge' && !this.activeResearchAgentless() && frozenAt === null && !inDeviceMode()) {
                 root.appendChild(el('p', 'research-overview__window-note', L.followNote));
             }
         } else {
@@ -822,7 +889,9 @@ export const researchOverviewMethods = uiModule({
             head.appendChild(close);
             root.appendChild(head);
             // Without following, the bridge answering: "Follow live" and what it does, under the head (§7.3).
-            if (source === 'bridge' && viewed) {
+            // Not on a device of the home network (spec 094 §4, 9): its tree is the research's already, editable; following
+            // live stays an option of the menu (read-only meanwhile, with the follow panel of today).
+            if (source === 'bridge' && viewed && !inDeviceMode()) {
                 const strip = this.overviewFollowStrip(viewed);
                 if (strip) root.appendChild(strip);
             }
@@ -838,7 +907,7 @@ export const researchOverviewMethods = uiModule({
         if (source === 'live') appendFollowNote(body, s);
         this.appendOverviewSummary(body, s, mode, viewed);
         // The own window without the bridge (§6 state 3): "not running · showing what is in the tree" and Turn on.
-        if (mode === 'window' && viewed?.kind === 'tree' && onComputer()) this.appendOverviewOffFrame(body, viewed);
+        if (mode === 'window' && viewed?.kind === 'tree' && researchHere()) this.appendOverviewOffFrame(body, viewed);
         if (s.update) this.appendUpdateStrip(body, s.update.version, s.busy);
 
         // A section hidden by the choice is not drawn, unless shown until the overview closes
@@ -854,6 +923,8 @@ export const researchOverviewMethods = uiModule({
             const pk = prefKeyOfOverview(key);
             return pk ? { ...f, menu: (h, at) => this.openLiveSectionMenu(h, pk, 'overview', at) } : f;
         };
+        // A device's phone (spec 094 §4, 4.3): a section without a choice of its own opens only when it is the first with content.
+        const firstOpen = mode === 'sheet' && inDeviceMode() ? firstSectionWithContent(s, source === 'tree') : null;
         const foldOf = (key: string): LiveFold => {
             const id = `ov-sec-${key}`;
             const pk = prefKeyOfOverview(key);
@@ -874,7 +945,7 @@ export const researchOverviewMethods = uiModule({
                     this.renderResearchOverview();
                 } };
             }
-            const collapsed = sectionCollapsed(key);
+            const collapsed = firstOpen !== null && sectionPref(key) === undefined ? key !== firstOpen : sectionCollapsed(key);
             return { id, collapsed, onToggle: () => {
                 if (pk) setSectionPref(pk, collapsed ? 'expanded' : 'collapsed');
             } };
@@ -923,7 +994,7 @@ export const researchOverviewMethods = uiModule({
                 if (!fromTree && !s.ended && shown('queue')) this.appendQueueSection(host, s, fold('queue'), 20, L.queueTitle, true);
             },
             knows: () => {
-                if (shown('knows')) this.appendOverviewKnows(host, fold('knows'), mode);
+                if (shown('knows')) this.appendOverviewKnows(host, fold('knows'), mode, s.treeId);
             },
         };
         // In the sections' order (one for the overview and the panel); the own window notes what each drew for its columns.
@@ -936,7 +1007,7 @@ export const researchOverviewMethods = uiModule({
         }
         // The research not running (on a computer): one line names what comes once it runs (not on a phone,
         // whose state says the agent's work is seen on the computer; none when all of it is hidden).
-        if (fromTree && onComputer()) {
+        if (fromTree && researchHere()) {
             const names = afterTurnOnKeys(sectionOrder(), sectionPrefs()).map(k => sectionTitle('overview', k));
             if (names.length > 0) body.appendChild(el('p', 'research-overview__after-on', L.afterTurnOn(joinAnd(getCurrentLanguage(), names))));
         }
@@ -1006,13 +1077,10 @@ export const researchOverviewMethods = uiModule({
         // Paused: when it goes on (and why, on hover) says more than the last change.
         const paused = stateCls === 'is-paused' ? s.working.find(w => w.paused) : undefined;
         const resumes = paused ? Date.parse(paused.paused!.until) : NaN;
-        // Two or more runs side by side (spec 126 U10 §3): "3 agents working", under it those waiting for the limit.
+        // Two or more runs side by side (spec 126 U10 §3): "3 agents working", under it those waiting (runsWaitingText).
         const runs = runLinesOn(s.features) && stateCls !== 'is-lost' ? liveRuns(s).filter(r => r.state !== 'ended') : [];
         if (runs.length >= 2) {
-            const waits = runs.filter(r => r.state === 'waiting' && r.wait?.for === 'limit');
-            const ends = waits.map(r => Date.parse(r.wait?.until ?? '')).filter(Number.isFinite);
-            const until = ends.length > 0 ? formatLiveClock(Math.min(...ends), Date.now(), getCurrentLanguage()) : '';
-            const sub = waits.length === 0 ? lastEl ?? '' : until ? L.stateAgentsWaiting(waits.length, until) : L.stateAgentsWaitingNoTime(waits.length);
+            const sub = runsWaitingText(runs) ?? lastEl ?? '';
             cell(L.state, L.stateAgents(runs.length), sub, 'is-working', [lastEl?.textContent ?? '', hover].filter(Boolean).join(' · '));
         } else if (paused && Number.isFinite(resumes)) {
             // A run waiting for an archive gives up then rather than resumes (spec 127): its own sentence.
@@ -1081,7 +1149,12 @@ export const researchOverviewMethods = uiModule({
         const L = strings.live;
         const c = strip.appendChild(el('div', 'research-overview__cell is-off'));
         c.appendChild(el('div', 'research-overview__cell-label', L.state));
-        if (!onComputer()) {
+        // A device of the home network asks the bridge through the gateway: without it its computer is not reachable (spec 094 §4).
+        if (inDeviceMode()) {
+            c.appendChild(el('div', 'research-overview__cell-value', strings.device.downShort(deviceComputerName())));
+            return;
+        }
+        if (!researchHere()) {
             c.append(el('div', 'research-overview__cell-value', L.phoneTreeOnly), el('div', 'research-overview__cell-sub research-overview__why-off', L.phoneWhy));
             return;
         }
@@ -1224,13 +1297,15 @@ export const researchOverviewMethods = uiModule({
         const books = grouped && booksOn(s);
         // The order chosen (spec 083 K5.1, K5.2): kept on this device; the Groups switch only in a time order.
         watchWaitingOrderStorage(() => this.renderResearchOverview());
-        const order = storedWaitingOrder(books);
+        // "Most helpful" (spec 105 K4.1) only where the research says what doing an item gains.
+        const gain = waitingGainOn(s);
+        const order = storedWaitingOrder(books, gain);
         const groupsShown = shownWaitingGroups(storedWaitingGroupMode(), order, books);
-        const flat = isTimeOrder(order) && grouped && groupsShown === 'none';
+        const flat = isSortedOrder(order) && grouped && groupsShown === 'none';
         // The research's books also by place: a file of a book's inbox set aside stands under its book there too.
         const groupOpts: WaitingGroupOpts = books ? { ...(groupsShown === 'book' ? { by: 'book' as const } : {}), books: s.books } : {};
         setWaitingDrawn(order, flat);
-        const orderRow = total >= 2 ? this.overviewWaitingOrderEl(order, grouped, mode, books) : null;
+        const orderRow = total >= 2 ? this.overviewWaitingOrderEl(order, grouped, mode, books, { gain }) : null;
         const chips = grouped ? waitingChips(s.waiting) : [];
         const chosen = storedWaitingFilter();
         const filter = grouped ? effectiveWaitingFilter(s.waiting, chosen) : 'all';
@@ -1245,10 +1320,10 @@ export const researchOverviewMethods = uiModule({
             const all = waitingPhases(s.waiting, filter, order, !flat, groupOpts);
             // Without groups a phase's rows count, else its bands (a wrapped title, a book's archive, facts and actions,
             // a place's actions and what it misses; spec 105 U4 §1, §2), "No book" and the parts of "Most tasks" (U4 §4).
-            const lines = (p: WaitingPhase): number => waitingPhaseLines(all[p], g => this.waitingGroupBandRows(g));
+            const lines = (p: WaitingPhase): number => waitingPhaseLines(all[p], g => this.waitingGroupBandRows(g, s, p, mode));
             noteOverviewSectionRows('waiting', (['todo', 'sent'] as WaitingPhase[]).reduce((n, p) => n + (all[p].length > 0 ? 1 + lines(p) : 0), 0)
-                + (orderRow && order === 'most' ? 1 : 0) + this.overviewBooksOfferRows(s, filter));
-        } else noteOverviewSectionRows('waiting', s.waiting.length + this.overviewBooksOfferRows(s, 'all'));
+                + (orderRow && order === 'most' ? 1 : 0) + this.overviewBooksOfferRows(s, filter) + this.waitingRetryOpenRows(s, mode));
+        } else noteOverviewSectionRows('waiting', s.waiting.length + this.overviewBooksOfferRows(s, 'all') + this.waitingRetryOpenRows(s, mode));
         // The hypotheses the search shows (the picked ones outside it stay picked) and what matched each by its number.
         const hypoSearch: HypothesisListSearch | null = searching ? {
             found: new Set(res.shown.filter(w => w.kind === 'hypothesis').map(w => w.id)),
@@ -1283,7 +1358,7 @@ export const researchOverviewMethods = uiModule({
         if (!grouped) {
             if (orderRow) host.appendChild(orderRow);
             appendSearchOutcome(host, search, { searching, found: res.shown.length, total: res.total, kindLabel: null, onAllKinds: () => {} });
-            const shown = isTimeOrder(order) ? sortWaitingByTime(res.shown, order) : res.shown;
+            const shown = isSortedOrder(order) ? sortWaiting(res.shown, order) : res.shown;
             if (shown.length > 0) host.appendChild(rows(shown));
             outsideFoot();
             this.appendOverviewBooksOffer(host, s, { filter: 'all', toks, searching, searchOpen: search?.searchOpen });
@@ -1568,16 +1643,18 @@ export const researchOverviewMethods = uiModule({
      * switch beside it (a research with places only). With the research's
      * books (spec 105 §1, §2) "Most tasks" too, and in place of the switch
      * the choice of groups (Archive | Book [| No groups]), none in "Most
-     * tasks". All stay in the app (no mark) and are kept on this device for
-     * every tree.
+     * tasks". With the items' gains (`gain`, spec 105 K4.1) "Most helpful",
+     * grouped as a time order. All stay in the app (no mark) and are kept on
+     * this device for every tree.
      */
     overviewWaitingOrderEl(order: WaitingOrder, grouped: boolean, mode: Mode, books = false,
-        opts: { compact?: boolean; redraw?: () => void } = {}): HTMLElement {
+        opts: { compact?: boolean; redraw?: () => void; gain?: boolean } = {}): HTMLElement {
         const L = strings.live;
         const redraw = opts.redraw ?? (() => this.renderResearchOverview());
-        const orders = waitingOrdersFor(books);
+        const gain = !!opts.gain;
+        const orders = waitingOrdersFor(books, gain);
         const bar = el('div', 'research-overview__order');
-        const btn = el('button', `research-overview__order-btn${isTimeOrder(order) ? ' is-time' : ''}`);
+        const btn = el('button', `research-overview__order-btn${isSortedOrder(order) ? ' is-time' : ''}`);
         btn.type = 'button';
         btn.dataset.focusKey = 'waiting-order';
         btn.setAttribute('aria-haspopup', 'menu');
@@ -1589,7 +1666,7 @@ export const researchOverviewMethods = uiModule({
         caret.setAttribute('aria-hidden', 'true');
         btn.appendChild(caret);
         const choose = (o: WaitingOrder): void => {
-            if (o === storedWaitingOrder(books)) return;
+            if (o === storedWaitingOrder(books, gain)) return;
             storeWaitingOrder(o);
             redraw();
         };
@@ -1602,7 +1679,7 @@ export const researchOverviewMethods = uiModule({
         bar.appendChild(btn);
         if (books && order !== 'most') {
             bar.appendChild(this.waitingGroupsChoiceEl(order, { compact: sheet || !!opts.compact, sheet, redraw }));
-        } else if (isTimeOrder(order) && grouped && !books) {
+        } else if (isSortedOrder(order) && grouped && !books) {
             const on = storedWaitingGroups();
             const sw = el('button', 'research-overview__groups');
             sw.type = 'button';
@@ -1742,29 +1819,42 @@ export const researchOverviewMethods = uiModule({
     },
 
     /**
-     * The fold button of a group's band (spec 105 U4 §1, §2): the chevron, the
-     * title wrapped up to its cap (its "more" goes under the button, see
-     * groupTitleMoreEl), and at the top right its kind, new and how many.
+     * The fold button of a group's band (spec 105 U4 §1, §2; spec 140 §2): the
+     * chevron, the title wrapped up to its cap (its "more" goes under the
+     * button, see groupTitleMoreEl; `titleExtra` wraps with it), and at the
+     * top right what `side` holds.
      */
+    groupBandButton(b: {
+        cls?: string; name: string; titleAttr: string; titleExtra?: HTMLElement; side: HTMLElement[];
+        label: string; open: boolean; toggle: () => void;
+    }): { button: HTMLButtonElement; title: HTMLElement } {
+        const gh = el('button', `research-overview__group-head research-overview__waiting-group${b.cls ? ` ${b.cls}` : ''}`);
+        gh.type = 'button';
+        gh.setAttribute('aria-expanded', String(b.open));
+        const chevron = el('span', 'live-section__chevron', b.open ? '▾' : '▸');
+        chevron.setAttribute('aria-hidden', 'true');
+        const title = el('span', 'research-overview__group-title', b.name);
+        if (b.titleExtra) title.appendChild(b.titleExtra);
+        title.title = b.titleAttr;
+        const side = el('span', 'research-overview__group-side');
+        side.append(...b.side);
+        gh.append(chevron, title, side);
+        gh.setAttribute('aria-label', b.label);
+        gh.onclick = b.toggle;
+        return { button: gh, title };
+    },
+
+    /** The band's button of a group of Awaiting action: its kind, new and how many at the top right. */
     waitingBandButton(g: WaitingGroupRows, open: boolean, toggle: () => void, h: {
         cls: string; name: string; titleAttr: string; kind: string | null; newText: string; label: string;
     }): { button: HTMLButtonElement; title: HTMLElement } {
-        const gh = el('button', `research-overview__group-head research-overview__waiting-group${h.cls ? ` ${h.cls}` : ''}`);
-        gh.type = 'button';
-        gh.dataset.group = g.key;
-        gh.setAttribute('aria-expanded', String(open));
-        const chevron = el('span', 'live-section__chevron', open ? '▾' : '▸');
-        chevron.setAttribute('aria-hidden', 'true');
-        const title = el('span', 'research-overview__group-title', h.name);
-        title.title = h.titleAttr;
-        const side = el('span', 'research-overview__group-side');
-        if (h.kind) side.appendChild(el('span', 'research-overview__group-kind', h.kind));
-        if (h.newText) side.appendChild(el('span', 'research-overview__new', h.newText));
-        side.appendChild(el('span', 'research-overview__group-span', String(g.items.length)));
-        gh.append(chevron, title, side);
-        gh.setAttribute('aria-label', h.label);
-        gh.onclick = toggle;
-        return { button: gh, title };
+        const side: HTMLElement[] = [];
+        if (h.kind) side.push(el('span', 'research-overview__group-kind', h.kind));
+        if (h.newText) side.push(el('span', 'research-overview__new', h.newText));
+        side.push(el('span', 'research-overview__group-span', String(g.items.length)));
+        const band = this.groupBandButton({ cls: h.cls, name: h.name, titleAttr: h.titleAttr, side, label: h.label, open, toggle });
+        band.button.dataset.group = g.key;
+        return band;
     },
 
     /** The title of a group's band as drawn (a place, "Other", the questions about places, a book with its years). */
@@ -1776,11 +1866,47 @@ export const researchOverviewMethods = uiModule({
         return g.key === PLACES_GROUP ? strings.places.waiting.group : g.group?.name ?? strings.live.waitingOtherGroup;
     },
 
-    /** How many lines a group's band adds to the section's guessed height (the own window's columns). */
-    waitingGroupBandRows(g: WaitingGroupRows): number {
+    /**
+     * How many lines a group's band adds to the section's guessed height (the
+     * own window's columns): with "Retry all with the agent" and its
+     * confirmation kept beforehand, and the Now line its items share (spec 089 §8).
+     */
+    waitingGroupBandRows(g: WaitingGroupRows, s: LiveSession, phase: WaitingPhase, mode: Mode): number {
         return waitingGroupBandLines(this.waitingGroupTitle(g), g.book
             ? { book: true, listed: listedBook(g.book) !== null }
-            : { missing: g.key !== PLACES_GROUP && waitingGroupMissing(g.items) !== null });
+            : {
+                missing: g.key !== PLACES_GROUP && waitingGroupMissing(g.items) !== null,
+                retry: this.waitingGroupRetryOffer(s, g, phase, mode) !== null,
+                now: this.waitingGroupRetryNow(g, mode) !== null,
+            });
+    },
+
+    /**
+     * "Retry all with the agent" of a place's band (spec 089 §4): what it
+     * takes back, counted of EVERY item of the place (the bridge takes the
+     * whole place, not what a filter or a search shows); null where it is not
+     * offered — the bridge without `waiting.retry`, a phone, the questions
+     * about places, a book or no place, fewer than two items that can go back
+     * now. Its band in one phase only: to do when one of them is there.
+     */
+    waitingGroupRetryOffer(s: LiveSession, g: WaitingGroupRows, phase: WaitingPhase, mode: Mode): WaitingGroupRetry | null {
+        const key = g.group?.key;
+        if (mode === 'sheet' || g.book || !key || g.key === PLACES_GROUP || !this.liveWaitingWrites(s).retry) return null;
+        const all = s.waiting.filter(w => w.group?.key === key);
+        const offer = waitingGroupRetry(all);
+        if (offer.n < 2) return null;
+        const at: WaitingPhase = all.some(w => w.retry?.can && waitingPhase(w) === 'todo') ? 'todo' : 'sent';
+        return at === phase ? offer : null;
+    },
+
+    /**
+     * The Now line a place's band says for its items (spec 089 §2, frame 9):
+     * two or more of its items shown wait for one reason; not on a phone (its
+     * band gets nothing new there, each item says its own).
+     */
+    waitingGroupRetryNow(g: WaitingGroupRows, mode: Mode): ReturnType<typeof waitingGroupRetryReason> {
+        if (mode === 'sheet' || g.book || g.key === PLACES_GROUP) return null;
+        return waitingGroupRetryReason(g.items, getCurrentLanguage());
     },
 
     /**
@@ -1814,12 +1940,21 @@ export const researchOverviewMethods = uiModule({
         const action = this.overviewWaitingGroupAction(s, g, phase, mode);
         if (action) row.appendChild(action);
         // Two or more of its items wait for images from one browser-only archive: said once, here (spec 048 §11.2).
+        // Items that can go back to the agent say why in their Now line instead (spec 089 §2).
         const ctx = this.overviewBrowserContext(mode);
-        const note = browserGroupNote(s.browser, g.items, s.waiting, ctx);
+        const noted = g.items.filter(w => !w.retry);
+        const note = browserGroupNote(s.browser, noted, s.waiting, ctx);
         if (note) {
             row.classList.add('has-browser-note');
             row.appendChild(this.browserNoteEl(note, s.researchId, 'research-overview__waiting-groupnote-browser'));
-            for (const w of g.items) if (browserNote(s.browser, w, s.waiting, ctx)?.host === note.host) browserNotedInHead.add(itemKey(s, w.id));
+            for (const w of noted) if (browserNote(s.browser, w, s.waiting, ctx)?.host === note.host) browserNotedInHead.add(itemKey(s, w.id));
+        }
+        // Two or more of its items that can go back wait for one reason: their Now line once, here; theirs left out (frame 9).
+        const shared = this.waitingGroupRetryNow(g, mode);
+        if (shared) {
+            row.classList.add('has-browser-note');
+            row.appendChild(this.waitingNowEl(s, shared, mode));
+            for (const id of shared.ids) browserNotedInHead.add(itemKey(s, id));
         }
         return row;
     },
@@ -1988,6 +2123,11 @@ export const researchOverviewMethods = uiModule({
                 box.appendChild(btn);
             }
         }
+        // Every item of the place that can go back, back to the agent at once (spec 089 §4), confirmed in place.
+        const retry = this.waitingGroupRetryOffer(s, g, phase, mode);
+        if (key && retry) this.appendWaitingGroupRetry(box, s, key, name, retry);
+        else if (key && retryConfirm && retryConfirm.key === key && !retryConfirm.saving
+            && !this.waitingGroupRetryOffer(s, g, 'todo', mode) && !this.waitingGroupRetryOffer(s, g, 'sent', mode)) retryConfirm = null;
         if (key && writes.note && waitingGroupHasNote(s.waiting.filter(w => w.group?.key === key))) {
             const btn = el('button', 'live-waiting-answer research-overview__waiting-groupwrite research-overview__waiting-groupnote', W.groupNote);
             btn.type = 'button';
@@ -2000,6 +2140,91 @@ export const researchOverviewMethods = uiModule({
             box.appendChild(btn);
         }
         return box.childElementCount > 0 ? box : null;
+    },
+
+    /**
+     * "Retry all with the agent (2 tasks, 5 images)" in a place's actions
+     * (spec 089 §4, frames 7, 8): through the bridge, no mark; "· 1 only
+     * tomorrow 9:12" after it for those held by the limit. A click asks in
+     * place — the question, Return (focused) and Cancel (Escape too) instead
+     * of the button; Return writes the place, "saving" meanwhile.
+     */
+    appendWaitingGroupRetry(box: HTMLElement, s: LiveSession, key: string, name: string, retry: WaitingGroupRetry): void {
+        const R = strings.live.waitingRetry;
+        const lang = getCurrentLanguage();
+        const buttonKey = `group-retry:${key}`;
+        if (retryConfirm?.key !== key) {
+            const btn = this.waitingWriteButton(R.groupAction, 'group-retry', () => {
+                retryConfirm = { key, saving: false };
+                this.renderResearchOverview();
+                focusOverviewKey('group-retry-yes');
+            }, 'research-overview__waiting-groupwrite research-overview__waiting-groupretry', false);
+            btn.append(' ', el('span', 'waiting-retry-count', groupRetryCountText(retry, lang)));
+            btn.setAttribute('aria-label', groupRetryAria(name, retry, lang));
+            btn.dataset.focusKey = buttonKey;
+            box.appendChild(btn);
+            const later = groupRetryLaterText(retry, lang);
+            if (later) box.appendChild(el('span', 'research-overview__muted research-overview__group-retry-later', `· ${later}`));
+            return;
+        }
+        const saving = retryConfirm.saving;
+        const ask = el('div', 'research-overview__retry-confirm');
+        ask.setAttribute('role', 'group');
+        ask.setAttribute('aria-label', R.groupAction);
+        ask.appendChild(el('span', 'research-overview__retry-question', groupRetryConfirmText(retry, lang)));
+        const cancel = (): void => {
+            if (retryConfirm?.key !== key || retryConfirm.saving) return;
+            retryConfirm = null;
+            this.renderResearchOverview();
+            focusOverviewKey(buttonKey);
+        };
+        const yes = el('button', 'waiting-action waiting-action--primary research-overview__retry-yes', R.yes);
+        yes.type = 'button';
+        yes.dataset.action = 'group-retry-yes';
+        yes.dataset.write = 'bridge';
+        yes.dataset.focusKey = 'group-retry-yes';
+        yes.disabled = saving;
+        yes.onclick = (e) => {
+            e.stopPropagation();
+            if (retryConfirm?.key !== key || retryConfirm.saving) return;
+            retryConfirm = { key, saving: true };
+            this.renderResearchOverview();
+            void this.retryWaitingGroup(s, key).then((r) => {
+                if (retryConfirm?.key === key) retryConfirm = null;
+                this.renderResearchOverview();
+                // Not taken: the focus back on the place's button.
+                if (!r || !r.ok || r.retried.length === 0) focusOverviewKey(buttonKey);
+            });
+        };
+        const no = el('button', 'waiting-action waiting-action--link research-overview__retry-no', R.no);
+        no.type = 'button';
+        no.dataset.action = 'group-retry-no';
+        no.disabled = saving;
+        no.onclick = (e) => {
+            e.stopPropagation();
+            cancel();
+        };
+        ask.append(yes, no);
+        if (saving) ask.appendChild(busyStatusEl(strings.busy.savingRow));
+        ask.onclick = (e) => e.stopPropagation();
+        ask.onkeydown = (e) => {
+            if (e.key !== 'Escape') return;
+            e.preventDefault();
+            e.stopPropagation();
+            cancel();
+        };
+        box.appendChild(ask);
+    },
+
+    /** A Now line (spec 089 §2): "Now:" bold, why it waits, the extension's link after it on a computer. */
+    waitingNowEl(s: LiveSession, reason: { text: string; extLink: boolean }, mode: Mode): HTMLElement {
+        const now = el('p', 'research-overview__waiting-now');
+        now.setAttribute('role', 'note');
+        const text = el('span');
+        text.append(el('b', undefined, strings.live.waitingRetry.now), ' ', reason.text);
+        now.appendChild(text);
+        if (reason.extLink && mode !== 'sheet' && s.browser?.url) now.appendChild(this.browserExtLink(s.browser.url));
+        return now;
     },
 
     /** The browser note's context in the overview: a phone gets no links. */
@@ -2064,6 +2289,9 @@ export const researchOverviewMethods = uiModule({
         // Without groups: the place it belongs to (spec 083 K5.2).
         if (drawnAs.flat) meta.appendChild(waitingGroupTagEl(w));
         row.appendChild(meta);
+        // "Most helpful" (spec 105 K4.1): why it helps, quiet under the row.
+        const gainWhy = waitingGainEl(w, drawnAs.order, 'span', 'research-overview__muted');
+        if (gainWhy) row.appendChild(gainWhy);
         // The "new" tag (any order) over the time it has waited since (a time order).
         let side = waitingSideEl(w, { isNew: view.tagged.has(w.id), time: isTimeOrder(drawnAs.order) });
         // Its own write not confirmed yet (§7, 7a): "saving" with the small spinner at the row's end.
@@ -2192,7 +2420,10 @@ export const researchOverviewMethods = uiModule({
         }
         // Images, a website or a check (spec 048 U6): the actions of their kind, an answer written here, the images' state.
         const writes = this.liveWaitingWrites(s);
-        const views = waitingActions(w, { writes, links: mode !== 'sheet' && this.researchLinkAvailable('task'), phone: mode === 'sheet' });
+        // "Retry with the agent" (spec 089 §1.2) stands among the actions of an item without the Deliver block.
+        // A device of the home network (spec 094 §4, 4.4): its photos go with the item, as a computer's files do.
+        const phoneOnly = mode === 'sheet' && !inDeviceMode();
+        let views = waitingActions(w, { writes, links: mode !== 'sheet' && this.researchLinkAvailable('task'), phone: phoneOnly, retry: true });
         const key = itemKey(s, w.id);
         // The body (spec 105 U4 §3): the text stands once, whole, in the open row above; first what changed of the answer,
         // then what it waits on, the images, the browser's note, the person · direction, the actions and their hint.
@@ -2200,11 +2431,15 @@ export const researchOverviewMethods = uiModule({
         // Images to deliver (spec 105 U4 §5): what and where first, the steps in their order (hidden while the upload
         // area is open or an answer is written); a phone only says where they are saved.
         const deliver = !!views && this.waitingTakesImages(s, w);
+        // With the Deliver block, "Retry with the agent" has its own row under the Now line (waitingRetryEl).
+        if (deliver) views = views!.filter(v => v.key !== 'retry');
         if (deliver) {
             const task = researchTaskRef(w.id);
             const busy = !!this.overviewImagesArea(s, w)
                 || (answeringKey === key && !!task && views!.some(v => v.key === 'answer' && v.via === 'bridge'));
-            detail.appendChild(this.waitingDeliverEl(s, w, { phone: mode === 'sheet', steps: !busy }));
+            // The one filled button of the item: Retry when it is the main action, "Add images" then outlined.
+            const retryMain = !!w.retry && this.waitingRetryOffered(s, w, mode) && waitingRetryMain(w.retry);
+            detail.appendChild(this.waitingDeliverEl(s, w, { phone: phoneOnly, steps: !busy, retryMain }));
         }
         const onBox = this.overviewWaitingOnBox(s, w);
         if (onBox) detail.appendChild(onBox);
@@ -2218,9 +2453,13 @@ export const researchOverviewMethods = uiModule({
         const img = views ? imagesState(w) : null;
         if (img) appendImagesDetail(detail, img);
         // An archive only the agent's browser reaches (spec 048 §11.2): under the book, unless its group's heading says it.
-        const bNote = views && !browserNotedInHead.has(key) ? browserNote(s.browser, w, s.waiting, this.overviewBrowserContext(mode)) : null;
+        // An item that can go back to the agent says why it waits in its Now line instead (spec 089 §2).
+        const bNote = views && !w.retry && !browserNotedInHead.has(key) ? browserNote(s.browser, w, s.waiting, this.overviewBrowserContext(mode)) : null;
         const bNoteEl = bNote ? this.browserNoteEl(bNote, s.researchId) : null;
         if (bNoteEl) detail.appendChild(bNoteEl);
+        // Its button there too with the Deliver block, or without actions of its kind; else among the actions below.
+        const retryEl = this.waitingRetryEl(s, w, mode, deliver || !views);
+        if (retryEl) detail.appendChild(retryEl);
         // A finding of how the task is recorded (spec 109 §1.2): under what it waits on and its images, above its actions.
         const audit = this.waitingAuditEl(s, w, mode);
         if (audit) detail.appendChild(audit);
@@ -2242,7 +2481,10 @@ export const researchOverviewMethods = uiModule({
         if (views) {
             this.appendWaitingTaskActions(detail, s, w, views, mode, deliver);
             // Not beside the open "Have images" area or an answer being written.
-            if (bNoteEl && detail.querySelector('.waiting-upload, .waiting-answer')) bNoteEl.remove();
+            if (detail.querySelector('.waiting-upload, .waiting-answer')) {
+                bNoteEl?.remove();
+                retryEl?.remove();
+            }
             return detail;
         }
 
@@ -2261,6 +2503,71 @@ export const researchOverviewMethods = uiModule({
         if (hint) detail.appendChild(el('p', 'research-overview__waiting-hint', L.waitingAnswerHint));
         if (mode === 'sheet') detail.appendChild(el('div', 'research-overview__muted', L.answerOnComputer));
         return detail;
+    },
+
+    /**
+     * "Retry with the agent" may be offered at an item (spec 089 §1.2, §7):
+     * the bridge here takes it, the item can go back now and it is not a
+     * phone. An item whose `retry` came while the bridge does not answer
+     * here keeps its Now line, without the button.
+     */
+    waitingRetryOffered(s: LiveSession, w: LiveWaiting, mode: Mode): boolean {
+        return mode !== 'sheet' && !!w.retry?.can && !!researchTaskRef(w.id) && this.liveWaitingWrites(s).retry;
+    },
+
+    /** The item's "Retry with the agent" as an action: its count after the name, disabled while its write runs. */
+    waitingRetryAction(s: LiveSession, w: LiveWaiting): ItemAction | null {
+        if (!w.retry) return null;
+        return {
+            key: 'retry', label: strings.live.waitingRetry.action, write: true,
+            count: waitingRetryCount(w.retry, getCurrentLanguage()) || undefined,
+            disabled: this.waitingRowNote(s, w.id)?.kind === 'saving',
+            run: () => { void this.retryWaitingItem(s, w); },
+        };
+    },
+
+    /**
+     * Why an item that can go back to the agent waits now, and what can be
+     * done (spec 089 §2, §3, §6, §8): the Now line (the extension's link
+     * after it on a computer), then — `button` — "Retry with the agent"
+     * (filled when it is the main action, else outlined), or the limit in
+     * its place (back three times in 24 hours), or on a phone where it is
+     * done. Null for an item without `retry` (an older research: today's
+     * detail). Without `button` the button stands among the item's actions.
+     */
+    waitingRetryEl(s: LiveSession, w: LiveWaiting, mode: Mode, button = true): HTMLElement | null {
+        const r = w.retry;
+        if (!r) return null;
+        const R = strings.live.waitingRetry;
+        const lang = getCurrentLanguage();
+        const box = el('div', 'research-overview__waiting-retry');
+        // Said once in its place's band for all its items (frame 9): only the button here.
+        const reason = browserNotedInHead.has(itemKey(s, w.id)) ? null : waitingRetryReason(w, lang);
+        if (reason) box.appendChild(this.waitingNowEl(s, reason, mode));
+        const limit = waitingRetryLimitText(r, lang);
+        if (limit) {
+            box.appendChild(el('p', 'research-overview__waiting-hint', limit));
+        } else if (mode === 'sheet') {
+            box.appendChild(el('p', 'research-overview__muted waiting-phone-note', R.phone));
+        } else if (button && this.waitingRetryOffered(s, w, mode)) {
+            const a = this.waitingRetryAction(s, w)!;
+            const row = el('div', 'research-overview__waiting-actions waiting-actions');
+            row.appendChild(waitingActionEl(a, waitingRetryMain(r) ? 'primary' : 'secondary'));
+            box.appendChild(row);
+        }
+        return box.childElementCount > 0 ? box : null;
+    },
+
+    /**
+     * The open item's rows of "Retry with the agent" for the guessed height
+     * in the own window's columns (spec 089 §8): its Now line, and the button
+     * or the limit in its place.
+     */
+    waitingRetryOpenRows(s: LiveSession, mode: Mode): number {
+        const w = s.waitingView.detail ? s.waiting.find(x => x.id === s.waitingView.detail) : undefined;
+        if (!w?.retry) return 0;
+        const now = waitingRetryReason(w, getCurrentLanguage()) ? 1 : 0;
+        return now + (!w.retry.can || this.waitingRetryOffered(s, w, mode) ? 1 : 0);
     },
 
     /**
@@ -2304,7 +2611,7 @@ export const researchOverviewMethods = uiModule({
         const task = researchTaskRef(w.id);
         const phone = mode === 'sheet';
         // The upload area of "Add images" (spec 048 §3): open, the actions hide meanwhile.
-        const area = !phone && views.some(v => v.key === 'images') ? this.overviewImagesArea(s, w) : null;
+        const area = (!phone || inDeviceMode()) && views.some(v => v.key === 'images') ? this.overviewImagesArea(s, w) : null;
         if (area) {
             detail.appendChild(area);
             return;
@@ -2327,6 +2634,12 @@ export const researchOverviewMethods = uiModule({
         const list: ItemAction[] = [];
         for (const v of views) {
             if (v.key === 'chat' && audited) continue;
+            // Back to the agent through the bridge (spec 089 §1.2): no mark, its count on the button.
+            if (v.key === 'retry') {
+                const a = this.waitingRetryAction(s, w);
+                if (a) list.push(a);
+                continue;
+            }
             if (v.key === 'web') {
                 if (w.url) list.push({ key: 'web', label: T.openWeb, href: w.url });
             } else if (v.key === 'images') {
@@ -2682,7 +2995,7 @@ export const researchOverviewMethods = uiModule({
             return;
         }
         if (starting) list.appendChild(this.overviewQueueStartRow(starting));
-        else if (s.working.length === 0 && lineStarts.length === 0) list.appendChild(el('li', 'live-empty', L.nobody));
+        else if (s.working.length === 0 && lineStarts.length === 0) list.appendChild(inDeviceMode() ? idleNowRow(s) : el('li', 'live-empty', L.nobody));
         for (const w of s.working) {
             const li = el('li', 'research-overview__now-row');
             if (w.run) li.dataset.run = w.run;
@@ -2690,6 +3003,8 @@ export const researchOverviewMethods = uiModule({
             const text = el('div', 'research-overview__now-text');
             text.appendChild(el('strong', undefined, w.who));
             if (w.task) text.appendChild(el('span', 'live-task', ` — ${w.task}`));
+            const saving = workingSavingEl(w);
+            if (saving) text.appendChild(saving);
             // How the task helps its line, or its branch outside the lines; else the line's name (two or more lines).
             const why = workingWhyText(w, s);
             const dir = why || taskDirectionName(s, w.research);
@@ -2701,7 +3016,7 @@ export const researchOverviewMethods = uiModule({
             li.appendChild(text);
             // Its actions in a row of links under the text (the text keeps the whole width).
             const person = personByRefn(w.person);
-            const actions = this.overviewNowActions(w, mode, person ? () => this.overviewShowPerson(person.id, mode) : null);
+            const actions = this.overviewNowActions(w, mode, person ? () => this.overviewShowPerson(person.id, mode) : null, s.features);
             if (actions) li.appendChild(actions);
             list.appendChild(li);
         }
@@ -2777,13 +3092,30 @@ export const researchOverviewMethods = uiModule({
      * what it found and closes the session; not on the phone's sheet).
      * Nothing to offer: no row.
      */
-    overviewNowActions(w: LiveWorker, mode: Mode, show: (() => void) | null): HTMLElement | null {
+    overviewNowActions(w: LiveWorker, mode: Mode, show: (() => void) | null, features: readonly string[] | null = null): HTMLElement | null {
         const L = strings.live;
         const row = el('div', 'research-overview__now-actions');
         if (show) {
             const btn = el('button', 'link-button research-overview__show-in-tree', L.showInTree);
             btn.type = 'button';
             btn.onclick = show;
+            row.appendChild(btn);
+        }
+        // A device of the home network (spec 094 §4, 4.3): "Stop run" through the bridge, without a mark.
+        const runId = w.run;
+        if (inDeviceMode() && runId && !w.paused && runStopOn(features) && researchDeviceAllows('run-stop')) {
+            const btn = el('button', 'link-button research-overview__run-stop');
+            btn.type = 'button';
+            btn.title = L.runStopHint;
+            if (runStopNote({ id: runId })?.state === 'stopping') {
+                btn.setAttribute('aria-disabled', 'true');
+                btn.setAttribute('aria-busy', 'true');
+                btn.classList.add('is-busy');
+                btn.innerHTML = `${busySpinHtml(12)}${researchBridgeActionLabel(L.runStopping, 'run-stop')}`;
+            } else {
+                btn.innerHTML = researchBridgeActionLabel(L.stopRun, 'run-stop');
+                btn.onclick = () => void this.stopRun(runId);
+            }
             row.appendChild(btn);
         }
         const finish = mode !== 'sheet' && w.session && !w.paused ? this.activeResearchLink('finish', { session: w.session }) : null;
@@ -2824,6 +3156,8 @@ export const researchOverviewMethods = uiModule({
             const head = el('div', 'research-overview__now-line');
             if (i === 0) head.appendChild(el('strong', undefined, name));
             if (w.task) head.appendChild(el('span', 'live-task', i === 0 ? ` — ${w.task}` : w.task));
+            const saving = workingSavingEl(w, head.childNodes.length > 0);
+            if (saving) head.appendChild(saving);
             text.appendChild(head);
             const meta = el('small', 'research-overview__now-meta');
             const person = personByRefn(w.person);
@@ -2920,6 +3254,8 @@ export const researchOverviewMethods = uiModule({
             const person = personByRefn(w.person);
             if (person || w.person) task.appendChild(el('span', 'research-overview__run-person', person ? fullName(person) : w.person!));
             if (w.task) task.appendChild(document.createTextNode(task.childNodes.length > 0 ? ` — ${w.task}` : w.task));
+            const saving = workingSavingEl(w, task.childNodes.length > 0);
+            if (saving) task.appendChild(saving);
             const why = workingWhyText(w, s, true);
             if (why) task.appendChild(el('span', 'research-overview__why', ` · ${why}`));
             if (task.childNodes.length > 0) text.appendChild(task);
@@ -3024,7 +3360,8 @@ export const researchOverviewMethods = uiModule({
             row.appendChild(btn);
         }
         const live = run.state === 'working' || run.state === 'waiting';
-        if (mode !== 'sheet' && live && runStopOn(s.features)) {
+        // A device's sheet stops a run too, through the bridge (spec 094 §4, 4.3).
+        if ((mode !== 'sheet' || inDeviceMode()) && live && runStopOn(s.features) && researchDeviceAllows('run-stop')) {
             const btn = el('button', 'link-button research-overview__run-stop');
             btn.type = 'button';
             btn.title = L.runStopHint;
@@ -3034,7 +3371,7 @@ export const researchOverviewMethods = uiModule({
                 btn.classList.add('is-busy');
                 btn.innerHTML = `${busySpinHtml(12)}${researchBridgeActionLabel(L.runStopping, 'run-stop')}`;
             } else {
-                btn.innerHTML = researchBridgeActionLabel(L.runStop, 'run-stop');
+                btn.innerHTML = researchBridgeActionLabel(inDeviceMode() ? L.stopRun : L.runStop, 'run-stop');
                 btn.onclick = () => void this.stopRun(run.id);
             }
             row.appendChild(btn);
@@ -3060,7 +3397,9 @@ export const researchOverviewMethods = uiModule({
         runStopNotes.set(runId, { state: 'stopping' });
         this.renderResearchOverview();
         const r = await this.writeRunStop(runId);
-        runStopNotes.set(runId, r.ok ? { state: 'stopped' } : { state: 'failed', text: r.text });
+        // Refused as the computer's only (a device): its button goes and one quiet sentence says why, nothing under the run.
+        if (!r.ok && !researchDeviceAllows('run-stop')) runStopNotes.delete(runId);
+        else runStopNotes.set(runId, r.ok ? { state: 'stopped' } : { state: 'failed', text: r.text });
         this.renderResearchOverview();
     },
 
@@ -3096,14 +3435,23 @@ export const researchOverviewMethods = uiModule({
             : groupChanges(s.changes)[0].items;
         const older = s.changes.length - changes.length;
         noteOverviewSectionRows('changes', changes.length);
-        const host = liveSection(body, { ...fold, title: L.timeline, summary: changes.length > 0 ? String(changes.length) : undefined });
+        // A device (spec 094 §4, 4.6): the sends among the rows, and what came since Progress was last seen here.
+        const device = inDeviceMode();
+        const sends = device ? deviceProgressSends(this.researchStatusOf(s.researchId)?.sends) : [];
+        const seen = device ? deviceProgressSeenAt(s.treeId) : Infinity;
+        const times = [...changes.map(c => Date.parse(c.at)), ...sends.map(x => Date.parse(x.at))].filter(Number.isFinite);
+        const unseen = times.filter(t => t > seen).length;
+        if (device && !fold.collapsed && times.length > 0) noteDeviceProgressSeen(s.treeId, Math.max(...times));
+        const summary = unseen > 0 ? L.newChanges(unseen) : changes.length + sends.length > 0 ? String(changes.length + sends.length) : undefined;
+        const host = liveSection(body, { ...fold, title: L.timeline, summary });
         host.classList.add('research-overview__timeline');
 
         const bar = el('div', 'research-overview__timeline-bar');
         const filters = el('div', 'research-overview__filters');
         filters.setAttribute('role', 'radiogroup');
         filters.setAttribute('aria-label', L.filterLabel);
-        const count = (f: Filter): number => (f === 'all' ? changes.length : changes.filter(c => c.kind === f).length);
+        const sendsIn = (f: Filter): boolean => f === 'all' || f === 'persons';
+        const count = (f: Filter): number => (f === 'all' ? changes.length : changes.filter(c => c.kind === f).length) + (sendsIn(f) ? sends.length : 0);
         const labels: Record<Filter, string> = { all: L.filterAll, persons: L.filterPersons, sources: L.filterSources, stories: L.filterStories };
         for (const f of ['all', 'persons', 'sources', 'stories'] as Filter[]) {
             const chip = el('button', 'research-overview__filter sel-opt', `${labels[f]} ${count(f)}`);
@@ -3147,6 +3495,11 @@ export const researchOverviewMethods = uiModule({
         host.appendChild(bar);
 
         const shown = filter === 'all' ? changes : changes.filter(c => c.kind === filter);
+        if (device) {
+            this.appendDeviceTimeline(host, s, shown, sendsIn(filter) ? sends : [], seen, mode);
+            this.appendOverviewOlder(host, older, mode);
+            return;
+        }
         if (shown.length === 0) {
             host.appendChild(el('p', 'live-empty', strings.research.noChanges));
             this.appendOverviewOlder(host, older, mode);
@@ -3184,13 +3537,14 @@ export const researchOverviewMethods = uiModule({
             if (!open) return;
             const list = el('ul', 'research-overview__rows live-changes');
             const sources = this.liveSourceLinks(s, mode === 'sheet');
+            const gateway = this.changeSourceGateway(s.researchId);
             for (const c of g.items.slice(0, GROUP_ROWS)) {
                 const li = el('li', 'research-overview__row');
                 const ts = Date.parse(c.at);
                 if (Number.isFinite(ts) && ts >= openedAt && Date.now() - ts < 4000) li.classList.add('is-new');
                 li.appendChild(el('span', 'research-overview__row-time', Number.isFinite(ts) ? hhmm(ts) : ''));
                 const text = el('span', 'research-overview__row-text');
-                if (appendChangeText(text, c, (id) => this.overviewShowPerson(id, mode), sources)) this.appendSourceInNewer(text, s, c, true);
+                if (appendChangeText(text, c, (id) => this.overviewShowPerson(id, mode), sources, gateway)) this.appendSourceInNewer(text, s, c, true);
                 li.appendChild(text);
                 const target = c.personIds.find(id => DataManager.getPerson(id));
                 if (target) {
@@ -3227,7 +3581,7 @@ export const researchOverviewMethods = uiModule({
      * found, the rows found, the bulk head and foot about the found ones, the
      * Verifying block under it all unchanged.
      */
-    appendOverviewKnows(body: HTMLElement, fold: LiveFold, mode: Mode): void {
+    appendOverviewKnows(body: HTMLElement, fold: LiveFold, mode: Mode, treeId: string): void {
         const L = strings.live;
         const facts = strings.research.changeWords.facts as Record<string, string>;
         const rows: (KnowsSearchRow & { person: Person; text: string; conflictId?: string; hypo?: ResearchHypothesis })[] = [];
@@ -3244,8 +3598,11 @@ export const researchOverviewMethods = uiModule({
                 const what = c.title || facts[c.fact] || c.fact;
                 const values = c.values.map(v => conflictValueSaid(researchValueText(c.fact, v.value)));
                 const conflictId = researchConflictRef(c.id) ?? undefined;
+                // Between two sends of two devices (spec 094 K2.4): each value by the device its edit came from.
+                const devices = this.researchConflictDevices(c);
+                const said = devices ? c.values.map((v, i) => v.side === 'user' || v.side === 'research' ? strings.conflict.valueFrom(devices[v.side], values[i]) : values[i]) : values;
                 rows.push({ key: `c:${p.id}:${conflictId ?? n++}`, person: p, name, personRef, words: [what, ...values],
-                    text: `${name} · ${what}: ${values.join(' × ')}`, conflict: true, conflictId });
+                    text: `${name} · ${what}: ${said.join(' × ')}`, conflict: true, conflictId });
             }
             for (const h of p.research?.hypotheses ?? []) {
                 if (!isOpenHypothesis(h) && !(h.id && acceptBatchRowResult(batch, h.id))) continue;
@@ -3289,10 +3646,43 @@ export const researchOverviewMethods = uiModule({
         const shownKeys = new Set(res.shown);
         const shownRows = rows.filter(r => shownKeys.has(r.key));
         const hitOf = (r: { key: string }): SearchHit | undefined => searching ? res.hits.get(r.key) : undefined;
-        if (choice.chips) {
-            host.appendChild(this.knowsKindChips(choice.kind, {
-                all: chipCount(res, 'all', rows.length), con: chipCount(res, 'con', conflicts), hyp: chipCount(res, 'hyp', rows.length - conflicts),
-            }, searching));
+        // Its groups (spec 140): offered from two rows (D5), by line only with lines; a stored choice that cannot draw draws as None.
+        const lineModel = researchLinesOf(DataManager.getData(), researchTableLive().places);
+        const hasLines = lineModel.lines.length > 0;
+        const offerGroups = !fold.collapsed && rows.length >= 2;
+        const groupBy = offerGroups ? knowsGroupShown(SettingsManager.getKnowsGroupForTree(treeId), hasLines, rows.length) : 'none';
+        const linesOfPerson = new Map<string, ReadonlySet<string>>();
+        const groupCtx = {
+            lines: lineModel.lines.map((l): KnowsGroupLine => ({ id: l.id, name: l.name?.trim() || L.knowsGroupLineUnnamed, done: l.state === 'done' })),
+            lineIdsOf: (r: typeof rows[number]): ReadonlySet<string> => {
+                let ids = linesOfPerson.get(r.person.id);
+                if (!ids) linesOfPerson.set(r.person.id, ids = personLineIds(lineModel, r.person));
+                return ids;
+            },
+            islandOf: (r: typeof rows[number]): boolean => !!r.person.research?.island,
+        };
+        const groupName = (g: KnowsGroupOf<unknown>): string =>
+            g.line?.name ?? (g.kind === 'noLine' ? L.knowsGroupNoLine : g.kind === 'in' ? L.knowsGroupIn : L.knowsGroupOut);
+        // A phone (P2): only the first group open when the overview opens.
+        const firstOnly = mode === 'sheet' && isMobile();
+        if (groupBy !== 'none') {
+            // Its guessed height in the own window's columns: the bar, each band (its title wrapped) and an open group's rows, without the search.
+            const est = knowsGroups(rows.filter(r => knowsKindShows(choice.kind, r.conflict)), groupBy, groupCtx);
+            noteOverviewSectionRows('knows', knowsGroupedRows(est.map((g, i) => ({
+                title: g.line?.done ? `${groupName(g)} · ${L.knowsLineEnded}` : groupName(g),
+                rows: sectionPartOpen(`${groupBy}:${g.key}`, !firstOnly || i === 0, false, knowsGroupsOpen, null) ? g.rows.length : 0,
+            }))));
+        }
+        // The kind chips and Group in one bar (the button wraps under the chips when it does not fit).
+        if (choice.chips || offerGroups) {
+            const bar = el('div', 'research-overview__knows-bar');
+            if (choice.chips) {
+                bar.appendChild(this.knowsKindChips(choice.kind, {
+                    all: chipCount(res, 'all', rows.length), con: chipCount(res, 'con', conflicts), hyp: chipCount(res, 'hyp', rows.length - conflicts),
+                }, searching));
+            }
+            if (offerGroups) bar.appendChild(this.knowsGroupButton(groupBy, knowsGroupOptions(hasLines), mode, treeId));
+            host.appendChild(bar);
         }
         appendSearchOutcome(host, search, {
             searching, found: res.shown.length, total: res.total,
@@ -3314,22 +3704,8 @@ export const researchOverviewMethods = uiModule({
         // The head and "Select all" are about the rows shown; the conflicts alone have none.
         const accept = choice.kind === 'con' || !shownRows.some(r => !r.conflict) ? null
             : this.hypothesisKnowsAccept(shownRows.flatMap(r => r.hypo?.id ? [r.hypo.id] : []), mode, hypoSearch);
-        // Both kinds shown: the conflicts first, the head of the accepting over the hypotheses under them.
-        const split = !!accept?.head && shownRows.some(r => r.conflict) && shownRows.some(r => !r.conflict);
-        let list = el('ul', `live-panel-list research-overview__knows${accept ? ' has-accept' : ''}`);
-        if (accept?.head && !split) host.appendChild(accept.head);
-        for (const row of shownRows) {
-            if (split && !row.conflict && list.dataset.kind === 'con') {
-                // The first hypothesis: the conflicts' list ends, the head stands over the hypotheses' one.
-                host.appendChild(list);
-                host.appendChild(accept!.head!);
-                list = el('ul', 'live-panel-list research-overview__knows has-accept');
-                list.dataset.kind = 'hyp';
-            }
-            if (split && row.conflict && !list.dataset.kind) {
-                list.className = 'live-panel-list research-overview__knows';
-                list.dataset.kind = 'con';
-            }
+        // A row: its text and tags (an island's person "outside the tree" when grouped by line), its box when accepting.
+        const rowLi = (row: typeof rows[number], box: boolean, island: boolean, where: string): HTMLLIElement => {
             const li = el('li');
             const btn = el('button', `research-overview__knows-row${row.conflict ? ' is-conflict' : ''}`);
             btn.type = 'button';
@@ -3338,9 +3714,14 @@ export const researchOverviewMethods = uiModule({
             const hit = hitOf(row);
             const entry = row.hypo?.id ? accept?.entries.get(row.hypo.id) ?? null : null;
             let tags = row.hypo ? this.hypothesisKnowsTagsEl(row.hypo, entry) : null;
+            // Outside the tree (spec 140 §2, D2): the first tag, after the amber ones of a match.
+            if (island) {
+                tags ??= el('span', 'rok-tags');
+                tags.prepend(el('span', 'rok-tag rok-tag--island', L.knowsIsland));
+            }
             // A hypothesis found by its number or its person's: the amber H… and P… lead its line of tags.
-            const lead = row.hypo ? [
-                ...(hit?.h && row.hypo.id ? [searchHitTag(row.hypo.id)] : []),
+            const lead = row.hypo || island ? [
+                ...(hit?.h && row.hypo?.id ? [searchHitTag(row.hypo.id)] : []),
                 ...(hit?.p && row.personRef ? [searchHitTag(row.personRef)] : []),
             ] : [];
             if (lead.length > 0) {
@@ -3362,15 +3743,65 @@ export const researchOverviewMethods = uiModule({
                 this.showPersonResearchDialog(row.person.id, row.conflictId ? { conflict: row.conflictId }
                     : row.hypo?.id && this.researchHypothesisPickable(row.hypo) !== 'old' ? { hypo: { id: row.hypo.id } } : {});
             };
-            if (accept && !(split && row.conflict)) {
+            if (box) {
                 li.classList.add('rok-item');
-                if (entry) li.appendChild(this.hypothesisAcceptBoxEl(rid!, entry, 'knows'));
+                if (entry) li.appendChild(this.hypothesisAcceptBoxEl(rid!, entry, where));
                 else li.appendChild(el('span', 'hp2-box hp2-box--none')).setAttribute('aria-hidden', 'true');
             }
             li.appendChild(btn);
-            list.appendChild(li);
+            return li;
+        };
+        if (groupBy !== 'none') {
+            // Grouped (spec 140 §2, §3): the head of the accepting once over the first group, each group's band and its rows.
+            host.classList.add('is-knows-grouped');
+            if (accept?.head) host.appendChild(accept.head);
+            const groups = knowsGroups(shownRows, groupBy, groupCtx);
+            groups.forEach((g, i) => {
+                const key = `${groupBy}:${g.key}`;
+                const open = sectionPartOpen(key, !firstOnly || i === 0, searching, knowsGroupsOpen, search?.searchOpen);
+                const name = groupName(g);
+                const ended = !!g.line?.done;
+                const state = ended ? el('span', 'research-overview__group-state', ` · ${L.knowsLineEnded}`) : undefined;
+                const head = el('div', `research-overview__waiting-grouphead research-overview__knows-grouphead${i === 0 ? ' is-first' : ''}`);
+                const { button, title } = this.groupBandButton({
+                    name, titleAttr: name, titleExtra: state, side: [el('span', 'research-overview__group-span', String(g.rows.length))],
+                    label: L.knowsGroupBandAria(name, g.rows.length, ended), open,
+                    toggle: () => {
+                        toggleSectionPart(key, open, searching, knowsGroupsOpen, search?.searchOpen);
+                        this.renderResearchOverview();
+                    },
+                });
+                button.dataset.band = key;
+                button.dataset.focusKey = `knows-band:${key}`;
+                head.append(button, groupTitleMoreEl(title, `knows:${key}`, knowsGroupsOpen));
+                host.appendChild(head);
+                if (!open) return;
+                const list = el('ul', `live-panel-list research-overview__knows is-grouped${accept ? ' has-accept' : ''}`);
+                list.setAttribute('aria-label', name);
+                for (const row of g.rows) list.appendChild(rowLi(row, !!accept, groupBy === 'line' && !!row.person.research?.island, `knows:${key}`));
+                host.appendChild(list);
+            });
+        } else {
+            // Both kinds shown: the conflicts first, the head of the accepting over the hypotheses under them.
+            const split = !!accept?.head && shownRows.some(r => r.conflict) && shownRows.some(r => !r.conflict);
+            let list = el('ul', `live-panel-list research-overview__knows${accept ? ' has-accept' : ''}`);
+            if (accept?.head && !split) host.appendChild(accept.head);
+            for (const row of shownRows) {
+                if (split && !row.conflict && list.dataset.kind === 'con') {
+                    // The first hypothesis: the conflicts' list ends, the head stands over the hypotheses' one.
+                    host.appendChild(list);
+                    host.appendChild(accept!.head!);
+                    list = el('ul', 'live-panel-list research-overview__knows has-accept');
+                    list.dataset.kind = 'hyp';
+                }
+                if (split && row.conflict && !list.dataset.kind) {
+                    list.className = 'live-panel-list research-overview__knows';
+                    list.dataset.kind = 'con';
+                }
+                list.appendChild(rowLi(row, !!accept && !(split && row.conflict), false, 'knows'));
+            }
+            if (shownRows.length > 0) host.appendChild(list);
         }
-        if (shownRows.length > 0) host.appendChild(list);
         if (accept?.foot) host.appendChild(accept.foot);
         else if (searching && !accept && rid && rows.some(r => !r.conflict) && this.hypothesesAcceptAvailable()) {
             // Searching and no list of hypotheses drawn (none found, or Conflicts chosen): the picked ones are still said.
@@ -3407,6 +3838,37 @@ export const researchOverviewMethods = uiModule({
             pills.appendChild(chip);
         }
         return pills;
+    },
+
+    /**
+     * "Group: By research line ▾" of "What the research knows" (spec 140 §1):
+     * a menu (a sheet on a phone) of None / By research line / In the tree
+     * and outside it, kept for the tree; dark-framed when something is chosen.
+     */
+    knowsGroupButton(shown: KnowsGroup, options: readonly KnowsGroup[], mode: Mode, treeId: string): HTMLElement {
+        const L = strings.live;
+        const label = (g: KnowsGroup): string => g === 'line' ? L.knowsGroupLine : g === 'tree' ? L.knowsGroupTree : L.knowsGroupNone;
+        const btn = el('button', `research-overview__order-btn research-overview__knows-group-btn${shown !== 'none' ? ' is-set' : ''}`);
+        btn.type = 'button';
+        btn.dataset.focusKey = 'knows-group';
+        btn.setAttribute('aria-haspopup', 'menu');
+        btn.setAttribute('aria-expanded', 'false');
+        btn.setAttribute('aria-label', L.knowsGroupAria(label(shown)));
+        btn.append(el('span', 'research-overview__groups-btn-label', L.knowsGroupBtn), el('span', 'research-overview__order-name', label(shown)));
+        const caret = el('span', 'research-overview__order-caret', '▾');
+        caret.setAttribute('aria-hidden', 'true');
+        btn.appendChild(caret);
+        const choose = (g: KnowsGroup): void => {
+            if (g === shown) return;
+            SettingsManager.setKnowsGroupForTree(treeId, g);
+            this.renderResearchOverview();
+        };
+        btn.onclick = () => this.openWaitingChoice(btn, {
+            title: L.knowsGroup, sheet: mode === 'sheet' || isPhoneBar(),
+            sheetClass: 'research-overview__knows-group-sheet', menuClass: 'research-overview__knows-group-menu',
+            options: options.map(g => ({ id: `knows-group-${g}`, label: label(g), on: g === shown, run: () => choose(g) })),
+        });
+        return btn;
     },
 
     /** Foot: where evidence is missing (the tree overview's Data quality), Open the research (research). */
@@ -3494,7 +3956,7 @@ export const researchOverviewMethods = uiModule({
             stop.type = 'button';
             stop.onclick = () => this.stopLiveFollow();
             head.appendChild(stop);
-        } else if (source === 'bridge' && !this.activeResearchAgentless()) {
+        } else if (source === 'bridge' && !this.activeResearchAgentless() && !inDeviceMode()) {
             const follow = el('button', 'research-overview__follow-live research-overview__follow-live--head', r.followLive);
             follow.type = 'button';
             follow.title = L.followNote;

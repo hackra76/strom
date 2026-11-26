@@ -150,6 +150,19 @@ function fullTree(): Required<StromData> {
             branches: [{ id: 'B-P0004', person: 'P0004', via: { person: 'P0002', rel: 'sibling' }, nearest: 'G0001', mode: 'occasional' }],
         },
         imports: [{ id: 'I1', program: 'Rodokmenář 5', version: '5.2', fileDate: '12 MAR 2024', at: '2026-11-08', file: 'rodokmen.ged', encoding: 'windows-1250' }],
+        // The merges into the tree (spec 134 §0.3, data v26): one partly undone, with its changes and prints.
+        merges: [{
+            id: 'mp-1', at: '2026-11-20T10:00:00.000Z',
+            source: { kind: 'ged', label: 'rodokmen.ged', program: 'Rodokmenář 5', importId: 'I1', persons: 2 },
+            target: { name: 'Tree', newTree: false },
+            counts: { joined: 1, added: 1, skipped: 0, pending: 0, total: 2, fieldChanges: 1, fieldFills: 0, differencesKept: 0, alongside: 0, partnerships: 0, links: 1, sourcesJoined: 0 },
+            state: 'partial', added: [BOB], joined: [[ALICE, 'I-1' as PersonId]],
+            fields: [{ person: ALICE, field: 'birthPlace', before: '', after: 'Kolín' }],
+            partnerships: [], sources: ['s1'], places: ['kolin'], media: [],
+            edits: [{ in: 'persons', id: ALICE, key: 'birthPlace', after: 'Kolín' }],
+            prints: { [BOB]: 'abc123' }, backupId: 'snap-1', sentToResearch: 'I0412',
+            undone: [{ at: '2026-11-21T10:00:00.000Z', items: ['s:s1'] }],
+        }],
         defaultPersonId: LAST_FOCUSED,
         defaultView: 'last',
         lastFocusPersonId: ALICE,
@@ -349,7 +362,7 @@ type EditedByUpdatePerson =
     | 'firstName' | 'lastName' | 'titleBefore' | 'titleAfter' | 'marriedSurname' | 'primaryName' | 'dismissedMarriedSuggestion' | 'gender' | 'nameVariants'
     | 'birthDate' | 'birthPlace' | 'birthAddress' | 'deathDate' | 'deathPlace'
     | 'deathCause' | 'deathAge' | 'deathAddress'
-    | 'notes' | 'refn' | 'question' | 'isDeceased' | 'isLocked' | 'photo' | 'photoSource' | 'story';
+    | 'notes' | 'refn' | 'question' | 'emails' | 'isDeceased' | 'isLocked' | 'photo' | 'photoSource' | 'story';
 
 /**
  * Fields updatePerson deliberately does NOT touch, and who owns them instead.
@@ -389,7 +402,8 @@ type OwnedElsewhere =
     | 'researchOrigins'     // written by Strom Research only (GEDCOM import), never edited
     | 'confirmed'           // confirmFact / unconfirmFact (spec 065); a changed value ends it by itself
     | 'researchVerify'      // written by Strom Research only (GEDCOM import, spec 065), never edited
-    | 'addedAt';            // written when the person comes into the tree (spec 084 §8), never edited
+    | 'addedAt'             // written when the person comes into the tree (spec 084 §8), never edited
+    | 'changedAt';          // stamped by the DataManager on every edit of the person (spec 136 D4), never edited
 
 /**
  * Compile-time proof that the two lists together cover Person exactly. Add a
@@ -449,6 +463,8 @@ describe('updatePerson applies every field it owns', () => {
         notes: 'Kept bees.',
         refn: 'box 12/1880',
         question: 'Who were her parents?',
+        // The contact (data v26, spec 134 K0.10).
+        emails: ['hromoslav@example.org', 'h.ozubec@example.org'],
         isDeceased: true,
         isLocked: true,
         photo: 'data:image/png;base64,iVBORw0KGgo=',
@@ -541,6 +557,9 @@ describe('updatePerson applies every field it owns', () => {
 const FOCUS_FIELDS: (keyof StromData)[] =
     ['defaultPersonId', 'defaultView', 'lastFocusPersonId', 'lastFocusDepthUp', 'lastFocusDepthDown'];
 
+const skipAll = (data: StromData): MergeState['decisions'] =>
+    new Map(Object.keys(data.persons).map(id => [id as PersonId, { type: 'skip' as const }]));
+
 describe('merge keeps every tree-level field', () => {
     beforeEach(() => {
         vi.spyOn(StorageManager, 'set').mockResolvedValue(undefined as never);
@@ -571,7 +590,9 @@ describe('merge keeps every tree-level field', () => {
             existingData: fullTree(),
             incomingData: incoming,
             matches: [], unmatchedExisting: [], unmatchedIncoming: [],
-            decisions: new Map(), conflictResolutions: new Map(), phase: 'executing',
+            // Only the registries matter here: the incoming persons are skipped
+            // (left out by a decision, never silently lost — spec 134 K0.2).
+            decisions: skipAll(incoming), conflictResolutions: new Map(), phase: 'executing',
         };
         const result = await executeMerge(state);
         expect(result.success).toBe(true);
@@ -593,7 +614,9 @@ describe('merge keeps every tree-level field', () => {
             existingData: fullTree(),
             incomingData: incoming,
             matches: [], unmatchedExisting: [], unmatchedIncoming: [],
-            decisions: new Map(), conflictResolutions: new Map(), phase: 'executing',
+            // Only the registries matter here: the incoming persons are skipped
+            // (left out by a decision, never silently lost — spec 134 K0.2).
+            decisions: skipAll(incoming), conflictResolutions: new Map(), phase: 'executing',
         };
         const result = await executeMerge(state);
         expect(result.mergedData.placeRecords?.['L0012']).toEqual(fullTree().placeRecords['L0012']);

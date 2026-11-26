@@ -90,7 +90,7 @@ test.describe('open a research', () => {
         await openApp(page);
         const dataTransfer = await page.evaluateHandle(() => {
             const dt = new DataTransfer();
-            dt.items.add(new File(['{}'], 'notes.json', { type: 'application/json' }));
+            dt.items.add(new File(['notes'], 'notes.txt', { type: 'text/plain' }));
             return dt;
         });
         await page.dispatchEvent('#tree-container', 'dragenter', { dataTransfer });
@@ -103,7 +103,7 @@ test.describe('open a research', () => {
     test('a plain GEDCOM dropped in goes to the normal import dialog', async ({ page }) => {
         await openApp(page);
         await dropFile(page, 'family.ged', PLAIN_GED);
-        await expect(page.locator('#gedcom-result-modal')).toBeVisible();
+        await expect(page.locator('#merge-modal')).toBeVisible();
     });
 
     test('edited in the app → asks; "Open as new copy" keeps the edited tree untouched', async ({ page }) => {
@@ -132,10 +132,10 @@ test.describe('open a research', () => {
         expect(names[0]).toBe('Fíškovi');
         expect(names[1]).toMatch(/^Fíškovi \(/);
         // The new tree takes the research's updates; the edited tree keeps its
-        // edit and its tie as a copy (its changes can still be sent back).
+        // edit as a copy without research (one research, one tree).
         const trees = await page.evaluate(() => window.Strom.TreeManager.getTrees());
-        expect(trees[0].research.id).toBe(UUID);
-        expect(trees[0].research.copy).toBe(true);
+        expect(trees[0].research).toBeUndefined();
+        expect(trees[0].copyOf).toEqual({ treeId: trees[1].id, name: trees[1].name });
         expect(trees[1].research.id).toBe(UUID);
         expect(trees[1].research.copy).toBeUndefined();
         expect(await page.evaluate((u) => window.Strom.TreeManager.findTreeByResearchId(u)?.id, UUID)).toBe(trees[1].id);

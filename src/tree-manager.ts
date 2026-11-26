@@ -21,7 +21,7 @@ import {
 import { generateTreeId, uniqueIdSuffix } from './ids.js';
 import { LAST_FOCUSED } from './model-values.js';
 import { STROM_DATA_VERSION } from './version.js';
-import { strings } from './strings.js';
+import { strings, getCurrentLanguage } from './strings.js';
 import { isEncrypted, EncryptedData, CryptoSession, decrypt, classifyCryptoError, CryptoFailure } from './crypto.js';
 import { SettingsManager } from './settings.js';
 import { peekReloadPoint, forgetLastView } from './resume-view.js';
@@ -42,6 +42,8 @@ import { convertLegacyCensusEvents } from './events.js';
 import { fillResearchConfirmedValues, hasUnvaluedResearchConfirmations } from './verify.js';
 import { requestPersistentStorage } from './persistence.js';
 import { newTieSendMode } from './research-sync.js';
+import { isResearchOwner, researchCopyOrigin, planSharedTieRepair, researchOriginalOf, transferResearchTie } from './research-owner.js';
+import { importOriginOf } from './tree-row.js';
 import { asciiSlug } from './filenames.js';
 import { browserMediaFingerprint } from './browser-media.js';
 import { looksLikeSampleTree } from './demo-sample.js';
@@ -49,9 +51,13 @@ import { announceTreeSaved, clearTreeStale, isTreeStale } from './tab-sync.js';
 import { cloneTreeDataAsJson, estimateJsonBytes } from './clone.js';
 import { imageLoads, type PendingImageNotes } from './image-loads.js';
 import {
-    withPoolLock, collectPoolable, storeImages, stringifyPooled, replacePooled,
-    unpoolJson, unpoolObject, registerPoolReferences, forgetPoolScope, seedPoolScope, notePoolSizes,
+    withPoolLock, poolImages, stringifyPooled, replacePooled,
+    unpoolJson, registerPoolReferences, forgetPoolScope, notePoolSizes,
+    packImageMeta, unpackImageMeta,
 } from './media-pool.js';
+import { treeImages, settleStoredImages, imagesInterned, pooledImageChars } from './image-intern.js';
+import { POOL_REF } from './image-ref.js';
+import type { ImageMetaRecord } from './image-meta.js';
 
 /** People in a tree, without the "?" stand-ins (as the focus bar counts them). */
 function realPersonCount(data: StromData): number {
@@ -74,7 +80,7 @@ export type TreeReadResult =
  * before its save landed: `<prefix><tree id>@<window>` — one per window, so
  * another window's save never drops it (N60-1); beta.58–60 wrote `<prefix><tree id>`.
  */
-const RESCUE_PREFIX = 'strom-save-rescue:';
+export const RESCUE_PREFIX = 'strom-save-rescue:';
 /** This window's part of its rescue keys. */
 const RESCUE_WINDOW = uniqueIdSuffix();
 /** Larger states are not rescued: localStorage holds about 5 million characters per origin. */
@@ -178,6 +184,8 @@ interface PooledTreeRecord {
     data?: StromData;
     encrypted?: EncryptedData;
     media: Record<string, number>;
+    /** The images' catalog entries (image-meta.ts; encrypted with the data); filled in by image-meta-backfill.ts. */
+    imageMeta?: ImageMetaRecord | EncryptedData;
 }
 
 function isPooledTree(raw: unknown): raw is PooledTreeRecord {
@@ -246,6 +254,8 @@ class TreeManagerClass {
             this.initialized = true;
             // Self-heal: an earlier bug could persist a hidden ACTIVE tree.
             this.ensureActiveVisible();
+            // Before anything can send: no two trees of this browser write to one research.
+            await this.repairSharedResearchTies();
             forgetResearchKeysOfGoneTrees(new Set(storedIndex.trees.map(t => t.id)));
             this.restoreRescuedSaves();
             return;
@@ -279,6 +289,8 @@ class TreeManagerClass {
             this.index.trees.push(metadata);
             this.index.activeTreeId = treeId;
         }
+        // A new index never held trees sharing one research (repairSharedResearchTies).
+        this.index.researchTiesRepaired = new Date().toISOString();
 
         // Save the index
         this.saveIndex();
@@ -620,8 +632,9 @@ class TreeManagerClass {
             sizeBytes,
             // A newer app's tree stays one in its copy (read-only here too).
             dataVersion: sourceData.version ?? 1,
-            // A duplicate of a research tree can be sent back too, as a copy.
-            ...(source?.research ? { research: { ...withoutSendState(source.research), copy: true } } : {}),
+            // Every copy is a tree without research: one research, one tree (spec 139 K2.4, K5.1, K5.2). It
+            // only names the tree it was copied from (a copy of a copy: that copy).
+            ...(source ? { copyOf: { treeId: source.id, name: source.name } } : {}),
         };
 
         // Add to index, then save through the encrypting path — a direct
@@ -941,34 +954,27 @@ class TreeManagerClass {
     /** readTreeData for a tree stored with its images in the pool. */
     private async readPooledTree(id: TreeId, raw: PooledTreeRecord): Promise<TreeReadResult> {
         let data: StromData;
-        let missing: number;
-        let urls: Map<string, string>;
         if (raw.encrypted) {
             if (!CryptoSession.isUnlocked()) {
                 this.unreadableTrees.add(id);
                 return { status: 'locked' };
             }
             try {
-                const text = await CryptoSession.decrypt(raw.encrypted);
-                const out = await unpoolJson(text);
-                data = JSON.parse(out.json) as StromData;
-                missing = out.missing;
-                urls = out.urls;
+                data = JSON.parse(await CryptoSession.decrypt(raw.encrypted)) as StromData;
             } catch (err) {
                 console.error('Failed to decrypt tree data:', id, err);
                 this.unreadableTrees.add(id);
                 return { status: 'undecryptable' };
             }
         } else {
-            const out = await unpoolObject(raw.data as StromData);
-            data = out.data;
-            missing = out.missing;
-            urls = out.urls;
+            data = raw.data as StromData;
         }
-        // The ids and sizes came with the images: the next save need not
-        // hash them or read them back.
-        await seedPoolScope(id, urls, !!raw.encrypted).catch(() => {});
+        // The images stay references (spec 135, D6): the record's sizes and
+        // catalog first — they make the references this browser's own for
+        // the load sanitizer and answer sizes and fingerprints.
         notePoolSizes(raw.media);
+        await unpackImageMeta(raw.imageMeta);
+        const { missing } = await settleStoredImages(data);
         // Never expected (the cleanup keeps what a tree names); the rest of
         // the tree still loads, the load sanitiser drops the empty images.
         if (missing > 0) console.error('Tree images missing from the pool:', id, missing);
@@ -1099,9 +1105,18 @@ class TreeManagerClass {
 
     /** How many states were handed to the queue per tree (a read can tell a write made meanwhile). */
     private queuedWrites = new Map<TreeId, number>();
+    /** Trees whose latest write failed, until one of theirs lands (saveTreeDataConfirmed). */
+    private failedWrites = new Set<TreeId>();
+    /** Trees whose failed write the caller reports itself (saveTreeDataConfirmed `quiet`). */
+    private quietWrites = new Set<TreeId>();
 
     /** Rescue keys of closed windows this one stored at start, per tree, until that write lands. */
     private restoredRescues = new Map<TreeId, string>();
+
+    /** A state of the tree handed to the queue has not landed yet. */
+    hasUnsettledSave(id: TreeId): boolean {
+        return this.unsettledSaves.has(id);
+    }
 
     /** A write landed: when it carried the newest state, nothing of the tree waits any more. */
     private settle(id: TreeId, written: { data: StromData; base: ResearchBase | null }): void {
@@ -1287,6 +1302,26 @@ class TreeManagerClass {
         this.queueWrite(id, { data: snapshot, base: this.researchBaseOf(id) });
     }
 
+    /**
+     * Save a tree's data and wait until the write has landed (spec 134 K0.5):
+     * true once stored, false when the save was refused (unreadable, newer,
+     * stale tree) or its write failed. A failure raises strom:save-failed
+     * as any save does, unless `quiet`: the caller says it itself (a merge's
+     * new tree, P0 N2 - the general toast would speak of lost edits).
+     */
+    async saveTreeDataConfirmed(id: TreeId, data: StromData, opts: { quiet?: boolean } = {}): Promise<boolean> {
+        const queued = this.queuedWrites.get(id) ?? 0;
+        if (opts.quiet) this.quietWrites.add(id);
+        try {
+            this.saveTreeData(id, data);
+            if ((this.queuedWrites.get(id) ?? 0) === queued) return false;
+            await this.flush(id);
+            return !this.failedWrites.has(id) && this.index.trees.some(t => t.id === id);
+        } finally {
+            if (opts.quiet) this.quietWrites.delete(id);
+        }
+    }
+
     /** Put a state on the tree's write queue (see saveTreeData). */
     private queueWrite(id: TreeId, entry: { data: StromData; base: ResearchBase | null }): void {
         this.queuedWrites.set(id, (this.queuedWrites.get(id) ?? 0) + 1);
@@ -1305,6 +1340,7 @@ class TreeManagerClass {
             const pending = this.pendingSaves.get(id);
             this.pendingSaves.delete(id);
             if (!pending) return;
+            this.failedWrites.delete(id);
             const latest = pending.data;
             // Deleted meanwhile: never resurrect the record (review S20).
             if (!this.index.trees.some(t => t.id === id)) {
@@ -1312,8 +1348,8 @@ class TreeManagerClass {
                 return;
             }
             await this.takePreMigrationBackup(id, latest);
-            const images = collectPoolable(latest);
-            if (images.size > 0) {
+            const images = treeImages(latest);
+            if (images.urls.size > 0 || images.refIds.size > 0) {
                 await this.writePooledTree(id, latest, images, pending.base);
             } else if (SettingsManager.isEncryptionEnabled()) {
                 if (!CryptoSession.isUnlocked()) throw new Error('locked');
@@ -1333,7 +1369,8 @@ class TreeManagerClass {
             // Surface instead of swallowing: quota/lock failures used to be
             // completely silent, leaving memory and disk divergent.
             console.error('saveTreeData failed', id, err);
-            dispatchSaveFailed(id, err);
+            this.failedWrites.add(id);
+            if (!this.quietWrites.has(id)) dispatchSaveFailed(id, err);
         });
         this.saveQueues.set(id, next);
     }
@@ -1343,12 +1380,13 @@ class TreeManagerClass {
      * references to them. Under the pool lock, so a cleanup cannot remove an
      * image between finding it stored and this record naming it.
      */
-    private writePooledTree(id: TreeId, data: StromData, images: Set<string>, base: ResearchBase | null = null): Promise<void> {
+    private writePooledTree(id: TreeId, data: StromData, images: ReturnType<typeof treeImages>, base: ResearchBase | null = null): Promise<void> {
         return withPoolLock(async () => {
             if (!this.index.trees.some(t => t.id === id)) return;
             const encrypted = SettingsManager.isEncryptionEnabled();
             if (encrypted && !CryptoSession.isUnlocked()) throw new Error('locked');
-            const { ids, media } = await storeImages(images, encrypted, id);
+            const { ids, media, meta } = await poolImages(images.urls, images.refIds, encrypted, id);
+            const imageMeta = await packImageMeta(meta, encrypted);
             let record: PooledTreeRecord;
             let sizeBytes: number;
             if (encrypted) {
@@ -1357,10 +1395,15 @@ class TreeManagerClass {
                 sizeBytes = JSON.stringify(enc).length + Object.values(media).reduce((a, b) => a + b, 0);
             } else {
                 record = { pooled: 1, data: replacePooled(data, ids), media };
-                sizeBytes = estimateJsonBytes(data);
+                sizeBytes = estimateJsonBytes(data) + pooledImageChars(data);
             }
+            if (imageMeta) record.imageMeta = imageMeta;
             await this.writeTreeRecord(id, record, base);
             this.updateMetadata(id, data, sizeBytes);
+            // Named by the record now: the tree's states in memory take the references (image-intern.ts).
+            const interned = new Map<string, string>();
+            for (const [value, poolId] of ids) interned.set(value, POOL_REF + poolId);
+            imagesInterned(id, interned);
         });
     }
 
@@ -1513,6 +1556,7 @@ class TreeManagerClass {
             tree.partnershipCount = Object.keys(data.partnerships).length;
             tree.sizeBytes = sizeBytes;
             tree.mediaFp = browserMediaFingerprint(data);
+            this.noteContents(tree, data);
             this.saveIndex();
         }
     }
@@ -1532,16 +1576,21 @@ class TreeManagerClass {
     // ==================== IMPORT ====================
 
     /**
-     * Create a new tree from imported data
+     * Create a new tree from imported data (or from a selection of another
+     * tree, `fromTree`); it never carries a research tie.
      */
-    createTreeFromImport(data: StromData, name: string, fromFile = true): TreeId {
+    createTreeFromImport(data: StromData, name: string, fromFile = true, fromTree?: TreeMetadata['fromTree']): TreeId {
         // Set current version on import
         data.version = STROM_DATA_VERSION;
 
         const treeId = generateTreeId();
         const now = new Date().toISOString();
-        const dataStr = JSON.stringify(data);
-        const sizeBytes = new Blob([dataStr]).size;
+        // Measured without building the JSON: a tree with its photos is 100 MB
+        // and more, and the text and its Blob are two more copies of them in
+        // memory at once (a phone's tab, opening a research). The save that
+        // follows sets the size as it is stored.
+        const sizeBytes = estimateJsonBytes(data);
+        const mediaFp = browserMediaFingerprint(data);
 
         const metadata: TreeMetadata = {
             id: treeId,
@@ -1551,10 +1600,15 @@ class TreeManagerClass {
             personCount: realPersonCount(data),
             partnershipCount: Object.keys(data.partnerships).length,
             sizeBytes,
-            mediaFp: browserMediaFingerprint(data),
+            mediaFp,
             // The file it came from is a copy (a split-off part is not).
-            ...(fromFile ? { fileCopyAt: now, fileCopyMediaFp: browserMediaFingerprint(data) } : {})
+            ...(fromFile ? { fileCopyAt: now, fileCopyMediaFp: mediaFp } : {}),
+            // Made of a selection of another tree: names it, never takes its research (spec 139 K2.4).
+            ...(fromTree ? { fromTree: { ...fromTree } } : {}),
         };
+        // The file it came from and its merges, for the Manage trees row (spec 139 §7.2).
+        if (fromFile) this.noteContents(metadata, data);
+        else if (data.merges?.length) metadata.mergeCount = data.merges.length;
 
         // Add to index
         this.index.trees.push(metadata);
@@ -1570,12 +1624,27 @@ class TreeManagerClass {
     }
 
     /**
-     * Format bytes to human readable string
+     * A tree split off another (Split into families, Separate unconnected
+     * parts; spec 139 §11.1): it names the tree it came from and the part
+     * (fromTree) and never carries a research tie.
+     */
+    createTreeFromPart(sourceId: TreeId | null, data: StromData, name: string, what: string = name): TreeId {
+        const source = sourceId ? this.getTreeMetadata(sourceId) : undefined;
+        return this.createTreeFromImport(data, name, false, sourceId && source ? { treeId: sourceId, name: source.name, what } : undefined);
+    }
+
+    /**
+     * Format bytes to human readable string, with the decimal sign of the
+     * UI language ("46.3 MB" in English, "46,3 MB" in Czech, German, Polish).
      */
     formatBytes(bytes: number): string {
         if (bytes < 1024) return bytes + ' B';
-        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-        return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        const num = (v: number): string => {
+            const s = v.toFixed(1);
+            return getCurrentLanguage() === 'en' ? s : s.replace('.', ',');
+        };
+        if (bytes < 1024 * 1024) return num(bytes / 1024) + ' KB';
+        return num(bytes / (1024 * 1024)) + ' MB';
     }
 
     // ==================== HELPERS ====================
@@ -1872,10 +1941,27 @@ class TreeManagerClass {
         return this.index.trees.find(t => t.research?.id === id && !t.research.copy) || null;
     }
 
-    /** Every tree tied to the research, copies included (what can be sent back). */
+    /** Every tree tied to the research, copies included (only its owner writes to it: canSendToResearch). */
     findTreesByResearchId(researchId: string): TreeMetadata[] {
         const id = researchId.toLowerCase();
         return this.index.trees.filter(t => t.research?.id === id);
+    }
+
+    /**
+     * The tree may write to its research (spec 139 K5.1): it owns the tie — a
+     * copy, a second tree of the same research and the sample tree never do.
+     */
+    canSendToResearch(treeId: TreeId | null | undefined): boolean {
+        // A satellite window has no index: the main window mirrors its tree's tie only when that tree owns it.
+        if (treeId && this.windowMeta?.id === treeId && !this.index.trees.some(t => t.id === treeId)) {
+            return isResearchOwner([this.windowMeta], treeId);
+        }
+        return isResearchOwner(this.index.trees, treeId);
+    }
+
+    /** A copy of a tree with a research: the name of the tree it was copied from (src/research-owner.ts). */
+    researchCopyOrigin(treeId: TreeId): { name: string | null } | null {
+        return researchCopyOrigin(this.index.trees, treeId);
     }
 
     /**
@@ -1902,6 +1988,7 @@ class TreeManagerClass {
             if (prev?.sentSources && link.sentSources === undefined) kept.sentSources = prev.sentSources;
             if (prev?.sendMode && link.sendMode === undefined) kept.sendMode = prev.sendMode;
             if (prev?.previewDue && link.previewDue === undefined) kept.previewDue = true;
+            if (prev?.mergeHold && link.mergeHold === undefined) kept.mergeHold = prev.mergeHold;
             // A new tie sends by hand until the user chooses otherwise (a tie from before 3.9 keeps "by itself");
             // a new tie to an archive (or a research waiting for its agent: `agentless`) by itself.
             if (!prev && link.sendMode === undefined) kept.sendMode = newTieSendMode(link.mode === 'archive' || !!opts.agentless);
@@ -1919,6 +2006,93 @@ class TreeManagerClass {
     private noteBaseChange(treeId: TreeId, before: ResearchBase | null): void {
         if (sameBase(before, this.researchBaseOf(treeId)) || typeof window === 'undefined') return;
         window.dispatchEvent(new CustomEvent(RESEARCH_BASE_EVENT, { detail: { treeId } }));
+    }
+
+    /**
+     * Make a tree a copy of `of` without research (spec 139 K5.1, K5.2): its
+     * tie goes, `copyOf` names the tree it is a copy of. The tree's data stay.
+     */
+    detachAsCopy(treeId: TreeId, of: { treeId: TreeId; name: string }): void {
+        const tree = this.index.trees.find(t => t.id === treeId);
+        if (!tree) return;
+        const before = this.researchBaseOf(treeId);
+        delete tree.research;
+        tree.copyOf = { treeId: of.treeId, name: of.name };
+        this.saveIndex();
+        this.noteBaseChange(treeId, before);
+    }
+
+    /** The tree whose research the copy `copyId` came from and that owns it now (research-owner.ts), or null. */
+    researchOriginalOf(copyId: TreeId): TreeMetadata | null {
+        return researchOriginalOf(this.index.trees, copyId);
+    }
+
+    /**
+     * The copy `toId` takes over the research of `fromId` (spec 139 K5.5):
+     * the original stays a tree without research, the copy is its owner and
+     * no copy any more (research-owner.ts transferResearchTie). Nothing is
+     * sent. False when nothing changed.
+     */
+    transferResearch(fromId: TreeId, toId: TreeId): boolean {
+        const before = [this.researchBaseOf(fromId), this.researchBaseOf(toId)];
+        if (!transferResearchTie(this.index.trees, fromId, toId)) return false;
+        this.saveIndex();
+        this.noteBaseChange(fromId, before[0]);
+        this.noteBaseChange(toId, before[1]);
+        return true;
+    }
+
+    /**
+     * The one-time repair of trees that share one research (package 134
+     * point 13; spec 139 K5.1): of every research tied to more than one tree
+     * here only one tree keeps it (planSharedTieRepair); every other is taken
+     * off it as a copy of that tree (detachAsCopy, its data untouched). Each
+     * such tree is backed up first ("Before the data update of a new
+     * version"); a tree whose data cannot be read now (encrypted and locked)
+     * is not read: only its index entry changes. The tie it had is kept in
+     * `researchDetached` (with what the one-time notice says). Runs once per
+     * index (`researchTiesRepaired`); an index without the mark (an older
+     * one brought back) is looked at again.
+     */
+    async repairSharedResearchTies(): Promise<void> {
+        if (this.index.researchTiesRepaired) return;
+        const plan = planSharedTieRepair(this.index.trees);
+        const at = new Date().toISOString();
+        for (const step of plan) {
+            const tree = this.index.trees.find(t => t.id === step.treeId);
+            const link = tree?.research;
+            if (!tree || !link) continue;
+            await this.backupBeforeTieRepair(tree.id);
+            const keeper = { treeId: step.keeper.treeId as TreeId, name: step.keeper.name };
+            this.detachAsCopy(tree.id, keeper);
+            tree.researchDetached = {
+                link, keeper, at,
+                ...(step.sentAfterCopy ? { sentAfterCopy: step.sentAfterCopy } : {}),
+            };
+        }
+        this.index.researchTiesRepaired = at;
+        this.saveIndex();
+    }
+
+    /** The backup before the tie repair: best-effort, never reading a tree that cannot be read now. */
+    private async backupBeforeTieRepair(id: TreeId): Promise<void> {
+        try {
+            const raw = await StorageManager.get<unknown>('trees', id);
+            if (!raw || (encryptedPart(raw) && !CryptoSession.isUnlocked()) || this.isTreeNewer(id)) return;
+            const read = await this.readStoredRecord(id);
+            if (read.status !== 'ok' || Object.keys(read.data.persons ?? {}).length === 0) return;
+            await createSnapshot(id, read.data, 'pre-migration', Date.now(), this.backupResearchBase(id, this.researchBaseOf(id)));
+        } catch (err) {
+            console.warn('The backup before taking a copy off its research could not be written', id, err);
+        }
+    }
+
+    /** The one-time notice of a tree taken off a shared research was shown. */
+    markResearchDetachedNoticed(treeId: TreeId): void {
+        const tree = this.index.trees.find(t => t.id === treeId);
+        if (!tree?.researchDetached || tree.researchDetached.noticed) return;
+        tree.researchDetached.noticed = true;
+        this.saveIndex();
     }
 
     /** Change part of a tree's research link (a send, its fate, the transcript setting); no-op without a link. */
@@ -1962,6 +2136,43 @@ class TreeManagerClass {
         tree.demo = true;
         delete tree.researchAdoptToken;
         this.saveIndex();
+    }
+
+    /**
+     * What the Manage trees row tells of a tree's data without reading it
+     * (spec 139 §7.2, §9.2): the number of its merges, and the file it was
+     * imported from when that is not known yet (an older tree, at its
+     * opening). Saves the index only when something changed.
+     */
+    noteTreeContents(treeId: TreeId, data: StromData): void {
+        const tree = this.index.trees.find(t => t.id === treeId);
+        if (tree && this.noteContents(tree, data)) this.saveIndex();
+    }
+
+    /** The JSON file a tree was imported from (its data carries no record of it). */
+    setImportedFrom(treeId: TreeId, file: string): void {
+        const tree = this.index.trees.find(t => t.id === treeId);
+        const name = file.trim();
+        if (!tree || !name) return;
+        tree.importedFrom = { file: name, kind: /\.(ged|gedcom)$/i.test(name) ? 'gedcom' : 'json' };
+        this.saveIndex();
+    }
+
+    /** noteTreeContents on a metadata record; true when it changed. */
+    private noteContents(tree: TreeMetadata, data: StromData): boolean {
+        let changed = false;
+        const merges = data.merges?.length ?? 0;
+        if ((tree.mergeCount ?? 0) !== merges) {
+            if (merges) tree.mergeCount = merges;
+            else delete tree.mergeCount;
+            changed = true;
+        }
+        // A tree made of another one (a selection, a split-off part) came from no file.
+        if (!tree.importedFrom && !tree.fromTree) {
+            const from = importOriginOf(data);
+            if (from) { tree.importedFrom = from; changed = true; }
+        }
+        return changed;
     }
 
     /** Mark (or unmark) a tree as moving to another browser for the research. */
@@ -2022,8 +2233,3 @@ registerPoolReferences('trees', async () => {
     return ids;
 });
 
-/** A research link without the state of a send (a duplicate starts with none, nor with sources waiting to be retracted). */
-function withoutSendState(link: ResearchLink): ResearchLink {
-    const { sent: _sent, refused: _refused, deletedSources: _deleted, ...rest } = link;
-    return rest;
-}

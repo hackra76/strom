@@ -33,14 +33,14 @@ import {
     applyResearch, isResearchChipId, researchChipCounts, researchChipOffer, researchColumnLiveOff, researchConflictWhat, researchOffer,
     researchAgentRow, researchOpenConflicts, researchTableEnv, type ResearchChipId, type ResearchColumnId, type ResearchNewWindow, type ResearchTableEnv, type ResearchTableInput,
 } from './table-research.js';
-import { onComputer, researchTableLive } from '../research-ui.js';
+import { researchTableLive, researchHere } from '../research-ui.js';
 import { researchBubble, researchConflictBubble, type ResearchBubble } from './table-research-bubble.js';
 import { AGENT_DONE_MS, materialsCountNow, researchConflictsNow } from '../../card-signals.js';
 import { onDirectionPlaces } from '../../research-directions-write.js';
 import { findCrossTreeMatches, getTreesDataForMatching, type CrossTreeMatch } from '../../cross-tree.js';
 import type { ChangeKind, PersonChange } from '../../research-changes.js';
 import {
-    addOnlyFilter, addWithoutFilter, researchFilterIdle, CHECK_CHIPS, chipItem, chipLabel, clearFilter, columnItem, filterRows, filterSummary, isChipItem, newWindowOf, removeColumnItemAt, searchQuery, setChip, setParticipantFilter,
+    addOnlyFilter, addWithoutFilter, researchFilterIdle, CHECK_CHIPS, chipItem, chipLabel, clearFilter, columnItem, filterRows, filterSummary, isChipItem, newWindowOf, removeColumnItemAt, searchQuery, setChip, setParticipantFilter, STATS_CHIP,
     setColumnFilter, setEmptyFilter, sortRows, columnItemActive, type ChipId, type ColumnFilter, type FilterResult, type TableFilter,
 } from './table-filter.js';
 import {
@@ -65,7 +65,7 @@ import {
     applyScopeCells, legacyScopeSelection, outsideScope, scopeCounts, scopeRows, selectionScopeKey, tableScopeNow, tableScopeOf, type TableScope,
 } from './table-scope.js';
 import { LEAD_COLUMNS } from './table-columns.js';
-import { listDisplayName, listKind } from '../../person-lists.js';
+import { listDisplayName, listIsAuto, listKind } from '../../person-lists.js';
 import { listKindIcon } from '../list-kind-icon.js';
 import { applyTableWindowState, readTableWindowState, tableWindowStateOf, type TableWindowState } from './table-window-state.js';
 import { canOpenWindows, openInNewWindow } from '../../windows/window-open.js';
@@ -121,6 +121,7 @@ import { decodeSelectionRef, type SelectionRef } from '../../view-selection-ref.
 import type { ViewScope } from '../../view-scope.js';
 import { realSelectionIds, registerScopeHost, type ScopeSegHost } from '../scope-seg-ui.js';
 import { selectionQuickRows } from '../selection-picker-ui.js';
+import { STATS_ROW_OPEN_EVENT, type StatsRowOpen, type StatsWindowState } from '../tree-stats-ui.js';
 
 interface Mounted {
     container: HTMLElement;
@@ -286,6 +287,9 @@ const scopeSeen = new Map<string, string | null>();
 let openGroupFor: string | null = null;
 /** A Table filter rule being edited in the Table (spec 084 §7, §9): ⋯ offers Save to the list. */
 let ruleEdit: { tree: string; listId: string } | null = null;
+/** The Statistics the Table's Statistics chip came from (spec 138 §8): Back to Statistics; this window's memory only, for its tree. */
+let statsBack: { tree: string; back: StatsWindowState } | null = null;
+let statsListening = false;
 
 /** What a row shown for now depends on: the People table's filter, search, sort and open view, the scope. */
 function peopleCtx(state: TableState, scope: TableScope | null): string {
@@ -920,6 +924,8 @@ export const tableMethods = uiModule({
         // # and Done read the People table's scope; the work list's chips too.
         applyScopeCells(m, windowScope);
         // Jumps by a name (spec 103 U3): another tree drops the history, the row shown for now and the strip.
+        // Another tree: Back to Statistics is gone (spec 138 §8).
+        if (statsBack && statsBack.tree !== tree) statsBack = null;
         if (jumpsTree !== tree) {
             jumps.clear();
             jumpsTree = tree;
@@ -1096,6 +1102,7 @@ export const tableMethods = uiModule({
                 onUnpinAll: () => this.changeTablePins(() => pins.clear()),
                 onUngroup: () => this.setTableGroupBy(null),
                 onSheet: () => this.showTableFilters(),
+                onStatsBack: () => this.tableStatsBack(),
             });
             const views = new ViewBar(bar.querySelector<HTMLElement>('.tv-slot-view')!, {
                 onList: () => this.showTableViewList(),
@@ -1226,6 +1233,7 @@ export const tableMethods = uiModule({
             model: m, type, filter: st.filter, search: st.search, shown: rows.length, checking: !index || !!checks?.running, phone,
             pinned: phone ? 0 : pins.count(),
             grouped: grouping ? strings.table.groupKey[grouping.by] : null,
+            statsBack: persons && statsBack?.tree === tree && !!chipItem(st.filter, STATS_CHIP),
             research: persons && research ? researchBarState(research, m, st.filter, display.columns, isResearchViewId(state.open[type])) : undefined,
         };
         mounted.filterState = filterState;
@@ -1404,7 +1412,7 @@ export const tableMethods = uiModule({
         const env = researchMemo?.env;
         if (!col || !env || !mounted || line.kind === 'more' || line.row.kind !== 'person') return;
         const b = researchBubble(env, line.row.person, col.id as ResearchColumnId, {
-            onComputer: onComputer(), bridgeLive: this.researchOriginBridge() === 'live',
+            onComputer: researchHere(), bridgeLive: this.researchOriginBridge() === 'live',
         });
         if (!b) return;
         this.openTableResearchAt(env, b, line, colPos, () => (cellEl.isConnected ? cellEl : null));
@@ -2218,6 +2226,21 @@ export const tableMethods = uiModule({
     },
 
     /**
+     * The people of the rows the Table shows now, after its filter, search
+     * and scope (the search's In view, spec 137 §2.3); null while it shows
+     * the whole tree (neither a filter, a search nor a scope) or no people.
+     */
+    tableShownPersonIds(): ReadonlySet<PersonId> | null {
+        if (!mounted || !model) return null;
+        const state = stateOf(treeKey());
+        const type = state.rowType;
+        if (type === 'sources') return null;
+        const st = state.types[type];
+        if (!this.tableWindowScope() && !st.filter.items.length && !st.search.trim()) return null;
+        return new Set(mounted.saveRows.flatMap(rowPeople));
+    },
+
+    /**
      * Whether a person's row is pinned in the People table now (spec 103 §3):
      * a jump to them while the filter hides them lands on their pinned row.
      */
@@ -2515,10 +2538,17 @@ export const tableMethods = uiModule({
         const outside = [...mounted.pinOutside].map(k => byKey.get(k)).filter((r): r is TableRow => !!r)
             .flatMap(rowPeople).map(id => DataManager.getPerson(id)).filter((p): p is Person => !!p).map(p => personName(p));
         const open = viewList(state, storedViews(), DataManager.isReadOnly());
-        const name = [...open.builtin, ...open.research, ...open.custom].find(v => v.active)?.name;
+        // The Statistics' people (spec 138 §8.3) are no rule: a fixed list, named after the chip.
+        const stats = type === 'persons' ? chipItem(st.filter, STATS_CHIP) : null;
+        const prefix = strings.treeStats.table.chip('');
+        const name = stats
+            ? (stats.name ?? '').startsWith(prefix) ? (stats.name ?? '').slice(prefix.length) : stats.name
+            : [...open.builtin, ...open.research, ...open.custom].find(v => v.active)?.name;
         this.showNewPersonList({
             source: type === 'unions' ? 'unions' : 'table',
-            rule: (() => { const v = viewFromState(type, st, '', '', ''); return { kind: 'tableFilter' as const, rowType: type, filter: v.filter, sort: v.sort }; })(),
+            ...(stats ? {} : {
+                rule: (() => { const v = viewFromState(type, st, '', '', ''); return { kind: 'tableFilter' as const, rowType: type, filter: v.filter, sort: v.sort }; })(),
+            }),
             personIds: ids, pinOut: outside.join(', '), ...(name ? { name } : {}),
         });
     },
@@ -2664,6 +2694,48 @@ export const tableMethods = uiModule({
     },
 
     /**
+     * The people of a Statistics' value (spec 138 §8): the People table on
+     * the whole tree with only the chip "Statistics: …" (no other filter, no
+     * search, so its count is the value's); `back` is the Statistics' state
+     * for Back to Statistics.
+     */
+    openTableForPersons(ids: readonly PersonId[], opts: { label: string; back?: StatsWindowState }): void {
+        const tree = treeKey();
+        const state = stateOf(tree);
+        this.rememberViewScope('table', 'tree');
+        state.rowType = 'persons';
+        tempShown = null;
+        hiddenJump = null;
+        const st = state.types.persons;
+        clearFilter(st.filter);
+        setChip(st.filter, STATS_CHIP, true, { values: [...new Set(ids)], name: opts.label });
+        st.search = '';
+        filterChanged(st);
+        st.top = 0;
+        st.selected = null;
+        statsBack = opts.back ? { tree, back: opts.back } : null;
+        this.showTableNow();
+    },
+
+    /** A Statistics' row click (strom:stats-row-open) opens its people in the Table; listened for once the Statistics open. */
+    listenForStatsRowOpen(): void {
+        if (statsListening) return;
+        statsListening = true;
+        window.addEventListener(STATS_ROW_OPEN_EVENT, (e) => {
+            const req = (e as CustomEvent<StatsRowOpen>).detail;
+            if (!req || req.treeId !== treeKey()) return;
+            this.openTableForPersons(req.ids, { label: req.label, back: req.back });
+        });
+    },
+
+    /** Back to Statistics (spec 138 §8): the window as it was (topic, options, scope, search, sort); the chip stays. */
+    tableStatsBack(): void {
+        const b = statsBack;
+        if (!b || b.tree !== treeKey()) return;
+        void this.showTreeStats(b.tree, b.back);
+    },
+
+    /**
      * The Table with the window's selection (spec 098 §5): a list's scope, or
      * the scope of a selection that is not a list; `filter: 'noPlace'` with
      * the chip of people without any place (the map's "N people … no place").
@@ -2729,7 +2801,7 @@ export const tableMethods = uiModule({
         const type = list.rule.rowType;
         const st = stateOf(treeKey()).types[type];
         const v = viewFromState(type, st, '', '', '');
-        if (!DataManager.setPersonListRule(list.id, { kind: 'tableFilter', rowType: type, filter: v.filter, sort: v.sort }, list.dynamic)) return;
+        if (!DataManager.setPersonListRule(list.id, { kind: 'tableFilter', rowType: type, filter: v.filter, sort: v.sort }, listIsAuto(list))) return;
         ruleEdit = null;
         this.showToast(strings.lists.toast.saved(listDisplayName(list)));
         if (mounted) this.renderTableView(mounted.container);
@@ -3516,8 +3588,9 @@ export const tableMethods = uiModule({
         const saveList = canSaveAsList(state.rowType);
         const groupChoices = this.tableGroupChoices();
         const groupedBy = groupChoices.find(c => c.current && c.id !== 'group-none')?.label ?? null;
-        // Editing a Table filter rule (spec 084 §7, §9): its list takes the filter as it is now.
-        const ruleList = this.tableRuleList();
+        // Editing a Table filter rule (spec 084 §7, §9): its list takes the filter as it is now
+        // (not the Statistics' people, spec 138 §8.3: they are no rule).
+        const ruleList = state.rowType === 'persons' && chipItem(st.filter, STATS_CHIP) ? null : this.tableRuleList();
         const saveRule = ruleList ? { label: strings.lists.saveRule(listDisplayName(ruleList)), run: () => this.saveTableRule() } : null;
         // On the map (spec 098 §6): only in a list's or the window selection's scope, the last row.
         const onMap = this.tableOnMap();

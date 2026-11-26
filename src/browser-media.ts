@@ -12,8 +12,9 @@
  * tree-manager records them, the UI asks these functions.
  */
 
-import { hasTreeMedia, personFilesAnyVersion } from './media.js';
+import { hasTreeMedia, personFilesAnyVersion, personMediaIndex } from './media.js';
 import type { PersonId, StromData } from './types.js';
+import { mediaToken as token, fnvHash as fnv } from './image-meta.js';
 
 /**
  * Does a tree's research keep its portraits, couples' photos and attachments,
@@ -28,28 +29,6 @@ export function archiveHoldsAppMedia(o: { keeps: boolean | null; researchId: str
     return o.keeps !== false && !!o.researchId && o.sentTo === o.researchId;
 }
 
-function fnv(text: string, start: number, step: number, seed: number): number {
-    let h = seed >>> 0;
-    for (let i = start; i < text.length; i += step) {
-        h ^= text.charCodeAt(i);
-        h = Math.imul(h, 0x01000193) >>> 0;
-    }
-    return h;
-}
-
-/**
- * Stands for one picture or file: its length and a hash of a sample (every
- * 64th character) and the tail. A new picture, a new crop or a rotation
- * changes the length or the sample; hashing every byte of a tree's images on
- * each edit would cost far more than the indicator is worth.
- */
-function token(url: string | undefined): string {
-    if (!url) return '';
-    const sample = fnv(url, 0, 64, 0x811c9dc5);
-    const tail = fnv(url, Math.max(0, url.length - 64), 1, sample);
-    return `${url.length.toString(36)}.${tail.toString(36)}`;
-}
-
 /**
  * Fingerprint of the pictures and files only the browser keeps: '' when the
  * tree has none. Counts what a lost browser storage would lose — the
@@ -58,11 +37,14 @@ function token(url: string | undefined): string {
  */
 export function browserMediaFingerprint(data: StromData): string {
     const parts: string[] = [];
+    // Each person's files read once for all (not every record of the tree per person: a research
+    // of a thousand people with a thousand photos is a million steps, on every save).
+    const index = personMediaIndex(data);
     for (const id of Object.keys(data.persons ?? {}).sort()) {
         const p = data.persons[id as keyof typeof data.persons];
         if (!p) continue;
         // An attachment that is only its original (no preview) lives in the research, not here.
-        const atts = personFilesAnyVersion(data, id as PersonId).filter(a => a.dataUrl);
+        const atts = personFilesAnyVersion(data, id as PersonId, index).filter(a => a.dataUrl);
         if (!p.photo && atts.length === 0) continue;
         parts.push(`p${id}:${token(p.photo)}:${atts.map(a => `${a.id}=${token(a.dataUrl)}`).join(',')}`);
     }

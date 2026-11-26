@@ -17,7 +17,7 @@
 
 import { Attachment, MaterialKind, Person, StromData } from './types.js';
 import { personMedia } from './media.js';
-import { cleanText, isResearchHead, researchPersonRef, researchSchemeUrl, withAppVersion, MATERIAL_LINKS_FEATURE, MEDIA_APP_FEATURE } from './research-link.js';
+import { cleanText, isResearchHead, researchPersonRef, researchSchemeUrl, withAppVersion, MATERIAL_LINKS_FEATURE, MEDIA_APP_FEATURE, researchDeviceAllows } from './research-link.js';
 import { strings } from './strings.js';
 import { ResearchWriteHeld, writeHeldOfCode } from './research-write-held.js';
 import { formatDateForInput, formatFlexDate, normalizeDateInput, parseFlexDate } from './dates.js';
@@ -542,11 +542,19 @@ export function materialMatches(item: MaterialItem, query: string): boolean {
 }
 
 /**
- * A file nobody said whom it concerns: no person on it, none from sorting and none on its batch.
+ * A file the research keeps at a couple (`material.links`: the family F…, or one of its events): the tree holds it
+ * at that union, so it is assigned as surely as a file of a person — sorting proposes no person for it.
+ */
+export function fileOnCouple(file: Pick<MaterialFile, 'links'> | undefined): boolean {
+    return !!file?.links?.some(l => l.type === 'family' || (l.type === 'event' && /^F\d/.test(l.ref)));
+}
+
+/**
+ * A file nobody said whom it concerns: no person on it, none from sorting, none on its batch and no couple.
  * `sourceOf` (the research has `material.sourceOf`): the file of a source counts as assigned (spec 102 §7).
  */
 export function fileWithoutPerson(file: MaterialFile, list: Pick<MaterialList, 'batches'>, opts: { sourceOf?: boolean } = {}): boolean {
-    if (file.persons.length || file.sorted?.persons?.length) return false;
+    if (file.persons.length || file.sorted?.persons?.length || fileOnCouple(file)) return false;
     if (opts.sourceOf && file.uses?.of?.length) return false;
     const batch = file.batch ? list.batches.find(b => b.id === file.batch) : undefined;
     return !batch?.persons?.length;
@@ -744,7 +752,8 @@ export function matEdit(env: MaterialEnv): boolean {
 
 /** The research's agent sorts files (`material.sort`; never an archive or a research waiting for its agent). */
 export function matSort(env: MaterialEnv): boolean {
-    return matList(env) && has(env, MATERIAL_SORT_FEATURE);
+    // Not on a device of the home network (spec 094 §6): the agent works on the computer with the research.
+    return matList(env) && has(env, MATERIAL_SORT_FEATURE) && researchDeviceAllows('material-sort');
 }
 
 /** The research keeps a run of batches (`material.sortRun`): one action sends up to 1500 files. */

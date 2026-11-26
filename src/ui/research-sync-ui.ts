@@ -46,18 +46,24 @@ import {
     researchHasTitles, hasTitles, withoutTitles, TITLES_FEATURE, researchConflictRef, isResearchHead, SYNC_REMOVED_FEATURE, SyncPersonConflict,
     SYNC_NW_CODES_FEATURE, researchLinkMark, researchUrlMark, type ResearchActionMark,
     researchMediaOut, researchSendDeclaresMedia, researchSyncUrl, researchMediaFirstSendDue, researchKeepsAppMedia,
+    noteResearchDeviceActions, researchDeviceAllows,
 } from '../research-link.js';
+import { deviceComputerName, inDeviceMode } from './device-mode-ui.js';
+import { isDeviceReplay } from '../device/gateway-client.js';
 import { SettingsManager } from '../settings.js';
 import { loadResearchCopy } from '../research-copy.js';
 import { foreignSendCheck } from '../research-foreign-send.js';
+import { isMediaRefUnknown, mediaRefGate, mediaRefUnknownShas, noteMediaRefRefused, prepareMediaRef, utf8Length } from '../research-media-ref.js';
 import { ResearchWriteHeld, joinSaid, writeHeldOfRefusal, writeHeldOfStatus, writeHeldSettled } from '../research-write-held.js';
 import { forgetOriginalsHeld } from './originals-ui.js';
 import {
     noteResearchLinks, noteResearchWaiting, noteResearchBridgeStatus, researchTreeOfStatus, storedResearchBridge, researchLinksEnabled,
     researchAutoState, patchResearchAutoState, researchWriteKey, researchWriteIsNews, researchAutoIntroSeen, noteResearchAutoIntroSeen, forgetResearchWaitingItems, anyResearchBridgeKnown,
     researchSendPreviewSkipped, announcedResearchScheme, RESEARCH_BRIDGE_MOVED_EVENT,
-    ResearchAutoState, ResearchHeldConflicts, StoredResearchTree,
+    ResearchAutoState, ResearchHeldConflicts, StoredResearchTree, rememberConflictSent, forgetConflictSent, researchConflictSides,
 } from '../research-device.js';
+import { deviceClient } from '../device-client.js';
+import { conflictDeviceWords, conflictDevicePair, conflictDevicePairLine, otherDeviceWords, sharedConflictWords, type ConflictDeviceWords } from '../conflict-devices.js';
 import {
     ResearchSyncState, ResearchSyncKind, researchSyncState, researchSyncWantsAttention, researchSyncUnsent,
     pendingSendFate, sourceReadings, THEN_LOAD_MAX_AGE_MS, conflictTakeovers, heldConflicts,
@@ -77,11 +83,12 @@ import { runBusy, activatedElement, busyToast, BUSY_SHOW_MS, BUSY_TIMEOUTS, type
 import { holdLeave, takeLeftPending } from './busy-leave.js';
 import { startTreeLoad, currentTreeLoad } from './tree-load-progress.js';
 import { researchWrittenList } from './research-changes-ui.js';
-import {
-    fetchWithTimeout, readStatusPart, readResearchTreeFile, postSync, onComputer, readTree, researchGedcom, researchGedcomExport,
-} from './research-ui.js';
+import { fetchWithTimeout, readStatusPart, readResearchTreeFile, postSync, readTree, researchGedcom, researchGedcomWithImages, researchReachable, researchDevice } from './research-ui.js';
 import { shownNameOrEmpty } from '../person-name.js';
 import { browserMediaFingerprint, browserMediaSafe, treeHasAppMedia, archiveHoldsAppMedia } from '../browser-media.js';
+import { poolRefSnapshot } from '../image-expand.js';
+import { gedcomText } from '../ged-export-images.js';
+import { settleMergeHold } from '../merge/research-hold.js';
 
 /** A person's conflicts less those still open that were decided since (`settled`, by id); the same list when none goes. */
 function withoutSettled(list: ResearchConflict[], settled: Set<string> | null): ResearchConflict[] {
@@ -337,6 +344,8 @@ function markCount(n: number): string {
 const LOADED_BLOCK_MS = 60 * 60 * 1000;
 
 function safariBrowser(): boolean {
+    // A device of the gateway (spec 094 P3) asks its own origin: Safari's block of 127.0.0.1 does not apply.
+    if (researchDevice()) return false;
     return typeof navigator !== 'undefined' && isSafariBrowser(navigator.userAgent || '')
         && /apple/i.test(navigator.vendor || '');
 }
@@ -435,8 +444,22 @@ export function lastBridgeStatus(researchId: string): LiveStatus | null {
     return lastSaidStatus.get(researchId.toLowerCase()) ?? null;
 }
 
+/** The last `treesRoot` any bridge said in this page (a computer's setting: every research here says the same). */
+let lastTreesRoot: string | null = null;
+
+/**
+ * Where the research on this computer makes a new research (`/status.treesRoot`, Strom Research 1.37), as a
+ * known status said it: `researchId`'s own when it said one, else the last any bridge said in this page; null:
+ * none said (an older research, none known) — the copy's dialog then shows the name alone (spec 139 §11.4).
+ */
+export function knownResearchTreesRoot(researchId?: string | null): string | null {
+    const own = researchId ? (researchStatusNow(researchId) ?? lastBridgeStatus(researchId))?.treesRoot : undefined;
+    return own ?? lastTreesRoot;
+}
+
 function tellBridgeStatus(researchId: string, status: LiveStatus): void {
     lastSaidStatus.set(researchId.toLowerCase(), status);
+    if (status.treesRoot) lastTreesRoot = status.treesRoot;
     for (const listener of bridgeStatusListeners) {
         try { listener(researchId, status); } catch (err) { console.warn('Bridge status listener failed', err); }
     }
@@ -601,12 +624,15 @@ export const researchSyncMethods = uiModule({
         this.researchAutoArm();
     },
 
-    /** The active tree's research link, when the new behaviour applies to it (else null). */
+    /**
+     * The active tree's research link, when the new behaviour applies to it (else null).
+     * Only the research's owner has one: a copy is a tree without research (spec 139 K5.1).
+     */
     researchSyncLink(): { treeId: TreeId; link: ResearchLink } | null {
         if (DataManager.isViewMode()) return null;
         const treeId = DataManager.getCurrentTreeId();
         const link = treeId ? TreeManager.getTreeMetadata(treeId)?.research : undefined;
-        return treeId && link ? { treeId, link } : null;
+        return treeId && link && TreeManager.canSendToResearch(treeId) ? { treeId, link } : null;
     },
 
     /**
@@ -664,6 +690,16 @@ export const researchSyncMethods = uiModule({
         return true;
     },
 
+    /**
+     * `POST /settings/run` written (spec 123 P2): its value put into the last status's `work.confirm` at once (no
+     * commit, so no event may follow), until the next status says it. Only for a status that has `work`.
+     */
+    noteRunConfirm(researchId: string, confirm: 'ask' | 'no'): void {
+        const rt = runtime.get(researchId);
+        if (!rt?.status?.work || rt.status.work.confirm === confirm) return;
+        runtime.set(researchId, { ...rt, status: { ...rt.status, work: { ...rt.status.work, confirm } } });
+    },
+
     /** The research's version as its bridge said it in this page ('' = not asked yet, or not said). */
     researchBridgeVersion(researchId: string): string {
         return runtime.get(researchId)?.status?.version ?? '';
@@ -679,6 +715,8 @@ export const researchSyncMethods = uiModule({
      * its bridge answering in this page with `conflict.decide`, else a link into the research, else not on this device.
      */
     researchConflictDecideMode(): ConflictDecideMode {
+        // A device of the home network (spec 094 §4, 4.8): through its gateway when announced, never a link.
+        if (inDeviceMode()) return researchDeviceAllows('conflict') ? 'bridge' : 'none';
         const id = this.activeResearchId();
         const status = id ? this.researchStatusOf(id) : null;
         return conflictDecideMode({ bridge: status ? { features: status.features } : null, linkAvailable: this.researchLinkAvailable('conflict') });
@@ -695,7 +733,8 @@ export const researchSyncMethods = uiModule({
         return hypothesisPickable(h, {
             readOnly: !id || DataManager.isReadOnly(),
             features: status?.features ?? null,
-            linkAvailable: this.researchLinkAvailable('hypothesis'),
+            // A device decides through its gateway when announced (spec 094 §4, 4.8).
+            linkAvailable: inDeviceMode() ? researchDeviceAllows('hypothesis') : this.researchLinkAvailable('hypothesis'),
         });
     },
 
@@ -711,7 +750,7 @@ export const researchSyncMethods = uiModule({
         let result: DecideResult = { ok: false, code: 'network', status: 0, reason: '' };
         if (!ctx || !bridge) return result;
         await this.researchWindowLock(ctx.treeId, false, async () => {
-            result = await postBridgeDecide(bridge.base, kind, id, body);
+            result = await postBridgeDecide(bridge.base, kind, id, body, { device: inDeviceMode() });
         });
         // The research's version after the write: known at once (not only at the next ask).
         const answer = result as DecideResult;
@@ -991,8 +1030,10 @@ export const researchSyncMethods = uiModule({
 
     /** The tree's changes go by themselves (a research that tells what it has, not Safari). */
     researchAutoOn(link: ResearchLink | undefined): boolean {
-        // (Out of "only load" with changes waiting: the first send goes by hand, through "What will be sent".)
-        return !!link && researchSendMode(link) === 'auto' && !link.previewDue && this.researchSyncCapable(link.id) && !safariBrowser();
+        // (Out of "only load" with changes waiting: the first send goes by hand, through "What will be sent";
+        // a merge not sent yet waits for a send by hand too, spec 134 K9.2.)
+        // A copy never sends (spec 139 K5.1; postResearchSend asks the owner too).
+        return !!link && !link.copy && researchSendMode(link) === 'auto' && !link.previewDue && !link.mergeHold && this.researchSyncCapable(link.id) && !safariBrowser();
     },
 
     /** The bridge answered within FRESH_MS. */
@@ -1090,7 +1131,7 @@ export const researchSyncMethods = uiModule({
         const ctx = this.researchSyncLink();
         if (!ctx) return { kind: 'none', core: 'none' };
         const { treeId, link } = ctx;
-        const shown = onComputer() && researchLinksEnabled() && !DataManager.isTreeLocked();
+        const shown = researchReachable() && researchLinksEnabled() && !DataManager.isTreeLocked();
         const capable = this.researchSyncCapable(link.id);
         if (!shown || !capable) return { kind: 'none', core: 'none' };
         const rt = runtime.get(link.id);
@@ -1153,10 +1194,18 @@ export const researchSyncMethods = uiModule({
             let busyFor = 0;
             let why: BridgeRuntime['why'] = '';
             let timedOut = false;
+            let deviceActions: unknown;
+            let deviceOthers: unknown;
             try {
                 // A bridge that answers the light status: its heavy parts read only when they changed.
                 const res = await fetchWithTimeout(statusAskUrl(url), BRIDGE_ANSWER_MS);
-                if (res.ok) status = sanitizeLiveStatus(await completeStatus(url, await res.json(), readStatusPart));
+                if (res.ok) {
+                    const json: unknown = await res.json();
+                    const device = (json as { device?: { actions?: unknown; others?: unknown } } | null)?.device;
+                    deviceActions = device?.actions;
+                    deviceOthers = device?.others;
+                    status = sanitizeLiveStatus(await completeStatus(url, json, readStatusPart));
+                }
                 // Busy (starting up, a long write): ask again after the time it names.
                 else if (res.status === 503) busyFor = retryAfterMs(res.headers.get('Retry-After'));
                 // Something answers there, but not to this address (an old token, another tree's bridge).
@@ -1180,7 +1229,9 @@ export const researchSyncMethods = uiModule({
             runtime.set(researchId, { up: !!status, checkedAt: Date.now(), status, blocked: !status && blocked, downSince,
                 busyUntil: busyFor ? Date.now() + busyFor : 0, why: status ? '' : why });
             if (status) {
-                noteResearchLinks(status.links, status.linkScheme);
+                // A device (spec 094): the actions the gateway announced for it; it hands over no links.
+                if (researchDevice()) noteResearchDeviceActions(deviceActions, deviceOthers);
+                else noteResearchLinks(status.links, status.linkScheme);
                 noteResearchWaiting(researchId, status.waiting, status);
                 noteResearchBridgeStatus(researchId, status.accepts, status.head, researchTreeOfStatus(status));
                 tellBridgeStatus(researchId, status);
@@ -1204,7 +1255,7 @@ export const researchSyncMethods = uiModule({
     async pollResearchBridge(opts: { timeout?: number; reschedule?: boolean } = {}): Promise<boolean> {
         if (opts.reschedule !== false) this.scheduleResearchPoll();
         const ctx = this.researchSyncLink();
-        if (!ctx || !onComputer() || !researchLinksEnabled()) return false;
+        if (!ctx || !researchReachable() || !researchLinksEnabled()) return false;
         const researchId = ctx.link.id;
         // A research that said what it takes (at a ?live= / ?send=) is asked
         // on its own. One that did not (an older version) is asked once per
@@ -1251,6 +1302,8 @@ export const researchSyncMethods = uiModule({
         if (status && opts.reschedule !== false) void this.researchAutoCheck();
         // Originals waiting for it go while it answers.
         if (status) void this.researchOriginalsKick();
+        // A device: photos handed over whose batch a reload or the computer away cut go again by themselves.
+        if (status) void this.batchResumeDevicePhotos();
         // A tree just imported or linked: its places not on the map, offered once (spec 034 U5 point 7).
         if (status) void this.maybeOfferPlaces();
         return !!status;
@@ -1608,7 +1661,8 @@ export const researchSyncMethods = uiModule({
         // nothing waits to be sent and nothing goes.
         if (DataManager.getCurrentTreeId() === treeId && DataManager.isLiveFollowing()) return;
         const link = TreeManager.getTreeMetadata(treeId)?.research;
-        if (!link || !this.researchSyncCapable(link.id)) return;
+        // A copy: nothing waits for a research it does not own (spec 139 K5.1).
+        if (!link || !TreeManager.canSendToResearch(treeId) || !this.researchSyncCapable(link.id)) return;
         fpCache = null;
         const st = researchAutoState(treeId);
         patchResearchAutoState(treeId, {
@@ -1755,7 +1809,7 @@ export const researchSyncMethods = uiModule({
      */
     async researchAutoSend(treeId: TreeId, why: 'quiet' | 'switch' | 'leave' | 'bridge' | 'newer' | 'media'): Promise<void> {
         const link = TreeManager.getTreeMetadata(treeId)?.research;
-        if (!link || !this.researchAutoOn(link) || link.refused) return;
+        if (!link || !TreeManager.canSendToResearch(treeId) || !this.researchAutoOn(link) || link.refused) return;
         // A send taken back and a research that would write it again from a copy: the user decides first
         // (Send again, or the research's version), never a copy by itself (finding 43).
         if (this.researchHoldsForUndo(link)) return;
@@ -1987,9 +2041,10 @@ export const researchSyncMethods = uiModule({
         const meta = TreeManager.getTreeMetadata(treeId);
         const link = meta?.research;
         if (!link || sendingTree) return;
-        // The sample tree never goes to a research (a tie it got before 3.29 included).
-        if (meta?.demo) {
-            console.warn('Not sending the sample tree to a research', treeId);
+        // Only the research's owner writes to it: never a copy, a second tree of the same research, nor the
+        // sample tree (a tie it got before 3.29 included; spec 139 K5.1).
+        if (!TreeManager.canSendToResearch(treeId)) {
+            console.warn(meta?.demo ? 'Not sending the sample tree to a research' : 'Not sending a tree that does not own its research', treeId);
             return;
         }
         const s = strings.sync;
@@ -2025,10 +2080,10 @@ export const researchSyncMethods = uiModule({
     },
 
     /** The send itself (postResearchSend, under the windows' lock). */
-    async postResearchSendNow(treeId: TreeId, opts: { auto: boolean; thenLoad?: boolean; keepalive?: boolean; again?: boolean; undoAgain?: boolean; noIdsRetried?: boolean }): Promise<void> {
+    async postResearchSendNow(treeId: TreeId, opts: { auto: boolean; thenLoad?: boolean; keepalive?: boolean; again?: boolean; undoAgain?: boolean; noIdsRetried?: boolean; mediaRefRetried?: boolean }): Promise<void> {
         const meta = TreeManager.getTreeMetadata(treeId);
         const link = meta?.research;
-        if (!link || sendingTree || meta?.demo) return;
+        if (!link || sendingTree || !TreeManager.canSendToResearch(treeId)) return;
         const s = strings.sync;
         // Never while a switch reads this tree to open it: what goes is the tree's own data, with its own
         // id and link. Sent by itself, it waits for the next answer of the bridge once it is open.
@@ -2130,12 +2185,28 @@ export const researchSyncMethods = uiModule({
         // The sources deleted here in edit mode (spec 117 §4): one back in the tree (Undo) forgotten, the rest said deleted.
         if (!again) forgetDeletedSourcesBack(treeId, data);
         const deletedSources = again ? [] : deletedSourcesToSend(TreeManager.getTreeMetadata(treeId)?.research);
-        const exported = again ? null : researchGedcomExport(data, meta?.name ?? '', {
+        // The tree as it is now, its pooled images as references: each is read as the GEDCOM is written
+        // (ged-export-images.ts), the tree is never expanded whole.
+        const whole = again ? null : poolRefSnapshot(data);
+        // The pictures the research holds go by reference (spec 133): never in a send written again (nothing is
+        // exported), nor in the one send with every picture's data after a reference it did not find.
+        const mediaFeatures = this.researchStatusOf(link.id)?.features;
+        const mediaRef = !whole || opts.mediaRefRetried ? undefined
+            : await prepareMediaRef({ researchId: link.id, base: bridge.base, features: mediaFeatures, data: whole, keepalive: !!opts.keepalive });
+        // Another send started while it was asked: one at a time.
+        if (sendingTree) return;
+        const exported = !whole ? null : await researchGedcomWithImages(whole, meta?.name ?? '', {
             id: link.id, head: link.head, appTree: treeId, transcripts: this.researchTranscriptsLink(link).transcripts, sent: fps.current,
-            ...(since ? { since } : {}), ...(deletedSources.length ? { deletedSources } : {}),
+            client: deviceClient(), ...(since ? { since } : {}), ...(deletedSources.length ? { deletedSources } : {}),
         }, titles, researchSendsReadings(this.researchStatusOf(link.id)), researchSendsSourceFields(this.researchStatusOf(link.id)), researchCitationsOut(this.researchStatusOf(link.id)),
-        researchMediaOut(this.researchStatusOf(link.id)));
-        const gedcom = exported?.content ?? '';
+        researchMediaOut(this.researchStatusOf(link.id)), mediaRef);
+        // The images were read before this send counts as going: another send asked meanwhile is stopped here, not posted beside it.
+        if (sendingTree) return;
+        const gedcom = exported ? gedcomText(exported) : '';
+        // What went by reference and how big the send is (no names; spec 133 K3.2).
+        if (exported && mediaRefGate(mediaFeatures)) {
+            console.info('Research send', { chars: gedcom.length, bytes: utf8Length(gedcom), ...exported.media, withData: !!opts.mediaRefRetried });
+        }
         // What this send carries, person by person (what was written, once it is).
         if (!again) this.researchNoteSending(treeId, data, fps.current);
         sendingTree = treeId;
@@ -2148,10 +2219,10 @@ export const researchSyncMethods = uiModule({
         this.refreshResearchSyncUi();
         // Leaving the page: its answer may never come back here — remembered, so the next look at the
         // research takes this send as the last one, never sends it a second time (audit 017 a-D1).
-        if (opts.keepalive && !again) {
-            patchResearchAutoState(treeId, { leftSend: { fingerprint: sentFp, at: new Date().toISOString(), head,
-                ...(ownBase ? { ownBase: true as const } : {}), ...(carriesTitles ? { titles: true as const } : {}), ...(version ? { version } : {}) } });
-        }
+        const sentAt = new Date().toISOString();
+        const leftSend = () => ({ fingerprint: sentFp, at: sentAt, head,
+            ...(ownBase ? { ownBase: true as const } : {}), ...(carriesTitles ? { titles: true as const } : {}), ...(version ? { version } : {}) });
+        if (opts.keepalive && !again) patchResearchAutoState(treeId, { leftSend: leftSend() });
         if (hand) {
             const n = this.researchChangesCount();
             const k = n ? n.persons + n.other : 0;
@@ -2167,6 +2238,15 @@ export const researchSyncMethods = uiModule({
             if (opts.keepalive) patchResearchAutoState(treeId, { leftSend: undefined });
         } catch (err) {
             if (opts.keepalive) patchResearchAutoState(treeId, { leftSend: undefined });
+            // A device: the gateway took this send already and only its answer was lost (U9d). Never sent again:
+            // remembered as a send left, the research's state read at once (deviceWriteUnsure) says whether it
+            // was written — as after leaving the page; not written, its changes wait as before.
+            if (isDeviceReplay(err)) {
+                if (!again) patchResearchAutoState(treeId, { leftSend: leftSend() });
+                sendingTree = null;
+                this.refreshResearchSyncUi();
+                return;
+            }
             console.warn('Sending to the research failed', err);
             sendingTree = null;
             const prev = runtime.get(link.id);
@@ -2197,16 +2277,33 @@ export const researchSyncMethods = uiModule({
         // What it did not write keeps its codes only from a research that says it sends them.
         const replyFeatures = this.researchStatusOf(link.id)?.features;
         let reply = sanitizeSyncReply(null);
-        try { reply = sanitizeSyncReply(await res.json(), replyFeatures); } catch { /* a refusal without a reason */ }
+        let replyBody: unknown = null;
+        try {
+            replyBody = await res.json();
+            reply = sanitizeSyncReply(replyBody, replyFeatures);
+        } catch { /* a refusal without a reason */ }
         sendingTree = null;
+        // A picture by reference the research does not find (spec 133 §1.4): nothing was taken. Those hashes go
+        // with data from now on, and the same tree goes once more with every picture's data — nothing to tell.
+        if (!res.ok && isMediaRefUnknown(replyBody) && mediaRef && !opts.mediaRefRetried) {
+            const unknown = mediaRefUnknownShas(replyBody);
+            noteMediaRefRefused(link.id, unknown);
+            console.info('Research send: a picture by reference not found there, sent again with data', { unknown: unknown.length });
+            return this.postResearchSendNow(treeId, { ...opts, mediaRefRetried: true });
+        }
         // The research has this copy now (any answer with its mark; a send written again is the old copy, not this one).
         if (res.ok && reply.ok && reply.intake && !again) {
             patchResearchAutoState(treeId, { lastCopy: { intake: reply.intake, base: link.head ?? '', ...(version ? { version } : {}) } });
         }
+        // Conflicts between this send and an earlier one (another device's, spec 094 K2.4): said only in this answer,
+        // shown later too. An older research says none: nothing is kept.
+        if (res.ok && reply.conflictSent.length) rememberConflictSent(treeId, reply.conflictSent);
         // The tree's files went with it, said so: its research's archive has them (spec 108 K2.7).
         if (res.ok && reply.ok && declaresMedia) patchResearchAutoState(treeId, { appMediaSent: link.id });
         // The first send out of "only load" went (through the preview): sending by itself may go on.
         if (res.ok && reply.ok && link.previewDue) TreeManager.patchResearchLink(treeId, { previewDue: undefined });
+        // A merge waiting for a send went with it (spec 134 §11): marked sent, sending by itself goes on.
+        if (res.ok && reply.ok && !again) await settleMergeHold(treeId, data, reply.intake);
         // Busy (503): not a refusal — it goes again at the next look.
         if (res.status === 503) {
             if (opts.auto) autoDue.add(treeId);
@@ -2466,7 +2563,8 @@ export const researchSyncMethods = uiModule({
         if (sent.manual && sent.changes !== 0) patchResearchAutoState(treeId, { manualWrites: (researchAutoState(treeId).manualWrites ?? 0) + 1 });
         if (sent.manual) {
             if (conflicts > 0) {
-                this.showToast(s.writtenConflictToast(sent.changes ?? 0, conflicts), 8000,
+                const devices = this.researchConflictsDevices(treeId, known?.ids ?? []);
+                this.showToast([s.writtenConflictToast(sent.changes ?? 0, conflicts), devices ? conflictDevicePairLine(devices) : ''].filter(Boolean).join(' '), 8000,
                     { action: { label: s.showConflicts, run: () => this.researchShowConflicts(persons) } });
             } else if (sent.changes !== 0 && toldNotWritten !== sent.fingerprint) {
                 // (0 written: nothing to say here — what was left out or skipped is told on its own;
@@ -2474,7 +2572,7 @@ export const researchSyncMethods = uiModule({
                 this.showToast(s.writtenToast(sent.changes ?? 0), 6000);
             }
         } else if (conflicts > 0) {
-            this.showResearchConflictNote(conflicts, persons);
+            this.showResearchConflictNote(conflicts, persons, this.researchConflictsDevices(treeId, known?.ids ?? []));
         }
         this.refreshResearchSyncUi();
     },
@@ -2684,7 +2782,8 @@ export const researchSyncMethods = uiModule({
     /** Tree menus' "Send changes": the same send for any tree (switched to first when a running research takes it straight). */
     async researchSendTree(treeId: TreeId, opts: { thenLoad?: boolean; undoAgain?: boolean } = {}): Promise<void> {
         const link = TreeManager.getTreeMetadata(treeId)?.research;
-        if (!link) return;
+        // A copy is a tree without research: nothing of it goes there (spec 139 K5.1).
+        if (!link || !TreeManager.canSendToResearch(treeId)) return;
         if (!this.researchSyncCapable(link.id)) {
             await this.sendTreeToResearch(treeId);
             return;
@@ -3034,6 +3133,15 @@ export const researchSyncMethods = uiModule({
         return persons.filter(id => this.personOpenConflicts(id).length > 0);
     },
 
+    /**
+     * The conflicts a write named, when every one is between the same two sends' devices (spec 094 K2.4):
+     * those devices; null otherwise (one with the research's own value, none known, or different pairs).
+     */
+    researchConflictsDevices(treeId: TreeId, ids: readonly string[]): ConflictDeviceWords | null {
+        const pc = inDeviceMode() ? deviceComputerName() : '';
+        return sharedConflictWords(ids.map(id => conflictDeviceWords(researchConflictSides(treeId, id), undefined, pc)));
+    },
+
     /** "Decide in the research (research)": the one open conflict of the one person, when the research announced the link. */
     researchDecideUrl(treeId: TreeId): string | null {
         if (!this.researchLinkAvailable('conflict')) return null;
@@ -3053,7 +3161,7 @@ export const researchSyncMethods = uiModule({
      * the line saying whom and what the menu's "Show" leads to. Null: more
      * than one, none known here, or one decided in the research only.
      */
-    researchShowConflictTarget(treeId: TreeId): { personId: PersonId; conflictId: string; lead: string } | null {
+    researchShowConflictTarget(treeId: TreeId): { personId: PersonId; conflictId: string; lead: string; devices: ConflictDeviceWords | null } | null {
         const named = researchAutoState(treeId).lastWritten?.conflictIds ?? [];
         if (named.length > 1) return null;
         // Named by the write: wherever it is shown here; unnamed: one person with one open conflict (as "Decide in the research (research)").
@@ -3071,7 +3179,9 @@ export const researchSyncMethods = uiModule({
         const [[conflictId, { personId, conflict }]] = [...found];
         const person = DataManager.getPerson(personId);
         if (!person || !canDecideInApp(conflict, person)) return null;
-        return { personId, conflictId, lead: [shownNameOrEmpty(person), researchConflictTitle(conflict)].filter(Boolean).join(' · ') };
+        // Between two sends of two devices (spec 094 K2.4): whose edits, after whom and what.
+        const devices = conflictDeviceWords(researchConflictSides(treeId, conflictId));
+        return { personId, conflictId, devices, lead: [shownNameOrEmpty(person), researchConflictTitle(conflict), devices ? conflictDevicePair(devices) : ''].filter(Boolean).join(' · ') };
     },
 
     /** "Show" (DEV §6.2): the person's "What the research knows" at the conflict's card; else the conflicts as before. */
@@ -3091,7 +3201,7 @@ export const researchSyncMethods = uiModule({
     /** What a delete adds in an archive the research already wrote to: it is set aside there, not lost. */
     researchArchiveDeleteNote(): { tag: string; text: string } | undefined {
         const ctx = this.researchSyncLink();
-        if (!ctx || !onComputer() || !this.researchSyncCapable(ctx.link.id)) return undefined;
+        if (!ctx || !researchReachable() || !this.researchSyncCapable(ctx.link.id)) return undefined;
         if (this.researchModeOf(ctx.link.id, ctx.link) !== 'archive') return undefined;
         // The archive has the tree: it came from there, or a send was written there.
         if (!ctx.link.head && !researchAutoState(ctx.treeId).lastWritten) return undefined;
@@ -3187,7 +3297,7 @@ export const researchSyncMethods = uiModule({
     researchHoldsTree(treeId: TreeId, now = Date.now()): { holds: boolean; until?: number; photos?: boolean } {
         const meta = TreeManager.getTreeMetadata(treeId);
         const link = meta?.research;
-        if (!link || !onComputer() || !researchLinksEnabled() || !this.researchSyncCapable(link.id)) return { holds: false };
+        if (!link || !researchReachable() || !researchLinksEnabled() || !this.researchSyncCapable(link.id)) return { holds: false };
         const rest = this.researchHoldsTreeText(treeId, now);
         if (browserMediaSafe(this.researchTreeMediaFp(treeId, meta), meta.fileCopyMediaFp, this.researchArchiveHoldsMedia(treeId))) return rest;
         return rest.holds ? { holds: false, photos: true, ...(rest.until ? { until: rest.until } : {}) } : { holds: false };
@@ -3279,6 +3389,9 @@ export const researchSyncMethods = uiModule({
                     const name = one ? shownNameOrEmpty(one) : '';
                     actions.push({ action: 'showConflicts', label: name ? `${name} ›` : `${s.showConflicts} ›`, asLink: true });
                     if (treeId && this.researchDecideUrl(treeId)) actions.push({ action: 'decideInResearch', label: s.decideInResearch, asLink: true });
+                    // Several between the same two devices' sends: that pair (one is said in the lead).
+                    const devices = treeId ? this.researchConflictsDevices(treeId, lw?.conflictIds ?? []) : null;
+                    if (devices) parts.push(conflictDevicePair(devices));
                 }
                 return { tone: 'quiet', title: s.writtenAt(when(lw?.at)), sub: parts.join(' · ') || undefined, actions, lead: show?.lead };
             },
@@ -3302,8 +3415,12 @@ export const researchSyncMethods = uiModule({
                 const conn = link ? this.researchConnectionNote(link.id) : null;
                 // The research's value stands there only while a conflict really is open.
                 const at = s.writtenAt(when(lw?.at ?? state.sent?.closedAt));
+                // Between two devices' sends (the one in the lead, or several of the same pair): what stays here
+                // and what stands in the research said by device, not as the app's value and the research's.
+                const devices = conflicts > 0 && treeId ? (show ? show.devices : this.researchConflictsDevices(treeId, lw?.conflictIds ?? [])) : null;
+                const held = devices ? strings.conflict.heldFrom(devices.user, devices.research) : s.writtenConflictsSub;
                 return { tone: conn && conn.warn ? 'warn' : 'neutral', title: conflicts > 0 ? s.flyConflict(conflicts) : at,
-                    sub: [conn ? `${conn.title}.` : '', conn?.sub ?? '', conflicts > 0 ? at : '', conflicts > 0 ? s.writtenConflictsSub : ''].filter(Boolean).join(' '), actions, lead: show?.lead };
+                    sub: [conn ? `${conn.title}.` : '', conn?.sub ?? '', conflicts > 0 ? at : '', conflicts > 0 ? held : ''].filter(Boolean).join(' '), actions, lead: show?.lead };
             },
             unsent: () => ({ tone: 'warn', title: s.stateUnsentShort, sub: changed ? s.changedAt(changed) : undefined, actions: [{ action: 'send', label: s.send }] }),
             notTaken: () => ({ tone: 'neutral', title: s.stateUnsentShort, sub: s.notTakenSub, actions: [{ action: 'send', label: s.send }] }),
@@ -3439,7 +3556,8 @@ export const researchSyncMethods = uiModule({
         const behind = this.researchUndoneLeftBehind();
         if (behind && !['rejected', 'stale', 'safari', 'sending'].includes(state.kind)) {
             b.tone = 'warn';
-            b.sub = [b.sub, s.leftBehind(when(behind.at))].filter(Boolean).join(' ');
+            const from = otherDeviceWords(behind.client);
+            b.sub = [b.sub, s.leftBehind(when(behind.at)), from ? strings.research.sentFromDevice(from) : ''].filter(Boolean).join(' ');
             if (!(b.actions ?? []).some(a => a.action === 'loadNewer')) b.actions = [...(b.actions ?? []), { action: 'loadNewer', label: s.loadVersion, asLink: true }];
         }
         // Whether a person comes back or goes, asked by a send and not decided there yet: said in any state
@@ -3541,6 +3659,9 @@ export const researchSyncMethods = uiModule({
         const sub = [foreign ? s.undoneForeignSub(when(sent?.closedAt))
             : kept ? s.undoneKeptSub(when(sent?.closedAt)) : auto ? s.undoneAutoSub(when(sent?.closedAt)) : s.undoneSub(when(sent?.closedAt))];
         if (sent?.takenBack) sub.push(s.takenBackSub(sent.takenBack));
+        // A send of another browser (spec 094 K2.4): which one, first.
+        const from = link && sent?.intake ? this.researchSendDevice(link.id, sent.intake) : '';
+        if (from) sub.unshift(strings.research.sentFromDevice(from));
         const conn = link ? this.researchConnectionNote(link.id) : null;
         if (conn) sub.unshift(`${conn.title}.`, ...(conn.warn ? [conn.sub] : []));
         if (treeId && conflicts > 0) {
@@ -3557,6 +3678,11 @@ export const researchSyncMethods = uiModule({
         if (foreign) actions.unshift({ action: 'acceptUndo', label: s.loadVersion });
         else actions.push({ action: 'acceptUndo', label: s.loadVersion, asLink: true });
         return { tone: 'warn', title: s.stateUndone(when(sent?.at)), sub: sub.join(' '), actions };
+    },
+
+    /** The browser a send of the research came from, when another one than this (spec 094 K2.4); '' this one or none said. */
+    researchSendDevice(researchId: string, intake: string): string {
+        return otherDeviceWords(this.researchStatusOf(researchId)?.sends?.find(r => r.intake === intake)?.client);
     },
 
     /**
@@ -3625,6 +3751,7 @@ export const researchSyncMethods = uiModule({
         // The last write's own count: this one off it (its record there follows at the next ask).
         const lw = st.lastWritten;
         const named = !!lw?.conflictIds?.includes(conflictId);
+        forgetConflictSent(treeId, conflictId);
         patchResearchAutoState(treeId, {
             settledConflicts: { base, ids },
             ...(lw && named ? { lastWritten: { ...lw, conflicts: Math.max(0, (lw.conflicts ?? 0) - 1), conflictIds: lw.conflictIds!.filter(x => x !== conflictId) } } : {}),
@@ -3839,6 +3966,9 @@ export const researchSyncMethods = uiModule({
             this.closeResearchSyncNote();
         };
         if (kind === 'none' || !ctx) { hide(); return; }
+        // On a device the computer's state is the tree switcher's second line (094 §3.1): no quiet mark of the
+        // bridge beside it, which would stay green while the computer is away.
+        const quietMarkOff = inDeviceMode();
         const set = (cls: string, html: string, title = ''): void => {
             const full = html + (note ? `<div class="research-sync-note" role="status">${note.html}</div>` : '');
             // A button of the bar in its working state or its ✓: redrawn after it (waiting buttons §1.5).
@@ -3935,6 +4065,7 @@ export const researchSyncMethods = uiModule({
             if (safariBrowser()) { hide(); return; }
             // "Only load from the research": never a Send button — the quiet mark says nothing goes.
             if (researchSendMode(link) === 'off') {
+                if (quietMarkOff) { hide(); return; }
                 const down = kind === 'bridgeDown';
                 const label = down ? s.stateBridgeDown : s.sendOffLine;
                 set('is-send', `<button type="button" class="research-sync-mark" id="research-sync-mark" data-look="${down ? 'ghost' : 'off'}"`
@@ -3944,6 +4075,7 @@ export const researchSyncMethods = uiModule({
             }
             // Nothing to send: the button's place stays (empty), so the toolbar does not move when it comes.
             if (kind !== 'unsent' && kind !== 'notTaken') {
+                if (quietMarkOff) { hide(); return; }
                 // In its place the quiet mark (in step, or the research not running), at the end next to the tree switcher.
                 const down = kind === 'bridgeDown' || kind === 'unsentBridgeDown';
                 // Changes waiting for a research that is not running: their number stays in sight beside the mark (audit 017 a-D6).
@@ -3972,6 +4104,7 @@ export const researchSyncMethods = uiModule({
             return;
         }
         // Sent by itself: the mark, always there (the toolbar does not move while a send goes).
+        if (quietMarkOff) { hide(); return; }
         const lw = researchAutoState(ctx.treeId).lastWritten;
         const writtenAt = lw ? s.writtenAt(when(lw.at)) : s.stateInSync;
         let look: 'ring' | 'spin' | 'check' | 'dot' | 'ghost';
@@ -4039,18 +4172,20 @@ export const researchSyncMethods = uiModule({
     },
 
     /** The note under the mark: a send by itself left a new conflict. */
-    showResearchConflictNote(conflicts: number, persons: readonly PersonId[]): void {
+    showResearchConflictNote(conflicts: number, persons: readonly PersonId[], devices: ConflictDeviceWords | null = null): void {
         const s = strings.sync;
         const one = persons.length === 1 ? DataManager.getPerson(persons[0]) : null;
         const name = one ? shownNameOrEmpty(one) : '';
+        // Between two sends of two devices (spec 094 K2.4): the pair after the count.
+        const said = [s.flyConflict(conflicts), devices ? conflictDevicePairLine(devices) : ''].filter(Boolean);
         // No room for the note under the mark: a toast says it, with the way to the conflicts.
         if (!toolbarWide()) {
-            this.showToast(s.flyConflict(conflicts), CONFLICT_NOTE_MS,
+            this.showToast(said.join('. '), CONFLICT_NOTE_MS,
                 { action: { label: name || s.showConflicts, run: () => this.researchShowConflicts([...persons]) } });
             return;
         }
         const ids = JSON.stringify(persons).replace(/"/g, '&quot;');
-        this.setResearchSyncNote('conflict', `<span class="research-sync-note-text">${esc(s.flyConflict(conflicts))}</span>`
+        this.setResearchSyncNote('conflict', `<span class="research-sync-note-text">${esc(said.join('. '))}</span>`
             + `<button type="button" class="research-sync-note-link" onclick="${call('researchShowConflicts', ids)}">${esc(name || s.showConflicts)} ›</button>`
             + `<button type="button" class="research-sync-note-x" aria-label="${esc(strings.buttons.close)}" onclick="${call('closeResearchSyncNote')}">&times;</button>`,
         CONFLICT_NOTE_MS);

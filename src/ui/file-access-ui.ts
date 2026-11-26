@@ -10,6 +10,7 @@
  */
 
 import { DataManager } from '../data.js';
+import { SettingsManager } from '../settings.js';
 import { TreeManager } from '../tree-manager.js';
 import { strings } from '../strings.js';
 import { TreeId, type StromData } from '../types.js';
@@ -21,8 +22,10 @@ import { uiModule } from './module.js';
 import { activatedElement, runBusy } from './busy.js';
 import { imagesToAwait } from '../image-loads.js';
 import { imagesBeforeOutput } from './output-images.js';
+import { confirmMemoryForOutput } from './memory-limit-ui.js';
 import { holdLeave } from './busy-leave.js';
 import { whilePicking } from './file-pick.js';
+import { inDeviceMode } from './device-mode-ui.js';
 
 export const fileAccessMethods = uiModule({
     /** Reveal FSA controls only when supported; refresh the indicator. */
@@ -34,7 +37,7 @@ export const fileAccessMethods = uiModule({
     },
 
     /** Build the working-file JSON, refusing when encryption is locked. */
-    async buildFileJsonOrWarn(treeId: TreeId): Promise<{ json: string; data: StromData } | null> {
+    async buildFileJsonOrWarn(treeId: TreeId): Promise<{ body: string | Blob; data: StromData } | null> {
         try {
             return await DataManager.buildAttachedFile(treeId);
         } catch (err) {
@@ -68,7 +71,7 @@ export const fileAccessMethods = uiModule({
             try {
                 const file = await this.buildFileJsonOrWarn(treeId);
                 if (file === null) return false;
-                await saveToHandle(handle, file.json);
+                await saveToHandle(handle, file.body);
                 TreeManager.noteFileCopy([treeId], { [treeId]: file.data });
                 await storeHandle(treeId, handle);
                 return true;
@@ -154,13 +157,16 @@ export const fileAccessMethods = uiModule({
         const waits = imagesToAwait(treeId);
         if (await imagesBeforeOutput(strings.photos.out.backup, { el: origin, treeId }) === 'cancelled') return;
         if (waits) await TreeManager.flush(treeId);
+        // The file with its images may need more memory than the page has (spec 135): asked first.
+        // Under encryption the file is sealed whole (its images whole in memory).
+        if (await confirmMemoryForOutput({ treeId, whole: SettingsManager.isEncryptionEnabled() }) === 'cancel') return;
         const save = async (): Promise<void> => {
             const release = holdLeave('export');
             try {
                 const file = await this.buildFileJsonOrWarn(treeId);
                 if (file === null) return;
                 try {
-                    await saveToHandle(handle, file.json);
+                    await saveToHandle(handle, file.body);
                     TreeManager.noteFileCopy([treeId], { [treeId]: file.data });
                     // From the "Where the data is" dialog: it goes once the file is written.
                     if (origin?.closest('#storage-status-modal')) this.closeStorageStatusDialog();
@@ -193,7 +199,8 @@ export const fileAccessMethods = uiModule({
         const indicator = document.getElementById('file-link-indicator');
         const treeId = DataManager.getCurrentTreeId();
         const handle: FileSystemFileHandleLike | null =
-            (treeId && !DataManager.isViewMode()) ? await loadHandle(treeId) : null;
+            // A device of the home network links no file: the tree is the computer's research's (spec 094 §3).
+            (treeId && !DataManager.isViewMode() && !inDeviceMode()) ? await loadHandle(treeId) : null;
         this.activeFileHandleName = handle?.name ?? null;
         // Gates the "Detach file" option in the export dialog.
         document.body.classList.toggle('file-linked', !!handle);

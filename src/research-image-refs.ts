@@ -37,6 +37,8 @@
 import { base64ToBytes, bytesToBase64, canonicalBase64Bytes } from './base64.js';
 import { rememberImageBytes, forgetImageBytes } from './known-image-bytes.js';
 import { sha256Bytes } from './sha256.js';
+import { imageMetaOf } from './image-meta.js';
+import { isPoolRef, poolIdOf } from './image-ref.js';
 
 /** A FILE value that names an image by its hash. */
 export const IMAGE_REF_PREFIX = 'strom-image:';
@@ -49,6 +51,32 @@ const SAFE_IMAGE_MIME = /^image\/(jpeg|png|webp|gif)$/;
 export const IMAGE_BATCH = 500;
 /** Asks in flight at once (the bridge recommends 2–3). */
 export const IMAGE_CONCURRENCY = 2;
+/**
+ * Image bytes asked at once when the file says their sizes (`_BYTES`): an
+ * answer this big fits into one of the bridge's (≤ 8 MB with the base64), so
+ * the asks go side by side from the start — the next one on its way while one
+ * is opened and checked — instead of one after another through `more`.
+ */
+export const IMAGE_ASK_BYTES = 6 * 1024 * 1024;
+
+/** The hashes of `refs` in asks of at most IMAGE_BATCH and, as far as their sizes are said, IMAGE_ASK_BYTES. */
+function imageAsks(refs: Iterable<ImageRef>): string[][] {
+    const asks: string[][] = [];
+    let ask: string[] = [];
+    let size = 0;
+    for (const ref of refs) {
+        const bytes = ref.bytes ?? 0;
+        if (ask.length && (ask.length >= IMAGE_BATCH || size + bytes > IMAGE_ASK_BYTES)) {
+            asks.push(ask);
+            ask = [];
+            size = 0;
+        }
+        ask.push(ref.sha);
+        size += bytes;
+    }
+    if (ask.length) asks.push(ask);
+    return asks;
+}
 /** Waits before asking again after a network error, a 5xx or an answer cut short. */
 export const IMAGE_RETRY_MS: readonly number[] = [500, 1500, 4000];
 /** How long one answer (≤ 8 MB) is waited for. */
@@ -232,11 +260,52 @@ export interface ImageFetchDeps {
     sleep(ms: number): Promise<void>;
     /** The address with what the bridge is told of the app (e.g. `app=`); as it is by default. */
     address?(url: string): string;
+    /**
+     * The bridge at `url` is reached through a channel that authenticates
+     * every byte as the research's own (a device's sealed tunnel to its
+     * paired computer, spec 094): an image is taken under the hash the
+     * research named, not hashed again — a phone's page from the gateway has
+     * no WebCrypto and hashes in JavaScript, slowly. Never by default.
+     */
+    sealed?(url: string): boolean;
 }
 
 /** What resolving needs besides: the images and files (data URLs) of the tree stored for a research. */
 export interface ImageResolveDeps extends ImageFetchDeps {
     treeImages(researchId: string): Promise<Iterable<string>>;
+    /**
+     * Images of this browser's pool by the hash of their bytes (the image
+     * catalog, spec 135): sha → the pooled image's reference. Taken as they
+     * are — nothing read, nothing hashed.
+     */
+    pooledBySha?(shas: readonly string[]): Promise<Map<string, string>>;
+}
+
+/**
+ * The data URL head (`data:<type>;base64,`) of an image value: a data URL's
+ * own, a pooled image's from the image catalog ('' when not known).
+ */
+export function imageFileHead(value: string): string {
+    if (value.startsWith('data:')) {
+        const comma = value.indexOf(',');
+        return comma < 0 ? '' : value.slice(0, comma + 1);
+    }
+    return isPoolRef(value) ? imageMetaOf(value)?.head ?? '' : '';
+}
+const headOf = imageFileHead;
+
+/**
+ * A FILE value read as the file itself: a data URL, or a pooled image's
+ * reference an image named by its hash resolved to (spec 135).
+ */
+export function isImageFile(value: string): boolean {
+    return value.startsWith('data:') || isPoolRef(value);
+}
+
+/** The bytes of an image file value: a data URL's decoded size, a pooled image's from the image catalog (0 when not known). */
+export function imageFileBytes(value: string): number {
+    if (isPoolRef(value)) return imageMetaOf(value)?.bytes ?? 0;
+    return Math.round((value.length - value.indexOf(',') - 1) * 0.75);
 }
 
 /** SHA-256 hex of bytes (Web Crypto, or the built-in implementation outside a secure context). */
@@ -347,7 +416,7 @@ async function askImagesAnswer(url: string, shas: string[], deps: ImageFetchDeps
  * the file with its images in it would carry it, or null when its type is
  * not the one asked or its bytes do not give its hash.
  */
-async function checkedImage(img: { sha: string; mime: string; data: string }, ref: ImageRef, deps: ImageFetchDeps): Promise<{ url: string } | { wrongType: true } | null> {
+async function checkedImage(img: { sha: string; mime: string; data: string }, ref: ImageRef, deps: ImageFetchDeps, sealed = false): Promise<{ url: string } | { wrongType: true } | null> {
     const sha = ref.sha;
     const mime = img.mime.toLowerCase();
     if (mime !== ref.mime || !SAFE_IMAGE_MIME.test(mime)) return { wrongType: true };
@@ -362,10 +431,11 @@ async function checkedImage(img: { sha: string; mime: string; data: string }, re
             bytes = null;
         }
     }
-    if (!bytes || await deps.sha256Hex(bytes) !== sha) return null;
+    // Through a sealed channel the research's own bytes: its hash taken as it named it (ImageFetchDeps.sealed).
+    if (!bytes || (!sealed && await deps.sha256Hex(bytes) !== sha)) return null;
     const dataUrl = `data:${mime};base64,${canonical ? img.data : bytesToBase64(bytes)}`;
-    // Storing the tree takes these checked bytes instead of decoding the text again.
-    rememberImageBytes(dataUrl, bytes);
+    // Storing the tree takes these checked bytes (and their hash) instead of decoding and hashing them again.
+    rememberImageBytes(dataUrl, bytes, sha);
     return { url: dataUrl };
 }
 
@@ -376,18 +446,17 @@ async function checkedImage(img: { sha: string; mime: string; data: string }, re
  * one cannot be had: the bridge lacks it, refuses, keeps failing, or sends
  * bytes that do not give the hash (once more asked, then given up).
  */
-export async function fetchImagesByHash(url: string, refs: readonly ImageRef[], deps: ImageFetchDeps): Promise<Map<string, string>> {
+export async function fetchImagesByHash(url: string, refs: readonly ImageRef[], deps: ImageFetchDeps, signal?: AbortSignal): Promise<Map<string, string>> {
     const out = new Map<string, string>();
     const wanted = new Map(refs.map(r => [r.sha, r]));
-    const queue: string[][] = [];
-    const all = [...wanted.keys()];
-    for (let i = 0; i < all.length; i += IMAGE_BATCH) queue.push(all.slice(i, i + IMAGE_BATCH));
+    const sealed = !!deps.sealed?.(url);
+    const queue: string[][] = imageAsks(wanted.values());
     /** Hashes whose bytes did not give them once: asked once more. */
     const mismatched = new Set<string>();
     let failed: unknown = null;
 
     const handle = async (batch: string[]): Promise<void> => {
-        const answer = await askImages(url, batch, deps);
+        const answer = await askImages(url, batch, deps, signal);
         if (failed) return;
         if (answer.missing.length) throw new ImagesNotResolved(`not at the bridge: ${answer.missing.length}`);
         const open = new Set(batch);
@@ -397,7 +466,7 @@ export async function fetchImagesByHash(url: string, refs: readonly ImageRef[], 
             const ref = wanted.get(sha);
             // Only what was asked, once: nothing is ever kept under a hash not asked for.
             if (!ref || !open.delete(sha)) continue;
-            const got = await checkedImage(img, ref, deps);
+            const got = await checkedImage(img, ref, deps, sealed);
             if (got && 'wrongType' in got) throw new ImagesNotResolved(`unexpected type ${img.mime}`);
             if (got) {
                 out.set(sha, got.url);
@@ -461,6 +530,7 @@ export interface ImageBatchResult {
 export async function fetchImageBatch(url: string, refs: readonly ImageRef[], deps: ImageFetchDeps, signal?: AbortSignal): Promise<ImageBatchResult> {
     const wanted = new Map(refs.map(r => [r.sha, r]));
     const out: ImageBatchResult = { images: new Map(), missing: [], more: [] };
+    const sealed = !!deps.sealed?.(url);
     let ask = [...wanted.keys()];
     /** Bytes that did not give their hash once: asked once more. */
     const mismatched = new Set<string>();
@@ -480,7 +550,7 @@ export async function fetchImageBatch(url: string, refs: readonly ImageRef[], de
             const ref = wanted.get(sha);
             // Only what was asked, once: nothing is ever kept under a hash not asked for.
             if (!ref || !open.delete(sha)) continue;
-            const got = await checkedImage(img, ref, deps);
+            const got = await checkedImage(img, ref, deps, sealed);
             if (got && 'url' in got) {
                 out.images.set(sha, got.url);
             } else if (got || mismatched.has(sha)) {
@@ -536,7 +606,7 @@ export interface ImagesResolved {
  * image (an attachment's PDF), never asked of the bridge, none missed.
  */
 export async function resolveImageRefs(
-    o: { researchId: string | null; refs: readonly ImageRef[]; imagesUrl: string; files?: readonly string[] },
+    o: { researchId: string | null; refs: readonly ImageRef[]; imagesUrl: string; files?: readonly string[]; signal?: AbortSignal },
     deps: ImageResolveDeps,
     later?: ImageRef[],
 ): Promise<ImagesResolved> {
@@ -548,18 +618,35 @@ export async function resolveImageRefs(
     const want = new Map<string, ImageRef>();
     for (const ref of o.refs) {
         const url = known?.get(ref.sha);
-        if (url && url.startsWith(`data:${ref.mime};base64,`)) images.set(ref.sha, url);
+        if (url && headOf(url) === `data:${ref.mime};base64,`) images.set(ref.sha, url);
         else want.set(ref.sha, ref);
     }
     const files = new Set<string>();
     for (const sha of o.files ?? []) {
         if (images.has(sha)) continue;
         const url = known?.get(sha);
-        if (url && !url.startsWith('data:image/')) images.set(sha, url);
+        const head = url ? headOf(url) : '';
+        if (url && head && !head.startsWith('data:image/')) images.set(sha, url);
         else files.add(sha);
     }
     const fromHeld = images.size;
     let seeded = 0;
+    // Pooled here already (the image catalog knows its hash): its reference, no image read or hashed.
+    if (deps.pooledBySha && (want.size || files.size)) {
+        for (const [sha, ref] of await deps.pooledBySha([...want.keys(), ...files])) {
+            const head = headOf(ref);
+            const wanted = want.get(sha);
+            if (wanted && head === `data:${wanted.mime};base64,`) {
+                images.set(sha, ref);
+                want.delete(sha);
+                seeded++;
+            } else if (files.has(sha) && head && !head.startsWith('data:image/')) {
+                images.set(sha, ref);
+                files.delete(sha);
+                seeded++;
+            }
+        }
+    }
     // A new session (or another research): the stored tree's images, hashed once. Its other files (few: an
     // attachment's PDF) whenever the file names one not held — one added here since comes back by its name.
     const seedImages = !known && want.size > 0;
@@ -591,7 +678,7 @@ export async function resolveImageRefs(
         want.clear();
     }
     if (want.size) {
-        const got = await fetchImagesByHash(o.imagesUrl, [...want.values()], deps);
+        const got = await fetchImagesByHash(o.imagesUrl, [...want.values()], deps, o.signal);
         for (const [sha, url] of got) images.set(sha, url);
         fetched = got.size;
     }
@@ -601,6 +688,25 @@ export async function resolveImageRefs(
     // A copy: the images that come later join the ones held, never the map handed out.
     if (researchId) held = { researchId, bySha: new Map(images) };
     return { images, held: fromHeld, seeded, fetched };
+}
+
+/**
+ * Images just stored in the pool (spec 135, D6; image-intern.ts): the images
+ * held take their references, so the held map keeps no copy the tree let go.
+ */
+export function internHeldImages(map: ReadonlyMap<string, string>): void {
+    if (!held || map.size === 0) return;
+    for (const [sha, url] of held.bySha) {
+        const ref = map.get(url);
+        if (ref !== undefined) held.bySha.set(sha, ref);
+    }
+}
+
+/** The pooled images the held images name (spec 135, D7: the pool's cleanup keeps them). */
+export function heldImageIds(): string[] {
+    const out: string[] = [];
+    if (held) for (const url of held.bySha.values()) { const id = poolIdOf(url); if (id) out.push(id); }
+    return out;
 }
 
 /** Images had since for the research whose images are held (images arriving later): held with them. */
