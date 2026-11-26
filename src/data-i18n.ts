@@ -247,6 +247,18 @@ const EXACT_EN: Record<string, string> = {
     'Sobáš Simon Krupa × Helena Woyciczonka 10. 11. 1795 Szymbark č. 85': 'Marriage of Simon Krupa × Helena Woyciczonka 10 Nov 1795 Szymbark No. 85',
     'Sobáš Stephanus Stawiarski × Magdalena Krupa 11. 11. 1822 Szymbark č. 142': 'Marriage of Stephanus Stawiarski × Magdalena Krupa 11 Nov 1822 Szymbark No. 142',
     'Sčítanie ľudu 1930 – Bardejov, Nová ulica 38/753 (Andrej Jurčák)': '1930 Census – Bardejov, Nová ulica 38/753 (Andrej Jurčák)',
+    'tesársky tovariš / tesár (ácslegény / ács)': 'journeyman carpenter / carpenter (ácslegény / ács)',
+    'Roľník (pór) v Bardejove; otec #30 Jána Zámborského.': 'Farmer (pór) in Bardejov; father of #30 Ján Zámborský.',
+    'Manželka Jozefa Zámborského (#60), matka #30 Jána Zámborského.': 'Wife of Jozef Zámborský (#60), mother of #30 Ján Zámborský.',
+    'Mešťan a remeselník (polgár / kézműves) v Bardejove č. 10; otec #31 Veroniky.': 'Burgher and craftsman (polgár / kézműves) in Bardejov No. 10; father of #31 Veronika.',
+    'Manželka Karola Geffertha (#62), matka #31 Veroniky.': 'Wife of Karol Gefferth (#62), mother of #31 Veronika.',
+    'Dieťa #30 Jána Zámborského a #31 Veroniky Gefferthovej; Zábava č. 16 (DGS 004406773 Item 3, sn. 90, pag. 172, č. 91).': 'Child of #30 Ján Zámborský and #31 Veronika Gefferthová; Zábava No. 16 (DGS 004406773 Item 3, img. 90, pag. 172, No. 91).',
+    'Dieťa #30 Jána Zámborského a #31 Veroniky Gefferthovej (index FS).': 'Child of #30 Ján Zámborský and #31 Veronika Gefferthová (FS index).',
+    'Dieťa #30 Jána Zámborského a #31 Veroniky Gefferthovej (index FS; 1930 žil s matkou na Zábave 1).': 'Child of #30 Ján Zámborský and #31 Veronika Gefferthová (FS index; lived with mother at Zábava 1 in 1930).',
+    'Sobáš Jána Zámborského a Veroniky Gefferthovej, Bardejov 1869': 'Marriage of Ján Zámborský and Veronika Gefferthová, Bardejov 1869',
+    'Prvý sobáš Jána Zámborského s Annou Kandráčovou, Bardejov 1866': 'First marriage of Ján Zámborský to Anna Kandráčová, Bardejov 1866',
+    'Krst Veroniky Juliány Gefferthovej, Bardejov 1847': 'Baptism of Veronika Juliána Gefferthová, Bardejov 1847',
+    'Krst Jána Zámborského, Bardejov 1844': 'Baptism of Ján Zámborský, Bardejov 1844',
 };
 
 function translateLineEn(line: string): string {
